@@ -2,1537 +2,1540 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Source: zig-0.16.0-std/Io/Kqueue.zig</title>
+    <title>Source: Io/Kqueue.zig</title>
     <style>
         body { background: #1e1e1e; color: #d4d4d4; font-family: monospace; padding: 20px; }
         pre { white-space: pre-wrap; word-wrap: break-word; }
         .header { border-bottom: 1px solid #444; padding-bottom: 10px; margin-bottom: 20px; }
         a { color: #569cd6; }
+        a[id] { color: inherit; text-decoration: none; }
+        :target { background: #3a3a00; }
     </style>
 </head>
 <body>
     <div class="header">
-        <a href="/">Index</a> | <strong>File: zig-0.16.0-std/Io/Kqueue.zig</strong>
+        <a href="/">Index</a> | <strong>File: Io/Kqueue.zig</strong>
     </div>
-    <pre>const Kqueue = @This();
-const builtin = @import("builtin");
-
-const std = @import("../std.zig");
-const Io = std.Io;
-const Dir = std.Io.Dir;
-const File = std.Io.File;
-const net = std.Io.net;
-const assert = std.debug.assert;
-const Allocator = std.mem.Allocator;
-const Alignment = std.mem.Alignment;
-const IpAddress = std.Io.net.IpAddress;
-const errnoBug = std.Io.Threaded.errnoBug;
-const closeFd = std.Io.Threaded.closeFd;
-const posix = std.posix;
-const posixSocketModeProtocol = Io.Threaded.posixSocketModeProtocol;
-
-/// Must be a thread-safe allocator.
-gpa: Allocator,
-mutex: Io.Mutex,
-main_fiber_buffer: [@sizeOf(Fiber) + Fiber.max_result_size]u8 align(@alignOf(Fiber)),
-threads: Thread.List,
-
-/// Empirically saw &gt;128KB being used by the self-hosted backend to panic.
-const idle_stack_size = 256 * 1024;
-
-const max_idle_search = 4;
-const max_steal_ready_search = 4;
-const max_iovecs_len = 8;
-
-const changes_buffer_len = 64;
-
-const Thread = struct {
-    thread: std.Thread,
-    idle_context: Io.fiber.Context,
-    current_context: *Io.fiber.Context,
-    ready_queue: ?*Fiber,
-    kq_fd: posix.fd_t,
-    idle_search_index: u32,
-    steal_ready_search_index: u32,
-    /// For ensuring multiple fibers waiting on the same file descriptor and
-    /// filter use the same kevent.
-    wait_queues: std.AutoArrayHashMapUnmanaged(WaitQueueKey, *Fiber),
-
-    const WaitQueueKey = struct {
-        ident: usize,
-        filter: i32,
-    };
-
-    const canceling: ?*Thread = @ptrFromInt(@alignOf(Thread));
-
-    threadlocal var self: *Thread = undefined;
-
-    fn current() *Thread {
-        return self;
-    }
-
-    fn currentFiber(thread: *Thread) *Fiber {
-        return @fieldParentPtr("context", thread.current_context);
-    }
-
-    const List = struct {
-        allocated: []Thread,
-        reserved: u32,
-        active: u32,
-    };
-
-    fn deinit(thread: *Thread, gpa: Allocator) void {
-        closeFd(thread.kq_fd);
-        assert(thread.wait_queues.count() == 0);
-        thread.wait_queues.deinit(gpa);
-        thread.* = undefined;
-    }
-};
-
-const Fiber = struct {
-    required_align: void align(4),
-    context: Io.fiber.Context,
-    awaiter: ?*Fiber,
-    queue_next: ?*Fiber,
-    cancel_thread: ?*Thread,
-    awaiting_completions: std.StaticBitSet(3),
-
-    const finished: ?*Fiber = @ptrFromInt(@alignOf(Thread));
-
-    const max_result_align: Alignment = .@"16";
-    const max_result_size = max_result_align.forward(64);
-    /// This includes any stack realignments that need to happen, and also the
-    /// initial frame return address slot and argument frame, depending on target.
-    const min_stack_size = 4 * 1024 * 1024;
-    const max_context_align: Alignment = .@"16";
-    const max_context_size = max_context_align.forward(1024);
-    const max_closure_size: usize = @sizeOf(AsyncClosure);
-    const max_closure_align: Alignment = .of(AsyncClosure);
-    const allocation_size = std.mem.alignForward(
-        usize,
-        max_closure_align.max(max_context_align).forward(
-            max_result_align.forward(@sizeOf(Fiber)) + max_result_size + min_stack_size,
-        ) + max_closure_size + max_context_size,
-        std.heap.page_size_max,
-    );
-
-    fn allocate(k: *Kqueue) error{OutOfMemory}!*Fiber {
-        return @ptrCast(try k.gpa.alignedAlloc(u8, .of(Fiber), allocation_size));
-    }
-
-    fn allocatedSlice(f: *Fiber) []align(@alignOf(Fiber)) u8 {
-        return @as([*]align(@alignOf(Fiber)) u8, @ptrCast(f))[0..allocation_size];
-    }
-
-    fn allocatedEnd(f: *Fiber) [*]u8 {
-        const allocated_slice = f.allocatedSlice();
-        return allocated_slice[allocated_slice.len..].ptr;
-    }
-
-    fn resultPointer(f: *Fiber, comptime Result: type) *Result {
-        return @ptrCast(@alignCast(f.resultBytes(.of(Result))));
-    }
-
-    fn resultBytes(f: *Fiber, alignment: Alignment) [*]u8 {
-        return @ptrFromInt(alignment.forward(@intFromPtr(f) + @sizeOf(Fiber)));
-    }
-
-    fn enterCancelRegion(fiber: *Fiber, thread: *Thread) error{Canceled}!void {
-        if (@cmpxchgStrong(
-            ?*Thread,
-            &amp;fiber.cancel_thread,
-            null,
-            thread,
-            .acq_rel,
-            .acquire,
-        )) |cancel_thread| {
-            assert(cancel_thread == Thread.canceling);
-            return error.Canceled;
-        }
-    }
-
-    fn exitCancelRegion(fiber: *Fiber, thread: *Thread) void {
-        if (@cmpxchgStrong(
-            ?*Thread,
-            &amp;fiber.cancel_thread,
-            thread,
-            null,
-            .acq_rel,
-            .acquire,
-        )) |cancel_thread| assert(cancel_thread == Thread.canceling);
-    }
-
-    const Queue = struct { head: *Fiber, tail: *Fiber };
-};
-
-fn recycle(k: *Kqueue, fiber: *Fiber) void {
-    std.log.debug("recyling {*}", .{fiber});
-    assert(fiber.queue_next == null);
-    k.gpa.free(fiber.allocatedSlice());
-}
-
-pub const InitOptions = struct {
-    n_threads: ?usize = null,
-};
-
-pub const InitError = Allocator.Error || CreateFileDescriptorError;
-
-pub fn init(k: *Kqueue, gpa: Allocator, options: InitOptions) !void {
-    assert(options.n_threads != 0);
-
-    const n_threads = @max(1, options.n_threads orelse std.Thread.getCpuCount() catch 1);
-    const threads_size = n_threads * @sizeOf(Thread);
-    const idle_stack_end_offset = std.mem.alignForward(usize, threads_size + idle_stack_size, std.heap.page_size_max);
-    const allocated_slice = try gpa.alignedAlloc(u8, .of(Thread), idle_stack_end_offset);
-    errdefer gpa.free(allocated_slice);
-    k.* = .{
-        .gpa = gpa,
-        .mutex = .init,
-        .main_fiber_buffer = undefined,
-        .threads = .{
-            .allocated = @ptrCast(allocated_slice[0..threads_size]),
-            .reserved = 1,
-            .active = 1,
-        },
-    };
-    const main_fiber: *Fiber = @ptrCast(&amp;k.main_fiber_buffer);
-    main_fiber.* = .{
-        .required_align = {},
-        .context = undefined,
-        .awaiter = null,
-        .queue_next = null,
-        .cancel_thread = null,
-        .awaiting_completions = .empty,
-    };
-    const main_thread = &amp;k.threads.allocated[0];
-    Thread.self = main_thread;
-    const idle_stack_end: [*]align(16) usize = @ptrCast(@alignCast(allocated_slice[idle_stack_end_offset..].ptr));
-    (idle_stack_end - 1)[0..1].* = .{@intFromPtr(k)};
-    main_thread.* = .{
-        .thread = undefined,
-        .idle_context = switch (builtin.cpu.arch) {
-            .aarch64 =&gt; .{
-                .sp = @intFromPtr(idle_stack_end),
-                .fp = 0,
-                .pc = @intFromPtr(&amp;mainIdleEntry),
-            },
-            .x86_64 =&gt; .{
-                .rsp = @intFromPtr(idle_stack_end - 1),
-                .rbp = 0,
-                .rip = @intFromPtr(&amp;mainIdleEntry),
-            },
-            else =&gt; @compileError("unimplemented architecture"),
-        },
-        .current_context = &amp;main_fiber.context,
-        .ready_queue = null,
-        .kq_fd = try createFileDescriptor(),
-        .idle_search_index = 1,
-        .steal_ready_search_index = 1,
-        .wait_queues = .empty,
-    };
-    errdefer closeFd(main_thread.kq_fd);
-    std.log.debug("created main idle {*}", .{&amp;main_thread.idle_context});
-    std.log.debug("created main {*}", .{main_fiber});
-}
-
-pub fn deinit(k: *Kqueue) void {
-    const active_threads = @atomicLoad(u32, &amp;k.threads.active, .acquire);
-    for (k.threads.allocated[0..active_threads]) |*thread| {
-        const ready_fiber = @atomicLoad(?*Fiber, &amp;thread.ready_queue, .monotonic);
-        assert(ready_fiber == null or ready_fiber == Fiber.finished); // pending async
-    }
-    k.yield(null, .exit);
-    const main_thread = &amp;k.threads.allocated[0];
-    const gpa = k.gpa;
-    main_thread.deinit(gpa);
-    const allocated_ptr: [*]align(@alignOf(Thread)) u8 = @ptrCast(@alignCast(k.threads.allocated.ptr));
-    const idle_stack_end_offset = std.mem.alignForward(usize, k.threads.allocated.len * @sizeOf(Thread) + idle_stack_size, std.heap.page_size_max);
-    for (k.threads.allocated[1..active_threads]) |*thread| thread.thread.join();
-    gpa.free(allocated_ptr[0..idle_stack_end_offset]);
-    k.* = undefined;
-}
-
-pub const CreateFileDescriptorError = error{
-    /// The per-process limit on the number of open file descriptors has been reached.
-    ProcessFdQuotaExceeded,
-    /// The system-wide limit on the total number of open files has been reached.
-    SystemFdQuotaExceeded,
-} || Io.UnexpectedError;
-
-pub fn createFileDescriptor() CreateFileDescriptorError!posix.fd_t {
-    const rc = posix.system.kqueue();
-    switch (posix.errno(rc)) {
-        .SUCCESS =&gt; return @intCast(rc),
-        .MFILE =&gt; return error.ProcessFdQuotaExceeded,
-        .NFILE =&gt; return error.SystemFdQuotaExceeded,
-        else =&gt; |err| return posix.unexpectedErrno(err),
-    }
-}
-
-fn findReadyFiber(k: *Kqueue, thread: *Thread) ?*Fiber {
-    if (@atomicRmw(?*Fiber, &amp;thread.ready_queue, .Xchg, Fiber.finished, .acquire)) |ready_fiber| {
-        @atomicStore(?*Fiber, &amp;thread.ready_queue, ready_fiber.queue_next, .release);
-        ready_fiber.queue_next = null;
-        return ready_fiber;
-    }
-    const active_threads = @atomicLoad(u32, &amp;k.threads.active, .acquire);
-    for (0..@min(max_steal_ready_search, active_threads)) |_| {
-        defer thread.steal_ready_search_index += 1;
-        if (thread.steal_ready_search_index == active_threads) thread.steal_ready_search_index = 0;
-        const steal_ready_search_thread = &amp;k.threads.allocated[0..active_threads][thread.steal_ready_search_index];
-        if (steal_ready_search_thread == thread) continue;
-        const ready_fiber = @atomicLoad(?*Fiber, &amp;steal_ready_search_thread.ready_queue, .acquire) orelse continue;
-        if (ready_fiber == Fiber.finished) continue;
-        if (@cmpxchgWeak(
-            ?*Fiber,
-            &amp;steal_ready_search_thread.ready_queue,
-            ready_fiber,
-            null,
-            .acquire,
-            .monotonic,
-        )) |_| continue;
-        @atomicStore(?*Fiber, &amp;thread.ready_queue, ready_fiber.queue_next, .release);
-        ready_fiber.queue_next = null;
-        return ready_fiber;
-    }
-    // couldn't find anything to do, so we are now open for business
-    @atomicStore(?*Fiber, &amp;thread.ready_queue, null, .monotonic);
-    return null;
-}
-
-fn yield(k: *Kqueue, maybe_ready_fiber: ?*Fiber, pending_task: SwitchMessage.PendingTask) void {
-    const thread: *Thread = .current();
-    const ready_context = if (maybe_ready_fiber orelse k.findReadyFiber(thread)) |ready_fiber|
-        &amp;ready_fiber.context
-    else
-        &amp;thread.idle_context;
-    const message: SwitchMessage = .{
-        .contexts = .{
-            .old = thread.current_context,
-            .new = ready_context,
-        },
-        .pending_task = pending_task,
-    };
-    std.log.debug("switching from {*} to {*}", .{ message.contexts.old, message.contexts.new });
-    contextSwitch(&amp;message).handle(k);
-}
-
-fn schedule(k: *Kqueue, thread: *Thread, ready_queue: Fiber.Queue) void {
-    {
-        var fiber = ready_queue.head;
-        while (true) {
-            std.log.debug("scheduling {*}", .{fiber});
-            fiber = fiber.queue_next orelse break;
-        }
-        assert(fiber == ready_queue.tail);
-    }
-    // shared fields of previous `Thread` must be initialized before later ones are marked as active
-    const new_thread_index = @atomicLoad(u32, &amp;k.threads.active, .acquire);
-    for (0..@min(max_idle_search, new_thread_index)) |_| {
-        defer thread.idle_search_index += 1;
-        if (thread.idle_search_index == new_thread_index) thread.idle_search_index = 0;
-        const idle_search_thread = &amp;k.threads.allocated[0..new_thread_index][thread.idle_search_index];
-        if (idle_search_thread == thread) continue;
-        if (@cmpxchgWeak(
-            ?*Fiber,
-            &amp;idle_search_thread.ready_queue,
-            null,
-            ready_queue.head,
-            .release,
-            .monotonic,
-        )) |_| continue;
-        const changes = [_]posix.Kevent{
-            .{
-                .ident = 0,
-                .filter = std.c.EVFILT.USER,
-                .flags = std.c.EV.ADD | std.c.EV.ONESHOT,
-                .fflags = std.c.NOTE.TRIGGER,
-                .data = 0,
-                .udata = @intFromEnum(Completion.UserData.wakeup),
-            },
-        };
-        // If an error occurs it only pessimises scheduling.
-        _ = kevent(idle_search_thread.kq_fd, &amp;changes, &amp;.{}, null) catch |err| {
-            // TODO handle EINTR for cancellation purposes
-            @panic(@errorName(err)); // TODO
-        };
-        return;
-    }
-    spawn_thread: {
-        // previous failed reservations must have completed before retrying
-        if (new_thread_index == k.threads.allocated.len or @cmpxchgWeak(
-            u32,
-            &amp;k.threads.reserved,
-            new_thread_index,
-            new_thread_index + 1,
-            .acquire,
-            .monotonic,
-        ) != null) break :spawn_thread;
-        const new_thread = &amp;k.threads.allocated[new_thread_index];
-        const next_thread_index = new_thread_index + 1;
-        new_thread.* = .{
-            .thread = undefined,
-            .idle_context = undefined,
-            .current_context = &amp;new_thread.idle_context,
-            .ready_queue = ready_queue.head,
-            .kq_fd = createFileDescriptor() catch |err| {
-                @atomicStore(u32, &amp;k.threads.reserved, new_thread_index, .release);
-                // no more access to `thread` after giving up reservation
-                std.log.warn("unable to create worker thread due to kqueue init failure: {t}", .{err});
-                break :spawn_thread;
-            },
-            .idle_search_index = 0,
-            .steal_ready_search_index = 0,
-            .wait_queues = .empty,
-        };
-        new_thread.thread = std.Thread.spawn(.{
-            .stack_size = idle_stack_size,
-            .allocator = k.gpa,
-        }, threadEntry, .{ k, new_thread_index }) catch |err| {
-            closeFd(new_thread.kq_fd);
-            @atomicStore(u32, &amp;k.threads.reserved, new_thread_index, .release);
-            // no more access to `thread` after giving up reservation
-            std.log.warn("unable to create worker thread due spawn failure: {s}", .{@errorName(err)});
-            break :spawn_thread;
-        };
-        // shared fields of `Thread` must be initialized before being marked active
-        @atomicStore(u32, &amp;k.threads.active, next_thread_index, .release);
-        return;
-    }
-    // nobody wanted it, so just queue it on ourselves
-    while (@cmpxchgWeak(
-        ?*Fiber,
-        &amp;thread.ready_queue,
-        ready_queue.tail.queue_next,
-        ready_queue.head,
-        .acq_rel,
-        .acquire,
-    )) |old_head| ready_queue.tail.queue_next = old_head;
-}
-
-fn mainIdle(k: *Kqueue, message: *const SwitchMessage) callconv(.withStackAlign(.c, @max(@alignOf(Thread), @alignOf(Io.fiber.Context)))) noreturn {
-    message.handle(k);
-    k.idle(&amp;k.threads.allocated[0]);
-    k.yield(@ptrCast(&amp;k.main_fiber_buffer), .nothing);
-    unreachable; // switched to dead fiber
-}
-
-fn threadEntry(k: *Kqueue, index: u32) void {
-    const thread: *Thread = &amp;k.threads.allocated[index];
-    Thread.self = thread;
-    std.log.debug("created thread idle {*}", .{&amp;thread.idle_context});
-    k.idle(thread);
-    thread.deinit(k.gpa);
-}
-
-const Completion = struct {
-    const UserData = enum(usize) {
-        unused,
-        wakeup,
-        cleanup,
-        exit,
-        /// *Fiber
-        _,
-    };
-    /// Corresponds to Kevent field.
-    flags: u16,
-    /// Corresponds to Kevent field.
-    fflags: u32,
-    /// Corresponds to Kevent field.
-    data: isize,
-};
-
-fn idle(k: *Kqueue, thread: *Thread) void {
-    var events_buffer: [changes_buffer_len]posix.Kevent = undefined;
-    var maybe_ready_fiber: ?*Fiber = null;
-    while (true) {
-        while (maybe_ready_fiber orelse k.findReadyFiber(thread)) |ready_fiber| {
-            k.yield(ready_fiber, .nothing);
-            maybe_ready_fiber = null;
-        }
-        const n = kevent(thread.kq_fd, &amp;.{}, &amp;events_buffer, null) catch |err| {
-            // TODO handle EINTR for cancellation purposes
-            @panic(@errorName(err)); // TODO
-        };
-        var maybe_ready_queue: ?Fiber.Queue = null;
-        for (events_buffer[0..n]) |event| switch (@as(Completion.UserData, @enumFromInt(event.udata))) {
-            .unused =&gt; unreachable, // bad submission queued?
-            .wakeup =&gt; {},
-            .cleanup =&gt; @panic("failed to notify other threads that we are exiting"),
-            .exit =&gt; {
-                assert(maybe_ready_fiber == null and maybe_ready_queue == null); // pending async
-                return;
-            },
-            _ =&gt; {
-                const event_head_fiber: *Fiber = @ptrFromInt(event.udata);
-                const event_tail_fiber = thread.wait_queues.fetchSwapRemove(.{
-                    .ident = event.ident,
-                    .filter = event.filter,
-                }).?.value;
-                assert(event_tail_fiber.queue_next == null);
-
-                // TODO reevaluate this logic
-                event_head_fiber.resultPointer(Completion).* = .{
-                    .flags = event.flags,
-                    .fflags = event.fflags,
-                    .data = event.data,
-                };
-
-                queue_ready: {
-                    const head: *Fiber = if (maybe_ready_fiber == null) f: {
-                        maybe_ready_fiber = event_head_fiber;
-                        const next = event_head_fiber.queue_next orelse break :queue_ready;
-                        event_head_fiber.queue_next = null;
-                        break :f next;
-                    } else event_head_fiber;
-
-                    if (maybe_ready_queue) |*ready_queue| {
-                        ready_queue.tail.queue_next = head;
-                        ready_queue.tail = event_tail_fiber;
-                    } else {
-                        maybe_ready_queue = .{ .head = head, .tail = event_tail_fiber };
-                    }
-                }
-            },
-        };
-        if (maybe_ready_queue) |ready_queue| k.schedule(thread, ready_queue);
-    }
-}
-
-const SwitchMessage = struct {
-    contexts: Io.fiber.Switch,
-    pending_task: PendingTask,
-
-    const PendingTask = union(enum) {
-        nothing,
-        reschedule,
-        recycle: *Fiber,
-        register_awaiter: *?*Fiber,
-        exit,
-    };
-
-    fn handle(message: *const SwitchMessage, k: *Kqueue) void {
-        const thread: *Thread = .current();
-        thread.current_context = message.contexts.new;
-        switch (message.pending_task) {
-            .nothing =&gt; {},
-            .reschedule =&gt; if (message.contexts.old != &amp;thread.idle_context) {
-                const prev_fiber: *Fiber = @alignCast(@fieldParentPtr("context", message.contexts.old));
-                assert(prev_fiber.queue_next == null);
-                k.schedule(thread, .{ .head = prev_fiber, .tail = prev_fiber });
-            },
-            .recycle =&gt; |fiber| {
-                k.recycle(fiber);
-            },
-            .register_awaiter =&gt; |awaiter| {
-                const prev_fiber: *Fiber = @alignCast(@fieldParentPtr("context", message.contexts.old));
-                assert(prev_fiber.queue_next == null);
-                if (@atomicRmw(?*Fiber, awaiter, .Xchg, prev_fiber, .acq_rel) == Fiber.finished)
-                    k.schedule(thread, .{ .head = prev_fiber, .tail = prev_fiber });
-            },
-            .exit =&gt; for (k.threads.allocated[0..@atomicLoad(u32, &amp;k.threads.active, .acquire)]) |*each_thread| {
-                const changes = [_]posix.Kevent{
-                    .{
-                        .ident = 0,
-                        .filter = std.c.EVFILT.USER,
-                        .flags = std.c.EV.ADD | std.c.EV.ONESHOT,
-                        .fflags = std.c.NOTE.TRIGGER,
-                        .data = 0,
-                        .udata = @intFromEnum(Completion.UserData.exit),
-                    },
-                };
-                _ = kevent(each_thread.kq_fd, &amp;changes, &amp;.{}, null) catch |err| {
-                    // TODO handle EINTR for cancellation purposes
-                    @panic(@errorName(err)); // TODO
-                };
-            },
-        }
-    }
-};
-
-inline fn contextSwitch(message: *const SwitchMessage) *const SwitchMessage {
-    return @fieldParentPtr("contexts", Io.fiber.contextSwitch(&amp;message.contexts));
-}
-
-fn mainIdleEntry() callconv(.naked) void {
-    switch (builtin.cpu.arch) {
-        .x86_64 =&gt; asm volatile (
-            \\ movq (%%rsp), %%rdi
-            \\ jmp %[mainIdle:P]
-            :
-            : [mainIdle] "X" (&amp;mainIdle),
-        ),
-        .aarch64 =&gt; asm volatile (
-            \\ ldr x0, [sp, #-8]
-            \\ b %[mainIdle]
-            :
-            : [mainIdle] "X" (&amp;mainIdle),
-        ),
-        else =&gt; |arch| @compileError("unimplemented architecture: " ++ @tagName(arch)),
-    }
-}
-
-fn fiberEntry() callconv(.naked) void {
-    switch (builtin.cpu.arch) {
-        .x86_64 =&gt; asm volatile (
-            \\ leaq 8(%%rsp), %%rdi
-            \\ jmp %[AsyncClosure_call:P]
-            :
-            : [AsyncClosure_call] "X" (&amp;AsyncClosure.call),
-        ),
-        .aarch64 =&gt; asm volatile (
-            \\ mov x0, sp
-            \\ b %[AsyncClosure_call]
-            :
-            : [AsyncClosure_call] "X" (&amp;AsyncClosure.call),
-        ),
-        else =&gt; |arch| @compileError("unimplemented architecture: " ++ @tagName(arch)),
-    }
-}
-
-const AsyncClosure = struct {
-    kqueue: *Kqueue,
-    fiber: *Fiber,
-    start: *const fn (context: *const anyopaque, result: *anyopaque) void,
-    result_align: Alignment,
-    already_awaited: bool,
-
-    fn contextPointer(closure: *AsyncClosure) [*]align(Fiber.max_context_align.toByteUnits()) u8 {
-        return @alignCast(@as([*]u8, @ptrCast(closure)) + @sizeOf(AsyncClosure));
-    }
-
-    fn call(closure: *AsyncClosure, message: *const SwitchMessage) callconv(.withStackAlign(.c, @alignOf(AsyncClosure))) noreturn {
-        message.handle(closure.kqueue);
-        const fiber = closure.fiber;
-        std.log.debug("{*} performing async", .{fiber});
-        closure.start(closure.contextPointer(), fiber.resultBytes(closure.result_align));
-        const awaiter = @atomicRmw(?*Fiber, &amp;fiber.awaiter, .Xchg, Fiber.finished, .acq_rel);
-        const ready_awaiter = r: {
-            const a = awaiter orelse break :r null;
-            if (@atomicRmw(bool, &amp;closure.already_awaited, .Xchg, true, .acq_rel)) break :r null;
-            break :r a;
-        };
-        closure.kqueue.yield(ready_awaiter, .nothing);
-        unreachable; // switched to dead fiber
-    }
-
-    fn fromFiber(fiber: *Fiber) *AsyncClosure {
-        return @ptrFromInt(Fiber.max_context_align.max(.of(AsyncClosure)).backward(
-            @intFromPtr(fiber.allocatedEnd()) - Fiber.max_context_size,
-        ) - @sizeOf(AsyncClosure));
-    }
-};
-
-pub fn io(k: *Kqueue) Io {
-    return .{
-        .userdata = k,
-        .vtable = &amp;.{
-            .async = async,
-            .concurrent = concurrent,
-            .await = await,
-            .cancel = cancel,
-
-            .groupAsync = groupAsync,
-            .groupConcurrent = groupConcurrent,
-            .groupAwait = groupAwait,
-            .groupCancel = groupCancel,
-
-            .dirCreateDir = dirCreateDir,
-            .dirCreateDirPath = dirCreateDirPath,
-            .dirCreateDirPathOpen = dirCreateDirPathOpen,
-            .dirStat = dirStat,
-            .dirStatFile = dirStatFile,
-
-            .fileStat = fileStat,
-            .dirAccess = dirAccess,
-            .dirCreateFile = dirCreateFile,
-            .dirOpenFile = dirOpenFile,
-            .dirOpenDir = dirOpenDir,
-            .dirClose = dirClose,
-            .fileClose = fileClose,
-            .fileWriteStreaming = fileWriteStreaming,
-            .fileWritePositional = fileWritePositional,
-            .fileReadStreaming = fileReadStreaming,
-            .fileReadPositional = fileReadPositional,
-            .fileSeekBy = fileSeekBy,
-            .fileSeekTo = fileSeekTo,
-
-            .now = now,
-            .sleep = sleep,
-
-            .netListenIp = netListenIp,
-            .netListenUnix = netListenUnix,
-            .netAccept = netAccept,
-            .netBindIp = netBindIp,
-            .netConnectIp = netConnectIp,
-            .netConnectUnix = netConnectUnix,
-            .netClose = netClose,
-            .netShutdown = netShutdown,
-            .netRead = netRead,
-            .netWrite = netWrite,
-            .netSend = netSend,
-            .netReceive = netReceive,
-            .netInterfaceNameResolve = netInterfaceNameResolve,
-            .netInterfaceName = netInterfaceName,
-            .netLookup = netLookup,
-        },
-    };
-}
-
-fn async(
-    userdata: ?*anyopaque,
-    result: []u8,
-    result_alignment: std.mem.Alignment,
-    context: []const u8,
-    context_alignment: std.mem.Alignment,
-    start: *const fn (context: *const anyopaque, result: *anyopaque) void,
-) ?*Io.AnyFuture {
-    return concurrent(userdata, result.len, result_alignment, context, context_alignment, start) catch {
-        start(context.ptr, result.ptr);
-        return null;
-    };
-}
-
-fn concurrent(
-    userdata: ?*anyopaque,
-    result_len: usize,
-    result_alignment: Alignment,
-    context: []const u8,
-    context_alignment: Alignment,
-    start: *const fn (context: *const anyopaque, result: *anyopaque) void,
-) Io.ConcurrentError!*Io.AnyFuture {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
-    assert(result_alignment.compare(.lte, Fiber.max_result_align)); // TODO
-    assert(context_alignment.compare(.lte, Fiber.max_context_align)); // TODO
-    assert(result_len &lt;= Fiber.max_result_size); // TODO
-    assert(context.len &lt;= Fiber.max_context_size); // TODO
-
-    const fiber = Fiber.allocate(k) catch return error.ConcurrencyUnavailable;
-    std.log.debug("allocated {*}", .{fiber});
-
-    const closure: *AsyncClosure = .fromFiber(fiber);
-    fiber.* = .{
-        .required_align = {},
-        .context = switch (builtin.cpu.arch) {
-            .x86_64 =&gt; .{
-                .rsp = @intFromPtr(closure) - @sizeOf(usize),
-                .rbp = 0,
-                .rip = @intFromPtr(&amp;fiberEntry),
-            },
-            .aarch64 =&gt; .{
-                .sp = @intFromPtr(closure),
-                .fp = 0,
-                .pc = @intFromPtr(&amp;fiberEntry),
-            },
-            else =&gt; |arch| @compileError("unimplemented architecture: " ++ @tagName(arch)),
-        },
-        .awaiter = null,
-        .queue_next = null,
-        .cancel_thread = null,
-        .awaiting_completions = .empty,
-    };
-    closure.* = .{
-        .kqueue = k,
-        .fiber = fiber,
-        .start = start,
-        .result_align = result_alignment,
-        .already_awaited = false,
-    };
-    @memcpy(closure.contextPointer(), context);
-
-    k.schedule(.current(), .{ .head = fiber, .tail = fiber });
-    return @ptrCast(fiber);
-}
-
-fn await(
-    userdata: ?*anyopaque,
-    any_future: *Io.AnyFuture,
-    result: []u8,
-    result_alignment: std.mem.Alignment,
-) void {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
-    const future_fiber: *Fiber = @ptrCast(@alignCast(any_future));
-    if (@atomicLoad(?*Fiber, &amp;future_fiber.awaiter, .acquire) != Fiber.finished)
-        k.yield(null, .{ .register_awaiter = &amp;future_fiber.awaiter });
-    @memcpy(result, future_fiber.resultBytes(result_alignment));
-    k.recycle(future_fiber);
-}
-
-fn cancel(
-    userdata: ?*anyopaque,
-    any_future: *Io.AnyFuture,
-    result: []u8,
-    result_alignment: std.mem.Alignment,
-) void {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
-    _ = k;
-    _ = any_future;
-    _ = result;
-    _ = result_alignment;
-    @panic("TODO");
-}
-
-fn cancelRequested(userdata: ?*anyopaque) bool {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
-    _ = k;
-    return false; // TODO
-}
-
-fn groupAsync(
-    userdata: ?*anyopaque,
-    type_erased: *Io.Group,
-    context: []const u8,
-    context_alignment: Alignment,
-    start: *const fn (context: *const anyopaque) void,
-) void {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
-    _ = k;
-    _ = type_erased;
-    _ = context;
-    _ = context_alignment;
-    _ = start;
-    @panic("TODO");
-}
-
-fn groupConcurrent(
-    userdata: ?*anyopaque,
-    type_erased: *Io.Group,
-    context: []const u8,
-    context_alignment: Alignment,
-    start: *const fn (context: *const anyopaque) void,
-) Io.ConcurrentError!void {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
-    _ = k;
-    _ = type_erased;
-    _ = context;
-    _ = context_alignment;
-    _ = start;
-    @panic("TODO");
-}
-
-fn groupAwait(userdata: ?*anyopaque, type_erased: *Io.Group, initial_token: *anyopaque) Io.Cancelable!void {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
-    _ = k;
-    _ = type_erased;
-    _ = initial_token;
-    @panic("TODO");
-}
-
-fn groupCancel(userdata: ?*anyopaque, group: *Io.Group, token: *anyopaque) void {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
-    _ = k;
-    _ = group;
-    _ = token;
-    @panic("TODO");
-}
-
-fn dirCreateDir(userdata: ?*anyopaque, dir: Dir, sub_path: []const u8, permissions: Dir.Permissions) Dir.CreateDirError!void {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
-    _ = k;
-    _ = dir;
-    _ = sub_path;
-    _ = permissions;
-    @panic("TODO");
-}
-
-fn dirCreateDirPath(
-    userdata: ?*anyopaque,
-    dir: Dir,
-    sub_path: []const u8,
-    permissions: Dir.Permissions,
-) Dir.CreateDirPathError!Dir.CreatePathStatus {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
-    _ = k;
-    _ = dir;
-    _ = sub_path;
-    _ = permissions;
-    @panic("TODO");
-}
-
-fn dirCreateDirPathOpen(
-    userdata: ?*anyopaque,
-    dir: Dir,
-    sub_path: []const u8,
-    permissions: Dir.Permissions,
-    options: Dir.OpenOptions,
-) Dir.CreateDirPathOpenError!Dir {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
-    _ = k;
-    _ = dir;
-    _ = sub_path;
-    _ = permissions;
-    _ = options;
-    @panic("TODO");
-}
-
-fn dirStat(userdata: ?*anyopaque, dir: Dir) Dir.StatError!Dir.Stat {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
-    _ = k;
-    _ = dir;
-    @panic("TODO");
-}
-
-fn dirStatFile(
-    userdata: ?*anyopaque,
-    dir: Dir,
-    sub_path: []const u8,
-    options: Dir.StatFileOptions,
-) Dir.StatFileError!File.Stat {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
-    _ = k;
-    _ = dir;
-    _ = sub_path;
-    _ = options;
-    @panic("TODO");
-}
-fn dirAccess(userdata: ?*anyopaque, dir: Dir, sub_path: []const u8, options: Dir.AccessOptions) Dir.AccessError!void {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
-    _ = k;
-    _ = dir;
-    _ = sub_path;
-    _ = options;
-    @panic("TODO");
-}
-fn dirCreateFile(userdata: ?*anyopaque, dir: Dir, sub_path: []const u8, flags: File.CreateFlags) File.OpenError!File {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
-    _ = k;
-    _ = dir;
-    _ = sub_path;
-    _ = flags;
-    @panic("TODO");
-}
-fn dirOpenFile(userdata: ?*anyopaque, dir: Dir, sub_path: []const u8, flags: File.OpenFlags) File.OpenError!File {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
-    _ = k;
-    _ = dir;
-    _ = sub_path;
-    _ = flags;
-    @panic("TODO");
-}
-fn dirOpenDir(userdata: ?*anyopaque, dir: Dir, sub_path: []const u8, options: Dir.OpenOptions) Dir.OpenError!Dir {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
-    _ = k;
-    _ = dir;
-    _ = sub_path;
-    _ = options;
-    @panic("TODO");
-}
-fn dirClose(userdata: ?*anyopaque, dirs: []const Dir) void {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
-    _ = k;
-    _ = dirs;
-    @panic("TODO");
-}
-fn fileStat(userdata: ?*anyopaque, file: File) File.StatError!File.Stat {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
-    _ = k;
-    _ = file;
-    @panic("TODO");
-}
-
-fn fileClose(userdata: ?*anyopaque, files: []const File) void {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
-    _ = k;
-    _ = files;
-    @panic("TODO");
-}
-
-fn fileWriteStreaming(
-    userdata: ?*anyopaque,
-    file: File,
-    header: []const u8,
-    data: []const []const u8,
-    splat: usize,
-) File.Writer.Error!usize {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
-    _ = k;
-    _ = file;
-    _ = header;
-    _ = data;
-    _ = splat;
-    @panic("TODO");
-}
-
-fn fileWritePositional(
-    userdata: ?*anyopaque,
-    file: File,
-    header: []const u8,
-    data: []const []const u8,
-    splat: usize,
-    offset: u64,
-) File.WritePositionalError!usize {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
-    _ = k;
-    _ = file;
-    _ = header;
-    _ = data;
-    _ = splat;
-    _ = offset;
-    @panic("TODO");
-}
-
-fn fileReadStreaming(userdata: ?*anyopaque, file: File, data: []const []u8) File.Reader.Error!usize {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
-    _ = k;
-    _ = file;
-    _ = data;
-    @panic("TODO");
-}
-
-fn fileReadPositional(userdata: ?*anyopaque, file: File, data: []const []u8, offset: u64) File.ReadPositionalError!usize {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
-    _ = k;
-    _ = file;
-    _ = data;
-    _ = offset;
-    @panic("TODO");
-}
-fn fileSeekBy(userdata: ?*anyopaque, file: File, relative_offset: i64) File.SeekError!void {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
-    _ = k;
-    _ = file;
-    _ = relative_offset;
-    @panic("TODO");
-}
-fn fileSeekTo(userdata: ?*anyopaque, file: File, absolute_offset: u64) File.SeekError!void {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
-    _ = k;
-    _ = file;
-    _ = absolute_offset;
-    @panic("TODO");
-}
-
-fn now(userdata: ?*anyopaque, clock: Io.Clock) Io.Clock.Error!Io.Timestamp {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
-    _ = k;
-    _ = clock;
-    @panic("TODO");
-}
-fn sleep(userdata: ?*anyopaque, timeout: Io.Timeout) Io.SleepError!void {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
-    _ = k;
-    _ = timeout;
-    @panic("TODO");
-}
-
-fn netListenIp(
-    userdata: ?*anyopaque,
-    address: *const net.IpAddress,
-    options: net.IpAddress.ListenOptions,
-) net.IpAddress.ListenError!net.Socket {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
-    _ = k;
-    _ = address;
-    _ = options;
-    @panic("TODO");
-}
-fn netAccept(userdata: ?*anyopaque, server: net.Socket.Handle, options: net.Server.AcceptOptions) net.Server.AcceptError!net.Socket {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
-    _ = k;
-    _ = server;
-    _ = options;
-    @panic("TODO");
-}
-fn netBindIp(
-    userdata: ?*anyopaque,
-    address: *const net.IpAddress,
-    options: net.IpAddress.BindOptions,
-) net.IpAddress.BindError!net.Socket {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
-    const family = Io.Threaded.posixAddressFamily(address);
-    const socket_fd = try openSocketPosix(k, family, options);
-    errdefer closeFd(socket_fd);
-    var storage: Io.Threaded.PosixAddress = undefined;
-    var addr_len = Io.Threaded.addressToPosix(address, &amp;storage);
-    try posixBind(k, socket_fd, &amp;storage.any, addr_len);
-    if (options.allow_broadcast) try setSocketOption(k, socket_fd, posix.SOL.SOCKET, posix.SO.BROADCAST, 1);
-    try posixGetSockName(k, socket_fd, &amp;storage.any, &amp;addr_len);
-    return .{ .handle = socket_fd, .address = Io.Threaded.addressFromPosix(&amp;storage) };
-}
-fn netConnectIp(userdata: ?*anyopaque, address: *const net.IpAddress, options: net.IpAddress.ConnectOptions) net.IpAddress.ConnectError!net.Socket {
-    if (options.timeout != .none) @panic("TODO");
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
-    const family = Io.Threaded.posixAddressFamily(address);
-    const socket_fd = try openSocketPosix(k, family, .{
-        .mode = options.mode,
-        .protocol = options.protocol,
-    });
-    errdefer closeFd(socket_fd);
-    var storage: Io.Threaded.PosixAddress = undefined;
-    var addr_len = Io.Threaded.addressToPosix(address, &amp;storage);
-    try posixConnect(k, socket_fd, &amp;storage.any, addr_len);
-    try posixGetSockName(k, socket_fd, &amp;storage.any, &amp;addr_len);
-    return .{ .handle = socket_fd, .address = Io.Threaded.addressFromPosix(&amp;storage) };
-}
-
-fn posixConnect(k: *Kqueue, socket_fd: posix.socket_t, addr: *const posix.sockaddr, addr_len: posix.socklen_t) !void {
-    while (true) {
-        try k.checkCancel();
-        switch (posix.errno(posix.system.connect(socket_fd, addr, addr_len))) {
-            .SUCCESS =&gt; return,
-            .INTR =&gt; continue,
-            .CANCELED =&gt; return error.Canceled,
-            .AGAIN =&gt; @panic("TODO"),
-            .INPROGRESS =&gt; return, // Due to TCP fast open, we find out possible error later.
-
-            .ADDRNOTAVAIL =&gt; return error.AddressUnavailable,
-            .AFNOSUPPORT =&gt; return error.AddressFamilyUnsupported,
-            .ALREADY =&gt; return error.ConnectionPending,
-            .BADF =&gt; |err| return errnoBug(err), // File descriptor used after closed.
-            .CONNREFUSED =&gt; return error.ConnectionRefused,
-            .CONNRESET =&gt; return error.ConnectionResetByPeer,
-            .FAULT =&gt; |err| return errnoBug(err),
-            .ISCONN =&gt; |err| return errnoBug(err),
-            .HOSTUNREACH =&gt; return error.HostUnreachable,
-            .NETUNREACH =&gt; return error.NetworkUnreachable,
-            .NOTSOCK =&gt; |err| return errnoBug(err),
-            .PROTOTYPE =&gt; |err| return errnoBug(err),
-            .TIMEDOUT =&gt; return error.Timeout,
-            .CONNABORTED =&gt; |err| return errnoBug(err),
-            .ACCES =&gt; return error.AccessDenied,
-            .PERM =&gt; |err| return errnoBug(err),
-            .NOENT =&gt; |err| return errnoBug(err),
-            .NETDOWN =&gt; return error.NetworkDown,
-            else =&gt; |err| return posix.unexpectedErrno(err),
-        }
-    }
-}
-
-fn netListenUnix(
-    userdata: ?*anyopaque,
-    unix_address: *const net.UnixAddress,
-    options: net.UnixAddress.ListenOptions,
-) net.UnixAddress.ListenError!net.Socket.Handle {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
-    _ = k;
-    _ = unix_address;
-    _ = options;
-    @panic("TODO");
-}
-fn netConnectUnix(
-    userdata: ?*anyopaque,
-    unix_address: *const net.UnixAddress,
-) net.UnixAddress.ConnectError!net.Socket.Handle {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
-    _ = k;
-    _ = unix_address;
-    @panic("TODO");
-}
-
-fn netSend(
-    userdata: ?*anyopaque,
-    handle: net.Socket.Handle,
-    outgoing_messages: []net.OutgoingMessage,
-    flags: net.SendFlags,
-) struct { ?net.Socket.SendError, usize } {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
-
-    const posix_flags: u32 =
-        @as(u32, if (@hasDecl(posix.MSG, "CONFIRM") and flags.confirm) posix.MSG.CONFIRM else 0) |
-        @as(u32, if (@hasDecl(posix.MSG, "DONTROUTE") and flags.dont_route) posix.MSG.DONTROUTE else 0) |
-        @as(u32, if (@hasDecl(posix.MSG, "EOR") and flags.eor) posix.MSG.EOR else 0) |
-        @as(u32, if (@hasDecl(posix.MSG, "OOB") and flags.oob) posix.MSG.OOB else 0) |
-        @as(u32, if (@hasDecl(posix.MSG, "FASTOPEN") and flags.fastopen) posix.MSG.FASTOPEN else 0) |
-        posix.MSG.NOSIGNAL;
-
-    for (outgoing_messages, 0..) |*msg, i| {
-        netSendOne(k, handle, msg, posix_flags) catch |err| return .{ err, i };
-    }
-
-    return .{ null, outgoing_messages.len };
-}
-
-fn netSendOne(
-    k: *Kqueue,
-    handle: net.Socket.Handle,
-    message: *net.OutgoingMessage,
-    flags: u32,
-) net.Socket.SendError!void {
-    var addr: Io.Threaded.PosixAddress = undefined;
-    var iovec: posix.iovec_const = .{ .base = @constCast(message.data_ptr), .len = message.data_len };
-    const msg: posix.msghdr_const = .{
-        .name = &amp;addr.any,
-        .namelen = Io.Threaded.addressToPosix(message.address, &amp;addr),
-        .iov = (&amp;iovec)[0..1],
-        .iovlen = 1,
-        // OS returns EINVAL if this pointer is invalid even if controllen is zero.
-        .control = if (message.control.len == 0) null else @constCast(message.control.ptr),
-        .controllen = @intCast(message.control.len),
-        .flags = 0,
-    };
-    while (true) {
-        try k.checkCancel();
-        const rc = posix.system.sendmsg(handle, &amp;msg, flags);
-        switch (posix.errno(rc)) {
-            .SUCCESS =&gt; {
-                message.data_len = @intCast(rc);
-                return;
-            },
-            .INTR =&gt; continue,
-            .CANCELED =&gt; return error.Canceled,
-            .AGAIN =&gt; @panic("TODO register kevent"),
-
-            .ACCES =&gt; return error.AccessDenied,
-            .ALREADY =&gt; return error.FastOpenAlreadyInProgress,
-            .BADF =&gt; |err| return errnoBug(err), // File descriptor used after closed.
-            .CONNRESET =&gt; return error.ConnectionResetByPeer,
-            .DESTADDRREQ =&gt; |err| return errnoBug(err),
-            .FAULT =&gt; |err| return errnoBug(err),
-            .INVAL =&gt; |err| return errnoBug(err),
-            .ISCONN =&gt; |err| return errnoBug(err),
-            .MSGSIZE =&gt; return error.MessageOversize,
-            .NOBUFS =&gt; return error.SystemResources,
-            .NOMEM =&gt; return error.SystemResources,
-            .NOTSOCK =&gt; |err| return errnoBug(err),
-            .OPNOTSUPP =&gt; |err| return errnoBug(err),
-            .PIPE =&gt; return error.SocketUnconnected,
-            .AFNOSUPPORT =&gt; return error.AddressFamilyUnsupported,
-            .HOSTUNREACH =&gt; return error.HostUnreachable,
-            .NETUNREACH =&gt; return error.NetworkUnreachable,
-            .NOTCONN =&gt; return error.SocketUnconnected,
-            .NETDOWN =&gt; return error.NetworkDown,
-            else =&gt; |err| return posix.unexpectedErrno(err),
-        }
-    }
-}
-
-fn netReceive(
-    userdata: ?*anyopaque,
-    handle: net.Socket.Handle,
-    message_buffer: []net.IncomingMessage,
-    data_buffer: []u8,
-    flags: net.ReceiveFlags,
-    timeout: Io.Timeout,
-) struct { ?net.Socket.ReceiveTimeoutError, usize } {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
-    _ = k;
-    _ = handle;
-    _ = message_buffer;
-    _ = data_buffer;
-    _ = flags;
-    _ = timeout;
-    @panic("TODO");
-}
-
-fn netRead(userdata: ?*anyopaque, fd: net.Socket.Handle, data: [][]u8) net.Stream.Reader.Error!usize {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
-
-    var iovecs_buffer: [max_iovecs_len]posix.iovec = undefined;
-    var i: usize = 0;
-    for (data) |buf| {
-        if (iovecs_buffer.len - i == 0) break;
-        if (buf.len != 0) {
-            iovecs_buffer[i] = .{ .base = buf.ptr, .len = buf.len };
-            i += 1;
-        }
-    }
-    const dest = iovecs_buffer[0..i];
-    assert(dest[0].len &gt; 0);
-
-    while (true) {
-        try k.checkCancel();
-        const rc = posix.system.readv(fd, dest.ptr, @intCast(dest.len));
-        switch (posix.errno(rc)) {
-            .SUCCESS =&gt; return @intCast(rc),
-            .INTR =&gt; continue,
-            .CANCELED =&gt; return error.Canceled,
-            .AGAIN =&gt; {
-                const thread: *Thread = .current();
-                const fiber = thread.currentFiber();
-                const ident: u32 = @bitCast(fd);
-                const filter = std.c.EVFILT.READ;
-                const gop = thread.wait_queues.getOrPut(k.gpa, .{
-                    .ident = ident,
-                    .filter = filter,
-                }) catch return error.SystemResources;
-                if (gop.found_existing) {
-                    const tail_fiber = gop.value_ptr.*;
-                    assert(tail_fiber.queue_next == null);
-                    tail_fiber.queue_next = fiber;
-                    gop.value_ptr.* = fiber;
-                } else {
-                    gop.value_ptr.* = fiber;
-                    const changes = [_]posix.Kevent{
-                        .{
-                            .ident = ident,
-                            .filter = filter,
-                            .flags = std.c.EV.ADD | std.c.EV.ONESHOT,
-                            .fflags = 0,
-                            .data = 0,
-                            .udata = @intFromPtr(fiber),
-                        },
-                    };
-                    assert(0 == (kevent(thread.kq_fd, &amp;changes, &amp;.{}, null) catch |err| {
-                        // TODO handle EINTR for cancellation purposes
-                        @panic(@errorName(err)); // TODO
-                    }));
-                }
-                yield(k, null, .nothing);
-                continue;
-            },
-
-            .INVAL =&gt; |err| return errnoBug(err),
-            .FAULT =&gt; |err| return errnoBug(err),
-            .BADF =&gt; |err| return errnoBug(err), // File descriptor used after closed.
-            .NOBUFS =&gt; return error.SystemResources,
-            .NOMEM =&gt; return error.SystemResources,
-            .NOTCONN =&gt; return error.SocketUnconnected,
-            .CONNRESET =&gt; return error.ConnectionResetByPeer,
-            .TIMEDOUT =&gt; return error.Timeout,
-            .PIPE =&gt; return error.SocketUnconnected,
-            .NETDOWN =&gt; return error.NetworkDown,
-            else =&gt; |err| return posix.unexpectedErrno(err),
-        }
-    }
-}
-
-fn netWrite(userdata: ?*anyopaque, dest: net.Socket.Handle, header: []const u8, data: []const []const u8, splat: usize) net.Stream.Writer.Error!usize {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
-    _ = k;
-    _ = dest;
-    _ = header;
-    _ = data;
-    _ = splat;
-    @panic("TODO");
-}
-
-fn netClose(userdata: ?*anyopaque, handles: []const net.Socket.Handle) void {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
-    _ = k;
-    _ = handles;
-    @panic("TODO");
-}
-
-fn netShutdown(userdata: ?*anyopaque, handle: net.Socket.Handle, how: net.ShutdownHow) net.ShutdownError!void {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
-    _ = k;
-    _ = handle;
-    _ = how;
-    @panic("TODO");
-}
-
-fn netInterfaceNameResolve(
-    userdata: ?*anyopaque,
-    name: *const net.Interface.Name,
-) net.Interface.Name.ResolveError!net.Interface {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
-    _ = k;
-    _ = name;
-    @panic("TODO");
-}
-
-fn netInterfaceName(userdata: ?*anyopaque, interface: net.Interface) net.Interface.NameError!net.Interface.Name {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
-    _ = k;
-    _ = interface;
-    @panic("TODO");
-}
-
-fn netLookup(
-    userdata: ?*anyopaque,
-    host_name: net.HostName,
-    resolved: *Io.Queue(net.HostName.LookupResult),
-    options: net.HostName.LookupOptions,
-) net.HostName.LookupError!void {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
-    _ = k;
-    _ = host_name;
-    _ = resolved;
-    _ = options;
-    @panic("TODO");
-}
-
-fn openSocketPosix(
-    k: *Kqueue,
-    family: posix.sa_family_t,
-    options: IpAddress.BindOptions,
-) error{
-    AddressFamilyUnsupported,
-    ProtocolUnsupportedBySystem,
-    ProcessFdQuotaExceeded,
-    SystemFdQuotaExceeded,
-    SystemResources,
-    ProtocolUnsupportedByAddressFamily,
-    SocketModeUnsupported,
-    OptionUnsupported,
-    Unexpected,
-    Canceled,
-}!posix.socket_t {
-    const mode, const protocol = try posixSocketModeProtocol(family, options.mode, options.protocol);
-    const socket_fd = while (true) {
-        try k.checkCancel();
-        const flags: u32 = mode | if (Io.Threaded.socket_flags_unsupported) 0 else posix.SOCK.CLOEXEC;
-        const socket_rc = posix.system.socket(family, flags, protocol);
-        switch (posix.errno(socket_rc)) {
-            .SUCCESS =&gt; {
-                const fd: posix.fd_t = @intCast(socket_rc);
-                errdefer closeFd(fd);
-                if (Io.Threaded.socket_flags_unsupported) {
-                    while (true) {
-                        try k.checkCancel();
-                        switch (posix.errno(posix.system.fcntl(fd, posix.F.SETFD, @as(usize, posix.FD_CLOEXEC)))) {
-                            .SUCCESS =&gt; break,
-                            .INTR =&gt; continue,
-                            .CANCELED =&gt; return error.Canceled,
-                            else =&gt; |err| return posix.unexpectedErrno(err),
-                        }
-                    }
-
-                    var fl_flags: usize = while (true) {
-                        try k.checkCancel();
-                        const rc = posix.system.fcntl(fd, posix.F.GETFL, @as(usize, 0));
-                        switch (posix.errno(rc)) {
-                            .SUCCESS =&gt; break @intCast(rc),
-                            .INTR =&gt; continue,
-                            .CANCELED =&gt; return error.Canceled,
-                            else =&gt; |err| return posix.unexpectedErrno(err),
-                        }
-                    };
-                    fl_flags |= @as(usize, 1 &lt;&lt; @bitOffsetOf(posix.O, "NONBLOCK"));
-                    while (true) {
-                        try k.checkCancel();
-                        switch (posix.errno(posix.system.fcntl(fd, posix.F.SETFL, fl_flags))) {
-                            .SUCCESS =&gt; break,
-                            .INTR =&gt; continue,
-                            .CANCELED =&gt; return error.Canceled,
-                            else =&gt; |err| return posix.unexpectedErrno(err),
-                        }
-                    }
-                }
-                break fd;
-            },
-            .INTR =&gt; continue,
-            .CANCELED =&gt; return error.Canceled,
-
-            .AFNOSUPPORT =&gt; return error.AddressFamilyUnsupported,
-            .INVAL =&gt; return error.ProtocolUnsupportedBySystem,
-            .MFILE =&gt; return error.ProcessFdQuotaExceeded,
-            .NFILE =&gt; return error.SystemFdQuotaExceeded,
-            .NOBUFS =&gt; return error.SystemResources,
-            .NOMEM =&gt; return error.SystemResources,
-            .PROTONOSUPPORT =&gt; return error.ProtocolUnsupportedByAddressFamily,
-            .PROTOTYPE =&gt; return error.SocketModeUnsupported,
-            else =&gt; |err| return posix.unexpectedErrno(err),
-        }
-    };
-    errdefer closeFd(socket_fd);
-
-    if (options.ip6_only) {
-        if (posix.IPV6 == void) return error.OptionUnsupported;
-        try setSocketOption(k, socket_fd, posix.IPPROTO.IPV6, posix.IPV6.V6ONLY, 0);
-    }
-
-    return socket_fd;
-}
-
-fn posixBind(
-    k: *Kqueue,
-    socket_fd: posix.socket_t,
-    addr: *const posix.sockaddr,
-    addr_len: posix.socklen_t,
-) !void {
-    while (true) {
-        try k.checkCancel();
-        switch (posix.errno(posix.system.bind(socket_fd, addr, addr_len))) {
-            .SUCCESS =&gt; break,
-            .INTR =&gt; continue,
-            .CANCELED =&gt; return error.Canceled,
-
-            .ADDRINUSE =&gt; return error.AddressInUse,
-            .BADF =&gt; |err| return errnoBug(err), // File descriptor used after closed.
-            .INVAL =&gt; |err| return errnoBug(err), // invalid parameters
-            .NOTSOCK =&gt; |err| return errnoBug(err), // invalid `sockfd`
-            .AFNOSUPPORT =&gt; return error.AddressFamilyUnsupported,
-            .ADDRNOTAVAIL =&gt; return error.AddressUnavailable,
-            .FAULT =&gt; |err| return errnoBug(err), // invalid `addr` pointer
-            .NOMEM =&gt; return error.SystemResources,
-            else =&gt; |err| return posix.unexpectedErrno(err),
-        }
-    }
-}
-
-fn posixGetSockName(k: *Kqueue, socket_fd: posix.fd_t, addr: *posix.sockaddr, addr_len: *posix.socklen_t) !void {
-    while (true) {
-        try k.checkCancel();
-        switch (posix.errno(posix.system.getsockname(socket_fd, addr, addr_len))) {
-            .SUCCESS =&gt; break,
-            .INTR =&gt; continue,
-            .CANCELED =&gt; return error.Canceled,
-
-            .BADF =&gt; |err| return errnoBug(err), // File descriptor used after closed.
-            .FAULT =&gt; |err| return errnoBug(err),
-            .INVAL =&gt; |err| return errnoBug(err), // invalid parameters
-            .NOTSOCK =&gt; |err| return errnoBug(err), // always a race condition
-            .NOBUFS =&gt; return error.SystemResources,
-            else =&gt; |err| return posix.unexpectedErrno(err),
-        }
-    }
-}
-
-fn setSocketOption(k: *Kqueue, fd: posix.fd_t, level: i32, opt_name: u32, option: u32) !void {
-    const o: []const u8 = @ptrCast(&amp;option);
-    while (true) {
-        try k.checkCancel();
-        switch (posix.errno(posix.system.setsockopt(fd, level, opt_name, o.ptr, @intCast(o.len)))) {
-            .SUCCESS =&gt; return,
-            .INTR =&gt; continue,
-            .CANCELED =&gt; return error.Canceled,
-
-            .BADF =&gt; |err| return errnoBug(err), // File descriptor used after closed.
-            .NOTSOCK =&gt; |err| return errnoBug(err),
-            .INVAL =&gt; |err| return errnoBug(err),
-            .FAULT =&gt; |err| return errnoBug(err),
-            else =&gt; |err| return posix.unexpectedErrno(err),
-        }
-    }
-}
-
-fn checkCancel(k: *Kqueue) error{Canceled}!void {
-    if (cancelRequested(k)) return error.Canceled;
-}
-
-pub const KEventError = error{
-    /// The process does not have permission to register a filter.
-    AccessDenied,
-    /// The event could not be found to be modified or deleted.
-    EventNotFound,
-    /// No memory was available to register the event.
-    SystemResources,
-    /// The specified process to attach to does not exist.
-    ProcessNotFound,
-    /// changelist or eventlist had too many items on it.
-    /// TODO remove this possibility
-    Overflow,
-};
-
-pub fn kevent(
-    kq: i32,
-    changelist: []const posix.Kevent,
-    eventlist: []posix.Kevent,
-    timeout: ?*const posix.timespec,
-) KEventError!usize {
-    while (true) {
-        const rc = posix.system.kevent(
-            kq,
-            changelist.ptr,
-            std.math.cast(c_int, changelist.len) orelse return error.Overflow,
-            eventlist.ptr,
-            std.math.cast(c_int, eventlist.len) orelse return error.Overflow,
-            timeout,
-        );
-        switch (posix.errno(rc)) {
-            .SUCCESS =&gt; return @intCast(rc),
-            .ACCES =&gt; return error.AccessDenied,
-            .FAULT =&gt; unreachable, // TODO use error.Unexpected for these
-            .BADF =&gt; unreachable, // Always a race condition.
-            .INTR =&gt; continue, // TODO handle cancelation
-            .INVAL =&gt; unreachable,
-            .NOENT =&gt; return error.EventNotFound,
-            .NOMEM =&gt; return error.SystemResources,
-            .SRCH =&gt; return error.ProcessNotFound,
-            else =&gt; unreachable,
-        }
-    }
-}</pre>
+    <pre><a id="L1"></a>const Kqueue = @This();
+<a id="L2"></a>const builtin = @import("builtin");
+<a id="L3"></a>
+<a id="L4"></a>const std = @import("../std.zig");
+<a id="L5"></a>const Io = std.Io;
+<a id="L6"></a>const Dir = std.Io.Dir;
+<a id="L7"></a>const File = std.Io.File;
+<a id="L8"></a>const net = std.Io.net;
+<a id="L9"></a>const assert = std.debug.assert;
+<a id="L10"></a>const Allocator = std.mem.Allocator;
+<a id="L11"></a>const Alignment = std.mem.Alignment;
+<a id="L12"></a>const IpAddress = std.Io.net.IpAddress;
+<a id="L13"></a>const errnoBug = std.Io.Threaded.errnoBug;
+<a id="L14"></a>const closeFd = std.Io.Threaded.closeFd;
+<a id="L15"></a>const posix = std.posix;
+<a id="L16"></a>const posixSocketModeProtocol = Io.Threaded.posixSocketModeProtocol;
+<a id="L17"></a>
+<a id="L18"></a>/// Must be a thread-safe allocator.
+<a id="L19"></a>gpa: Allocator,
+<a id="L20"></a>mutex: Io.Mutex,
+<a id="L21"></a>main_fiber_buffer: [@sizeOf(Fiber) + Fiber.max_result_size]u8 align(@alignOf(Fiber)),
+<a id="L22"></a>threads: Thread.List,
+<a id="L23"></a>
+<a id="L24"></a>/// Empirically saw &gt;128KB being used by the self-hosted backend to panic.
+<a id="L25"></a>const idle_stack_size = 256 * 1024;
+<a id="L26"></a>
+<a id="L27"></a>const max_idle_search = 4;
+<a id="L28"></a>const max_steal_ready_search = 4;
+<a id="L29"></a>const max_iovecs_len = 8;
+<a id="L30"></a>
+<a id="L31"></a>const changes_buffer_len = 64;
+<a id="L32"></a>
+<a id="L33"></a>const Thread = struct {
+<a id="L34"></a>    thread: std.Thread,
+<a id="L35"></a>    idle_context: Io.fiber.Context,
+<a id="L36"></a>    current_context: *Io.fiber.Context,
+<a id="L37"></a>    ready_queue: ?*Fiber,
+<a id="L38"></a>    kq_fd: posix.fd_t,
+<a id="L39"></a>    idle_search_index: u32,
+<a id="L40"></a>    steal_ready_search_index: u32,
+<a id="L41"></a>    /// For ensuring multiple fibers waiting on the same file descriptor and
+<a id="L42"></a>    /// filter use the same kevent.
+<a id="L43"></a>    wait_queues: std.AutoArrayHashMapUnmanaged(WaitQueueKey, *Fiber),
+<a id="L44"></a>
+<a id="L45"></a>    const WaitQueueKey = struct {
+<a id="L46"></a>        ident: usize,
+<a id="L47"></a>        filter: i32,
+<a id="L48"></a>    };
+<a id="L49"></a>
+<a id="L50"></a>    const canceling: ?*Thread = @ptrFromInt(@alignOf(Thread));
+<a id="L51"></a>
+<a id="L52"></a>    threadlocal var self: *Thread = undefined;
+<a id="L53"></a>
+<a id="L54"></a>    fn current() *Thread {
+<a id="L55"></a>        return self;
+<a id="L56"></a>    }
+<a id="L57"></a>
+<a id="L58"></a>    fn currentFiber(thread: *Thread) *Fiber {
+<a id="L59"></a>        return @fieldParentPtr("context", thread.current_context);
+<a id="L60"></a>    }
+<a id="L61"></a>
+<a id="L62"></a>    const List = struct {
+<a id="L63"></a>        allocated: []Thread,
+<a id="L64"></a>        reserved: u32,
+<a id="L65"></a>        active: u32,
+<a id="L66"></a>    };
+<a id="L67"></a>
+<a id="L68"></a>    fn deinit(thread: *Thread, gpa: Allocator) void {
+<a id="L69"></a>        closeFd(thread.kq_fd);
+<a id="L70"></a>        assert(thread.wait_queues.count() == 0);
+<a id="L71"></a>        thread.wait_queues.deinit(gpa);
+<a id="L72"></a>        thread.* = undefined;
+<a id="L73"></a>    }
+<a id="L74"></a>};
+<a id="L75"></a>
+<a id="L76"></a>const Fiber = struct {
+<a id="L77"></a>    required_align: void align(4),
+<a id="L78"></a>    context: Io.fiber.Context,
+<a id="L79"></a>    awaiter: ?*Fiber,
+<a id="L80"></a>    queue_next: ?*Fiber,
+<a id="L81"></a>    cancel_thread: ?*Thread,
+<a id="L82"></a>    awaiting_completions: std.StaticBitSet(3),
+<a id="L83"></a>
+<a id="L84"></a>    const finished: ?*Fiber = @ptrFromInt(@alignOf(Thread));
+<a id="L85"></a>
+<a id="L86"></a>    const max_result_align: Alignment = .@"16";
+<a id="L87"></a>    const max_result_size = max_result_align.forward(64);
+<a id="L88"></a>    /// This includes any stack realignments that need to happen, and also the
+<a id="L89"></a>    /// initial frame return address slot and argument frame, depending on target.
+<a id="L90"></a>    const min_stack_size = 4 * 1024 * 1024;
+<a id="L91"></a>    const max_context_align: Alignment = .@"16";
+<a id="L92"></a>    const max_context_size = max_context_align.forward(1024);
+<a id="L93"></a>    const max_closure_size: usize = @sizeOf(AsyncClosure);
+<a id="L94"></a>    const max_closure_align: Alignment = .of(AsyncClosure);
+<a id="L95"></a>    const allocation_size = std.mem.alignForward(
+<a id="L96"></a>        usize,
+<a id="L97"></a>        max_closure_align.max(max_context_align).forward(
+<a id="L98"></a>            max_result_align.forward(@sizeOf(Fiber)) + max_result_size + min_stack_size,
+<a id="L99"></a>        ) + max_closure_size + max_context_size,
+<a id="L100"></a>        std.heap.page_size_max,
+<a id="L101"></a>    );
+<a id="L102"></a>
+<a id="L103"></a>    fn allocate(k: *Kqueue) error{OutOfMemory}!*Fiber {
+<a id="L104"></a>        return @ptrCast(try k.gpa.alignedAlloc(u8, .of(Fiber), allocation_size));
+<a id="L105"></a>    }
+<a id="L106"></a>
+<a id="L107"></a>    fn allocatedSlice(f: *Fiber) []align(@alignOf(Fiber)) u8 {
+<a id="L108"></a>        return @as([*]align(@alignOf(Fiber)) u8, @ptrCast(f))[0..allocation_size];
+<a id="L109"></a>    }
+<a id="L110"></a>
+<a id="L111"></a>    fn allocatedEnd(f: *Fiber) [*]u8 {
+<a id="L112"></a>        const allocated_slice = f.allocatedSlice();
+<a id="L113"></a>        return allocated_slice[allocated_slice.len..].ptr;
+<a id="L114"></a>    }
+<a id="L115"></a>
+<a id="L116"></a>    fn resultPointer(f: *Fiber, comptime Result: type) *Result {
+<a id="L117"></a>        return @ptrCast(@alignCast(f.resultBytes(.of(Result))));
+<a id="L118"></a>    }
+<a id="L119"></a>
+<a id="L120"></a>    fn resultBytes(f: *Fiber, alignment: Alignment) [*]u8 {
+<a id="L121"></a>        return @ptrFromInt(alignment.forward(@intFromPtr(f) + @sizeOf(Fiber)));
+<a id="L122"></a>    }
+<a id="L123"></a>
+<a id="L124"></a>    fn enterCancelRegion(fiber: *Fiber, thread: *Thread) error{Canceled}!void {
+<a id="L125"></a>        if (@cmpxchgStrong(
+<a id="L126"></a>            ?*Thread,
+<a id="L127"></a>            &amp;fiber.cancel_thread,
+<a id="L128"></a>            null,
+<a id="L129"></a>            thread,
+<a id="L130"></a>            .acq_rel,
+<a id="L131"></a>            .acquire,
+<a id="L132"></a>        )) |cancel_thread| {
+<a id="L133"></a>            assert(cancel_thread == Thread.canceling);
+<a id="L134"></a>            return error.Canceled;
+<a id="L135"></a>        }
+<a id="L136"></a>    }
+<a id="L137"></a>
+<a id="L138"></a>    fn exitCancelRegion(fiber: *Fiber, thread: *Thread) void {
+<a id="L139"></a>        if (@cmpxchgStrong(
+<a id="L140"></a>            ?*Thread,
+<a id="L141"></a>            &amp;fiber.cancel_thread,
+<a id="L142"></a>            thread,
+<a id="L143"></a>            null,
+<a id="L144"></a>            .acq_rel,
+<a id="L145"></a>            .acquire,
+<a id="L146"></a>        )) |cancel_thread| assert(cancel_thread == Thread.canceling);
+<a id="L147"></a>    }
+<a id="L148"></a>
+<a id="L149"></a>    const Queue = struct { head: *Fiber, tail: *Fiber };
+<a id="L150"></a>};
+<a id="L151"></a>
+<a id="L152"></a>fn recycle(k: *Kqueue, fiber: *Fiber) void {
+<a id="L153"></a>    std.log.debug("recyling {*}", .{fiber});
+<a id="L154"></a>    assert(fiber.queue_next == null);
+<a id="L155"></a>    k.gpa.free(fiber.allocatedSlice());
+<a id="L156"></a>}
+<a id="L157"></a>
+<a id="L158"></a>pub const InitOptions = struct {
+<a id="L159"></a>    n_threads: ?usize = null,
+<a id="L160"></a>};
+<a id="L161"></a>
+<a id="L162"></a>pub const InitError = Allocator.Error || CreateFileDescriptorError;
+<a id="L163"></a>
+<a id="L164"></a>pub fn init(k: *Kqueue, gpa: Allocator, options: InitOptions) !void {
+<a id="L165"></a>    assert(options.n_threads != 0);
+<a id="L166"></a>
+<a id="L167"></a>    const n_threads = @max(1, options.n_threads orelse std.Thread.getCpuCount() catch 1);
+<a id="L168"></a>    const threads_size = n_threads * @sizeOf(Thread);
+<a id="L169"></a>    const idle_stack_end_offset = std.mem.alignForward(usize, threads_size + idle_stack_size, std.heap.page_size_max);
+<a id="L170"></a>    const allocated_slice = try gpa.alignedAlloc(u8, .of(Thread), idle_stack_end_offset);
+<a id="L171"></a>    errdefer gpa.free(allocated_slice);
+<a id="L172"></a>    k.* = .{
+<a id="L173"></a>        .gpa = gpa,
+<a id="L174"></a>        .mutex = .init,
+<a id="L175"></a>        .main_fiber_buffer = undefined,
+<a id="L176"></a>        .threads = .{
+<a id="L177"></a>            .allocated = @ptrCast(allocated_slice[0..threads_size]),
+<a id="L178"></a>            .reserved = 1,
+<a id="L179"></a>            .active = 1,
+<a id="L180"></a>        },
+<a id="L181"></a>    };
+<a id="L182"></a>    const main_fiber: *Fiber = @ptrCast(&amp;k.main_fiber_buffer);
+<a id="L183"></a>    main_fiber.* = .{
+<a id="L184"></a>        .required_align = {},
+<a id="L185"></a>        .context = undefined,
+<a id="L186"></a>        .awaiter = null,
+<a id="L187"></a>        .queue_next = null,
+<a id="L188"></a>        .cancel_thread = null,
+<a id="L189"></a>        .awaiting_completions = .empty,
+<a id="L190"></a>    };
+<a id="L191"></a>    const main_thread = &amp;k.threads.allocated[0];
+<a id="L192"></a>    Thread.self = main_thread;
+<a id="L193"></a>    const idle_stack_end: [*]align(16) usize = @ptrCast(@alignCast(allocated_slice[idle_stack_end_offset..].ptr));
+<a id="L194"></a>    (idle_stack_end - 1)[0..1].* = .{@intFromPtr(k)};
+<a id="L195"></a>    main_thread.* = .{
+<a id="L196"></a>        .thread = undefined,
+<a id="L197"></a>        .idle_context = switch (builtin.cpu.arch) {
+<a id="L198"></a>            .aarch64 =&gt; .{
+<a id="L199"></a>                .sp = @intFromPtr(idle_stack_end),
+<a id="L200"></a>                .fp = 0,
+<a id="L201"></a>                .pc = @intFromPtr(&amp;mainIdleEntry),
+<a id="L202"></a>            },
+<a id="L203"></a>            .x86_64 =&gt; .{
+<a id="L204"></a>                .rsp = @intFromPtr(idle_stack_end - 1),
+<a id="L205"></a>                .rbp = 0,
+<a id="L206"></a>                .rip = @intFromPtr(&amp;mainIdleEntry),
+<a id="L207"></a>            },
+<a id="L208"></a>            else =&gt; @compileError("unimplemented architecture"),
+<a id="L209"></a>        },
+<a id="L210"></a>        .current_context = &amp;main_fiber.context,
+<a id="L211"></a>        .ready_queue = null,
+<a id="L212"></a>        .kq_fd = try createFileDescriptor(),
+<a id="L213"></a>        .idle_search_index = 1,
+<a id="L214"></a>        .steal_ready_search_index = 1,
+<a id="L215"></a>        .wait_queues = .empty,
+<a id="L216"></a>    };
+<a id="L217"></a>    errdefer closeFd(main_thread.kq_fd);
+<a id="L218"></a>    std.log.debug("created main idle {*}", .{&amp;main_thread.idle_context});
+<a id="L219"></a>    std.log.debug("created main {*}", .{main_fiber});
+<a id="L220"></a>}
+<a id="L221"></a>
+<a id="L222"></a>pub fn deinit(k: *Kqueue) void {
+<a id="L223"></a>    const active_threads = @atomicLoad(u32, &amp;k.threads.active, .acquire);
+<a id="L224"></a>    for (k.threads.allocated[0..active_threads]) |*thread| {
+<a id="L225"></a>        const ready_fiber = @atomicLoad(?*Fiber, &amp;thread.ready_queue, .monotonic);
+<a id="L226"></a>        assert(ready_fiber == null or ready_fiber == Fiber.finished); // pending async
+<a id="L227"></a>    }
+<a id="L228"></a>    k.yield(null, .exit);
+<a id="L229"></a>    const main_thread = &amp;k.threads.allocated[0];
+<a id="L230"></a>    const gpa = k.gpa;
+<a id="L231"></a>    main_thread.deinit(gpa);
+<a id="L232"></a>    const allocated_ptr: [*]align(@alignOf(Thread)) u8 = @ptrCast(@alignCast(k.threads.allocated.ptr));
+<a id="L233"></a>    const idle_stack_end_offset = std.mem.alignForward(usize, k.threads.allocated.len * @sizeOf(Thread) + idle_stack_size, std.heap.page_size_max);
+<a id="L234"></a>    for (k.threads.allocated[1..active_threads]) |*thread| thread.thread.join();
+<a id="L235"></a>    gpa.free(allocated_ptr[0..idle_stack_end_offset]);
+<a id="L236"></a>    k.* = undefined;
+<a id="L237"></a>}
+<a id="L238"></a>
+<a id="L239"></a>pub const CreateFileDescriptorError = error{
+<a id="L240"></a>    /// The per-process limit on the number of open file descriptors has been reached.
+<a id="L241"></a>    ProcessFdQuotaExceeded,
+<a id="L242"></a>    /// The system-wide limit on the total number of open files has been reached.
+<a id="L243"></a>    SystemFdQuotaExceeded,
+<a id="L244"></a>} || Io.UnexpectedError;
+<a id="L245"></a>
+<a id="L246"></a>pub fn createFileDescriptor() CreateFileDescriptorError!posix.fd_t {
+<a id="L247"></a>    const rc = posix.system.kqueue();
+<a id="L248"></a>    switch (posix.errno(rc)) {
+<a id="L249"></a>        .SUCCESS =&gt; return @intCast(rc),
+<a id="L250"></a>        .MFILE =&gt; return error.ProcessFdQuotaExceeded,
+<a id="L251"></a>        .NFILE =&gt; return error.SystemFdQuotaExceeded,
+<a id="L252"></a>        else =&gt; |err| return posix.unexpectedErrno(err),
+<a id="L253"></a>    }
+<a id="L254"></a>}
+<a id="L255"></a>
+<a id="L256"></a>fn findReadyFiber(k: *Kqueue, thread: *Thread) ?*Fiber {
+<a id="L257"></a>    if (@atomicRmw(?*Fiber, &amp;thread.ready_queue, .Xchg, Fiber.finished, .acquire)) |ready_fiber| {
+<a id="L258"></a>        @atomicStore(?*Fiber, &amp;thread.ready_queue, ready_fiber.queue_next, .release);
+<a id="L259"></a>        ready_fiber.queue_next = null;
+<a id="L260"></a>        return ready_fiber;
+<a id="L261"></a>    }
+<a id="L262"></a>    const active_threads = @atomicLoad(u32, &amp;k.threads.active, .acquire);
+<a id="L263"></a>    for (0..@min(max_steal_ready_search, active_threads)) |_| {
+<a id="L264"></a>        defer thread.steal_ready_search_index += 1;
+<a id="L265"></a>        if (thread.steal_ready_search_index == active_threads) thread.steal_ready_search_index = 0;
+<a id="L266"></a>        const steal_ready_search_thread = &amp;k.threads.allocated[0..active_threads][thread.steal_ready_search_index];
+<a id="L267"></a>        if (steal_ready_search_thread == thread) continue;
+<a id="L268"></a>        const ready_fiber = @atomicLoad(?*Fiber, &amp;steal_ready_search_thread.ready_queue, .acquire) orelse continue;
+<a id="L269"></a>        if (ready_fiber == Fiber.finished) continue;
+<a id="L270"></a>        if (@cmpxchgWeak(
+<a id="L271"></a>            ?*Fiber,
+<a id="L272"></a>            &amp;steal_ready_search_thread.ready_queue,
+<a id="L273"></a>            ready_fiber,
+<a id="L274"></a>            null,
+<a id="L275"></a>            .acquire,
+<a id="L276"></a>            .monotonic,
+<a id="L277"></a>        )) |_| continue;
+<a id="L278"></a>        @atomicStore(?*Fiber, &amp;thread.ready_queue, ready_fiber.queue_next, .release);
+<a id="L279"></a>        ready_fiber.queue_next = null;
+<a id="L280"></a>        return ready_fiber;
+<a id="L281"></a>    }
+<a id="L282"></a>    // couldn't find anything to do, so we are now open for business
+<a id="L283"></a>    @atomicStore(?*Fiber, &amp;thread.ready_queue, null, .monotonic);
+<a id="L284"></a>    return null;
+<a id="L285"></a>}
+<a id="L286"></a>
+<a id="L287"></a>fn yield(k: *Kqueue, maybe_ready_fiber: ?*Fiber, pending_task: SwitchMessage.PendingTask) void {
+<a id="L288"></a>    const thread: *Thread = .current();
+<a id="L289"></a>    const ready_context = if (maybe_ready_fiber orelse k.findReadyFiber(thread)) |ready_fiber|
+<a id="L290"></a>        &amp;ready_fiber.context
+<a id="L291"></a>    else
+<a id="L292"></a>        &amp;thread.idle_context;
+<a id="L293"></a>    const message: SwitchMessage = .{
+<a id="L294"></a>        .contexts = .{
+<a id="L295"></a>            .old = thread.current_context,
+<a id="L296"></a>            .new = ready_context,
+<a id="L297"></a>        },
+<a id="L298"></a>        .pending_task = pending_task,
+<a id="L299"></a>    };
+<a id="L300"></a>    std.log.debug("switching from {*} to {*}", .{ message.contexts.old, message.contexts.new });
+<a id="L301"></a>    contextSwitch(&amp;message).handle(k);
+<a id="L302"></a>}
+<a id="L303"></a>
+<a id="L304"></a>fn schedule(k: *Kqueue, thread: *Thread, ready_queue: Fiber.Queue) void {
+<a id="L305"></a>    {
+<a id="L306"></a>        var fiber = ready_queue.head;
+<a id="L307"></a>        while (true) {
+<a id="L308"></a>            std.log.debug("scheduling {*}", .{fiber});
+<a id="L309"></a>            fiber = fiber.queue_next orelse break;
+<a id="L310"></a>        }
+<a id="L311"></a>        assert(fiber == ready_queue.tail);
+<a id="L312"></a>    }
+<a id="L313"></a>    // shared fields of previous `Thread` must be initialized before later ones are marked as active
+<a id="L314"></a>    const new_thread_index = @atomicLoad(u32, &amp;k.threads.active, .acquire);
+<a id="L315"></a>    for (0..@min(max_idle_search, new_thread_index)) |_| {
+<a id="L316"></a>        defer thread.idle_search_index += 1;
+<a id="L317"></a>        if (thread.idle_search_index == new_thread_index) thread.idle_search_index = 0;
+<a id="L318"></a>        const idle_search_thread = &amp;k.threads.allocated[0..new_thread_index][thread.idle_search_index];
+<a id="L319"></a>        if (idle_search_thread == thread) continue;
+<a id="L320"></a>        if (@cmpxchgWeak(
+<a id="L321"></a>            ?*Fiber,
+<a id="L322"></a>            &amp;idle_search_thread.ready_queue,
+<a id="L323"></a>            null,
+<a id="L324"></a>            ready_queue.head,
+<a id="L325"></a>            .release,
+<a id="L326"></a>            .monotonic,
+<a id="L327"></a>        )) |_| continue;
+<a id="L328"></a>        const changes = [_]posix.Kevent{
+<a id="L329"></a>            .{
+<a id="L330"></a>                .ident = 0,
+<a id="L331"></a>                .filter = std.c.EVFILT.USER,
+<a id="L332"></a>                .flags = std.c.EV.ADD | std.c.EV.ONESHOT,
+<a id="L333"></a>                .fflags = std.c.NOTE.TRIGGER,
+<a id="L334"></a>                .data = 0,
+<a id="L335"></a>                .udata = @intFromEnum(Completion.UserData.wakeup),
+<a id="L336"></a>            },
+<a id="L337"></a>        };
+<a id="L338"></a>        // If an error occurs it only pessimises scheduling.
+<a id="L339"></a>        _ = kevent(idle_search_thread.kq_fd, &amp;changes, &amp;.{}, null) catch |err| {
+<a id="L340"></a>            // TODO handle EINTR for cancellation purposes
+<a id="L341"></a>            @panic(@errorName(err)); // TODO
+<a id="L342"></a>        };
+<a id="L343"></a>        return;
+<a id="L344"></a>    }
+<a id="L345"></a>    spawn_thread: {
+<a id="L346"></a>        // previous failed reservations must have completed before retrying
+<a id="L347"></a>        if (new_thread_index == k.threads.allocated.len or @cmpxchgWeak(
+<a id="L348"></a>            u32,
+<a id="L349"></a>            &amp;k.threads.reserved,
+<a id="L350"></a>            new_thread_index,
+<a id="L351"></a>            new_thread_index + 1,
+<a id="L352"></a>            .acquire,
+<a id="L353"></a>            .monotonic,
+<a id="L354"></a>        ) != null) break :spawn_thread;
+<a id="L355"></a>        const new_thread = &amp;k.threads.allocated[new_thread_index];
+<a id="L356"></a>        const next_thread_index = new_thread_index + 1;
+<a id="L357"></a>        new_thread.* = .{
+<a id="L358"></a>            .thread = undefined,
+<a id="L359"></a>            .idle_context = undefined,
+<a id="L360"></a>            .current_context = &amp;new_thread.idle_context,
+<a id="L361"></a>            .ready_queue = ready_queue.head,
+<a id="L362"></a>            .kq_fd = createFileDescriptor() catch |err| {
+<a id="L363"></a>                @atomicStore(u32, &amp;k.threads.reserved, new_thread_index, .release);
+<a id="L364"></a>                // no more access to `thread` after giving up reservation
+<a id="L365"></a>                std.log.warn("unable to create worker thread due to kqueue init failure: {t}", .{err});
+<a id="L366"></a>                break :spawn_thread;
+<a id="L367"></a>            },
+<a id="L368"></a>            .idle_search_index = 0,
+<a id="L369"></a>            .steal_ready_search_index = 0,
+<a id="L370"></a>            .wait_queues = .empty,
+<a id="L371"></a>        };
+<a id="L372"></a>        new_thread.thread = std.Thread.spawn(.{
+<a id="L373"></a>            .stack_size = idle_stack_size,
+<a id="L374"></a>            .allocator = k.gpa,
+<a id="L375"></a>        }, threadEntry, .{ k, new_thread_index }) catch |err| {
+<a id="L376"></a>            closeFd(new_thread.kq_fd);
+<a id="L377"></a>            @atomicStore(u32, &amp;k.threads.reserved, new_thread_index, .release);
+<a id="L378"></a>            // no more access to `thread` after giving up reservation
+<a id="L379"></a>            std.log.warn("unable to create worker thread due spawn failure: {s}", .{@errorName(err)});
+<a id="L380"></a>            break :spawn_thread;
+<a id="L381"></a>        };
+<a id="L382"></a>        // shared fields of `Thread` must be initialized before being marked active
+<a id="L383"></a>        @atomicStore(u32, &amp;k.threads.active, next_thread_index, .release);
+<a id="L384"></a>        return;
+<a id="L385"></a>    }
+<a id="L386"></a>    // nobody wanted it, so just queue it on ourselves
+<a id="L387"></a>    while (@cmpxchgWeak(
+<a id="L388"></a>        ?*Fiber,
+<a id="L389"></a>        &amp;thread.ready_queue,
+<a id="L390"></a>        ready_queue.tail.queue_next,
+<a id="L391"></a>        ready_queue.head,
+<a id="L392"></a>        .acq_rel,
+<a id="L393"></a>        .acquire,
+<a id="L394"></a>    )) |old_head| ready_queue.tail.queue_next = old_head;
+<a id="L395"></a>}
+<a id="L396"></a>
+<a id="L397"></a>fn mainIdle(k: *Kqueue, message: *const SwitchMessage) callconv(.withStackAlign(.c, @max(@alignOf(Thread), @alignOf(Io.fiber.Context)))) noreturn {
+<a id="L398"></a>    message.handle(k);
+<a id="L399"></a>    k.idle(&amp;k.threads.allocated[0]);
+<a id="L400"></a>    k.yield(@ptrCast(&amp;k.main_fiber_buffer), .nothing);
+<a id="L401"></a>    unreachable; // switched to dead fiber
+<a id="L402"></a>}
+<a id="L403"></a>
+<a id="L404"></a>fn threadEntry(k: *Kqueue, index: u32) void {
+<a id="L405"></a>    const thread: *Thread = &amp;k.threads.allocated[index];
+<a id="L406"></a>    Thread.self = thread;
+<a id="L407"></a>    std.log.debug("created thread idle {*}", .{&amp;thread.idle_context});
+<a id="L408"></a>    k.idle(thread);
+<a id="L409"></a>    thread.deinit(k.gpa);
+<a id="L410"></a>}
+<a id="L411"></a>
+<a id="L412"></a>const Completion = struct {
+<a id="L413"></a>    const UserData = enum(usize) {
+<a id="L414"></a>        unused,
+<a id="L415"></a>        wakeup,
+<a id="L416"></a>        cleanup,
+<a id="L417"></a>        exit,
+<a id="L418"></a>        /// *Fiber
+<a id="L419"></a>        _,
+<a id="L420"></a>    };
+<a id="L421"></a>    /// Corresponds to Kevent field.
+<a id="L422"></a>    flags: u16,
+<a id="L423"></a>    /// Corresponds to Kevent field.
+<a id="L424"></a>    fflags: u32,
+<a id="L425"></a>    /// Corresponds to Kevent field.
+<a id="L426"></a>    data: isize,
+<a id="L427"></a>};
+<a id="L428"></a>
+<a id="L429"></a>fn idle(k: *Kqueue, thread: *Thread) void {
+<a id="L430"></a>    var events_buffer: [changes_buffer_len]posix.Kevent = undefined;
+<a id="L431"></a>    var maybe_ready_fiber: ?*Fiber = null;
+<a id="L432"></a>    while (true) {
+<a id="L433"></a>        while (maybe_ready_fiber orelse k.findReadyFiber(thread)) |ready_fiber| {
+<a id="L434"></a>            k.yield(ready_fiber, .nothing);
+<a id="L435"></a>            maybe_ready_fiber = null;
+<a id="L436"></a>        }
+<a id="L437"></a>        const n = kevent(thread.kq_fd, &amp;.{}, &amp;events_buffer, null) catch |err| {
+<a id="L438"></a>            // TODO handle EINTR for cancellation purposes
+<a id="L439"></a>            @panic(@errorName(err)); // TODO
+<a id="L440"></a>        };
+<a id="L441"></a>        var maybe_ready_queue: ?Fiber.Queue = null;
+<a id="L442"></a>        for (events_buffer[0..n]) |event| switch (@as(Completion.UserData, @enumFromInt(event.udata))) {
+<a id="L443"></a>            .unused =&gt; unreachable, // bad submission queued?
+<a id="L444"></a>            .wakeup =&gt; {},
+<a id="L445"></a>            .cleanup =&gt; @panic("failed to notify other threads that we are exiting"),
+<a id="L446"></a>            .exit =&gt; {
+<a id="L447"></a>                assert(maybe_ready_fiber == null and maybe_ready_queue == null); // pending async
+<a id="L448"></a>                return;
+<a id="L449"></a>            },
+<a id="L450"></a>            _ =&gt; {
+<a id="L451"></a>                const event_head_fiber: *Fiber = @ptrFromInt(event.udata);
+<a id="L452"></a>                const event_tail_fiber = thread.wait_queues.fetchSwapRemove(.{
+<a id="L453"></a>                    .ident = event.ident,
+<a id="L454"></a>                    .filter = event.filter,
+<a id="L455"></a>                }).?.value;
+<a id="L456"></a>                assert(event_tail_fiber.queue_next == null);
+<a id="L457"></a>
+<a id="L458"></a>                // TODO reevaluate this logic
+<a id="L459"></a>                event_head_fiber.resultPointer(Completion).* = .{
+<a id="L460"></a>                    .flags = event.flags,
+<a id="L461"></a>                    .fflags = event.fflags,
+<a id="L462"></a>                    .data = event.data,
+<a id="L463"></a>                };
+<a id="L464"></a>
+<a id="L465"></a>                queue_ready: {
+<a id="L466"></a>                    const head: *Fiber = if (maybe_ready_fiber == null) f: {
+<a id="L467"></a>                        maybe_ready_fiber = event_head_fiber;
+<a id="L468"></a>                        const next = event_head_fiber.queue_next orelse break :queue_ready;
+<a id="L469"></a>                        event_head_fiber.queue_next = null;
+<a id="L470"></a>                        break :f next;
+<a id="L471"></a>                    } else event_head_fiber;
+<a id="L472"></a>
+<a id="L473"></a>                    if (maybe_ready_queue) |*ready_queue| {
+<a id="L474"></a>                        ready_queue.tail.queue_next = head;
+<a id="L475"></a>                        ready_queue.tail = event_tail_fiber;
+<a id="L476"></a>                    } else {
+<a id="L477"></a>                        maybe_ready_queue = .{ .head = head, .tail = event_tail_fiber };
+<a id="L478"></a>                    }
+<a id="L479"></a>                }
+<a id="L480"></a>            },
+<a id="L481"></a>        };
+<a id="L482"></a>        if (maybe_ready_queue) |ready_queue| k.schedule(thread, ready_queue);
+<a id="L483"></a>    }
+<a id="L484"></a>}
+<a id="L485"></a>
+<a id="L486"></a>const SwitchMessage = struct {
+<a id="L487"></a>    contexts: Io.fiber.Switch,
+<a id="L488"></a>    pending_task: PendingTask,
+<a id="L489"></a>
+<a id="L490"></a>    const PendingTask = union(enum) {
+<a id="L491"></a>        nothing,
+<a id="L492"></a>        reschedule,
+<a id="L493"></a>        recycle: *Fiber,
+<a id="L494"></a>        register_awaiter: *?*Fiber,
+<a id="L495"></a>        exit,
+<a id="L496"></a>    };
+<a id="L497"></a>
+<a id="L498"></a>    fn handle(message: *const SwitchMessage, k: *Kqueue) void {
+<a id="L499"></a>        const thread: *Thread = .current();
+<a id="L500"></a>        thread.current_context = message.contexts.new;
+<a id="L501"></a>        switch (message.pending_task) {
+<a id="L502"></a>            .nothing =&gt; {},
+<a id="L503"></a>            .reschedule =&gt; if (message.contexts.old != &amp;thread.idle_context) {
+<a id="L504"></a>                const prev_fiber: *Fiber = @alignCast(@fieldParentPtr("context", message.contexts.old));
+<a id="L505"></a>                assert(prev_fiber.queue_next == null);
+<a id="L506"></a>                k.schedule(thread, .{ .head = prev_fiber, .tail = prev_fiber });
+<a id="L507"></a>            },
+<a id="L508"></a>            .recycle =&gt; |fiber| {
+<a id="L509"></a>                k.recycle(fiber);
+<a id="L510"></a>            },
+<a id="L511"></a>            .register_awaiter =&gt; |awaiter| {
+<a id="L512"></a>                const prev_fiber: *Fiber = @alignCast(@fieldParentPtr("context", message.contexts.old));
+<a id="L513"></a>                assert(prev_fiber.queue_next == null);
+<a id="L514"></a>                if (@atomicRmw(?*Fiber, awaiter, .Xchg, prev_fiber, .acq_rel) == Fiber.finished)
+<a id="L515"></a>                    k.schedule(thread, .{ .head = prev_fiber, .tail = prev_fiber });
+<a id="L516"></a>            },
+<a id="L517"></a>            .exit =&gt; for (k.threads.allocated[0..@atomicLoad(u32, &amp;k.threads.active, .acquire)]) |*each_thread| {
+<a id="L518"></a>                const changes = [_]posix.Kevent{
+<a id="L519"></a>                    .{
+<a id="L520"></a>                        .ident = 0,
+<a id="L521"></a>                        .filter = std.c.EVFILT.USER,
+<a id="L522"></a>                        .flags = std.c.EV.ADD | std.c.EV.ONESHOT,
+<a id="L523"></a>                        .fflags = std.c.NOTE.TRIGGER,
+<a id="L524"></a>                        .data = 0,
+<a id="L525"></a>                        .udata = @intFromEnum(Completion.UserData.exit),
+<a id="L526"></a>                    },
+<a id="L527"></a>                };
+<a id="L528"></a>                _ = kevent(each_thread.kq_fd, &amp;changes, &amp;.{}, null) catch |err| {
+<a id="L529"></a>                    // TODO handle EINTR for cancellation purposes
+<a id="L530"></a>                    @panic(@errorName(err)); // TODO
+<a id="L531"></a>                };
+<a id="L532"></a>            },
+<a id="L533"></a>        }
+<a id="L534"></a>    }
+<a id="L535"></a>};
+<a id="L536"></a>
+<a id="L537"></a>inline fn contextSwitch(message: *const SwitchMessage) *const SwitchMessage {
+<a id="L538"></a>    return @fieldParentPtr("contexts", Io.fiber.contextSwitch(&amp;message.contexts));
+<a id="L539"></a>}
+<a id="L540"></a>
+<a id="L541"></a>fn mainIdleEntry() callconv(.naked) void {
+<a id="L542"></a>    switch (builtin.cpu.arch) {
+<a id="L543"></a>        .x86_64 =&gt; asm volatile (
+<a id="L544"></a>            \\ movq (%%rsp), %%rdi
+<a id="L545"></a>            \\ jmp %[mainIdle:P]
+<a id="L546"></a>            :
+<a id="L547"></a>            : [mainIdle] "X" (&amp;mainIdle),
+<a id="L548"></a>        ),
+<a id="L549"></a>        .aarch64 =&gt; asm volatile (
+<a id="L550"></a>            \\ ldr x0, [sp, #-8]
+<a id="L551"></a>            \\ b %[mainIdle]
+<a id="L552"></a>            :
+<a id="L553"></a>            : [mainIdle] "X" (&amp;mainIdle),
+<a id="L554"></a>        ),
+<a id="L555"></a>        else =&gt; |arch| @compileError("unimplemented architecture: " ++ @tagName(arch)),
+<a id="L556"></a>    }
+<a id="L557"></a>}
+<a id="L558"></a>
+<a id="L559"></a>fn fiberEntry() callconv(.naked) void {
+<a id="L560"></a>    switch (builtin.cpu.arch) {
+<a id="L561"></a>        .x86_64 =&gt; asm volatile (
+<a id="L562"></a>            \\ leaq 8(%%rsp), %%rdi
+<a id="L563"></a>            \\ jmp %[AsyncClosure_call:P]
+<a id="L564"></a>            :
+<a id="L565"></a>            : [AsyncClosure_call] "X" (&amp;AsyncClosure.call),
+<a id="L566"></a>        ),
+<a id="L567"></a>        .aarch64 =&gt; asm volatile (
+<a id="L568"></a>            \\ mov x0, sp
+<a id="L569"></a>            \\ b %[AsyncClosure_call]
+<a id="L570"></a>            :
+<a id="L571"></a>            : [AsyncClosure_call] "X" (&amp;AsyncClosure.call),
+<a id="L572"></a>        ),
+<a id="L573"></a>        else =&gt; |arch| @compileError("unimplemented architecture: " ++ @tagName(arch)),
+<a id="L574"></a>    }
+<a id="L575"></a>}
+<a id="L576"></a>
+<a id="L577"></a>const AsyncClosure = struct {
+<a id="L578"></a>    kqueue: *Kqueue,
+<a id="L579"></a>    fiber: *Fiber,
+<a id="L580"></a>    start: *const fn (context: *const anyopaque, result: *anyopaque) void,
+<a id="L581"></a>    result_align: Alignment,
+<a id="L582"></a>    already_awaited: bool,
+<a id="L583"></a>
+<a id="L584"></a>    fn contextPointer(closure: *AsyncClosure) [*]align(Fiber.max_context_align.toByteUnits()) u8 {
+<a id="L585"></a>        return @alignCast(@as([*]u8, @ptrCast(closure)) + @sizeOf(AsyncClosure));
+<a id="L586"></a>    }
+<a id="L587"></a>
+<a id="L588"></a>    fn call(closure: *AsyncClosure, message: *const SwitchMessage) callconv(.withStackAlign(.c, @alignOf(AsyncClosure))) noreturn {
+<a id="L589"></a>        message.handle(closure.kqueue);
+<a id="L590"></a>        const fiber = closure.fiber;
+<a id="L591"></a>        std.log.debug("{*} performing async", .{fiber});
+<a id="L592"></a>        closure.start(closure.contextPointer(), fiber.resultBytes(closure.result_align));
+<a id="L593"></a>        const awaiter = @atomicRmw(?*Fiber, &amp;fiber.awaiter, .Xchg, Fiber.finished, .acq_rel);
+<a id="L594"></a>        const ready_awaiter = r: {
+<a id="L595"></a>            const a = awaiter orelse break :r null;
+<a id="L596"></a>            if (@atomicRmw(bool, &amp;closure.already_awaited, .Xchg, true, .acq_rel)) break :r null;
+<a id="L597"></a>            break :r a;
+<a id="L598"></a>        };
+<a id="L599"></a>        closure.kqueue.yield(ready_awaiter, .nothing);
+<a id="L600"></a>        unreachable; // switched to dead fiber
+<a id="L601"></a>    }
+<a id="L602"></a>
+<a id="L603"></a>    fn fromFiber(fiber: *Fiber) *AsyncClosure {
+<a id="L604"></a>        return @ptrFromInt(Fiber.max_context_align.max(.of(AsyncClosure)).backward(
+<a id="L605"></a>            @intFromPtr(fiber.allocatedEnd()) - Fiber.max_context_size,
+<a id="L606"></a>        ) - @sizeOf(AsyncClosure));
+<a id="L607"></a>    }
+<a id="L608"></a>};
+<a id="L609"></a>
+<a id="L610"></a>pub fn io(k: *Kqueue) Io {
+<a id="L611"></a>    return .{
+<a id="L612"></a>        .userdata = k,
+<a id="L613"></a>        .vtable = &amp;.{
+<a id="L614"></a>            .async = async,
+<a id="L615"></a>            .concurrent = concurrent,
+<a id="L616"></a>            .await = await,
+<a id="L617"></a>            .cancel = cancel,
+<a id="L618"></a>
+<a id="L619"></a>            .groupAsync = groupAsync,
+<a id="L620"></a>            .groupConcurrent = groupConcurrent,
+<a id="L621"></a>            .groupAwait = groupAwait,
+<a id="L622"></a>            .groupCancel = groupCancel,
+<a id="L623"></a>
+<a id="L624"></a>            .dirCreateDir = dirCreateDir,
+<a id="L625"></a>            .dirCreateDirPath = dirCreateDirPath,
+<a id="L626"></a>            .dirCreateDirPathOpen = dirCreateDirPathOpen,
+<a id="L627"></a>            .dirStat = dirStat,
+<a id="L628"></a>            .dirStatFile = dirStatFile,
+<a id="L629"></a>
+<a id="L630"></a>            .fileStat = fileStat,
+<a id="L631"></a>            .dirAccess = dirAccess,
+<a id="L632"></a>            .dirCreateFile = dirCreateFile,
+<a id="L633"></a>            .dirOpenFile = dirOpenFile,
+<a id="L634"></a>            .dirOpenDir = dirOpenDir,
+<a id="L635"></a>            .dirClose = dirClose,
+<a id="L636"></a>            .fileClose = fileClose,
+<a id="L637"></a>            .fileWriteStreaming = fileWriteStreaming,
+<a id="L638"></a>            .fileWritePositional = fileWritePositional,
+<a id="L639"></a>            .fileReadStreaming = fileReadStreaming,
+<a id="L640"></a>            .fileReadPositional = fileReadPositional,
+<a id="L641"></a>            .fileSeekBy = fileSeekBy,
+<a id="L642"></a>            .fileSeekTo = fileSeekTo,
+<a id="L643"></a>
+<a id="L644"></a>            .now = now,
+<a id="L645"></a>            .sleep = sleep,
+<a id="L646"></a>
+<a id="L647"></a>            .netListenIp = netListenIp,
+<a id="L648"></a>            .netListenUnix = netListenUnix,
+<a id="L649"></a>            .netAccept = netAccept,
+<a id="L650"></a>            .netBindIp = netBindIp,
+<a id="L651"></a>            .netConnectIp = netConnectIp,
+<a id="L652"></a>            .netConnectUnix = netConnectUnix,
+<a id="L653"></a>            .netClose = netClose,
+<a id="L654"></a>            .netShutdown = netShutdown,
+<a id="L655"></a>            .netRead = netRead,
+<a id="L656"></a>            .netWrite = netWrite,
+<a id="L657"></a>            .netSend = netSend,
+<a id="L658"></a>            .netReceive = netReceive,
+<a id="L659"></a>            .netInterfaceNameResolve = netInterfaceNameResolve,
+<a id="L660"></a>            .netInterfaceName = netInterfaceName,
+<a id="L661"></a>            .netLookup = netLookup,
+<a id="L662"></a>        },
+<a id="L663"></a>    };
+<a id="L664"></a>}
+<a id="L665"></a>
+<a id="L666"></a>fn async(
+<a id="L667"></a>    userdata: ?*anyopaque,
+<a id="L668"></a>    result: []u8,
+<a id="L669"></a>    result_alignment: std.mem.Alignment,
+<a id="L670"></a>    context: []const u8,
+<a id="L671"></a>    context_alignment: std.mem.Alignment,
+<a id="L672"></a>    start: *const fn (context: *const anyopaque, result: *anyopaque) void,
+<a id="L673"></a>) ?*Io.AnyFuture {
+<a id="L674"></a>    return concurrent(userdata, result.len, result_alignment, context, context_alignment, start) catch {
+<a id="L675"></a>        start(context.ptr, result.ptr);
+<a id="L676"></a>        return null;
+<a id="L677"></a>    };
+<a id="L678"></a>}
+<a id="L679"></a>
+<a id="L680"></a>fn concurrent(
+<a id="L681"></a>    userdata: ?*anyopaque,
+<a id="L682"></a>    result_len: usize,
+<a id="L683"></a>    result_alignment: Alignment,
+<a id="L684"></a>    context: []const u8,
+<a id="L685"></a>    context_alignment: Alignment,
+<a id="L686"></a>    start: *const fn (context: *const anyopaque, result: *anyopaque) void,
+<a id="L687"></a>) Io.ConcurrentError!*Io.AnyFuture {
+<a id="L688"></a>    const k: *Kqueue = @ptrCast(@alignCast(userdata));
+<a id="L689"></a>    assert(result_alignment.compare(.lte, Fiber.max_result_align)); // TODO
+<a id="L690"></a>    assert(context_alignment.compare(.lte, Fiber.max_context_align)); // TODO
+<a id="L691"></a>    assert(result_len &lt;= Fiber.max_result_size); // TODO
+<a id="L692"></a>    assert(context.len &lt;= Fiber.max_context_size); // TODO
+<a id="L693"></a>
+<a id="L694"></a>    const fiber = Fiber.allocate(k) catch return error.ConcurrencyUnavailable;
+<a id="L695"></a>    std.log.debug("allocated {*}", .{fiber});
+<a id="L696"></a>
+<a id="L697"></a>    const closure: *AsyncClosure = .fromFiber(fiber);
+<a id="L698"></a>    fiber.* = .{
+<a id="L699"></a>        .required_align = {},
+<a id="L700"></a>        .context = switch (builtin.cpu.arch) {
+<a id="L701"></a>            .x86_64 =&gt; .{
+<a id="L702"></a>                .rsp = @intFromPtr(closure) - @sizeOf(usize),
+<a id="L703"></a>                .rbp = 0,
+<a id="L704"></a>                .rip = @intFromPtr(&amp;fiberEntry),
+<a id="L705"></a>            },
+<a id="L706"></a>            .aarch64 =&gt; .{
+<a id="L707"></a>                .sp = @intFromPtr(closure),
+<a id="L708"></a>                .fp = 0,
+<a id="L709"></a>                .pc = @intFromPtr(&amp;fiberEntry),
+<a id="L710"></a>            },
+<a id="L711"></a>            else =&gt; |arch| @compileError("unimplemented architecture: " ++ @tagName(arch)),
+<a id="L712"></a>        },
+<a id="L713"></a>        .awaiter = null,
+<a id="L714"></a>        .queue_next = null,
+<a id="L715"></a>        .cancel_thread = null,
+<a id="L716"></a>        .awaiting_completions = .empty,
+<a id="L717"></a>    };
+<a id="L718"></a>    closure.* = .{
+<a id="L719"></a>        .kqueue = k,
+<a id="L720"></a>        .fiber = fiber,
+<a id="L721"></a>        .start = start,
+<a id="L722"></a>        .result_align = result_alignment,
+<a id="L723"></a>        .already_awaited = false,
+<a id="L724"></a>    };
+<a id="L725"></a>    @memcpy(closure.contextPointer(), context);
+<a id="L726"></a>
+<a id="L727"></a>    k.schedule(.current(), .{ .head = fiber, .tail = fiber });
+<a id="L728"></a>    return @ptrCast(fiber);
+<a id="L729"></a>}
+<a id="L730"></a>
+<a id="L731"></a>fn await(
+<a id="L732"></a>    userdata: ?*anyopaque,
+<a id="L733"></a>    any_future: *Io.AnyFuture,
+<a id="L734"></a>    result: []u8,
+<a id="L735"></a>    result_alignment: std.mem.Alignment,
+<a id="L736"></a>) void {
+<a id="L737"></a>    const k: *Kqueue = @ptrCast(@alignCast(userdata));
+<a id="L738"></a>    const future_fiber: *Fiber = @ptrCast(@alignCast(any_future));
+<a id="L739"></a>    if (@atomicLoad(?*Fiber, &amp;future_fiber.awaiter, .acquire) != Fiber.finished)
+<a id="L740"></a>        k.yield(null, .{ .register_awaiter = &amp;future_fiber.awaiter });
+<a id="L741"></a>    @memcpy(result, future_fiber.resultBytes(result_alignment));
+<a id="L742"></a>    k.recycle(future_fiber);
+<a id="L743"></a>}
+<a id="L744"></a>
+<a id="L745"></a>fn cancel(
+<a id="L746"></a>    userdata: ?*anyopaque,
+<a id="L747"></a>    any_future: *Io.AnyFuture,
+<a id="L748"></a>    result: []u8,
+<a id="L749"></a>    result_alignment: std.mem.Alignment,
+<a id="L750"></a>) void {
+<a id="L751"></a>    const k: *Kqueue = @ptrCast(@alignCast(userdata));
+<a id="L752"></a>    _ = k;
+<a id="L753"></a>    _ = any_future;
+<a id="L754"></a>    _ = result;
+<a id="L755"></a>    _ = result_alignment;
+<a id="L756"></a>    @panic("TODO");
+<a id="L757"></a>}
+<a id="L758"></a>
+<a id="L759"></a>fn cancelRequested(userdata: ?*anyopaque) bool {
+<a id="L760"></a>    const k: *Kqueue = @ptrCast(@alignCast(userdata));
+<a id="L761"></a>    _ = k;
+<a id="L762"></a>    return false; // TODO
+<a id="L763"></a>}
+<a id="L764"></a>
+<a id="L765"></a>fn groupAsync(
+<a id="L766"></a>    userdata: ?*anyopaque,
+<a id="L767"></a>    type_erased: *Io.Group,
+<a id="L768"></a>    context: []const u8,
+<a id="L769"></a>    context_alignment: Alignment,
+<a id="L770"></a>    start: *const fn (context: *const anyopaque) void,
+<a id="L771"></a>) void {
+<a id="L772"></a>    const k: *Kqueue = @ptrCast(@alignCast(userdata));
+<a id="L773"></a>    _ = k;
+<a id="L774"></a>    _ = type_erased;
+<a id="L775"></a>    _ = context;
+<a id="L776"></a>    _ = context_alignment;
+<a id="L777"></a>    _ = start;
+<a id="L778"></a>    @panic("TODO");
+<a id="L779"></a>}
+<a id="L780"></a>
+<a id="L781"></a>fn groupConcurrent(
+<a id="L782"></a>    userdata: ?*anyopaque,
+<a id="L783"></a>    type_erased: *Io.Group,
+<a id="L784"></a>    context: []const u8,
+<a id="L785"></a>    context_alignment: Alignment,
+<a id="L786"></a>    start: *const fn (context: *const anyopaque) void,
+<a id="L787"></a>) Io.ConcurrentError!void {
+<a id="L788"></a>    const k: *Kqueue = @ptrCast(@alignCast(userdata));
+<a id="L789"></a>    _ = k;
+<a id="L790"></a>    _ = type_erased;
+<a id="L791"></a>    _ = context;
+<a id="L792"></a>    _ = context_alignment;
+<a id="L793"></a>    _ = start;
+<a id="L794"></a>    @panic("TODO");
+<a id="L795"></a>}
+<a id="L796"></a>
+<a id="L797"></a>fn groupAwait(userdata: ?*anyopaque, type_erased: *Io.Group, initial_token: *anyopaque) Io.Cancelable!void {
+<a id="L798"></a>    const k: *Kqueue = @ptrCast(@alignCast(userdata));
+<a id="L799"></a>    _ = k;
+<a id="L800"></a>    _ = type_erased;
+<a id="L801"></a>    _ = initial_token;
+<a id="L802"></a>    @panic("TODO");
+<a id="L803"></a>}
+<a id="L804"></a>
+<a id="L805"></a>fn groupCancel(userdata: ?*anyopaque, group: *Io.Group, token: *anyopaque) void {
+<a id="L806"></a>    const k: *Kqueue = @ptrCast(@alignCast(userdata));
+<a id="L807"></a>    _ = k;
+<a id="L808"></a>    _ = group;
+<a id="L809"></a>    _ = token;
+<a id="L810"></a>    @panic("TODO");
+<a id="L811"></a>}
+<a id="L812"></a>
+<a id="L813"></a>fn dirCreateDir(userdata: ?*anyopaque, dir: Dir, sub_path: []const u8, permissions: Dir.Permissions) Dir.CreateDirError!void {
+<a id="L814"></a>    const k: *Kqueue = @ptrCast(@alignCast(userdata));
+<a id="L815"></a>    _ = k;
+<a id="L816"></a>    _ = dir;
+<a id="L817"></a>    _ = sub_path;
+<a id="L818"></a>    _ = permissions;
+<a id="L819"></a>    @panic("TODO");
+<a id="L820"></a>}
+<a id="L821"></a>
+<a id="L822"></a>fn dirCreateDirPath(
+<a id="L823"></a>    userdata: ?*anyopaque,
+<a id="L824"></a>    dir: Dir,
+<a id="L825"></a>    sub_path: []const u8,
+<a id="L826"></a>    permissions: Dir.Permissions,
+<a id="L827"></a>) Dir.CreateDirPathError!Dir.CreatePathStatus {
+<a id="L828"></a>    const k: *Kqueue = @ptrCast(@alignCast(userdata));
+<a id="L829"></a>    _ = k;
+<a id="L830"></a>    _ = dir;
+<a id="L831"></a>    _ = sub_path;
+<a id="L832"></a>    _ = permissions;
+<a id="L833"></a>    @panic("TODO");
+<a id="L834"></a>}
+<a id="L835"></a>
+<a id="L836"></a>fn dirCreateDirPathOpen(
+<a id="L837"></a>    userdata: ?*anyopaque,
+<a id="L838"></a>    dir: Dir,
+<a id="L839"></a>    sub_path: []const u8,
+<a id="L840"></a>    permissions: Dir.Permissions,
+<a id="L841"></a>    options: Dir.OpenOptions,
+<a id="L842"></a>) Dir.CreateDirPathOpenError!Dir {
+<a id="L843"></a>    const k: *Kqueue = @ptrCast(@alignCast(userdata));
+<a id="L844"></a>    _ = k;
+<a id="L845"></a>    _ = dir;
+<a id="L846"></a>    _ = sub_path;
+<a id="L847"></a>    _ = permissions;
+<a id="L848"></a>    _ = options;
+<a id="L849"></a>    @panic("TODO");
+<a id="L850"></a>}
+<a id="L851"></a>
+<a id="L852"></a>fn dirStat(userdata: ?*anyopaque, dir: Dir) Dir.StatError!Dir.Stat {
+<a id="L853"></a>    const k: *Kqueue = @ptrCast(@alignCast(userdata));
+<a id="L854"></a>    _ = k;
+<a id="L855"></a>    _ = dir;
+<a id="L856"></a>    @panic("TODO");
+<a id="L857"></a>}
+<a id="L858"></a>
+<a id="L859"></a>fn dirStatFile(
+<a id="L860"></a>    userdata: ?*anyopaque,
+<a id="L861"></a>    dir: Dir,
+<a id="L862"></a>    sub_path: []const u8,
+<a id="L863"></a>    options: Dir.StatFileOptions,
+<a id="L864"></a>) Dir.StatFileError!File.Stat {
+<a id="L865"></a>    const k: *Kqueue = @ptrCast(@alignCast(userdata));
+<a id="L866"></a>    _ = k;
+<a id="L867"></a>    _ = dir;
+<a id="L868"></a>    _ = sub_path;
+<a id="L869"></a>    _ = options;
+<a id="L870"></a>    @panic("TODO");
+<a id="L871"></a>}
+<a id="L872"></a>fn dirAccess(userdata: ?*anyopaque, dir: Dir, sub_path: []const u8, options: Dir.AccessOptions) Dir.AccessError!void {
+<a id="L873"></a>    const k: *Kqueue = @ptrCast(@alignCast(userdata));
+<a id="L874"></a>    _ = k;
+<a id="L875"></a>    _ = dir;
+<a id="L876"></a>    _ = sub_path;
+<a id="L877"></a>    _ = options;
+<a id="L878"></a>    @panic("TODO");
+<a id="L879"></a>}
+<a id="L880"></a>fn dirCreateFile(userdata: ?*anyopaque, dir: Dir, sub_path: []const u8, flags: File.CreateFlags) File.OpenError!File {
+<a id="L881"></a>    const k: *Kqueue = @ptrCast(@alignCast(userdata));
+<a id="L882"></a>    _ = k;
+<a id="L883"></a>    _ = dir;
+<a id="L884"></a>    _ = sub_path;
+<a id="L885"></a>    _ = flags;
+<a id="L886"></a>    @panic("TODO");
+<a id="L887"></a>}
+<a id="L888"></a>fn dirOpenFile(userdata: ?*anyopaque, dir: Dir, sub_path: []const u8, flags: File.OpenFlags) File.OpenError!File {
+<a id="L889"></a>    const k: *Kqueue = @ptrCast(@alignCast(userdata));
+<a id="L890"></a>    _ = k;
+<a id="L891"></a>    _ = dir;
+<a id="L892"></a>    _ = sub_path;
+<a id="L893"></a>    _ = flags;
+<a id="L894"></a>    @panic("TODO");
+<a id="L895"></a>}
+<a id="L896"></a>fn dirOpenDir(userdata: ?*anyopaque, dir: Dir, sub_path: []const u8, options: Dir.OpenOptions) Dir.OpenError!Dir {
+<a id="L897"></a>    const k: *Kqueue = @ptrCast(@alignCast(userdata));
+<a id="L898"></a>    _ = k;
+<a id="L899"></a>    _ = dir;
+<a id="L900"></a>    _ = sub_path;
+<a id="L901"></a>    _ = options;
+<a id="L902"></a>    @panic("TODO");
+<a id="L903"></a>}
+<a id="L904"></a>fn dirClose(userdata: ?*anyopaque, dirs: []const Dir) void {
+<a id="L905"></a>    const k: *Kqueue = @ptrCast(@alignCast(userdata));
+<a id="L906"></a>    _ = k;
+<a id="L907"></a>    _ = dirs;
+<a id="L908"></a>    @panic("TODO");
+<a id="L909"></a>}
+<a id="L910"></a>fn fileStat(userdata: ?*anyopaque, file: File) File.StatError!File.Stat {
+<a id="L911"></a>    const k: *Kqueue = @ptrCast(@alignCast(userdata));
+<a id="L912"></a>    _ = k;
+<a id="L913"></a>    _ = file;
+<a id="L914"></a>    @panic("TODO");
+<a id="L915"></a>}
+<a id="L916"></a>
+<a id="L917"></a>fn fileClose(userdata: ?*anyopaque, files: []const File) void {
+<a id="L918"></a>    const k: *Kqueue = @ptrCast(@alignCast(userdata));
+<a id="L919"></a>    _ = k;
+<a id="L920"></a>    _ = files;
+<a id="L921"></a>    @panic("TODO");
+<a id="L922"></a>}
+<a id="L923"></a>
+<a id="L924"></a>fn fileWriteStreaming(
+<a id="L925"></a>    userdata: ?*anyopaque,
+<a id="L926"></a>    file: File,
+<a id="L927"></a>    header: []const u8,
+<a id="L928"></a>    data: []const []const u8,
+<a id="L929"></a>    splat: usize,
+<a id="L930"></a>) File.Writer.Error!usize {
+<a id="L931"></a>    const k: *Kqueue = @ptrCast(@alignCast(userdata));
+<a id="L932"></a>    _ = k;
+<a id="L933"></a>    _ = file;
+<a id="L934"></a>    _ = header;
+<a id="L935"></a>    _ = data;
+<a id="L936"></a>    _ = splat;
+<a id="L937"></a>    @panic("TODO");
+<a id="L938"></a>}
+<a id="L939"></a>
+<a id="L940"></a>fn fileWritePositional(
+<a id="L941"></a>    userdata: ?*anyopaque,
+<a id="L942"></a>    file: File,
+<a id="L943"></a>    header: []const u8,
+<a id="L944"></a>    data: []const []const u8,
+<a id="L945"></a>    splat: usize,
+<a id="L946"></a>    offset: u64,
+<a id="L947"></a>) File.WritePositionalError!usize {
+<a id="L948"></a>    const k: *Kqueue = @ptrCast(@alignCast(userdata));
+<a id="L949"></a>    _ = k;
+<a id="L950"></a>    _ = file;
+<a id="L951"></a>    _ = header;
+<a id="L952"></a>    _ = data;
+<a id="L953"></a>    _ = splat;
+<a id="L954"></a>    _ = offset;
+<a id="L955"></a>    @panic("TODO");
+<a id="L956"></a>}
+<a id="L957"></a>
+<a id="L958"></a>fn fileReadStreaming(userdata: ?*anyopaque, file: File, data: []const []u8) File.Reader.Error!usize {
+<a id="L959"></a>    const k: *Kqueue = @ptrCast(@alignCast(userdata));
+<a id="L960"></a>    _ = k;
+<a id="L961"></a>    _ = file;
+<a id="L962"></a>    _ = data;
+<a id="L963"></a>    @panic("TODO");
+<a id="L964"></a>}
+<a id="L965"></a>
+<a id="L966"></a>fn fileReadPositional(userdata: ?*anyopaque, file: File, data: []const []u8, offset: u64) File.ReadPositionalError!usize {
+<a id="L967"></a>    const k: *Kqueue = @ptrCast(@alignCast(userdata));
+<a id="L968"></a>    _ = k;
+<a id="L969"></a>    _ = file;
+<a id="L970"></a>    _ = data;
+<a id="L971"></a>    _ = offset;
+<a id="L972"></a>    @panic("TODO");
+<a id="L973"></a>}
+<a id="L974"></a>fn fileSeekBy(userdata: ?*anyopaque, file: File, relative_offset: i64) File.SeekError!void {
+<a id="L975"></a>    const k: *Kqueue = @ptrCast(@alignCast(userdata));
+<a id="L976"></a>    _ = k;
+<a id="L977"></a>    _ = file;
+<a id="L978"></a>    _ = relative_offset;
+<a id="L979"></a>    @panic("TODO");
+<a id="L980"></a>}
+<a id="L981"></a>fn fileSeekTo(userdata: ?*anyopaque, file: File, absolute_offset: u64) File.SeekError!void {
+<a id="L982"></a>    const k: *Kqueue = @ptrCast(@alignCast(userdata));
+<a id="L983"></a>    _ = k;
+<a id="L984"></a>    _ = file;
+<a id="L985"></a>    _ = absolute_offset;
+<a id="L986"></a>    @panic("TODO");
+<a id="L987"></a>}
+<a id="L988"></a>
+<a id="L989"></a>fn now(userdata: ?*anyopaque, clock: Io.Clock) Io.Clock.Error!Io.Timestamp {
+<a id="L990"></a>    const k: *Kqueue = @ptrCast(@alignCast(userdata));
+<a id="L991"></a>    _ = k;
+<a id="L992"></a>    _ = clock;
+<a id="L993"></a>    @panic("TODO");
+<a id="L994"></a>}
+<a id="L995"></a>fn sleep(userdata: ?*anyopaque, timeout: Io.Timeout) Io.SleepError!void {
+<a id="L996"></a>    const k: *Kqueue = @ptrCast(@alignCast(userdata));
+<a id="L997"></a>    _ = k;
+<a id="L998"></a>    _ = timeout;
+<a id="L999"></a>    @panic("TODO");
+<a id="L1000"></a>}
+<a id="L1001"></a>
+<a id="L1002"></a>fn netListenIp(
+<a id="L1003"></a>    userdata: ?*anyopaque,
+<a id="L1004"></a>    address: *const net.IpAddress,
+<a id="L1005"></a>    options: net.IpAddress.ListenOptions,
+<a id="L1006"></a>) net.IpAddress.ListenError!net.Socket {
+<a id="L1007"></a>    const k: *Kqueue = @ptrCast(@alignCast(userdata));
+<a id="L1008"></a>    _ = k;
+<a id="L1009"></a>    _ = address;
+<a id="L1010"></a>    _ = options;
+<a id="L1011"></a>    @panic("TODO");
+<a id="L1012"></a>}
+<a id="L1013"></a>fn netAccept(userdata: ?*anyopaque, server: net.Socket.Handle, options: net.Server.AcceptOptions) net.Server.AcceptError!net.Socket {
+<a id="L1014"></a>    const k: *Kqueue = @ptrCast(@alignCast(userdata));
+<a id="L1015"></a>    _ = k;
+<a id="L1016"></a>    _ = server;
+<a id="L1017"></a>    _ = options;
+<a id="L1018"></a>    @panic("TODO");
+<a id="L1019"></a>}
+<a id="L1020"></a>fn netBindIp(
+<a id="L1021"></a>    userdata: ?*anyopaque,
+<a id="L1022"></a>    address: *const net.IpAddress,
+<a id="L1023"></a>    options: net.IpAddress.BindOptions,
+<a id="L1024"></a>) net.IpAddress.BindError!net.Socket {
+<a id="L1025"></a>    const k: *Kqueue = @ptrCast(@alignCast(userdata));
+<a id="L1026"></a>    const family = Io.Threaded.posixAddressFamily(address);
+<a id="L1027"></a>    const socket_fd = try openSocketPosix(k, family, options);
+<a id="L1028"></a>    errdefer closeFd(socket_fd);
+<a id="L1029"></a>    var storage: Io.Threaded.PosixAddress = undefined;
+<a id="L1030"></a>    var addr_len = Io.Threaded.addressToPosix(address, &amp;storage);
+<a id="L1031"></a>    try posixBind(k, socket_fd, &amp;storage.any, addr_len);
+<a id="L1032"></a>    if (options.allow_broadcast) try setSocketOption(k, socket_fd, posix.SOL.SOCKET, posix.SO.BROADCAST, 1);
+<a id="L1033"></a>    try posixGetSockName(k, socket_fd, &amp;storage.any, &amp;addr_len);
+<a id="L1034"></a>    return .{ .handle = socket_fd, .address = Io.Threaded.addressFromPosix(&amp;storage) };
+<a id="L1035"></a>}
+<a id="L1036"></a>fn netConnectIp(userdata: ?*anyopaque, address: *const net.IpAddress, options: net.IpAddress.ConnectOptions) net.IpAddress.ConnectError!net.Socket {
+<a id="L1037"></a>    if (options.timeout != .none) @panic("TODO");
+<a id="L1038"></a>    const k: *Kqueue = @ptrCast(@alignCast(userdata));
+<a id="L1039"></a>    const family = Io.Threaded.posixAddressFamily(address);
+<a id="L1040"></a>    const socket_fd = try openSocketPosix(k, family, .{
+<a id="L1041"></a>        .mode = options.mode,
+<a id="L1042"></a>        .protocol = options.protocol,
+<a id="L1043"></a>    });
+<a id="L1044"></a>    errdefer closeFd(socket_fd);
+<a id="L1045"></a>    var storage: Io.Threaded.PosixAddress = undefined;
+<a id="L1046"></a>    var addr_len = Io.Threaded.addressToPosix(address, &amp;storage);
+<a id="L1047"></a>    try posixConnect(k, socket_fd, &amp;storage.any, addr_len);
+<a id="L1048"></a>    try posixGetSockName(k, socket_fd, &amp;storage.any, &amp;addr_len);
+<a id="L1049"></a>    return .{ .handle = socket_fd, .address = Io.Threaded.addressFromPosix(&amp;storage) };
+<a id="L1050"></a>}
+<a id="L1051"></a>
+<a id="L1052"></a>fn posixConnect(k: *Kqueue, socket_fd: posix.socket_t, addr: *const posix.sockaddr, addr_len: posix.socklen_t) !void {
+<a id="L1053"></a>    while (true) {
+<a id="L1054"></a>        try k.checkCancel();
+<a id="L1055"></a>        switch (posix.errno(posix.system.connect(socket_fd, addr, addr_len))) {
+<a id="L1056"></a>            .SUCCESS =&gt; return,
+<a id="L1057"></a>            .INTR =&gt; continue,
+<a id="L1058"></a>            .CANCELED =&gt; return error.Canceled,
+<a id="L1059"></a>            .AGAIN =&gt; @panic("TODO"),
+<a id="L1060"></a>            .INPROGRESS =&gt; return, // Due to TCP fast open, we find out possible error later.
+<a id="L1061"></a>
+<a id="L1062"></a>            .ADDRNOTAVAIL =&gt; return error.AddressUnavailable,
+<a id="L1063"></a>            .AFNOSUPPORT =&gt; return error.AddressFamilyUnsupported,
+<a id="L1064"></a>            .ALREADY =&gt; return error.ConnectionPending,
+<a id="L1065"></a>            .BADF =&gt; |err| return errnoBug(err), // File descriptor used after closed.
+<a id="L1066"></a>            .CONNREFUSED =&gt; return error.ConnectionRefused,
+<a id="L1067"></a>            .CONNRESET =&gt; return error.ConnectionResetByPeer,
+<a id="L1068"></a>            .FAULT =&gt; |err| return errnoBug(err),
+<a id="L1069"></a>            .ISCONN =&gt; |err| return errnoBug(err),
+<a id="L1070"></a>            .HOSTUNREACH =&gt; return error.HostUnreachable,
+<a id="L1071"></a>            .NETUNREACH =&gt; return error.NetworkUnreachable,
+<a id="L1072"></a>            .NOTSOCK =&gt; |err| return errnoBug(err),
+<a id="L1073"></a>            .PROTOTYPE =&gt; |err| return errnoBug(err),
+<a id="L1074"></a>            .TIMEDOUT =&gt; return error.Timeout,
+<a id="L1075"></a>            .CONNABORTED =&gt; |err| return errnoBug(err),
+<a id="L1076"></a>            .ACCES =&gt; return error.AccessDenied,
+<a id="L1077"></a>            .PERM =&gt; |err| return errnoBug(err),
+<a id="L1078"></a>            .NOENT =&gt; |err| return errnoBug(err),
+<a id="L1079"></a>            .NETDOWN =&gt; return error.NetworkDown,
+<a id="L1080"></a>            else =&gt; |err| return posix.unexpectedErrno(err),
+<a id="L1081"></a>        }
+<a id="L1082"></a>    }
+<a id="L1083"></a>}
+<a id="L1084"></a>
+<a id="L1085"></a>fn netListenUnix(
+<a id="L1086"></a>    userdata: ?*anyopaque,
+<a id="L1087"></a>    unix_address: *const net.UnixAddress,
+<a id="L1088"></a>    options: net.UnixAddress.ListenOptions,
+<a id="L1089"></a>) net.UnixAddress.ListenError!net.Socket.Handle {
+<a id="L1090"></a>    const k: *Kqueue = @ptrCast(@alignCast(userdata));
+<a id="L1091"></a>    _ = k;
+<a id="L1092"></a>    _ = unix_address;
+<a id="L1093"></a>    _ = options;
+<a id="L1094"></a>    @panic("TODO");
+<a id="L1095"></a>}
+<a id="L1096"></a>fn netConnectUnix(
+<a id="L1097"></a>    userdata: ?*anyopaque,
+<a id="L1098"></a>    unix_address: *const net.UnixAddress,
+<a id="L1099"></a>) net.UnixAddress.ConnectError!net.Socket.Handle {
+<a id="L1100"></a>    const k: *Kqueue = @ptrCast(@alignCast(userdata));
+<a id="L1101"></a>    _ = k;
+<a id="L1102"></a>    _ = unix_address;
+<a id="L1103"></a>    @panic("TODO");
+<a id="L1104"></a>}
+<a id="L1105"></a>
+<a id="L1106"></a>fn netSend(
+<a id="L1107"></a>    userdata: ?*anyopaque,
+<a id="L1108"></a>    handle: net.Socket.Handle,
+<a id="L1109"></a>    outgoing_messages: []net.OutgoingMessage,
+<a id="L1110"></a>    flags: net.SendFlags,
+<a id="L1111"></a>) struct { ?net.Socket.SendError, usize } {
+<a id="L1112"></a>    const k: *Kqueue = @ptrCast(@alignCast(userdata));
+<a id="L1113"></a>
+<a id="L1114"></a>    const posix_flags: u32 =
+<a id="L1115"></a>        @as(u32, if (@hasDecl(posix.MSG, "CONFIRM") and flags.confirm) posix.MSG.CONFIRM else 0) |
+<a id="L1116"></a>        @as(u32, if (@hasDecl(posix.MSG, "DONTROUTE") and flags.dont_route) posix.MSG.DONTROUTE else 0) |
+<a id="L1117"></a>        @as(u32, if (@hasDecl(posix.MSG, "EOR") and flags.eor) posix.MSG.EOR else 0) |
+<a id="L1118"></a>        @as(u32, if (@hasDecl(posix.MSG, "OOB") and flags.oob) posix.MSG.OOB else 0) |
+<a id="L1119"></a>        @as(u32, if (@hasDecl(posix.MSG, "FASTOPEN") and flags.fastopen) posix.MSG.FASTOPEN else 0) |
+<a id="L1120"></a>        posix.MSG.NOSIGNAL;
+<a id="L1121"></a>
+<a id="L1122"></a>    for (outgoing_messages, 0..) |*msg, i| {
+<a id="L1123"></a>        netSendOne(k, handle, msg, posix_flags) catch |err| return .{ err, i };
+<a id="L1124"></a>    }
+<a id="L1125"></a>
+<a id="L1126"></a>    return .{ null, outgoing_messages.len };
+<a id="L1127"></a>}
+<a id="L1128"></a>
+<a id="L1129"></a>fn netSendOne(
+<a id="L1130"></a>    k: *Kqueue,
+<a id="L1131"></a>    handle: net.Socket.Handle,
+<a id="L1132"></a>    message: *net.OutgoingMessage,
+<a id="L1133"></a>    flags: u32,
+<a id="L1134"></a>) net.Socket.SendError!void {
+<a id="L1135"></a>    var addr: Io.Threaded.PosixAddress = undefined;
+<a id="L1136"></a>    var iovec: posix.iovec_const = .{ .base = @constCast(message.data_ptr), .len = message.data_len };
+<a id="L1137"></a>    const msg: posix.msghdr_const = .{
+<a id="L1138"></a>        .name = &amp;addr.any,
+<a id="L1139"></a>        .namelen = Io.Threaded.addressToPosix(message.address, &amp;addr),
+<a id="L1140"></a>        .iov = (&amp;iovec)[0..1],
+<a id="L1141"></a>        .iovlen = 1,
+<a id="L1142"></a>        // OS returns EINVAL if this pointer is invalid even if controllen is zero.
+<a id="L1143"></a>        .control = if (message.control.len == 0) null else @constCast(message.control.ptr),
+<a id="L1144"></a>        .controllen = @intCast(message.control.len),
+<a id="L1145"></a>        .flags = 0,
+<a id="L1146"></a>    };
+<a id="L1147"></a>    while (true) {
+<a id="L1148"></a>        try k.checkCancel();
+<a id="L1149"></a>        const rc = posix.system.sendmsg(handle, &amp;msg, flags);
+<a id="L1150"></a>        switch (posix.errno(rc)) {
+<a id="L1151"></a>            .SUCCESS =&gt; {
+<a id="L1152"></a>                message.data_len = @intCast(rc);
+<a id="L1153"></a>                return;
+<a id="L1154"></a>            },
+<a id="L1155"></a>            .INTR =&gt; continue,
+<a id="L1156"></a>            .CANCELED =&gt; return error.Canceled,
+<a id="L1157"></a>            .AGAIN =&gt; @panic("TODO register kevent"),
+<a id="L1158"></a>
+<a id="L1159"></a>            .ACCES =&gt; return error.AccessDenied,
+<a id="L1160"></a>            .ALREADY =&gt; return error.FastOpenAlreadyInProgress,
+<a id="L1161"></a>            .BADF =&gt; |err| return errnoBug(err), // File descriptor used after closed.
+<a id="L1162"></a>            .CONNRESET =&gt; return error.ConnectionResetByPeer,
+<a id="L1163"></a>            .DESTADDRREQ =&gt; |err| return errnoBug(err),
+<a id="L1164"></a>            .FAULT =&gt; |err| return errnoBug(err),
+<a id="L1165"></a>            .INVAL =&gt; |err| return errnoBug(err),
+<a id="L1166"></a>            .ISCONN =&gt; |err| return errnoBug(err),
+<a id="L1167"></a>            .MSGSIZE =&gt; return error.MessageOversize,
+<a id="L1168"></a>            .NOBUFS =&gt; return error.SystemResources,
+<a id="L1169"></a>            .NOMEM =&gt; return error.SystemResources,
+<a id="L1170"></a>            .NOTSOCK =&gt; |err| return errnoBug(err),
+<a id="L1171"></a>            .OPNOTSUPP =&gt; |err| return errnoBug(err),
+<a id="L1172"></a>            .PIPE =&gt; return error.SocketUnconnected,
+<a id="L1173"></a>            .AFNOSUPPORT =&gt; return error.AddressFamilyUnsupported,
+<a id="L1174"></a>            .HOSTUNREACH =&gt; return error.HostUnreachable,
+<a id="L1175"></a>            .NETUNREACH =&gt; return error.NetworkUnreachable,
+<a id="L1176"></a>            .NOTCONN =&gt; return error.SocketUnconnected,
+<a id="L1177"></a>            .NETDOWN =&gt; return error.NetworkDown,
+<a id="L1178"></a>            else =&gt; |err| return posix.unexpectedErrno(err),
+<a id="L1179"></a>        }
+<a id="L1180"></a>    }
+<a id="L1181"></a>}
+<a id="L1182"></a>
+<a id="L1183"></a>fn netReceive(
+<a id="L1184"></a>    userdata: ?*anyopaque,
+<a id="L1185"></a>    handle: net.Socket.Handle,
+<a id="L1186"></a>    message_buffer: []net.IncomingMessage,
+<a id="L1187"></a>    data_buffer: []u8,
+<a id="L1188"></a>    flags: net.ReceiveFlags,
+<a id="L1189"></a>    timeout: Io.Timeout,
+<a id="L1190"></a>) struct { ?net.Socket.ReceiveTimeoutError, usize } {
+<a id="L1191"></a>    const k: *Kqueue = @ptrCast(@alignCast(userdata));
+<a id="L1192"></a>    _ = k;
+<a id="L1193"></a>    _ = handle;
+<a id="L1194"></a>    _ = message_buffer;
+<a id="L1195"></a>    _ = data_buffer;
+<a id="L1196"></a>    _ = flags;
+<a id="L1197"></a>    _ = timeout;
+<a id="L1198"></a>    @panic("TODO");
+<a id="L1199"></a>}
+<a id="L1200"></a>
+<a id="L1201"></a>fn netRead(userdata: ?*anyopaque, fd: net.Socket.Handle, data: [][]u8) net.Stream.Reader.Error!usize {
+<a id="L1202"></a>    const k: *Kqueue = @ptrCast(@alignCast(userdata));
+<a id="L1203"></a>
+<a id="L1204"></a>    var iovecs_buffer: [max_iovecs_len]posix.iovec = undefined;
+<a id="L1205"></a>    var i: usize = 0;
+<a id="L1206"></a>    for (data) |buf| {
+<a id="L1207"></a>        if (iovecs_buffer.len - i == 0) break;
+<a id="L1208"></a>        if (buf.len != 0) {
+<a id="L1209"></a>            iovecs_buffer[i] = .{ .base = buf.ptr, .len = buf.len };
+<a id="L1210"></a>            i += 1;
+<a id="L1211"></a>        }
+<a id="L1212"></a>    }
+<a id="L1213"></a>    const dest = iovecs_buffer[0..i];
+<a id="L1214"></a>    assert(dest[0].len &gt; 0);
+<a id="L1215"></a>
+<a id="L1216"></a>    while (true) {
+<a id="L1217"></a>        try k.checkCancel();
+<a id="L1218"></a>        const rc = posix.system.readv(fd, dest.ptr, @intCast(dest.len));
+<a id="L1219"></a>        switch (posix.errno(rc)) {
+<a id="L1220"></a>            .SUCCESS =&gt; return @intCast(rc),
+<a id="L1221"></a>            .INTR =&gt; continue,
+<a id="L1222"></a>            .CANCELED =&gt; return error.Canceled,
+<a id="L1223"></a>            .AGAIN =&gt; {
+<a id="L1224"></a>                const thread: *Thread = .current();
+<a id="L1225"></a>                const fiber = thread.currentFiber();
+<a id="L1226"></a>                const ident: u32 = @bitCast(fd);
+<a id="L1227"></a>                const filter = std.c.EVFILT.READ;
+<a id="L1228"></a>                const gop = thread.wait_queues.getOrPut(k.gpa, .{
+<a id="L1229"></a>                    .ident = ident,
+<a id="L1230"></a>                    .filter = filter,
+<a id="L1231"></a>                }) catch return error.SystemResources;
+<a id="L1232"></a>                if (gop.found_existing) {
+<a id="L1233"></a>                    const tail_fiber = gop.value_ptr.*;
+<a id="L1234"></a>                    assert(tail_fiber.queue_next == null);
+<a id="L1235"></a>                    tail_fiber.queue_next = fiber;
+<a id="L1236"></a>                    gop.value_ptr.* = fiber;
+<a id="L1237"></a>                } else {
+<a id="L1238"></a>                    gop.value_ptr.* = fiber;
+<a id="L1239"></a>                    const changes = [_]posix.Kevent{
+<a id="L1240"></a>                        .{
+<a id="L1241"></a>                            .ident = ident,
+<a id="L1242"></a>                            .filter = filter,
+<a id="L1243"></a>                            .flags = std.c.EV.ADD | std.c.EV.ONESHOT,
+<a id="L1244"></a>                            .fflags = 0,
+<a id="L1245"></a>                            .data = 0,
+<a id="L1246"></a>                            .udata = @intFromPtr(fiber),
+<a id="L1247"></a>                        },
+<a id="L1248"></a>                    };
+<a id="L1249"></a>                    assert(0 == (kevent(thread.kq_fd, &amp;changes, &amp;.{}, null) catch |err| {
+<a id="L1250"></a>                        // TODO handle EINTR for cancellation purposes
+<a id="L1251"></a>                        @panic(@errorName(err)); // TODO
+<a id="L1252"></a>                    }));
+<a id="L1253"></a>                }
+<a id="L1254"></a>                yield(k, null, .nothing);
+<a id="L1255"></a>                continue;
+<a id="L1256"></a>            },
+<a id="L1257"></a>
+<a id="L1258"></a>            .INVAL =&gt; |err| return errnoBug(err),
+<a id="L1259"></a>            .FAULT =&gt; |err| return errnoBug(err),
+<a id="L1260"></a>            .BADF =&gt; |err| return errnoBug(err), // File descriptor used after closed.
+<a id="L1261"></a>            .NOBUFS =&gt; return error.SystemResources,
+<a id="L1262"></a>            .NOMEM =&gt; return error.SystemResources,
+<a id="L1263"></a>            .NOTCONN =&gt; return error.SocketUnconnected,
+<a id="L1264"></a>            .CONNRESET =&gt; return error.ConnectionResetByPeer,
+<a id="L1265"></a>            .TIMEDOUT =&gt; return error.Timeout,
+<a id="L1266"></a>            .PIPE =&gt; return error.SocketUnconnected,
+<a id="L1267"></a>            .NETDOWN =&gt; return error.NetworkDown,
+<a id="L1268"></a>            else =&gt; |err| return posix.unexpectedErrno(err),
+<a id="L1269"></a>        }
+<a id="L1270"></a>    }
+<a id="L1271"></a>}
+<a id="L1272"></a>
+<a id="L1273"></a>fn netWrite(userdata: ?*anyopaque, dest: net.Socket.Handle, header: []const u8, data: []const []const u8, splat: usize) net.Stream.Writer.Error!usize {
+<a id="L1274"></a>    const k: *Kqueue = @ptrCast(@alignCast(userdata));
+<a id="L1275"></a>    _ = k;
+<a id="L1276"></a>    _ = dest;
+<a id="L1277"></a>    _ = header;
+<a id="L1278"></a>    _ = data;
+<a id="L1279"></a>    _ = splat;
+<a id="L1280"></a>    @panic("TODO");
+<a id="L1281"></a>}
+<a id="L1282"></a>
+<a id="L1283"></a>fn netClose(userdata: ?*anyopaque, handles: []const net.Socket.Handle) void {
+<a id="L1284"></a>    const k: *Kqueue = @ptrCast(@alignCast(userdata));
+<a id="L1285"></a>    _ = k;
+<a id="L1286"></a>    _ = handles;
+<a id="L1287"></a>    @panic("TODO");
+<a id="L1288"></a>}
+<a id="L1289"></a>
+<a id="L1290"></a>fn netShutdown(userdata: ?*anyopaque, handle: net.Socket.Handle, how: net.ShutdownHow) net.ShutdownError!void {
+<a id="L1291"></a>    const k: *Kqueue = @ptrCast(@alignCast(userdata));
+<a id="L1292"></a>    _ = k;
+<a id="L1293"></a>    _ = handle;
+<a id="L1294"></a>    _ = how;
+<a id="L1295"></a>    @panic("TODO");
+<a id="L1296"></a>}
+<a id="L1297"></a>
+<a id="L1298"></a>fn netInterfaceNameResolve(
+<a id="L1299"></a>    userdata: ?*anyopaque,
+<a id="L1300"></a>    name: *const net.Interface.Name,
+<a id="L1301"></a>) net.Interface.Name.ResolveError!net.Interface {
+<a id="L1302"></a>    const k: *Kqueue = @ptrCast(@alignCast(userdata));
+<a id="L1303"></a>    _ = k;
+<a id="L1304"></a>    _ = name;
+<a id="L1305"></a>    @panic("TODO");
+<a id="L1306"></a>}
+<a id="L1307"></a>
+<a id="L1308"></a>fn netInterfaceName(userdata: ?*anyopaque, interface: net.Interface) net.Interface.NameError!net.Interface.Name {
+<a id="L1309"></a>    const k: *Kqueue = @ptrCast(@alignCast(userdata));
+<a id="L1310"></a>    _ = k;
+<a id="L1311"></a>    _ = interface;
+<a id="L1312"></a>    @panic("TODO");
+<a id="L1313"></a>}
+<a id="L1314"></a>
+<a id="L1315"></a>fn netLookup(
+<a id="L1316"></a>    userdata: ?*anyopaque,
+<a id="L1317"></a>    host_name: net.HostName,
+<a id="L1318"></a>    resolved: *Io.Queue(net.HostName.LookupResult),
+<a id="L1319"></a>    options: net.HostName.LookupOptions,
+<a id="L1320"></a>) net.HostName.LookupError!void {
+<a id="L1321"></a>    const k: *Kqueue = @ptrCast(@alignCast(userdata));
+<a id="L1322"></a>    _ = k;
+<a id="L1323"></a>    _ = host_name;
+<a id="L1324"></a>    _ = resolved;
+<a id="L1325"></a>    _ = options;
+<a id="L1326"></a>    @panic("TODO");
+<a id="L1327"></a>}
+<a id="L1328"></a>
+<a id="L1329"></a>fn openSocketPosix(
+<a id="L1330"></a>    k: *Kqueue,
+<a id="L1331"></a>    family: posix.sa_family_t,
+<a id="L1332"></a>    options: IpAddress.BindOptions,
+<a id="L1333"></a>) error{
+<a id="L1334"></a>    AddressFamilyUnsupported,
+<a id="L1335"></a>    ProtocolUnsupportedBySystem,
+<a id="L1336"></a>    ProcessFdQuotaExceeded,
+<a id="L1337"></a>    SystemFdQuotaExceeded,
+<a id="L1338"></a>    SystemResources,
+<a id="L1339"></a>    ProtocolUnsupportedByAddressFamily,
+<a id="L1340"></a>    SocketModeUnsupported,
+<a id="L1341"></a>    OptionUnsupported,
+<a id="L1342"></a>    Unexpected,
+<a id="L1343"></a>    Canceled,
+<a id="L1344"></a>}!posix.socket_t {
+<a id="L1345"></a>    const mode, const protocol = try posixSocketModeProtocol(family, options.mode, options.protocol);
+<a id="L1346"></a>    const socket_fd = while (true) {
+<a id="L1347"></a>        try k.checkCancel();
+<a id="L1348"></a>        const flags: u32 = mode | if (Io.Threaded.socket_flags_unsupported) 0 else posix.SOCK.CLOEXEC;
+<a id="L1349"></a>        const socket_rc = posix.system.socket(family, flags, protocol);
+<a id="L1350"></a>        switch (posix.errno(socket_rc)) {
+<a id="L1351"></a>            .SUCCESS =&gt; {
+<a id="L1352"></a>                const fd: posix.fd_t = @intCast(socket_rc);
+<a id="L1353"></a>                errdefer closeFd(fd);
+<a id="L1354"></a>                if (Io.Threaded.socket_flags_unsupported) {
+<a id="L1355"></a>                    while (true) {
+<a id="L1356"></a>                        try k.checkCancel();
+<a id="L1357"></a>                        switch (posix.errno(posix.system.fcntl(fd, posix.F.SETFD, @as(usize, posix.FD_CLOEXEC)))) {
+<a id="L1358"></a>                            .SUCCESS =&gt; break,
+<a id="L1359"></a>                            .INTR =&gt; continue,
+<a id="L1360"></a>                            .CANCELED =&gt; return error.Canceled,
+<a id="L1361"></a>                            else =&gt; |err| return posix.unexpectedErrno(err),
+<a id="L1362"></a>                        }
+<a id="L1363"></a>                    }
+<a id="L1364"></a>
+<a id="L1365"></a>                    var fl_flags: usize = while (true) {
+<a id="L1366"></a>                        try k.checkCancel();
+<a id="L1367"></a>                        const rc = posix.system.fcntl(fd, posix.F.GETFL, @as(usize, 0));
+<a id="L1368"></a>                        switch (posix.errno(rc)) {
+<a id="L1369"></a>                            .SUCCESS =&gt; break @intCast(rc),
+<a id="L1370"></a>                            .INTR =&gt; continue,
+<a id="L1371"></a>                            .CANCELED =&gt; return error.Canceled,
+<a id="L1372"></a>                            else =&gt; |err| return posix.unexpectedErrno(err),
+<a id="L1373"></a>                        }
+<a id="L1374"></a>                    };
+<a id="L1375"></a>                    fl_flags |= @as(usize, 1 &lt;&lt; @bitOffsetOf(posix.O, "NONBLOCK"));
+<a id="L1376"></a>                    while (true) {
+<a id="L1377"></a>                        try k.checkCancel();
+<a id="L1378"></a>                        switch (posix.errno(posix.system.fcntl(fd, posix.F.SETFL, fl_flags))) {
+<a id="L1379"></a>                            .SUCCESS =&gt; break,
+<a id="L1380"></a>                            .INTR =&gt; continue,
+<a id="L1381"></a>                            .CANCELED =&gt; return error.Canceled,
+<a id="L1382"></a>                            else =&gt; |err| return posix.unexpectedErrno(err),
+<a id="L1383"></a>                        }
+<a id="L1384"></a>                    }
+<a id="L1385"></a>                }
+<a id="L1386"></a>                break fd;
+<a id="L1387"></a>            },
+<a id="L1388"></a>            .INTR =&gt; continue,
+<a id="L1389"></a>            .CANCELED =&gt; return error.Canceled,
+<a id="L1390"></a>
+<a id="L1391"></a>            .AFNOSUPPORT =&gt; return error.AddressFamilyUnsupported,
+<a id="L1392"></a>            .INVAL =&gt; return error.ProtocolUnsupportedBySystem,
+<a id="L1393"></a>            .MFILE =&gt; return error.ProcessFdQuotaExceeded,
+<a id="L1394"></a>            .NFILE =&gt; return error.SystemFdQuotaExceeded,
+<a id="L1395"></a>            .NOBUFS =&gt; return error.SystemResources,
+<a id="L1396"></a>            .NOMEM =&gt; return error.SystemResources,
+<a id="L1397"></a>            .PROTONOSUPPORT =&gt; return error.ProtocolUnsupportedByAddressFamily,
+<a id="L1398"></a>            .PROTOTYPE =&gt; return error.SocketModeUnsupported,
+<a id="L1399"></a>            else =&gt; |err| return posix.unexpectedErrno(err),
+<a id="L1400"></a>        }
+<a id="L1401"></a>    };
+<a id="L1402"></a>    errdefer closeFd(socket_fd);
+<a id="L1403"></a>
+<a id="L1404"></a>    if (options.ip6_only) {
+<a id="L1405"></a>        if (posix.IPV6 == void) return error.OptionUnsupported;
+<a id="L1406"></a>        try setSocketOption(k, socket_fd, posix.IPPROTO.IPV6, posix.IPV6.V6ONLY, 0);
+<a id="L1407"></a>    }
+<a id="L1408"></a>
+<a id="L1409"></a>    return socket_fd;
+<a id="L1410"></a>}
+<a id="L1411"></a>
+<a id="L1412"></a>fn posixBind(
+<a id="L1413"></a>    k: *Kqueue,
+<a id="L1414"></a>    socket_fd: posix.socket_t,
+<a id="L1415"></a>    addr: *const posix.sockaddr,
+<a id="L1416"></a>    addr_len: posix.socklen_t,
+<a id="L1417"></a>) !void {
+<a id="L1418"></a>    while (true) {
+<a id="L1419"></a>        try k.checkCancel();
+<a id="L1420"></a>        switch (posix.errno(posix.system.bind(socket_fd, addr, addr_len))) {
+<a id="L1421"></a>            .SUCCESS =&gt; break,
+<a id="L1422"></a>            .INTR =&gt; continue,
+<a id="L1423"></a>            .CANCELED =&gt; return error.Canceled,
+<a id="L1424"></a>
+<a id="L1425"></a>            .ADDRINUSE =&gt; return error.AddressInUse,
+<a id="L1426"></a>            .BADF =&gt; |err| return errnoBug(err), // File descriptor used after closed.
+<a id="L1427"></a>            .INVAL =&gt; |err| return errnoBug(err), // invalid parameters
+<a id="L1428"></a>            .NOTSOCK =&gt; |err| return errnoBug(err), // invalid `sockfd`
+<a id="L1429"></a>            .AFNOSUPPORT =&gt; return error.AddressFamilyUnsupported,
+<a id="L1430"></a>            .ADDRNOTAVAIL =&gt; return error.AddressUnavailable,
+<a id="L1431"></a>            .FAULT =&gt; |err| return errnoBug(err), // invalid `addr` pointer
+<a id="L1432"></a>            .NOMEM =&gt; return error.SystemResources,
+<a id="L1433"></a>            else =&gt; |err| return posix.unexpectedErrno(err),
+<a id="L1434"></a>        }
+<a id="L1435"></a>    }
+<a id="L1436"></a>}
+<a id="L1437"></a>
+<a id="L1438"></a>fn posixGetSockName(k: *Kqueue, socket_fd: posix.fd_t, addr: *posix.sockaddr, addr_len: *posix.socklen_t) !void {
+<a id="L1439"></a>    while (true) {
+<a id="L1440"></a>        try k.checkCancel();
+<a id="L1441"></a>        switch (posix.errno(posix.system.getsockname(socket_fd, addr, addr_len))) {
+<a id="L1442"></a>            .SUCCESS =&gt; break,
+<a id="L1443"></a>            .INTR =&gt; continue,
+<a id="L1444"></a>            .CANCELED =&gt; return error.Canceled,
+<a id="L1445"></a>
+<a id="L1446"></a>            .BADF =&gt; |err| return errnoBug(err), // File descriptor used after closed.
+<a id="L1447"></a>            .FAULT =&gt; |err| return errnoBug(err),
+<a id="L1448"></a>            .INVAL =&gt; |err| return errnoBug(err), // invalid parameters
+<a id="L1449"></a>            .NOTSOCK =&gt; |err| return errnoBug(err), // always a race condition
+<a id="L1450"></a>            .NOBUFS =&gt; return error.SystemResources,
+<a id="L1451"></a>            else =&gt; |err| return posix.unexpectedErrno(err),
+<a id="L1452"></a>        }
+<a id="L1453"></a>    }
+<a id="L1454"></a>}
+<a id="L1455"></a>
+<a id="L1456"></a>fn setSocketOption(k: *Kqueue, fd: posix.fd_t, level: i32, opt_name: u32, option: u32) !void {
+<a id="L1457"></a>    const o: []const u8 = @ptrCast(&amp;option);
+<a id="L1458"></a>    while (true) {
+<a id="L1459"></a>        try k.checkCancel();
+<a id="L1460"></a>        switch (posix.errno(posix.system.setsockopt(fd, level, opt_name, o.ptr, @intCast(o.len)))) {
+<a id="L1461"></a>            .SUCCESS =&gt; return,
+<a id="L1462"></a>            .INTR =&gt; continue,
+<a id="L1463"></a>            .CANCELED =&gt; return error.Canceled,
+<a id="L1464"></a>
+<a id="L1465"></a>            .BADF =&gt; |err| return errnoBug(err), // File descriptor used after closed.
+<a id="L1466"></a>            .NOTSOCK =&gt; |err| return errnoBug(err),
+<a id="L1467"></a>            .INVAL =&gt; |err| return errnoBug(err),
+<a id="L1468"></a>            .FAULT =&gt; |err| return errnoBug(err),
+<a id="L1469"></a>            else =&gt; |err| return posix.unexpectedErrno(err),
+<a id="L1470"></a>        }
+<a id="L1471"></a>    }
+<a id="L1472"></a>}
+<a id="L1473"></a>
+<a id="L1474"></a>fn checkCancel(k: *Kqueue) error{Canceled}!void {
+<a id="L1475"></a>    if (cancelRequested(k)) return error.Canceled;
+<a id="L1476"></a>}
+<a id="L1477"></a>
+<a id="L1478"></a>pub const KEventError = error{
+<a id="L1479"></a>    /// The process does not have permission to register a filter.
+<a id="L1480"></a>    AccessDenied,
+<a id="L1481"></a>    /// The event could not be found to be modified or deleted.
+<a id="L1482"></a>    EventNotFound,
+<a id="L1483"></a>    /// No memory was available to register the event.
+<a id="L1484"></a>    SystemResources,
+<a id="L1485"></a>    /// The specified process to attach to does not exist.
+<a id="L1486"></a>    ProcessNotFound,
+<a id="L1487"></a>    /// changelist or eventlist had too many items on it.
+<a id="L1488"></a>    /// TODO remove this possibility
+<a id="L1489"></a>    Overflow,
+<a id="L1490"></a>};
+<a id="L1491"></a>
+<a id="L1492"></a>pub fn kevent(
+<a id="L1493"></a>    kq: i32,
+<a id="L1494"></a>    changelist: []const posix.Kevent,
+<a id="L1495"></a>    eventlist: []posix.Kevent,
+<a id="L1496"></a>    timeout: ?*const posix.timespec,
+<a id="L1497"></a>) KEventError!usize {
+<a id="L1498"></a>    while (true) {
+<a id="L1499"></a>        const rc = posix.system.kevent(
+<a id="L1500"></a>            kq,
+<a id="L1501"></a>            changelist.ptr,
+<a id="L1502"></a>            std.math.cast(c_int, changelist.len) orelse return error.Overflow,
+<a id="L1503"></a>            eventlist.ptr,
+<a id="L1504"></a>            std.math.cast(c_int, eventlist.len) orelse return error.Overflow,
+<a id="L1505"></a>            timeout,
+<a id="L1506"></a>        );
+<a id="L1507"></a>        switch (posix.errno(rc)) {
+<a id="L1508"></a>            .SUCCESS =&gt; return @intCast(rc),
+<a id="L1509"></a>            .ACCES =&gt; return error.AccessDenied,
+<a id="L1510"></a>            .FAULT =&gt; unreachable, // TODO use error.Unexpected for these
+<a id="L1511"></a>            .BADF =&gt; unreachable, // Always a race condition.
+<a id="L1512"></a>            .INTR =&gt; continue, // TODO handle cancelation
+<a id="L1513"></a>            .INVAL =&gt; unreachable,
+<a id="L1514"></a>            .NOENT =&gt; return error.EventNotFound,
+<a id="L1515"></a>            .NOMEM =&gt; return error.SystemResources,
+<a id="L1516"></a>            .SRCH =&gt; return error.ProcessNotFound,
+<a id="L1517"></a>            else =&gt; unreachable,
+<a id="L1518"></a>        }
+<a id="L1519"></a>    }
+<a id="L1520"></a>}
+</pre>
 </body>
 </html>

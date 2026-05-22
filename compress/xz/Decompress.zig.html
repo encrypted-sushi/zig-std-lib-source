@@ -2,336 +2,339 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Source: zig-0.16.0-std/compress/xz/Decompress.zig</title>
+    <title>Source: compress/xz/Decompress.zig</title>
     <style>
         body { background: #1e1e1e; color: #d4d4d4; font-family: monospace; padding: 20px; }
         pre { white-space: pre-wrap; word-wrap: break-word; }
         .header { border-bottom: 1px solid #444; padding-bottom: 10px; margin-bottom: 20px; }
         a { color: #569cd6; }
+        a[id] { color: inherit; text-decoration: none; }
+        :target { background: #3a3a00; }
     </style>
 </head>
 <body>
     <div class="header">
-        <a href="/">Index</a> | <strong>File: zig-0.16.0-std/compress/xz/Decompress.zig</strong>
+        <a href="/">Index</a> | <strong>File: compress/xz/Decompress.zig</strong>
     </div>
-    <pre>const Decompress = @This();
-const std = @import("../../std.zig");
-const Allocator = std.mem.Allocator;
-const ArrayList = std.ArrayList;
-const Crc32 = std.hash.Crc32;
-const Crc64 = std.hash.crc.Crc64Xz;
-const Sha256 = std.crypto.hash.sha2.Sha256;
-const lzma2 = std.compress.lzma2;
-const Writer = std.Io.Writer;
-const Reader = std.Io.Reader;
-const assert = std.debug.assert;
-
-/// Underlying compressed data stream to pull bytes from.
-input: *Reader,
-/// Uncompressed bytes output by this stream implementation.
-reader: Reader,
-gpa: Allocator,
-check: Check,
-block_count: usize,
-err: ?Error,
-
-pub const Error = error{
-    ReadFailed,
-    OutOfMemory,
-    CorruptInput,
-    EndOfStream,
-    WrongChecksum,
-    Unsupported,
-    Overflow,
-    InvalidRangeCode,
-    DecompressedSizeMismatch,
-    CompressedSizeMismatch,
-};
-
-pub const Check = enum(u4) {
-    none = 0x00,
-    crc32 = 0x01,
-    crc64 = 0x04,
-    sha256 = 0x0A,
-    _,
-};
-
-pub const StreamFlags = packed struct(u16) {
-    null: u8 = 0,
-    check: Check,
-    reserved: u4 = 0,
-};
-
-pub const InitError = error{
-    NotXzStream,
-    WrongChecksum,
-};
-
-/// XZ uses a series of LZMA2 blocks which each specify a dictionary size
-/// anywhere from 4K to 4G. Thus, this API dynamically allocates the dictionary
-/// as-needed.
-pub fn init(
-    input: *Reader,
-    gpa: Allocator,
-    /// Decompress takes ownership of this buffer and resizes it with `gpa`.
-    buffer: []u8,
-) !Decompress {
-    const magic = try input.takeArray(6);
-    if (!std.mem.eql(u8, magic, &amp;.{ 0xFD, '7', 'z', 'X', 'Z', 0x00 }))
-        return error.NotXzStream;
-
-    const computed_checksum = Crc32.hash(try input.peek(@sizeOf(StreamFlags)));
-    const stream_flags = input.takeStruct(StreamFlags, .little) catch unreachable;
-    const stored_hash = try input.takeInt(u32, .little);
-    if (computed_checksum != stored_hash) return error.WrongChecksum;
-
-    return .{
-        .input = input,
-        .reader = .{
-            .vtable = &amp;.{
-                .stream = stream,
-                .readVec = readVec,
-                .discard = discard,
-            },
-            .buffer = buffer,
-            .seek = 0,
-            .end = 0,
-        },
-        .gpa = gpa,
-        .check = stream_flags.check,
-        .block_count = 0,
-        .err = null,
-    };
-}
-
-/// Reclaim ownership of the buffer passed to `init`.
-pub fn takeBuffer(d: *Decompress) []u8 {
-    const buffer = d.reader.buffer;
-    d.reader.buffer = &amp;.{};
-    return buffer;
-}
-
-pub fn deinit(d: *Decompress) void {
-    const gpa = d.gpa;
-    gpa.free(d.reader.buffer);
-    d.* = undefined;
-}
-
-fn readVec(r: *Reader, data: [][]u8) Reader.Error!usize {
-    _ = data;
-    return readIndirect(r);
-}
-
-fn stream(r: *Reader, w: *Writer, limit: std.Io.Limit) Reader.StreamError!usize {
-    _ = w;
-    _ = limit;
-    return readIndirect(r);
-}
-
-fn discard(r: *Reader, limit: std.Io.Limit) Reader.Error!usize {
-    const d: *Decompress = @alignCast(@fieldParentPtr("reader", r));
-    _ = d;
-    _ = limit;
-    @panic("TODO");
-}
-
-fn readIndirect(r: *Reader) Reader.Error!usize {
-    const d: *Decompress = @alignCast(@fieldParentPtr("reader", r));
-    const gpa = d.gpa;
-    const input = d.input;
-
-    var allocating = Writer.Allocating.initOwnedSlice(gpa, r.buffer);
-    allocating.writer.end = r.end;
-    defer {
-        r.buffer = allocating.writer.buffer;
-        r.end = allocating.writer.end;
-    }
-
-    if (d.err != null) return error.ReadFailed;
-    if (d.block_count == std.math.maxInt(usize)) return error.EndOfStream;
-
-    readBlock(input, &amp;allocating) catch |err| switch (err) {
-        error.WriteFailed =&gt; {
-            d.err = error.OutOfMemory;
-            return error.ReadFailed;
-        },
-        error.SuccessfulEndOfStream =&gt; {
-            finish(d) catch |finish_err| {
-                d.err = finish_err;
-                return error.ReadFailed;
-            };
-            d.block_count = std.math.maxInt(usize);
-            return error.EndOfStream;
-        },
-        else =&gt; |e| {
-            d.err = e;
-            return error.ReadFailed;
-        },
-    };
-    switch (d.check) {
-        .none =&gt; {},
-        .crc32 =&gt; {
-            const declared_checksum = try input.takeInt(u32, .little);
-            // TODO
-            //const hash_a = Crc32.hash(unpacked_bytes);
-            //if (hash_a != hash_b) return error.WrongChecksum;
-            _ = declared_checksum;
-        },
-        .crc64 =&gt; {
-            const declared_checksum = try input.takeInt(u64, .little);
-            // TODO
-            //const hash_a = Crc64.hash(unpacked_bytes);
-            //if (hash_a != hash_b) return error.WrongChecksum;
-            _ = declared_checksum;
-        },
-        .sha256 =&gt; {
-            const declared_hash = try input.take(Sha256.digest_length);
-            // TODO
-            //var hash_a: [Sha256.digest_length]u8 = undefined;
-            //Sha256.hash(unpacked_bytes, &amp;hash_a, .{});
-            //if (!std.mem.eql(u8, &amp;hash_a, &amp;hash_b))
-            //    return error.WrongChecksum;
-            _ = declared_hash;
-        },
-        else =&gt; {
-            d.err = error.Unsupported;
-            return error.ReadFailed;
-        },
-    }
-    d.block_count += 1;
-    return 0;
-}
-
-fn readBlock(input: *Reader, allocating: *Writer.Allocating) !void {
-    var packed_size: ?u64 = null;
-    var unpacked_size: ?u64 = null;
-
-    const header_size = h: {
-        // Read the block header via peeking so that we can hash the whole thing too.
-        const first_byte: usize = try input.peekByte();
-        if (first_byte == 0) return error.SuccessfulEndOfStream;
-
-        const declared_header_size = first_byte * 4;
-        try input.fill(declared_header_size);
-        const header_seek_start = input.seek;
-        input.toss(1);
-
-        const Flags = packed struct(u8) {
-            last_filter_index: u2,
-            reserved: u4,
-            has_packed_size: bool,
-            has_unpacked_size: bool,
-        };
-        const flags = try input.takeStruct(Flags, .little);
-
-        const filter_count = @as(u3, flags.last_filter_index) + 1;
-        if (filter_count &gt; 1) return error.Unsupported;
-
-        if (flags.has_packed_size) packed_size = try input.takeLeb128(u64);
-        if (flags.has_unpacked_size) unpacked_size = try input.takeLeb128(u64);
-
-        const FilterId = enum(u64) {
-            lzma2 = 0x21,
-            _,
-        };
-
-        const filter_id: FilterId = @enumFromInt(try input.takeLeb128(u64));
-        if (filter_id != .lzma2) return error.Unsupported;
-
-        const properties_size = try input.takeLeb128(u64);
-        if (properties_size != 1) return error.CorruptInput;
-        // TODO: use filter properties
-        _ = try input.takeByte();
-
-        const actual_header_size = input.seek - header_seek_start;
-        if (actual_header_size &gt; declared_header_size) return error.CorruptInput;
-        const remaining_bytes = declared_header_size - actual_header_size;
-        for (0..remaining_bytes) |_| {
-            if (try input.takeByte() != 0) return error.CorruptInput;
-        }
-
-        const header_slice = input.buffer[header_seek_start..][0..declared_header_size];
-        const computed_checksum = Crc32.hash(header_slice);
-        const declared_checksum = try input.takeInt(u32, .little);
-        if (computed_checksum != declared_checksum) return error.WrongChecksum;
-        break :h declared_header_size;
-    };
-
-    // Compressed Data
-
-    var lzma2_decode = try lzma2.Decode.init(allocating.allocator);
-    defer lzma2_decode.deinit(allocating.allocator);
-    const before_size = allocating.writer.end;
-    const packed_bytes_read = try lzma2_decode.decompress(input, allocating);
-    const unpacked_bytes = allocating.writer.end - before_size;
-
-    if (packed_size) |s| {
-        if (s != packed_bytes_read) return error.CorruptInput;
-    }
-
-    if (unpacked_size) |s| {
-        if (s != unpacked_bytes) return error.CorruptInput;
-    }
-
-    // Block Padding
-    const block_counter = header_size + packed_bytes_read;
-    const padding = try input.take(@intCast((4 - (block_counter % 4)) % 4));
-    for (padding) |byte| {
-        if (byte != 0) return error.CorruptInput;
-    }
-}
-
-fn finish(d: *Decompress) !void {
-    const input = d.input;
-    const index_size = blk: {
-        // Assume that we already peeked a zero in readBlock().
-        assert(input.buffered()[0] == 0);
-        var input_counter: u64 = 1;
-        var checksum: Crc32 = .init();
-        checksum.update(&amp;.{0});
-        input.toss(1);
-
-        const record_count = try countLeb128(input, u64, &amp;input_counter, &amp;checksum);
-        if (record_count != d.block_count)
-            return error.CorruptInput;
-
-        for (0..@intCast(record_count)) |_| {
-            // TODO: validate records
-            _ = try countLeb128(input, u64, &amp;input_counter, &amp;checksum);
-            _ = try countLeb128(input, u64, &amp;input_counter, &amp;checksum);
-        }
-
-        const padding = try input.take(@intCast((4 - (input_counter % 4)) % 4));
-        for (padding) |byte| {
-            if (byte != 0) return error.CorruptInput;
-        }
-        checksum.update(padding);
-
-        const declared_checksum = try input.takeInt(u32, .little);
-        const computed_checksum = checksum.final();
-        if (computed_checksum != declared_checksum) return error.WrongChecksum;
-
-        break :blk input_counter + padding.len + 4;
-    };
-
-    const declared_checksum = try input.takeInt(u32, .little);
-    const computed_checksum = Crc32.hash(try input.peek(4 + @sizeOf(StreamFlags)));
-    if (declared_checksum != computed_checksum) return error.WrongChecksum;
-    const backward_size = (@as(u64, try input.takeInt(u32, .little)) + 1) * 4;
-    if (backward_size != index_size) return error.CorruptInput;
-    input.toss(@sizeOf(StreamFlags));
-    if (!std.mem.eql(u8, try input.takeArray(2), &amp;.{ 'Y', 'Z' }))
-        return error.CorruptInput;
-}
-
-fn countLeb128(reader: *Reader, comptime T: type, counter: *u64, hasher: *Crc32) !T {
-    try reader.fill(8);
-    const start = reader.seek;
-    const result = try reader.takeLeb128(T);
-    const read_slice = reader.buffer[start..reader.seek];
-    hasher.update(read_slice);
-    counter.* += read_slice.len;
-    return result;
-}</pre>
+    <pre><a id="L1"></a>const Decompress = @This();
+<a id="L2"></a>const std = @import("../../std.zig");
+<a id="L3"></a>const Allocator = std.mem.Allocator;
+<a id="L4"></a>const ArrayList = std.ArrayList;
+<a id="L5"></a>const Crc32 = std.hash.Crc32;
+<a id="L6"></a>const Crc64 = std.hash.crc.Crc64Xz;
+<a id="L7"></a>const Sha256 = std.crypto.hash.sha2.Sha256;
+<a id="L8"></a>const lzma2 = std.compress.lzma2;
+<a id="L9"></a>const Writer = std.Io.Writer;
+<a id="L10"></a>const Reader = std.Io.Reader;
+<a id="L11"></a>const assert = std.debug.assert;
+<a id="L12"></a>
+<a id="L13"></a>/// Underlying compressed data stream to pull bytes from.
+<a id="L14"></a>input: *Reader,
+<a id="L15"></a>/// Uncompressed bytes output by this stream implementation.
+<a id="L16"></a>reader: Reader,
+<a id="L17"></a>gpa: Allocator,
+<a id="L18"></a>check: Check,
+<a id="L19"></a>block_count: usize,
+<a id="L20"></a>err: ?Error,
+<a id="L21"></a>
+<a id="L22"></a>pub const Error = error{
+<a id="L23"></a>    ReadFailed,
+<a id="L24"></a>    OutOfMemory,
+<a id="L25"></a>    CorruptInput,
+<a id="L26"></a>    EndOfStream,
+<a id="L27"></a>    WrongChecksum,
+<a id="L28"></a>    Unsupported,
+<a id="L29"></a>    Overflow,
+<a id="L30"></a>    InvalidRangeCode,
+<a id="L31"></a>    DecompressedSizeMismatch,
+<a id="L32"></a>    CompressedSizeMismatch,
+<a id="L33"></a>};
+<a id="L34"></a>
+<a id="L35"></a>pub const Check = enum(u4) {
+<a id="L36"></a>    none = 0x00,
+<a id="L37"></a>    crc32 = 0x01,
+<a id="L38"></a>    crc64 = 0x04,
+<a id="L39"></a>    sha256 = 0x0A,
+<a id="L40"></a>    _,
+<a id="L41"></a>};
+<a id="L42"></a>
+<a id="L43"></a>pub const StreamFlags = packed struct(u16) {
+<a id="L44"></a>    null: u8 = 0,
+<a id="L45"></a>    check: Check,
+<a id="L46"></a>    reserved: u4 = 0,
+<a id="L47"></a>};
+<a id="L48"></a>
+<a id="L49"></a>pub const InitError = error{
+<a id="L50"></a>    NotXzStream,
+<a id="L51"></a>    WrongChecksum,
+<a id="L52"></a>};
+<a id="L53"></a>
+<a id="L54"></a>/// XZ uses a series of LZMA2 blocks which each specify a dictionary size
+<a id="L55"></a>/// anywhere from 4K to 4G. Thus, this API dynamically allocates the dictionary
+<a id="L56"></a>/// as-needed.
+<a id="L57"></a>pub fn init(
+<a id="L58"></a>    input: *Reader,
+<a id="L59"></a>    gpa: Allocator,
+<a id="L60"></a>    /// Decompress takes ownership of this buffer and resizes it with `gpa`.
+<a id="L61"></a>    buffer: []u8,
+<a id="L62"></a>) !Decompress {
+<a id="L63"></a>    const magic = try input.takeArray(6);
+<a id="L64"></a>    if (!std.mem.eql(u8, magic, &amp;.{ 0xFD, '7', 'z', 'X', 'Z', 0x00 }))
+<a id="L65"></a>        return error.NotXzStream;
+<a id="L66"></a>
+<a id="L67"></a>    const computed_checksum = Crc32.hash(try input.peek(@sizeOf(StreamFlags)));
+<a id="L68"></a>    const stream_flags = input.takeStruct(StreamFlags, .little) catch unreachable;
+<a id="L69"></a>    const stored_hash = try input.takeInt(u32, .little);
+<a id="L70"></a>    if (computed_checksum != stored_hash) return error.WrongChecksum;
+<a id="L71"></a>
+<a id="L72"></a>    return .{
+<a id="L73"></a>        .input = input,
+<a id="L74"></a>        .reader = .{
+<a id="L75"></a>            .vtable = &amp;.{
+<a id="L76"></a>                .stream = stream,
+<a id="L77"></a>                .readVec = readVec,
+<a id="L78"></a>                .discard = discard,
+<a id="L79"></a>            },
+<a id="L80"></a>            .buffer = buffer,
+<a id="L81"></a>            .seek = 0,
+<a id="L82"></a>            .end = 0,
+<a id="L83"></a>        },
+<a id="L84"></a>        .gpa = gpa,
+<a id="L85"></a>        .check = stream_flags.check,
+<a id="L86"></a>        .block_count = 0,
+<a id="L87"></a>        .err = null,
+<a id="L88"></a>    };
+<a id="L89"></a>}
+<a id="L90"></a>
+<a id="L91"></a>/// Reclaim ownership of the buffer passed to `init`.
+<a id="L92"></a>pub fn takeBuffer(d: *Decompress) []u8 {
+<a id="L93"></a>    const buffer = d.reader.buffer;
+<a id="L94"></a>    d.reader.buffer = &amp;.{};
+<a id="L95"></a>    return buffer;
+<a id="L96"></a>}
+<a id="L97"></a>
+<a id="L98"></a>pub fn deinit(d: *Decompress) void {
+<a id="L99"></a>    const gpa = d.gpa;
+<a id="L100"></a>    gpa.free(d.reader.buffer);
+<a id="L101"></a>    d.* = undefined;
+<a id="L102"></a>}
+<a id="L103"></a>
+<a id="L104"></a>fn readVec(r: *Reader, data: [][]u8) Reader.Error!usize {
+<a id="L105"></a>    _ = data;
+<a id="L106"></a>    return readIndirect(r);
+<a id="L107"></a>}
+<a id="L108"></a>
+<a id="L109"></a>fn stream(r: *Reader, w: *Writer, limit: std.Io.Limit) Reader.StreamError!usize {
+<a id="L110"></a>    _ = w;
+<a id="L111"></a>    _ = limit;
+<a id="L112"></a>    return readIndirect(r);
+<a id="L113"></a>}
+<a id="L114"></a>
+<a id="L115"></a>fn discard(r: *Reader, limit: std.Io.Limit) Reader.Error!usize {
+<a id="L116"></a>    const d: *Decompress = @alignCast(@fieldParentPtr("reader", r));
+<a id="L117"></a>    _ = d;
+<a id="L118"></a>    _ = limit;
+<a id="L119"></a>    @panic("TODO");
+<a id="L120"></a>}
+<a id="L121"></a>
+<a id="L122"></a>fn readIndirect(r: *Reader) Reader.Error!usize {
+<a id="L123"></a>    const d: *Decompress = @alignCast(@fieldParentPtr("reader", r));
+<a id="L124"></a>    const gpa = d.gpa;
+<a id="L125"></a>    const input = d.input;
+<a id="L126"></a>
+<a id="L127"></a>    var allocating = Writer.Allocating.initOwnedSlice(gpa, r.buffer);
+<a id="L128"></a>    allocating.writer.end = r.end;
+<a id="L129"></a>    defer {
+<a id="L130"></a>        r.buffer = allocating.writer.buffer;
+<a id="L131"></a>        r.end = allocating.writer.end;
+<a id="L132"></a>    }
+<a id="L133"></a>
+<a id="L134"></a>    if (d.err != null) return error.ReadFailed;
+<a id="L135"></a>    if (d.block_count == std.math.maxInt(usize)) return error.EndOfStream;
+<a id="L136"></a>
+<a id="L137"></a>    readBlock(input, &amp;allocating) catch |err| switch (err) {
+<a id="L138"></a>        error.WriteFailed =&gt; {
+<a id="L139"></a>            d.err = error.OutOfMemory;
+<a id="L140"></a>            return error.ReadFailed;
+<a id="L141"></a>        },
+<a id="L142"></a>        error.SuccessfulEndOfStream =&gt; {
+<a id="L143"></a>            finish(d) catch |finish_err| {
+<a id="L144"></a>                d.err = finish_err;
+<a id="L145"></a>                return error.ReadFailed;
+<a id="L146"></a>            };
+<a id="L147"></a>            d.block_count = std.math.maxInt(usize);
+<a id="L148"></a>            return error.EndOfStream;
+<a id="L149"></a>        },
+<a id="L150"></a>        else =&gt; |e| {
+<a id="L151"></a>            d.err = e;
+<a id="L152"></a>            return error.ReadFailed;
+<a id="L153"></a>        },
+<a id="L154"></a>    };
+<a id="L155"></a>    switch (d.check) {
+<a id="L156"></a>        .none =&gt; {},
+<a id="L157"></a>        .crc32 =&gt; {
+<a id="L158"></a>            const declared_checksum = try input.takeInt(u32, .little);
+<a id="L159"></a>            // TODO
+<a id="L160"></a>            //const hash_a = Crc32.hash(unpacked_bytes);
+<a id="L161"></a>            //if (hash_a != hash_b) return error.WrongChecksum;
+<a id="L162"></a>            _ = declared_checksum;
+<a id="L163"></a>        },
+<a id="L164"></a>        .crc64 =&gt; {
+<a id="L165"></a>            const declared_checksum = try input.takeInt(u64, .little);
+<a id="L166"></a>            // TODO
+<a id="L167"></a>            //const hash_a = Crc64.hash(unpacked_bytes);
+<a id="L168"></a>            //if (hash_a != hash_b) return error.WrongChecksum;
+<a id="L169"></a>            _ = declared_checksum;
+<a id="L170"></a>        },
+<a id="L171"></a>        .sha256 =&gt; {
+<a id="L172"></a>            const declared_hash = try input.take(Sha256.digest_length);
+<a id="L173"></a>            // TODO
+<a id="L174"></a>            //var hash_a: [Sha256.digest_length]u8 = undefined;
+<a id="L175"></a>            //Sha256.hash(unpacked_bytes, &amp;hash_a, .{});
+<a id="L176"></a>            //if (!std.mem.eql(u8, &amp;hash_a, &amp;hash_b))
+<a id="L177"></a>            //    return error.WrongChecksum;
+<a id="L178"></a>            _ = declared_hash;
+<a id="L179"></a>        },
+<a id="L180"></a>        else =&gt; {
+<a id="L181"></a>            d.err = error.Unsupported;
+<a id="L182"></a>            return error.ReadFailed;
+<a id="L183"></a>        },
+<a id="L184"></a>    }
+<a id="L185"></a>    d.block_count += 1;
+<a id="L186"></a>    return 0;
+<a id="L187"></a>}
+<a id="L188"></a>
+<a id="L189"></a>fn readBlock(input: *Reader, allocating: *Writer.Allocating) !void {
+<a id="L190"></a>    var packed_size: ?u64 = null;
+<a id="L191"></a>    var unpacked_size: ?u64 = null;
+<a id="L192"></a>
+<a id="L193"></a>    const header_size = h: {
+<a id="L194"></a>        // Read the block header via peeking so that we can hash the whole thing too.
+<a id="L195"></a>        const first_byte: usize = try input.peekByte();
+<a id="L196"></a>        if (first_byte == 0) return error.SuccessfulEndOfStream;
+<a id="L197"></a>
+<a id="L198"></a>        const declared_header_size = first_byte * 4;
+<a id="L199"></a>        try input.fill(declared_header_size);
+<a id="L200"></a>        const header_seek_start = input.seek;
+<a id="L201"></a>        input.toss(1);
+<a id="L202"></a>
+<a id="L203"></a>        const Flags = packed struct(u8) {
+<a id="L204"></a>            last_filter_index: u2,
+<a id="L205"></a>            reserved: u4,
+<a id="L206"></a>            has_packed_size: bool,
+<a id="L207"></a>            has_unpacked_size: bool,
+<a id="L208"></a>        };
+<a id="L209"></a>        const flags = try input.takeStruct(Flags, .little);
+<a id="L210"></a>
+<a id="L211"></a>        const filter_count = @as(u3, flags.last_filter_index) + 1;
+<a id="L212"></a>        if (filter_count &gt; 1) return error.Unsupported;
+<a id="L213"></a>
+<a id="L214"></a>        if (flags.has_packed_size) packed_size = try input.takeLeb128(u64);
+<a id="L215"></a>        if (flags.has_unpacked_size) unpacked_size = try input.takeLeb128(u64);
+<a id="L216"></a>
+<a id="L217"></a>        const FilterId = enum(u64) {
+<a id="L218"></a>            lzma2 = 0x21,
+<a id="L219"></a>            _,
+<a id="L220"></a>        };
+<a id="L221"></a>
+<a id="L222"></a>        const filter_id: FilterId = @enumFromInt(try input.takeLeb128(u64));
+<a id="L223"></a>        if (filter_id != .lzma2) return error.Unsupported;
+<a id="L224"></a>
+<a id="L225"></a>        const properties_size = try input.takeLeb128(u64);
+<a id="L226"></a>        if (properties_size != 1) return error.CorruptInput;
+<a id="L227"></a>        // TODO: use filter properties
+<a id="L228"></a>        _ = try input.takeByte();
+<a id="L229"></a>
+<a id="L230"></a>        const actual_header_size = input.seek - header_seek_start;
+<a id="L231"></a>        if (actual_header_size &gt; declared_header_size) return error.CorruptInput;
+<a id="L232"></a>        const remaining_bytes = declared_header_size - actual_header_size;
+<a id="L233"></a>        for (0..remaining_bytes) |_| {
+<a id="L234"></a>            if (try input.takeByte() != 0) return error.CorruptInput;
+<a id="L235"></a>        }
+<a id="L236"></a>
+<a id="L237"></a>        const header_slice = input.buffer[header_seek_start..][0..declared_header_size];
+<a id="L238"></a>        const computed_checksum = Crc32.hash(header_slice);
+<a id="L239"></a>        const declared_checksum = try input.takeInt(u32, .little);
+<a id="L240"></a>        if (computed_checksum != declared_checksum) return error.WrongChecksum;
+<a id="L241"></a>        break :h declared_header_size;
+<a id="L242"></a>    };
+<a id="L243"></a>
+<a id="L244"></a>    // Compressed Data
+<a id="L245"></a>
+<a id="L246"></a>    var lzma2_decode = try lzma2.Decode.init(allocating.allocator);
+<a id="L247"></a>    defer lzma2_decode.deinit(allocating.allocator);
+<a id="L248"></a>    const before_size = allocating.writer.end;
+<a id="L249"></a>    const packed_bytes_read = try lzma2_decode.decompress(input, allocating);
+<a id="L250"></a>    const unpacked_bytes = allocating.writer.end - before_size;
+<a id="L251"></a>
+<a id="L252"></a>    if (packed_size) |s| {
+<a id="L253"></a>        if (s != packed_bytes_read) return error.CorruptInput;
+<a id="L254"></a>    }
+<a id="L255"></a>
+<a id="L256"></a>    if (unpacked_size) |s| {
+<a id="L257"></a>        if (s != unpacked_bytes) return error.CorruptInput;
+<a id="L258"></a>    }
+<a id="L259"></a>
+<a id="L260"></a>    // Block Padding
+<a id="L261"></a>    const block_counter = header_size + packed_bytes_read;
+<a id="L262"></a>    const padding = try input.take(@intCast((4 - (block_counter % 4)) % 4));
+<a id="L263"></a>    for (padding) |byte| {
+<a id="L264"></a>        if (byte != 0) return error.CorruptInput;
+<a id="L265"></a>    }
+<a id="L266"></a>}
+<a id="L267"></a>
+<a id="L268"></a>fn finish(d: *Decompress) !void {
+<a id="L269"></a>    const input = d.input;
+<a id="L270"></a>    const index_size = blk: {
+<a id="L271"></a>        // Assume that we already peeked a zero in readBlock().
+<a id="L272"></a>        assert(input.buffered()[0] == 0);
+<a id="L273"></a>        var input_counter: u64 = 1;
+<a id="L274"></a>        var checksum: Crc32 = .init();
+<a id="L275"></a>        checksum.update(&amp;.{0});
+<a id="L276"></a>        input.toss(1);
+<a id="L277"></a>
+<a id="L278"></a>        const record_count = try countLeb128(input, u64, &amp;input_counter, &amp;checksum);
+<a id="L279"></a>        if (record_count != d.block_count)
+<a id="L280"></a>            return error.CorruptInput;
+<a id="L281"></a>
+<a id="L282"></a>        for (0..@intCast(record_count)) |_| {
+<a id="L283"></a>            // TODO: validate records
+<a id="L284"></a>            _ = try countLeb128(input, u64, &amp;input_counter, &amp;checksum);
+<a id="L285"></a>            _ = try countLeb128(input, u64, &amp;input_counter, &amp;checksum);
+<a id="L286"></a>        }
+<a id="L287"></a>
+<a id="L288"></a>        const padding = try input.take(@intCast((4 - (input_counter % 4)) % 4));
+<a id="L289"></a>        for (padding) |byte| {
+<a id="L290"></a>            if (byte != 0) return error.CorruptInput;
+<a id="L291"></a>        }
+<a id="L292"></a>        checksum.update(padding);
+<a id="L293"></a>
+<a id="L294"></a>        const declared_checksum = try input.takeInt(u32, .little);
+<a id="L295"></a>        const computed_checksum = checksum.final();
+<a id="L296"></a>        if (computed_checksum != declared_checksum) return error.WrongChecksum;
+<a id="L297"></a>
+<a id="L298"></a>        break :blk input_counter + padding.len + 4;
+<a id="L299"></a>    };
+<a id="L300"></a>
+<a id="L301"></a>    const declared_checksum = try input.takeInt(u32, .little);
+<a id="L302"></a>    const computed_checksum = Crc32.hash(try input.peek(4 + @sizeOf(StreamFlags)));
+<a id="L303"></a>    if (declared_checksum != computed_checksum) return error.WrongChecksum;
+<a id="L304"></a>    const backward_size = (@as(u64, try input.takeInt(u32, .little)) + 1) * 4;
+<a id="L305"></a>    if (backward_size != index_size) return error.CorruptInput;
+<a id="L306"></a>    input.toss(@sizeOf(StreamFlags));
+<a id="L307"></a>    if (!std.mem.eql(u8, try input.takeArray(2), &amp;.{ 'Y', 'Z' }))
+<a id="L308"></a>        return error.CorruptInput;
+<a id="L309"></a>}
+<a id="L310"></a>
+<a id="L311"></a>fn countLeb128(reader: *Reader, comptime T: type, counter: *u64, hasher: *Crc32) !T {
+<a id="L312"></a>    try reader.fill(8);
+<a id="L313"></a>    const start = reader.seek;
+<a id="L314"></a>    const result = try reader.takeLeb128(T);
+<a id="L315"></a>    const read_slice = reader.buffer[start..reader.seek];
+<a id="L316"></a>    hasher.update(read_slice);
+<a id="L317"></a>    counter.* += read_slice.len;
+<a id="L318"></a>    return result;
+<a id="L319"></a>}
+</pre>
 </body>
 </html>

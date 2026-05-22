@@ -1,0 +1,997 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Source: process/Args.zig</title>
+    <style>
+        body { background: #1e1e1e; color: #d4d4d4; font-family: monospace; padding: 20px; }
+        pre { white-space: pre-wrap; word-wrap: break-word; }
+        .header { border-bottom: 1px solid #444; padding-bottom: 10px; margin-bottom: 20px; }
+        a { color: #569cd6; }
+        a[id] { color: inherit; text-decoration: none; }
+        :target { background: #3a3a00; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <a href="/">Index</a> | <strong>File: process/Args.zig</strong>
+    </div>
+    <pre><a id="L1"></a>const Args = @This();
+<a id="L2"></a>
+<a id="L3"></a>const builtin = @import("builtin");
+<a id="L4"></a>const native_os = builtin.os.tag;
+<a id="L5"></a>
+<a id="L6"></a>const std = @import("../std.zig");
+<a id="L7"></a>const Allocator = std.mem.Allocator;
+<a id="L8"></a>const assert = std.debug.assert;
+<a id="L9"></a>const testing = std.testing;
+<a id="L10"></a>
+<a id="L11"></a>vector: Vector,
+<a id="L12"></a>
+<a id="L13"></a>/// On WASI without libc, this is `void` because the environment has to be
+<a id="L14"></a>/// queried and heap-allocated at runtime.
+<a id="L15"></a>pub const Vector = switch (native_os) {
+<a id="L16"></a>    .windows =&gt; []const u16, // WTF-16 encoded
+<a id="L17"></a>    .wasi =&gt; switch (builtin.link_libc) {
+<a id="L18"></a>        false =&gt; void,
+<a id="L19"></a>        true =&gt; []const [*:0]const u8,
+<a id="L20"></a>    },
+<a id="L21"></a>    .freestanding, .other =&gt; void,
+<a id="L22"></a>    else =&gt; []const [*:0]const u8,
+<a id="L23"></a>};
+<a id="L24"></a>
+<a id="L25"></a>/// Cross-platform access to command line one argument at a time.
+<a id="L26"></a>pub const Iterator = struct {
+<a id="L27"></a>    const Inner = switch (native_os) {
+<a id="L28"></a>        .windows =&gt; Windows,
+<a id="L29"></a>        .wasi =&gt; if (builtin.link_libc) Posix else Wasi,
+<a id="L30"></a>        else =&gt; Posix,
+<a id="L31"></a>    };
+<a id="L32"></a>
+<a id="L33"></a>    inner: Inner,
+<a id="L34"></a>
+<a id="L35"></a>    /// Initialize the args iterator. Consider using `initAllocator` instead
+<a id="L36"></a>    /// for cross-platform compatibility.
+<a id="L37"></a>    pub fn init(a: Args) Iterator {
+<a id="L38"></a>        if (native_os == .wasi) @compileError("In WASI, use initAllocator instead.");
+<a id="L39"></a>        if (native_os == .windows) @compileError("In Windows, use initAllocator instead.");
+<a id="L40"></a>        return .{ .inner = .init(a) };
+<a id="L41"></a>    }
+<a id="L42"></a>
+<a id="L43"></a>    pub const InitError = Inner.InitError;
+<a id="L44"></a>
+<a id="L45"></a>    /// You must deinitialize iterator's internal buffers by calling `deinit` when done.
+<a id="L46"></a>    pub fn initAllocator(a: Args, gpa: Allocator) InitError!Iterator {
+<a id="L47"></a>        if (native_os == .wasi and !builtin.link_libc) {
+<a id="L48"></a>            return .{ .inner = try .init(gpa) };
+<a id="L49"></a>        }
+<a id="L50"></a>        if (native_os == .windows) {
+<a id="L51"></a>            return .{ .inner = try .init(gpa, a.vector) };
+<a id="L52"></a>        }
+<a id="L53"></a>
+<a id="L54"></a>        return .{ .inner = .init(a) };
+<a id="L55"></a>    }
+<a id="L56"></a>
+<a id="L57"></a>    /// Return subsequent argument, or `null` if no more remaining.
+<a id="L58"></a>    ///
+<a id="L59"></a>    /// Returned slice is pointing to the iterator's internal buffer.
+<a id="L60"></a>    /// On Windows, the result is encoded as [WTF-8](https://wtf-8.codeberg.page/).
+<a id="L61"></a>    /// On other platforms, the result is an opaque sequence of bytes with no particular encoding.
+<a id="L62"></a>    pub fn next(it: *Iterator) ?[:0]const u8 {
+<a id="L63"></a>        return it.inner.next();
+<a id="L64"></a>    }
+<a id="L65"></a>
+<a id="L66"></a>    /// Parse past 1 argument without capturing it.
+<a id="L67"></a>    /// Returns `true` if skipped an arg, `false` if we are at the end.
+<a id="L68"></a>    pub fn skip(it: *Iterator) bool {
+<a id="L69"></a>        return it.inner.skip();
+<a id="L70"></a>    }
+<a id="L71"></a>
+<a id="L72"></a>    /// Required to release resources if the iterator was initialized with
+<a id="L73"></a>    /// `initAllocator` function.
+<a id="L74"></a>    pub fn deinit(it: *Iterator) void {
+<a id="L75"></a>        // Unless we're targeting WASI or Windows, this is a no-op.
+<a id="L76"></a>        if (native_os == .wasi and !builtin.link_libc) it.inner.deinit();
+<a id="L77"></a>        if (native_os == .windows) it.inner.deinit();
+<a id="L78"></a>    }
+<a id="L79"></a>
+<a id="L80"></a>    /// Iterator that implements the Windows command-line parsing algorithm.
+<a id="L81"></a>    ///
+<a id="L82"></a>    /// The implementation is intended to be compatible with the post-2008 C runtime,
+<a id="L83"></a>    /// but is *not* intended to be compatible with `CommandLineToArgvW` since
+<a id="L84"></a>    /// `CommandLineToArgvW` uses the pre-2008 parsing rules.
+<a id="L85"></a>    ///
+<a id="L86"></a>    /// This iterator faithfully implements the parsing behavior observed from the C runtime with
+<a id="L87"></a>    /// one exception: if the command-line string is empty, the iterator will immediately complete
+<a id="L88"></a>    /// without returning any arguments (whereas the C runtime will return a single argument
+<a id="L89"></a>    /// representing the name of the current executable).
+<a id="L90"></a>    ///
+<a id="L91"></a>    /// The essential parts of the algorithm are described in Microsoft's documentation:
+<a id="L92"></a>    ///
+<a id="L93"></a>    /// - https://learn.microsoft.com/en-us/cpp/cpp/main-function-command-line-args?view=msvc-170#parsing-c-command-line-arguments
+<a id="L94"></a>    ///
+<a id="L95"></a>    /// David Deley explains some additional undocumented quirks in great detail:
+<a id="L96"></a>    ///
+<a id="L97"></a>    /// - https://daviddeley.com/autohotkey/parameters/parameters.htm#WINCRULES
+<a id="L98"></a>    pub const Windows = struct {
+<a id="L99"></a>        allocator: Allocator,
+<a id="L100"></a>        /// Encoded as WTF-16 LE.
+<a id="L101"></a>        cmd_line: []const u16,
+<a id="L102"></a>        index: usize = 0,
+<a id="L103"></a>        /// Owned by the iterator. Long enough to hold contiguous NUL-terminated slices
+<a id="L104"></a>        /// of each argument encoded as WTF-8.
+<a id="L105"></a>        buffer: []u8,
+<a id="L106"></a>        start: usize = 0,
+<a id="L107"></a>        end: usize = 0,
+<a id="L108"></a>
+<a id="L109"></a>        pub const InitError = error{OutOfMemory};
+<a id="L110"></a>
+<a id="L111"></a>        /// `cmd_line_w` *must* be a WTF16-LE-encoded string.
+<a id="L112"></a>        ///
+<a id="L113"></a>        /// The iterator stores and uses `cmd_line_w`, so its memory must be valid for
+<a id="L114"></a>        /// at least as long as the returned Windows.
+<a id="L115"></a>        pub fn init(gpa: Allocator, cmd_line_w: []const u16) Windows.InitError!Windows {
+<a id="L116"></a>            const wtf8_len = std.unicode.calcWtf8Len(cmd_line_w);
+<a id="L117"></a>
+<a id="L118"></a>            // This buffer must be large enough to contain contiguous NUL-terminated slices
+<a id="L119"></a>            // of each argument.
+<a id="L120"></a>            // - During parsing, the length of a parsed argument will always be equal to
+<a id="L121"></a>            //   to less than its unparsed length
+<a id="L122"></a>            // - The first argument needs one extra byte of space allocated for its NUL
+<a id="L123"></a>            //   terminator, but for each subsequent argument the necessary whitespace
+<a id="L124"></a>            //   between arguments guarantees room for their NUL terminator(s).
+<a id="L125"></a>            const buffer = try gpa.alloc(u8, wtf8_len + 1);
+<a id="L126"></a>            errdefer gpa.free(buffer);
+<a id="L127"></a>
+<a id="L128"></a>            return .{
+<a id="L129"></a>                .allocator = gpa,
+<a id="L130"></a>                .cmd_line = cmd_line_w,
+<a id="L131"></a>                .buffer = buffer,
+<a id="L132"></a>            };
+<a id="L133"></a>        }
+<a id="L134"></a>
+<a id="L135"></a>        /// Returns the next argument and advances the iterator. Returns `null` if at the end of the
+<a id="L136"></a>        /// command-line string. The iterator owns the returned slice.
+<a id="L137"></a>        /// The result is encoded as [WTF-8](https://wtf-8.codeberg.page/).
+<a id="L138"></a>        pub fn next(self: *Windows) ?[:0]const u8 {
+<a id="L139"></a>            return self.nextWithStrategy(next_strategy);
+<a id="L140"></a>        }
+<a id="L141"></a>
+<a id="L142"></a>        /// Skips the next argument and advances the iterator. Returns `true` if an argument was
+<a id="L143"></a>        /// skipped, `false` if at the end of the command-line string.
+<a id="L144"></a>        pub fn skip(self: *Windows) bool {
+<a id="L145"></a>            return self.nextWithStrategy(skip_strategy);
+<a id="L146"></a>        }
+<a id="L147"></a>
+<a id="L148"></a>        const next_strategy = struct {
+<a id="L149"></a>            const T = ?[:0]const u8;
+<a id="L150"></a>
+<a id="L151"></a>            const eof = null;
+<a id="L152"></a>
+<a id="L153"></a>            /// Returns '\' if any backslashes are emitted, otherwise returns `last_emitted_code_unit`.
+<a id="L154"></a>            fn emitBackslashes(self: *Windows, count: usize, last_emitted_code_unit: ?u16) ?u16 {
+<a id="L155"></a>                for (0..count) |_| {
+<a id="L156"></a>                    self.buffer[self.end] = '\\';
+<a id="L157"></a>                    self.end += 1;
+<a id="L158"></a>                }
+<a id="L159"></a>                return if (count != 0) '\\' else last_emitted_code_unit;
+<a id="L160"></a>            }
+<a id="L161"></a>
+<a id="L162"></a>            /// If `last_emitted_code_unit` and `code_unit` form a surrogate pair, then
+<a id="L163"></a>            /// the previously emitted high surrogate is overwritten by the codepoint encoded
+<a id="L164"></a>            /// by the surrogate pair, and `null` is returned.
+<a id="L165"></a>            /// Otherwise, `code_unit` is emitted and returned.
+<a id="L166"></a>            fn emitCharacter(self: *Windows, code_unit: u16, last_emitted_code_unit: ?u16) ?u16 {
+<a id="L167"></a>                // Because we are emitting WTF-8, we need to
+<a id="L168"></a>                // check to see if we've emitted two consecutive surrogate
+<a id="L169"></a>                // codepoints that form a valid surrogate pair in order
+<a id="L170"></a>                // to ensure that we're always emitting well-formed WTF-8
+<a id="L171"></a>                // (https://wtf-8.codeberg.page/#concatenating).
+<a id="L172"></a>                //
+<a id="L173"></a>                // If we do have a valid surrogate pair, we need to emit
+<a id="L174"></a>                // the UTF-8 sequence for the codepoint that they encode
+<a id="L175"></a>                // instead of the WTF-8 encoding for the two surrogate pairs
+<a id="L176"></a>                // separately.
+<a id="L177"></a>                //
+<a id="L178"></a>                // This is relevant when dealing with a WTF-16 encoded
+<a id="L179"></a>                // command line like this:
+<a id="L180"></a>                // "&lt;0xD801&gt;"&lt;0xDC37&gt;
+<a id="L181"></a>                // which would get parsed and converted to WTF-8 as:
+<a id="L182"></a>                // &lt;0xED&gt;&lt;0xA0&gt;&lt;0x81&gt;&lt;0xED&gt;&lt;0xB0&gt;&lt;0xB7&gt;
+<a id="L183"></a>                // but instead, we need to recognize the surrogate pair
+<a id="L184"></a>                // and emit the codepoint it encodes, which in this
+<a id="L185"></a>                // example is U+10437 (𐐷), which is encoded in UTF-8 as:
+<a id="L186"></a>                // &lt;0xF0&gt;&lt;0x90&gt;&lt;0x90&gt;&lt;0xB7&gt;
+<a id="L187"></a>                if (last_emitted_code_unit != null and
+<a id="L188"></a>                    std.unicode.utf16IsLowSurrogate(code_unit) and
+<a id="L189"></a>                    std.unicode.utf16IsHighSurrogate(last_emitted_code_unit.?))
+<a id="L190"></a>                {
+<a id="L191"></a>                    const codepoint = std.unicode.utf16DecodeSurrogatePair(&amp;.{ last_emitted_code_unit.?, code_unit }) catch unreachable;
+<a id="L192"></a>
+<a id="L193"></a>                    // Unpaired surrogate is 3 bytes long
+<a id="L194"></a>                    const dest = self.buffer[self.end - 3 ..];
+<a id="L195"></a>                    const len = std.unicode.utf8Encode(codepoint, dest) catch unreachable;
+<a id="L196"></a>                    // All codepoints that require a surrogate pair (&gt; U+FFFF) are encoded as 4 bytes
+<a id="L197"></a>                    assert(len == 4);
+<a id="L198"></a>                    self.end += 1;
+<a id="L199"></a>                    return null;
+<a id="L200"></a>                }
+<a id="L201"></a>
+<a id="L202"></a>                const wtf8_len = std.unicode.wtf8Encode(code_unit, self.buffer[self.end..]) catch unreachable;
+<a id="L203"></a>                self.end += wtf8_len;
+<a id="L204"></a>                return code_unit;
+<a id="L205"></a>            }
+<a id="L206"></a>
+<a id="L207"></a>            fn yieldArg(self: *Windows) [:0]const u8 {
+<a id="L208"></a>                self.buffer[self.end] = 0;
+<a id="L209"></a>                const arg = self.buffer[self.start..self.end :0];
+<a id="L210"></a>                self.end += 1;
+<a id="L211"></a>                self.start = self.end;
+<a id="L212"></a>                return arg;
+<a id="L213"></a>            }
+<a id="L214"></a>        };
+<a id="L215"></a>
+<a id="L216"></a>        const skip_strategy = struct {
+<a id="L217"></a>            const T = bool;
+<a id="L218"></a>
+<a id="L219"></a>            const eof = false;
+<a id="L220"></a>
+<a id="L221"></a>            fn emitBackslashes(_: *Windows, _: usize, last_emitted_code_unit: ?u16) ?u16 {
+<a id="L222"></a>                return last_emitted_code_unit;
+<a id="L223"></a>            }
+<a id="L224"></a>
+<a id="L225"></a>            fn emitCharacter(_: *Windows, _: u16, last_emitted_code_unit: ?u16) ?u16 {
+<a id="L226"></a>                return last_emitted_code_unit;
+<a id="L227"></a>            }
+<a id="L228"></a>
+<a id="L229"></a>            fn yieldArg(_: *Windows) bool {
+<a id="L230"></a>                return true;
+<a id="L231"></a>            }
+<a id="L232"></a>        };
+<a id="L233"></a>
+<a id="L234"></a>        fn nextWithStrategy(self: *Windows, comptime strategy: type) strategy.T {
+<a id="L235"></a>            var last_emitted_code_unit: ?u16 = null;
+<a id="L236"></a>            // The first argument (the executable name) uses different parsing rules.
+<a id="L237"></a>            if (self.index == 0) {
+<a id="L238"></a>                if (self.cmd_line.len == 0 or self.cmd_line[0] == 0) {
+<a id="L239"></a>                    // Immediately complete the iterator.
+<a id="L240"></a>                    // The C runtime would return the name of the current executable here.
+<a id="L241"></a>                    return strategy.eof;
+<a id="L242"></a>                }
+<a id="L243"></a>
+<a id="L244"></a>                var inside_quotes = false;
+<a id="L245"></a>                while (true) : (self.index += 1) {
+<a id="L246"></a>                    const char = if (self.index != self.cmd_line.len)
+<a id="L247"></a>                        std.mem.littleToNative(u16, self.cmd_line[self.index])
+<a id="L248"></a>                    else
+<a id="L249"></a>                        0;
+<a id="L250"></a>                    switch (char) {
+<a id="L251"></a>                        0 =&gt; {
+<a id="L252"></a>                            return strategy.yieldArg(self);
+<a id="L253"></a>                        },
+<a id="L254"></a>                        '"' =&gt; {
+<a id="L255"></a>                            inside_quotes = !inside_quotes;
+<a id="L256"></a>                        },
+<a id="L257"></a>                        ' ', '\t' =&gt; {
+<a id="L258"></a>                            if (inside_quotes) {
+<a id="L259"></a>                                last_emitted_code_unit = strategy.emitCharacter(self, char, last_emitted_code_unit);
+<a id="L260"></a>                            } else {
+<a id="L261"></a>                                self.index += 1;
+<a id="L262"></a>                                return strategy.yieldArg(self);
+<a id="L263"></a>                            }
+<a id="L264"></a>                        },
+<a id="L265"></a>                        else =&gt; {
+<a id="L266"></a>                            last_emitted_code_unit = strategy.emitCharacter(self, char, last_emitted_code_unit);
+<a id="L267"></a>                        },
+<a id="L268"></a>                    }
+<a id="L269"></a>                }
+<a id="L270"></a>            }
+<a id="L271"></a>
+<a id="L272"></a>            // Skip spaces and tabs. The iterator completes if we reach the end of the string here.
+<a id="L273"></a>            while (true) : (self.index += 1) {
+<a id="L274"></a>                const char = if (self.index != self.cmd_line.len)
+<a id="L275"></a>                    std.mem.littleToNative(u16, self.cmd_line[self.index])
+<a id="L276"></a>                else
+<a id="L277"></a>                    0;
+<a id="L278"></a>                switch (char) {
+<a id="L279"></a>                    0 =&gt; return strategy.eof,
+<a id="L280"></a>                    ' ', '\t' =&gt; continue,
+<a id="L281"></a>                    else =&gt; break,
+<a id="L282"></a>                }
+<a id="L283"></a>            }
+<a id="L284"></a>
+<a id="L285"></a>            // Parsing rules for subsequent arguments:
+<a id="L286"></a>            //
+<a id="L287"></a>            // - The end of the string always terminates the current argument.
+<a id="L288"></a>            // - When not in 'inside_quotes' mode, a space or tab terminates the current argument.
+<a id="L289"></a>            // - 2n backslashes followed by a quote emit n backslashes (note: n can be zero).
+<a id="L290"></a>            //   If in 'inside_quotes' and the quote is immediately followed by a second quote,
+<a id="L291"></a>            //   one quote is emitted and the other is skipped, otherwise, the quote is skipped
+<a id="L292"></a>            //   and 'inside_quotes' is toggled.
+<a id="L293"></a>            // - 2n + 1 backslashes followed by a quote emit n backslashes followed by a quote.
+<a id="L294"></a>            // - n backslashes not followed by a quote emit n backslashes.
+<a id="L295"></a>            var backslash_count: usize = 0;
+<a id="L296"></a>            var inside_quotes = false;
+<a id="L297"></a>            while (true) : (self.index += 1) {
+<a id="L298"></a>                const char = if (self.index != self.cmd_line.len)
+<a id="L299"></a>                    std.mem.littleToNative(u16, self.cmd_line[self.index])
+<a id="L300"></a>                else
+<a id="L301"></a>                    0;
+<a id="L302"></a>                switch (char) {
+<a id="L303"></a>                    0 =&gt; {
+<a id="L304"></a>                        last_emitted_code_unit = strategy.emitBackslashes(self, backslash_count, last_emitted_code_unit);
+<a id="L305"></a>                        return strategy.yieldArg(self);
+<a id="L306"></a>                    },
+<a id="L307"></a>                    ' ', '\t' =&gt; {
+<a id="L308"></a>                        last_emitted_code_unit = strategy.emitBackslashes(self, backslash_count, last_emitted_code_unit);
+<a id="L309"></a>                        backslash_count = 0;
+<a id="L310"></a>                        if (inside_quotes) {
+<a id="L311"></a>                            last_emitted_code_unit = strategy.emitCharacter(self, char, last_emitted_code_unit);
+<a id="L312"></a>                        } else return strategy.yieldArg(self);
+<a id="L313"></a>                    },
+<a id="L314"></a>                    '"' =&gt; {
+<a id="L315"></a>                        const char_is_escaped_quote = backslash_count % 2 != 0;
+<a id="L316"></a>                        last_emitted_code_unit = strategy.emitBackslashes(self, backslash_count / 2, last_emitted_code_unit);
+<a id="L317"></a>                        backslash_count = 0;
+<a id="L318"></a>                        if (char_is_escaped_quote) {
+<a id="L319"></a>                            last_emitted_code_unit = strategy.emitCharacter(self, '"', last_emitted_code_unit);
+<a id="L320"></a>                        } else {
+<a id="L321"></a>                            if (inside_quotes and
+<a id="L322"></a>                                self.index + 1 != self.cmd_line.len and
+<a id="L323"></a>                                std.mem.littleToNative(u16, self.cmd_line[self.index + 1]) == '"')
+<a id="L324"></a>                            {
+<a id="L325"></a>                                last_emitted_code_unit = strategy.emitCharacter(self, '"', last_emitted_code_unit);
+<a id="L326"></a>                                self.index += 1;
+<a id="L327"></a>                            } else {
+<a id="L328"></a>                                inside_quotes = !inside_quotes;
+<a id="L329"></a>                            }
+<a id="L330"></a>                        }
+<a id="L331"></a>                    },
+<a id="L332"></a>                    '\\' =&gt; {
+<a id="L333"></a>                        backslash_count += 1;
+<a id="L334"></a>                    },
+<a id="L335"></a>                    else =&gt; {
+<a id="L336"></a>                        last_emitted_code_unit = strategy.emitBackslashes(self, backslash_count, last_emitted_code_unit);
+<a id="L337"></a>                        backslash_count = 0;
+<a id="L338"></a>                        last_emitted_code_unit = strategy.emitCharacter(self, char, last_emitted_code_unit);
+<a id="L339"></a>                    },
+<a id="L340"></a>                }
+<a id="L341"></a>            }
+<a id="L342"></a>        }
+<a id="L343"></a>
+<a id="L344"></a>        /// Frees the iterator's copy of the command-line string and all previously returned
+<a id="L345"></a>        /// argument slices.
+<a id="L346"></a>        pub fn deinit(self: *Windows) void {
+<a id="L347"></a>            self.allocator.free(self.buffer);
+<a id="L348"></a>        }
+<a id="L349"></a>    };
+<a id="L350"></a>
+<a id="L351"></a>    pub const Posix = struct {
+<a id="L352"></a>        remaining: Vector,
+<a id="L353"></a>
+<a id="L354"></a>        pub const InitError = error{};
+<a id="L355"></a>
+<a id="L356"></a>        pub fn init(a: Args) Posix {
+<a id="L357"></a>            return .{ .remaining = a.vector };
+<a id="L358"></a>        }
+<a id="L359"></a>
+<a id="L360"></a>        pub fn next(it: *Posix) ?[:0]const u8 {
+<a id="L361"></a>            if (it.remaining.len == 0) return null;
+<a id="L362"></a>            const arg = it.remaining[0];
+<a id="L363"></a>            it.remaining = it.remaining[1..];
+<a id="L364"></a>            return std.mem.sliceTo(arg, 0);
+<a id="L365"></a>        }
+<a id="L366"></a>
+<a id="L367"></a>        pub fn skip(it: *Posix) bool {
+<a id="L368"></a>            if (it.remaining.len == 0) return false;
+<a id="L369"></a>            it.remaining = it.remaining[1..];
+<a id="L370"></a>            return true;
+<a id="L371"></a>        }
+<a id="L372"></a>    };
+<a id="L373"></a>
+<a id="L374"></a>    pub const Wasi = struct {
+<a id="L375"></a>        allocator: Allocator,
+<a id="L376"></a>        index: usize,
+<a id="L377"></a>        args: [][:0]u8,
+<a id="L378"></a>
+<a id="L379"></a>        pub const InitError = error{OutOfMemory} || std.posix.UnexpectedError;
+<a id="L380"></a>
+<a id="L381"></a>        /// You must call deinit to free the internal buffer of the
+<a id="L382"></a>        /// iterator after you are done.
+<a id="L383"></a>        pub fn init(allocator: Allocator) Wasi.InitError!Wasi {
+<a id="L384"></a>            const fetched_args = try Wasi.internalInit(allocator);
+<a id="L385"></a>            return Wasi{
+<a id="L386"></a>                .allocator = allocator,
+<a id="L387"></a>                .index = 0,
+<a id="L388"></a>                .args = fetched_args,
+<a id="L389"></a>            };
+<a id="L390"></a>        }
+<a id="L391"></a>
+<a id="L392"></a>        fn internalInit(allocator: Allocator) Wasi.InitError![][:0]u8 {
+<a id="L393"></a>            var count: usize = undefined;
+<a id="L394"></a>            var buf_size: usize = undefined;
+<a id="L395"></a>
+<a id="L396"></a>            switch (std.os.wasi.args_sizes_get(&amp;count, &amp;buf_size)) {
+<a id="L397"></a>                .SUCCESS =&gt; {},
+<a id="L398"></a>                else =&gt; |err| return std.posix.unexpectedErrno(err),
+<a id="L399"></a>            }
+<a id="L400"></a>
+<a id="L401"></a>            if (count == 0) {
+<a id="L402"></a>                return &amp;[_][:0]u8{};
+<a id="L403"></a>            }
+<a id="L404"></a>
+<a id="L405"></a>            const argv = try allocator.alloc([*:0]u8, count);
+<a id="L406"></a>            defer allocator.free(argv);
+<a id="L407"></a>
+<a id="L408"></a>            const argv_buf = try allocator.alloc(u8, buf_size);
+<a id="L409"></a>
+<a id="L410"></a>            switch (std.os.wasi.args_get(argv.ptr, argv_buf.ptr)) {
+<a id="L411"></a>                .SUCCESS =&gt; {},
+<a id="L412"></a>                else =&gt; |err| return std.posix.unexpectedErrno(err),
+<a id="L413"></a>            }
+<a id="L414"></a>
+<a id="L415"></a>            var result_args = try allocator.alloc([:0]u8, count);
+<a id="L416"></a>            var i: usize = 0;
+<a id="L417"></a>            while (i &lt; count) : (i += 1) {
+<a id="L418"></a>                result_args[i] = std.mem.sliceTo(argv[i], 0);
+<a id="L419"></a>            }
+<a id="L420"></a>
+<a id="L421"></a>            return result_args;
+<a id="L422"></a>        }
+<a id="L423"></a>
+<a id="L424"></a>        pub fn next(self: *Wasi) ?[:0]const u8 {
+<a id="L425"></a>            if (self.index == self.args.len) return null;
+<a id="L426"></a>
+<a id="L427"></a>            const arg = self.args[self.index];
+<a id="L428"></a>            self.index += 1;
+<a id="L429"></a>            return arg;
+<a id="L430"></a>        }
+<a id="L431"></a>
+<a id="L432"></a>        pub fn skip(self: *Wasi) bool {
+<a id="L433"></a>            if (self.index == self.args.len) return false;
+<a id="L434"></a>
+<a id="L435"></a>            self.index += 1;
+<a id="L436"></a>            return true;
+<a id="L437"></a>        }
+<a id="L438"></a>
+<a id="L439"></a>        /// Call to free the internal buffer of the iterator.
+<a id="L440"></a>        pub fn deinit(self: *Wasi) void {
+<a id="L441"></a>            // Nothing is allocated when there are no args
+<a id="L442"></a>            if (self.args.len == 0) return;
+<a id="L443"></a>
+<a id="L444"></a>            const last_item = self.args[self.args.len - 1];
+<a id="L445"></a>            const last_byte_addr = @intFromPtr(last_item.ptr) + last_item.len + 1; // null terminated
+<a id="L446"></a>            const first_item_ptr = self.args[0].ptr;
+<a id="L447"></a>            const len = last_byte_addr - @intFromPtr(first_item_ptr);
+<a id="L448"></a>            self.allocator.free(first_item_ptr[0..len]);
+<a id="L449"></a>            self.allocator.free(self.args);
+<a id="L450"></a>        }
+<a id="L451"></a>    };
+<a id="L452"></a>};
+<a id="L453"></a>
+<a id="L454"></a>/// Holds the command-line arguments, with the program name as the first entry.
+<a id="L455"></a>/// Use `iterateAllocator` for cross-platform code.
+<a id="L456"></a>pub fn iterate(a: Args) Iterator {
+<a id="L457"></a>    return .init(a);
+<a id="L458"></a>}
+<a id="L459"></a>
+<a id="L460"></a>/// You must deinitialize iterator's internal buffers by calling `deinit` when
+<a id="L461"></a>/// done.
+<a id="L462"></a>pub fn iterateAllocator(a: Args, gpa: Allocator) Iterator.InitError!Iterator {
+<a id="L463"></a>    return .initAllocator(a, gpa);
+<a id="L464"></a>}
+<a id="L465"></a>
+<a id="L466"></a>pub const ToSliceError = Iterator.Windows.InitError || Iterator.Wasi.InitError;
+<a id="L467"></a>
+<a id="L468"></a>/// Returned value may reference several allocations and may point into `a`.
+<a id="L469"></a>/// Thefore, an arena-style allocator must be used.
+<a id="L470"></a>///
+<a id="L471"></a>/// * On Windows, the result is encoded as
+<a id="L472"></a>///   [WTF-8](https://wtf-8.codeberg.page/).
+<a id="L473"></a>/// * On other platforms, the result is an opaque sequence of bytes with no
+<a id="L474"></a>///   particular encoding.
+<a id="L475"></a>///
+<a id="L476"></a>/// See also:
+<a id="L477"></a>/// * `iterate`
+<a id="L478"></a>/// * `iterateAllocator`
+<a id="L479"></a>pub fn toSlice(a: Args, arena: Allocator) ToSliceError![]const [:0]const u8 {
+<a id="L480"></a>    if (native_os == .windows) {
+<a id="L481"></a>        var it = try a.iterateAllocator(arena);
+<a id="L482"></a>        var contents: std.ArrayList(u8) = .empty;
+<a id="L483"></a>        var slice_list: std.ArrayList(usize) = .empty;
+<a id="L484"></a>        while (it.next()) |arg| {
+<a id="L485"></a>            try contents.appendSlice(arena, arg[0 .. arg.len + 1]);
+<a id="L486"></a>            try slice_list.append(arena, arg.len);
+<a id="L487"></a>        }
+<a id="L488"></a>        const contents_slice = contents.items;
+<a id="L489"></a>        const slice_sizes = slice_list.items;
+<a id="L490"></a>        const slice_list_bytes = std.math.mul(usize, @sizeOf([]u8), slice_sizes.len) catch return error.OutOfMemory;
+<a id="L491"></a>        const total_bytes = std.math.add(usize, slice_list_bytes, contents_slice.len) catch return error.OutOfMemory;
+<a id="L492"></a>        const buf = try arena.alignedAlloc(u8, .of([]u8), total_bytes);
+<a id="L493"></a>        errdefer arena.free(buf);
+<a id="L494"></a>
+<a id="L495"></a>        const result_slice_list = std.mem.bytesAsSlice([:0]u8, buf[0..slice_list_bytes]);
+<a id="L496"></a>        const result_contents = buf[slice_list_bytes..];
+<a id="L497"></a>        @memcpy(result_contents[0..contents_slice.len], contents_slice);
+<a id="L498"></a>
+<a id="L499"></a>        var contents_index: usize = 0;
+<a id="L500"></a>        for (slice_sizes, 0..) |len, i| {
+<a id="L501"></a>            const new_index = contents_index + len;
+<a id="L502"></a>            result_slice_list[i] = result_contents[contents_index..new_index :0];
+<a id="L503"></a>            contents_index = new_index + 1;
+<a id="L504"></a>        }
+<a id="L505"></a>
+<a id="L506"></a>        return result_slice_list;
+<a id="L507"></a>    } else if (native_os == .wasi and !builtin.link_libc) {
+<a id="L508"></a>        var count: usize = undefined;
+<a id="L509"></a>        var buf_size: usize = undefined;
+<a id="L510"></a>
+<a id="L511"></a>        switch (std.os.wasi.args_sizes_get(&amp;count, &amp;buf_size)) {
+<a id="L512"></a>            .SUCCESS =&gt; {},
+<a id="L513"></a>            else =&gt; |err| return std.posix.unexpectedErrno(err),
+<a id="L514"></a>        }
+<a id="L515"></a>
+<a id="L516"></a>        if (count == 0) return &amp;.{};
+<a id="L517"></a>
+<a id="L518"></a>        const argv = try arena.alloc([*:0]u8, count);
+<a id="L519"></a>        const argv_buf = try arena.alloc(u8, buf_size);
+<a id="L520"></a>
+<a id="L521"></a>        switch (std.os.wasi.args_get(argv.ptr, argv_buf.ptr)) {
+<a id="L522"></a>            .SUCCESS =&gt; {},
+<a id="L523"></a>            else =&gt; |err| return std.posix.unexpectedErrno(err),
+<a id="L524"></a>        }
+<a id="L525"></a>
+<a id="L526"></a>        const args = try arena.alloc([:0]const u8, count);
+<a id="L527"></a>        for (args, argv) |*dst, src| dst.* = std.mem.sliceTo(src, 0);
+<a id="L528"></a>        return args;
+<a id="L529"></a>    } else {
+<a id="L530"></a>        const args = try arena.alloc([:0]const u8, a.vector.len);
+<a id="L531"></a>        for (args, a.vector) |*dst, src| dst.* = std.mem.sliceTo(src, 0);
+<a id="L532"></a>        return args;
+<a id="L533"></a>    }
+<a id="L534"></a>}
+<a id="L535"></a>
+<a id="L536"></a>test "Iterator.Windows" {
+<a id="L537"></a>    const t = testIteratorWindows;
+<a id="L538"></a>
+<a id="L539"></a>    try t(
+<a id="L540"></a>        \\"C:\Program Files\zig\zig.exe" run .\src\main.zig -target x86_64-windows-gnu -O ReleaseSafe -- --emoji=🗿 --eval="new Regex(\"Dwayne \\\"The Rock\\\" Johnson\")"
+<a id="L541"></a>    , &amp;.{
+<a id="L542"></a>        \\C:\Program Files\zig\zig.exe
+<a id="L543"></a>        ,
+<a id="L544"></a>        \\run
+<a id="L545"></a>        ,
+<a id="L546"></a>        \\.\src\main.zig
+<a id="L547"></a>        ,
+<a id="L548"></a>        \\-target
+<a id="L549"></a>        ,
+<a id="L550"></a>        \\x86_64-windows-gnu
+<a id="L551"></a>        ,
+<a id="L552"></a>        \\-O
+<a id="L553"></a>        ,
+<a id="L554"></a>        \\ReleaseSafe
+<a id="L555"></a>        ,
+<a id="L556"></a>        \\--
+<a id="L557"></a>        ,
+<a id="L558"></a>        \\--emoji=🗿
+<a id="L559"></a>        ,
+<a id="L560"></a>        \\--eval=new Regex("Dwayne \"The Rock\" Johnson")
+<a id="L561"></a>        ,
+<a id="L562"></a>    });
+<a id="L563"></a>
+<a id="L564"></a>    // Empty
+<a id="L565"></a>    try t("", &amp;.{});
+<a id="L566"></a>
+<a id="L567"></a>    // Separators
+<a id="L568"></a>    try t("aa bb cc", &amp;.{ "aa", "bb", "cc" });
+<a id="L569"></a>    try t("aa\tbb\tcc", &amp;.{ "aa", "bb", "cc" });
+<a id="L570"></a>    try t("aa\nbb\ncc", &amp;.{"aa\nbb\ncc"});
+<a id="L571"></a>    try t("aa\r\nbb\r\ncc", &amp;.{"aa\r\nbb\r\ncc"});
+<a id="L572"></a>    try t("aa\rbb\rcc", &amp;.{"aa\rbb\rcc"});
+<a id="L573"></a>    try t("aa\x07bb\x07cc", &amp;.{"aa\x07bb\x07cc"});
+<a id="L574"></a>    try t("aa\x7Fbb\x7Fcc", &amp;.{"aa\x7Fbb\x7Fcc"});
+<a id="L575"></a>    try t("aa🦎bb🦎cc", &amp;.{"aa🦎bb🦎cc"});
+<a id="L576"></a>
+<a id="L577"></a>    // Leading/trailing whitespace
+<a id="L578"></a>    try t("  ", &amp;.{""});
+<a id="L579"></a>    try t("  aa  bb  ", &amp;.{ "", "aa", "bb" });
+<a id="L580"></a>    try t("\t\t", &amp;.{""});
+<a id="L581"></a>    try t("\t\taa\t\tbb\t\t", &amp;.{ "", "aa", "bb" });
+<a id="L582"></a>    try t("\n\n", &amp;.{"\n\n"});
+<a id="L583"></a>    try t("\n\naa\n\nbb\n\n", &amp;.{"\n\naa\n\nbb\n\n"});
+<a id="L584"></a>
+<a id="L585"></a>    // Executable name with quotes/backslashes
+<a id="L586"></a>    try t("\"aa bb\tcc\ndd\"", &amp;.{"aa bb\tcc\ndd"});
+<a id="L587"></a>    try t("\"", &amp;.{""});
+<a id="L588"></a>    try t("\"\"", &amp;.{""});
+<a id="L589"></a>    try t("\"\"\"", &amp;.{""});
+<a id="L590"></a>    try t("\"\"\"\"", &amp;.{""});
+<a id="L591"></a>    try t("\"\"\"\"\"", &amp;.{""});
+<a id="L592"></a>    try t("aa\"bb\"cc\"dd", &amp;.{"aabbccdd"});
+<a id="L593"></a>    try t("aa\"bb cc\"dd", &amp;.{"aabb ccdd"});
+<a id="L594"></a>    try t("\"aa\\\"bb\"", &amp;.{"aa\\bb"});
+<a id="L595"></a>    try t("\"aa\\\\\"", &amp;.{"aa\\\\"});
+<a id="L596"></a>    try t("aa\\\"bb", &amp;.{"aa\\bb"});
+<a id="L597"></a>    try t("aa\\\\\"bb", &amp;.{"aa\\\\bb"});
+<a id="L598"></a>
+<a id="L599"></a>    // Arguments with quotes/backslashes
+<a id="L600"></a>    try t(". \"aa bb\tcc\ndd\"", &amp;.{ ".", "aa bb\tcc\ndd" });
+<a id="L601"></a>    try t(". aa\" \"bb\"\t\"cc\"\n\"dd\"", &amp;.{ ".", "aa bb\tcc\ndd" });
+<a id="L602"></a>    try t(". ", &amp;.{"."});
+<a id="L603"></a>    try t(". \"", &amp;.{ ".", "" });
+<a id="L604"></a>    try t(". \"\"", &amp;.{ ".", "" });
+<a id="L605"></a>    try t(". \"\"\"", &amp;.{ ".", "\"" });
+<a id="L606"></a>    try t(". \"\"\"\"", &amp;.{ ".", "\"" });
+<a id="L607"></a>    try t(". \"\"\"\"\"", &amp;.{ ".", "\"\"" });
+<a id="L608"></a>    try t(". \"\"\"\"\"\"", &amp;.{ ".", "\"\"" });
+<a id="L609"></a>    try t(". \" \"", &amp;.{ ".", " " });
+<a id="L610"></a>    try t(". \" \"\"", &amp;.{ ".", " \"" });
+<a id="L611"></a>    try t(". \" \"\"\"", &amp;.{ ".", " \"" });
+<a id="L612"></a>    try t(". \" \"\"\"\"", &amp;.{ ".", " \"\"" });
+<a id="L613"></a>    try t(". \" \"\"\"\"\"", &amp;.{ ".", " \"\"" });
+<a id="L614"></a>    try t(". \" \"\"\"\"\"\"", &amp;.{ ".", " \"\"\"" });
+<a id="L615"></a>    try t(". \\\"", &amp;.{ ".", "\"" });
+<a id="L616"></a>    try t(". \\\"\"", &amp;.{ ".", "\"" });
+<a id="L617"></a>    try t(". \\\"\"\"", &amp;.{ ".", "\"" });
+<a id="L618"></a>    try t(". \\\"\"\"\"", &amp;.{ ".", "\"\"" });
+<a id="L619"></a>    try t(". \\\"\"\"\"\"", &amp;.{ ".", "\"\"" });
+<a id="L620"></a>    try t(". \\\"\"\"\"\"\"", &amp;.{ ".", "\"\"\"" });
+<a id="L621"></a>    try t(". \" \\\"", &amp;.{ ".", " \"" });
+<a id="L622"></a>    try t(". \" \\\"\"", &amp;.{ ".", " \"" });
+<a id="L623"></a>    try t(". \" \\\"\"\"", &amp;.{ ".", " \"\"" });
+<a id="L624"></a>    try t(". \" \\\"\"\"\"", &amp;.{ ".", " \"\"" });
+<a id="L625"></a>    try t(". \" \\\"\"\"\"\"", &amp;.{ ".", " \"\"\"" });
+<a id="L626"></a>    try t(". \" \\\"\"\"\"\"\"", &amp;.{ ".", " \"\"\"" });
+<a id="L627"></a>    try t(". aa\\bb\\\\cc\\\\\\dd", &amp;.{ ".", "aa\\bb\\\\cc\\\\\\dd" });
+<a id="L628"></a>    try t(". \\\\\\\"aa bb\"", &amp;.{ ".", "\\\"aa", "bb" });
+<a id="L629"></a>    try t(". \\\\\\\\\"aa bb\"", &amp;.{ ".", "\\\\aa bb" });
+<a id="L630"></a>
+<a id="L631"></a>    // From https://learn.microsoft.com/en-us/cpp/cpp/main-function-command-line-args#results-of-parsing-command-lines
+<a id="L632"></a>    try t(
+<a id="L633"></a>        \\foo.exe "abc" d e
+<a id="L634"></a>    , &amp;.{ "foo.exe", "abc", "d", "e" });
+<a id="L635"></a>    try t(
+<a id="L636"></a>        \\foo.exe a\\b d"e f"g h
+<a id="L637"></a>    , &amp;.{ "foo.exe", "a\\\\b", "de fg", "h" });
+<a id="L638"></a>    try t(
+<a id="L639"></a>        \\foo.exe a\\\"b c d
+<a id="L640"></a>    , &amp;.{ "foo.exe", "a\\\"b", "c", "d" });
+<a id="L641"></a>    try t(
+<a id="L642"></a>        \\foo.exe a\\\\"b c" d e
+<a id="L643"></a>    , &amp;.{ "foo.exe", "a\\\\b c", "d", "e" });
+<a id="L644"></a>    try t(
+<a id="L645"></a>        \\foo.exe a"b"" c d
+<a id="L646"></a>    , &amp;.{ "foo.exe", "ab\" c d" });
+<a id="L647"></a>
+<a id="L648"></a>    // From https://daviddeley.com/autohotkey/parameters/parameters.htm#WINCRULESEX
+<a id="L649"></a>    try t("foo.exe CallMeIshmael", &amp;.{ "foo.exe", "CallMeIshmael" });
+<a id="L650"></a>    try t("foo.exe \"Call Me Ishmael\"", &amp;.{ "foo.exe", "Call Me Ishmael" });
+<a id="L651"></a>    try t("foo.exe Cal\"l Me I\"shmael", &amp;.{ "foo.exe", "Call Me Ishmael" });
+<a id="L652"></a>    try t("foo.exe CallMe\\\"Ishmael", &amp;.{ "foo.exe", "CallMe\"Ishmael" });
+<a id="L653"></a>    try t("foo.exe \"CallMe\\\"Ishmael\"", &amp;.{ "foo.exe", "CallMe\"Ishmael" });
+<a id="L654"></a>    try t("foo.exe \"Call Me Ishmael\\\\\"", &amp;.{ "foo.exe", "Call Me Ishmael\\" });
+<a id="L655"></a>    try t("foo.exe \"CallMe\\\\\\\"Ishmael\"", &amp;.{ "foo.exe", "CallMe\\\"Ishmael" });
+<a id="L656"></a>    try t("foo.exe a\\\\\\b", &amp;.{ "foo.exe", "a\\\\\\b" });
+<a id="L657"></a>    try t("foo.exe \"a\\\\\\b\"", &amp;.{ "foo.exe", "a\\\\\\b" });
+<a id="L658"></a>
+<a id="L659"></a>    // Surrogate pair encoding of 𐐷 separated by quotes.
+<a id="L660"></a>    // Encoded as WTF-16:
+<a id="L661"></a>    // "&lt;0xD801&gt;"&lt;0xDC37&gt;
+<a id="L662"></a>    // Encoded as WTF-8:
+<a id="L663"></a>    // "&lt;0xED&gt;&lt;0xA0&gt;&lt;0x81&gt;"&lt;0xED&gt;&lt;0xB0&gt;&lt;0xB7&gt;
+<a id="L664"></a>    // During parsing, the quotes drop out and the surrogate pair
+<a id="L665"></a>    // should end up encoded as its normal UTF-8 representation.
+<a id="L666"></a>    try t("foo.exe \"\xed\xa0\x81\"\xed\xb0\xb7", &amp;.{ "foo.exe", "𐐷" });
+<a id="L667"></a>}
+<a id="L668"></a>
+<a id="L669"></a>fn testIteratorWindows(cmd_line: []const u8, expected_args: []const []const u8) !void {
+<a id="L670"></a>    const cmd_line_w = try std.unicode.wtf8ToWtf16LeAllocZ(testing.allocator, cmd_line);
+<a id="L671"></a>    defer testing.allocator.free(cmd_line_w);
+<a id="L672"></a>
+<a id="L673"></a>    // next
+<a id="L674"></a>    {
+<a id="L675"></a>        var it = try Iterator.Windows.init(testing.allocator, cmd_line_w);
+<a id="L676"></a>        defer it.deinit();
+<a id="L677"></a>
+<a id="L678"></a>        for (expected_args) |expected| {
+<a id="L679"></a>            if (it.next()) |actual| {
+<a id="L680"></a>                try testing.expectEqualStrings(expected, actual);
+<a id="L681"></a>            } else {
+<a id="L682"></a>                return error.TestUnexpectedResult;
+<a id="L683"></a>            }
+<a id="L684"></a>        }
+<a id="L685"></a>        try testing.expect(it.next() == null);
+<a id="L686"></a>    }
+<a id="L687"></a>
+<a id="L688"></a>    // skip
+<a id="L689"></a>    {
+<a id="L690"></a>        var it = try Iterator.Windows.init(testing.allocator, cmd_line_w);
+<a id="L691"></a>        defer it.deinit();
+<a id="L692"></a>
+<a id="L693"></a>        for (0..expected_args.len) |_| {
+<a id="L694"></a>            try testing.expect(it.skip());
+<a id="L695"></a>        }
+<a id="L696"></a>        try testing.expect(!it.skip());
+<a id="L697"></a>    }
+<a id="L698"></a>}
+<a id="L699"></a>
+<a id="L700"></a>test "general parsing" {
+<a id="L701"></a>    try testGeneralCmdLine("a   b\tc d", &amp;.{ "a", "b", "c", "d" });
+<a id="L702"></a>    try testGeneralCmdLine("\"abc\" d e", &amp;.{ "abc", "d", "e" });
+<a id="L703"></a>    try testGeneralCmdLine("a\\\\\\b d\"e f\"g h", &amp;.{ "a\\\\\\b", "de fg", "h" });
+<a id="L704"></a>    try testGeneralCmdLine("a\\\\\\\"b c d", &amp;.{ "a\\\"b", "c", "d" });
+<a id="L705"></a>    try testGeneralCmdLine("a\\\\\\\\\"b c\" d e", &amp;.{ "a\\\\b c", "d", "e" });
+<a id="L706"></a>    try testGeneralCmdLine("a   b\tc \"d f", &amp;.{ "a", "b", "c", "d f" });
+<a id="L707"></a>    try testGeneralCmdLine("j k l\\", &amp;.{ "j", "k", "l\\" });
+<a id="L708"></a>    try testGeneralCmdLine("\"\" x y z\\\\", &amp;.{ "", "x", "y", "z\\\\" });
+<a id="L709"></a>
+<a id="L710"></a>    try testGeneralCmdLine("\".\\..\\zig-cache\\build\" \"bin\\zig.exe\" \".\\..\" \".\\..\\zig-cache\" \"--help\"", &amp;.{
+<a id="L711"></a>        ".\\..\\zig-cache\\build",
+<a id="L712"></a>        "bin\\zig.exe",
+<a id="L713"></a>        ".\\..",
+<a id="L714"></a>        ".\\..\\zig-cache",
+<a id="L715"></a>        "--help",
+<a id="L716"></a>    });
+<a id="L717"></a>
+<a id="L718"></a>    try testGeneralCmdLine(
+<a id="L719"></a>        \\ 'foo' "bar"
+<a id="L720"></a>    , &amp;.{ "'foo'", "bar" });
+<a id="L721"></a>}
+<a id="L722"></a>
+<a id="L723"></a>fn testGeneralCmdLine(input_cmd_line: []const u8, expected_args: []const []const u8) !void {
+<a id="L724"></a>    var it = try IteratorGeneral(.{}).init(std.testing.allocator, input_cmd_line);
+<a id="L725"></a>    defer it.deinit();
+<a id="L726"></a>    for (expected_args) |expected_arg| {
+<a id="L727"></a>        const arg = it.next().?;
+<a id="L728"></a>        try testing.expectEqualStrings(expected_arg, arg);
+<a id="L729"></a>    }
+<a id="L730"></a>    try testing.expect(it.next() == null);
+<a id="L731"></a>}
+<a id="L732"></a>
+<a id="L733"></a>/// Optional parameters for `IteratorGeneral`
+<a id="L734"></a>pub const IteratorGeneralOptions = struct {
+<a id="L735"></a>    comments: bool = false,
+<a id="L736"></a>    single_quotes: bool = false,
+<a id="L737"></a>};
+<a id="L738"></a>
+<a id="L739"></a>/// A general Iterator to parse a string into a set of arguments
+<a id="L740"></a>pub fn IteratorGeneral(comptime options: IteratorGeneralOptions) type {
+<a id="L741"></a>    return struct {
+<a id="L742"></a>        allocator: Allocator,
+<a id="L743"></a>        index: usize = 0,
+<a id="L744"></a>        cmd_line: []const u8,
+<a id="L745"></a>
+<a id="L746"></a>        /// Should the cmd_line field be free'd (using the allocator) on deinit()?
+<a id="L747"></a>        free_cmd_line_on_deinit: bool,
+<a id="L748"></a>
+<a id="L749"></a>        /// buffer MUST be long enough to hold the cmd_line plus a null terminator.
+<a id="L750"></a>        /// buffer will we free'd (using the allocator) on deinit()
+<a id="L751"></a>        buffer: []u8,
+<a id="L752"></a>        start: usize = 0,
+<a id="L753"></a>        end: usize = 0,
+<a id="L754"></a>
+<a id="L755"></a>        pub const Self = @This();
+<a id="L756"></a>
+<a id="L757"></a>        pub const InitError = error{OutOfMemory};
+<a id="L758"></a>
+<a id="L759"></a>        /// cmd_line_utf8 MUST remain valid and constant while using this instance
+<a id="L760"></a>        pub fn init(allocator: Allocator, cmd_line_utf8: []const u8) InitError!Self {
+<a id="L761"></a>            const buffer = try allocator.alloc(u8, cmd_line_utf8.len + 1);
+<a id="L762"></a>            errdefer allocator.free(buffer);
+<a id="L763"></a>
+<a id="L764"></a>            return Self{
+<a id="L765"></a>                .allocator = allocator,
+<a id="L766"></a>                .cmd_line = cmd_line_utf8,
+<a id="L767"></a>                .free_cmd_line_on_deinit = false,
+<a id="L768"></a>                .buffer = buffer,
+<a id="L769"></a>            };
+<a id="L770"></a>        }
+<a id="L771"></a>
+<a id="L772"></a>        /// cmd_line_utf8 will be free'd (with the allocator) on deinit()
+<a id="L773"></a>        pub fn initTakeOwnership(allocator: Allocator, cmd_line_utf8: []const u8) InitError!Self {
+<a id="L774"></a>            const buffer = try allocator.alloc(u8, cmd_line_utf8.len + 1);
+<a id="L775"></a>            errdefer allocator.free(buffer);
+<a id="L776"></a>
+<a id="L777"></a>            return Self{
+<a id="L778"></a>                .allocator = allocator,
+<a id="L779"></a>                .cmd_line = cmd_line_utf8,
+<a id="L780"></a>                .free_cmd_line_on_deinit = true,
+<a id="L781"></a>                .buffer = buffer,
+<a id="L782"></a>            };
+<a id="L783"></a>        }
+<a id="L784"></a>
+<a id="L785"></a>        // Skips over whitespace in the cmd_line.
+<a id="L786"></a>        // Returns false if the terminating sentinel is reached, true otherwise.
+<a id="L787"></a>        // Also skips over comments (if supported).
+<a id="L788"></a>        fn skipWhitespace(self: *Self) bool {
+<a id="L789"></a>            while (true) : (self.index += 1) {
+<a id="L790"></a>                const character = if (self.index != self.cmd_line.len) self.cmd_line[self.index] else 0;
+<a id="L791"></a>                switch (character) {
+<a id="L792"></a>                    0 =&gt; return false,
+<a id="L793"></a>                    ' ', '\t', '\r', '\n' =&gt; continue,
+<a id="L794"></a>                    '#' =&gt; {
+<a id="L795"></a>                        if (options.comments) {
+<a id="L796"></a>                            while (true) : (self.index += 1) {
+<a id="L797"></a>                                switch (self.cmd_line[self.index]) {
+<a id="L798"></a>                                    '\n' =&gt; break,
+<a id="L799"></a>                                    0 =&gt; return false,
+<a id="L800"></a>                                    else =&gt; continue,
+<a id="L801"></a>                                }
+<a id="L802"></a>                            }
+<a id="L803"></a>                            continue;
+<a id="L804"></a>                        } else {
+<a id="L805"></a>                            break;
+<a id="L806"></a>                        }
+<a id="L807"></a>                    },
+<a id="L808"></a>                    else =&gt; break,
+<a id="L809"></a>                }
+<a id="L810"></a>            }
+<a id="L811"></a>            return true;
+<a id="L812"></a>        }
+<a id="L813"></a>
+<a id="L814"></a>        pub fn skip(self: *Self) bool {
+<a id="L815"></a>            if (!self.skipWhitespace()) {
+<a id="L816"></a>                return false;
+<a id="L817"></a>            }
+<a id="L818"></a>
+<a id="L819"></a>            var backslash_count: usize = 0;
+<a id="L820"></a>            var in_quote = false;
+<a id="L821"></a>            while (true) : (self.index += 1) {
+<a id="L822"></a>                const character = if (self.index != self.cmd_line.len) self.cmd_line[self.index] else 0;
+<a id="L823"></a>                switch (character) {
+<a id="L824"></a>                    0 =&gt; return true,
+<a id="L825"></a>                    '"', '\'' =&gt; {
+<a id="L826"></a>                        if (!options.single_quotes and character == '\'') {
+<a id="L827"></a>                            backslash_count = 0;
+<a id="L828"></a>                            continue;
+<a id="L829"></a>                        }
+<a id="L830"></a>                        const quote_is_real = backslash_count % 2 == 0;
+<a id="L831"></a>                        if (quote_is_real) {
+<a id="L832"></a>                            in_quote = !in_quote;
+<a id="L833"></a>                        }
+<a id="L834"></a>                    },
+<a id="L835"></a>                    '\\' =&gt; {
+<a id="L836"></a>                        backslash_count += 1;
+<a id="L837"></a>                    },
+<a id="L838"></a>                    ' ', '\t', '\r', '\n' =&gt; {
+<a id="L839"></a>                        if (!in_quote) {
+<a id="L840"></a>                            return true;
+<a id="L841"></a>                        }
+<a id="L842"></a>                        backslash_count = 0;
+<a id="L843"></a>                    },
+<a id="L844"></a>                    else =&gt; {
+<a id="L845"></a>                        backslash_count = 0;
+<a id="L846"></a>                        continue;
+<a id="L847"></a>                    },
+<a id="L848"></a>                }
+<a id="L849"></a>            }
+<a id="L850"></a>        }
+<a id="L851"></a>
+<a id="L852"></a>        /// Returns a slice of the internal buffer that contains the next argument.
+<a id="L853"></a>        /// Returns null when it reaches the end.
+<a id="L854"></a>        pub fn next(self: *Self) ?[:0]const u8 {
+<a id="L855"></a>            if (!self.skipWhitespace()) {
+<a id="L856"></a>                return null;
+<a id="L857"></a>            }
+<a id="L858"></a>
+<a id="L859"></a>            var backslash_count: usize = 0;
+<a id="L860"></a>            var in_quote = false;
+<a id="L861"></a>            while (true) : (self.index += 1) {
+<a id="L862"></a>                const character = if (self.index != self.cmd_line.len) self.cmd_line[self.index] else 0;
+<a id="L863"></a>                switch (character) {
+<a id="L864"></a>                    0 =&gt; {
+<a id="L865"></a>                        self.emitBackslashes(backslash_count);
+<a id="L866"></a>                        self.buffer[self.end] = 0;
+<a id="L867"></a>                        const token = self.buffer[self.start..self.end :0];
+<a id="L868"></a>                        self.end += 1;
+<a id="L869"></a>                        self.start = self.end;
+<a id="L870"></a>                        return token;
+<a id="L871"></a>                    },
+<a id="L872"></a>                    '"', '\'' =&gt; {
+<a id="L873"></a>                        if (!options.single_quotes and character == '\'') {
+<a id="L874"></a>                            self.emitBackslashes(backslash_count);
+<a id="L875"></a>                            backslash_count = 0;
+<a id="L876"></a>                            self.emitCharacter(character);
+<a id="L877"></a>                            continue;
+<a id="L878"></a>                        }
+<a id="L879"></a>                        const quote_is_real = backslash_count % 2 == 0;
+<a id="L880"></a>                        self.emitBackslashes(backslash_count / 2);
+<a id="L881"></a>                        backslash_count = 0;
+<a id="L882"></a>
+<a id="L883"></a>                        if (quote_is_real) {
+<a id="L884"></a>                            in_quote = !in_quote;
+<a id="L885"></a>                        } else {
+<a id="L886"></a>                            self.emitCharacter('"');
+<a id="L887"></a>                        }
+<a id="L888"></a>                    },
+<a id="L889"></a>                    '\\' =&gt; {
+<a id="L890"></a>                        backslash_count += 1;
+<a id="L891"></a>                    },
+<a id="L892"></a>                    ' ', '\t', '\r', '\n' =&gt; {
+<a id="L893"></a>                        self.emitBackslashes(backslash_count);
+<a id="L894"></a>                        backslash_count = 0;
+<a id="L895"></a>                        if (in_quote) {
+<a id="L896"></a>                            self.emitCharacter(character);
+<a id="L897"></a>                        } else {
+<a id="L898"></a>                            self.buffer[self.end] = 0;
+<a id="L899"></a>                            const token = self.buffer[self.start..self.end :0];
+<a id="L900"></a>                            self.end += 1;
+<a id="L901"></a>                            self.start = self.end;
+<a id="L902"></a>                            return token;
+<a id="L903"></a>                        }
+<a id="L904"></a>                    },
+<a id="L905"></a>                    else =&gt; {
+<a id="L906"></a>                        self.emitBackslashes(backslash_count);
+<a id="L907"></a>                        backslash_count = 0;
+<a id="L908"></a>                        self.emitCharacter(character);
+<a id="L909"></a>                    },
+<a id="L910"></a>                }
+<a id="L911"></a>            }
+<a id="L912"></a>        }
+<a id="L913"></a>
+<a id="L914"></a>        fn emitBackslashes(self: *Self, emit_count: usize) void {
+<a id="L915"></a>            var i: usize = 0;
+<a id="L916"></a>            while (i &lt; emit_count) : (i += 1) {
+<a id="L917"></a>                self.emitCharacter('\\');
+<a id="L918"></a>            }
+<a id="L919"></a>        }
+<a id="L920"></a>
+<a id="L921"></a>        fn emitCharacter(self: *Self, char: u8) void {
+<a id="L922"></a>            self.buffer[self.end] = char;
+<a id="L923"></a>            self.end += 1;
+<a id="L924"></a>        }
+<a id="L925"></a>
+<a id="L926"></a>        /// Call to free the internal buffer of the iterator.
+<a id="L927"></a>        pub fn deinit(self: *Self) void {
+<a id="L928"></a>            self.allocator.free(self.buffer);
+<a id="L929"></a>
+<a id="L930"></a>            if (self.free_cmd_line_on_deinit) {
+<a id="L931"></a>                self.allocator.free(self.cmd_line);
+<a id="L932"></a>            }
+<a id="L933"></a>        }
+<a id="L934"></a>    };
+<a id="L935"></a>}
+<a id="L936"></a>
+<a id="L937"></a>test "response file arg parsing" {
+<a id="L938"></a>    try testResponseFileCmdLine(
+<a id="L939"></a>        \\a b
+<a id="L940"></a>        \\c d\
+<a id="L941"></a>    , &amp;.{ "a", "b", "c", "d\\" });
+<a id="L942"></a>    try testResponseFileCmdLine("a b c d\\", &amp;.{ "a", "b", "c", "d\\" });
+<a id="L943"></a>
+<a id="L944"></a>    try testResponseFileCmdLine(
+<a id="L945"></a>        \\j
+<a id="L946"></a>        \\ k l # this is a comment \\ \\\ \\\\ "none" "\\" "\\\"
+<a id="L947"></a>        \\ "m" #another comment
+<a id="L948"></a>        \\
+<a id="L949"></a>    , &amp;.{ "j", "k", "l", "m" });
+<a id="L950"></a>
+<a id="L951"></a>    try testResponseFileCmdLine(
+<a id="L952"></a>        \\ "" q ""
+<a id="L953"></a>        \\ "r s # t" "u\" v" #another comment
+<a id="L954"></a>        \\
+<a id="L955"></a>    , &amp;.{ "", "q", "", "r s # t", "u\" v" });
+<a id="L956"></a>
+<a id="L957"></a>    try testResponseFileCmdLine(
+<a id="L958"></a>        \\ -l"advapi32" a# b#c d#
+<a id="L959"></a>        \\e\\\
+<a id="L960"></a>    , &amp;.{ "-ladvapi32", "a#", "b#c", "d#", "e\\\\\\" });
+<a id="L961"></a>
+<a id="L962"></a>    try testResponseFileCmdLine(
+<a id="L963"></a>        \\ 'foo' "bar"
+<a id="L964"></a>    , &amp;.{ "foo", "bar" });
+<a id="L965"></a>}
+<a id="L966"></a>
+<a id="L967"></a>fn testResponseFileCmdLine(input_cmd_line: []const u8, expected_args: []const []const u8) !void {
+<a id="L968"></a>    var it = try IteratorGeneral(.{ .comments = true, .single_quotes = true })
+<a id="L969"></a>        .init(std.testing.allocator, input_cmd_line);
+<a id="L970"></a>    defer it.deinit();
+<a id="L971"></a>    for (expected_args) |expected_arg| {
+<a id="L972"></a>        const arg = it.next().?;
+<a id="L973"></a>        try testing.expectEqualStrings(expected_arg, arg);
+<a id="L974"></a>    }
+<a id="L975"></a>    try testing.expect(it.next() == null);
+<a id="L976"></a>}
+</pre>
+</body>
+</html>

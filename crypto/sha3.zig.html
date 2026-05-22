@@ -2,795 +2,798 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Source: zig-0.16.0-std/crypto/sha3.zig</title>
+    <title>Source: crypto/sha3.zig</title>
     <style>
         body { background: #1e1e1e; color: #d4d4d4; font-family: monospace; padding: 20px; }
         pre { white-space: pre-wrap; word-wrap: break-word; }
         .header { border-bottom: 1px solid #444; padding-bottom: 10px; margin-bottom: 20px; }
         a { color: #569cd6; }
+        a[id] { color: inherit; text-decoration: none; }
+        :target { background: #3a3a00; }
     </style>
 </head>
 <body>
     <div class="header">
-        <a href="/">Index</a> | <strong>File: zig-0.16.0-std/crypto/sha3.zig</strong>
+        <a href="/">Index</a> | <strong>File: crypto/sha3.zig</strong>
     </div>
-    <pre>const builtin = @import("builtin");
-const std = @import("std");
-const assert = std.debug.assert;
-const math = std.math;
-const mem = std.mem;
-
-const kangarootwelve = @import("kangarootwelve.zig");
-
-const KeccakState = std.crypto.core.keccak.State;
-
-pub const Sha3_224 = Keccak(1600, 224, 0x06, 24);
-pub const Sha3_256 = Keccak(1600, 256, 0x06, 24);
-pub const Sha3_384 = Keccak(1600, 384, 0x06, 24);
-pub const Sha3_512 = Keccak(1600, 512, 0x06, 24);
-
-pub const Keccak256 = Keccak(1600, 256, 0x01, 24);
-pub const Keccak512 = Keccak(1600, 512, 0x01, 24);
-
-pub const Shake128 = Shake(128);
-pub const Shake256 = Shake(256);
-
-pub const CShake128 = CShake(128, null);
-pub const CShake256 = CShake(256, null);
-
-pub const KMac128 = KMac(128);
-pub const KMac256 = KMac(256);
-
-pub const TupleHash128 = TupleHash(128);
-pub const TupleHash256 = TupleHash(256);
-
-pub const KT128 = kangarootwelve.KT128;
-pub const KT256 = kangarootwelve.KT256;
-
-/// TurboSHAKE128 is a XOF (a secure hash function with a variable output length), with a 128 bit security level.
-/// It is based on the same permutation as SHA3 and SHAKE128, but which much higher performance.
-/// The delimiter is 0x1f by default, but can be changed for context-separation.
-/// For a protocol that uses both KangarooTwelve and TurboSHAKE128, it is recommended to avoid using 0x06, 0x07 or 0x0b for the delimiter.
-pub fn TurboShake128(delim: ?u7) type {
-    return TurboShake(128, delim);
-}
-
-/// TurboSHAKE256 is a XOF (a secure hash function with a variable output length), with a 256 bit security level.
-/// It is based on the same permutation as SHA3 and SHAKE256, but which much higher performance.
-/// The delimiter is 0x1f by default, but can be changed for context-separation.
-pub fn TurboShake256(comptime delim: ?u7) type {
-    return TurboShake(256, delim);
-}
-
-/// A generic Keccak hash function.
-pub fn Keccak(comptime f: u11, comptime output_bits: u11, comptime default_delim: u8, comptime rounds: u5) type {
-    comptime assert(output_bits &gt; 0 and output_bits * 2 &lt; f and output_bits % 8 == 0); // invalid output length
-
-    const State = KeccakState(f, output_bits * 2, rounds);
-
-    return struct {
-        const Self = @This();
-
-        st: State,
-
-        /// The output length, in bytes.
-        pub const digest_length = std.math.divCeil(comptime_int, output_bits, 8) catch unreachable;
-        /// The block length, or rate, in bytes.
-        pub const block_length = State.rate;
-        /// The delimiter can be overwritten in the options.
-        pub const Options = struct { delim: u8 = default_delim };
-
-        /// Initialize a Keccak hash function.
-        pub fn init(options: Options) Self {
-            return Self{ .st = .{ .delim = options.delim } };
-        }
-
-        /// Hash a slice of bytes.
-        pub fn hash(bytes: []const u8, out: *[digest_length]u8, options: Options) void {
-            var st = Self.init(options);
-            st.update(bytes);
-            st.final(out);
-        }
-
-        /// Absorb a slice of bytes into the state.
-        pub fn update(self: *Self, bytes: []const u8) void {
-            self.st.absorb(bytes);
-        }
-
-        /// Return the hash of the absorbed bytes.
-        pub fn final(self: *Self, out: *[digest_length]u8) void {
-            self.st.pad();
-            self.st.squeeze(out[0..]);
-        }
-    };
-}
-
-/// The SHAKE extendable output hash function.
-pub fn Shake(comptime security_level: u11) type {
-    return ShakeLike(security_level, 0x1f, 24);
-}
-
-/// The TurboSHAKE extendable output hash function.
-/// It is based on the same permutation as SHA3 and SHAKE, but which much higher performance.
-/// The delimiter is 0x1f by default, but can be changed for context-separation.
-/// https://eprint.iacr.org/2023/342
-pub fn TurboShake(comptime security_level: u11, comptime delim: ?u7) type {
-    comptime assert(security_level &lt;= 256);
-    const d = delim orelse 0x1f;
-    comptime assert(d &gt;= 0x01); // delimiter must be &gt;= 1
-    return ShakeLike(security_level, d, 12);
-}
-
-fn ShakeLike(comptime security_level: u11, comptime default_delim: u8, comptime rounds: u5) type {
-    const f = 1600;
-    const State = KeccakState(f, security_level * 2, rounds);
-
-    return struct {
-        const Self = @This();
-
-        st: State,
-        buf: [State.rate]u8 = undefined,
-        offset: usize = 0,
-        padded: bool = false,
-
-        /// The recommended output length, in bytes.
-        pub const digest_length = security_level / 8 * 2;
-        /// The block length, or rate, in bytes.
-        pub const block_length = State.rate;
-        /// The delimiter can be overwritten in the options.
-        pub const Options = struct { delim: u8 = default_delim };
-
-        /// Initialize a SHAKE extensible hash function.
-        pub fn init(options: Options) Self {
-            return Self{ .st = .{ .delim = options.delim } };
-        }
-
-        /// Hash a slice of bytes.
-        /// `out` can be any length.
-        pub fn hash(bytes: []const u8, out: []u8, options: Options) void {
-            var st = Self.init(options);
-            st.update(bytes);
-            st.squeeze(out);
-        }
-
-        /// Absorb a slice of bytes into the state.
-        pub fn update(self: *Self, bytes: []const u8) void {
-            self.st.absorb(bytes);
-        }
-
-        /// Squeeze a slice of bytes from the state.
-        /// `out` can be any length, and the function can be called multiple times.
-        pub fn squeeze(self: *Self, out_: []u8) void {
-            if (!self.padded) {
-                self.st.pad();
-                self.padded = true;
-            }
-            var out = out_;
-            if (self.offset &gt; 0) {
-                const left = self.buf.len - self.offset;
-                if (left &gt; 0) {
-                    const n = @min(left, out.len);
-                    @memcpy(out[0..n], self.buf[self.offset..][0..n]);
-                    out = out[n..];
-                    self.offset += n;
-                    if (out.len == 0) {
-                        return;
-                    }
-                }
-            }
-            const full_blocks = out[0 .. out.len - out.len % State.rate];
-            if (full_blocks.len &gt; 0) {
-                self.st.squeeze(full_blocks);
-                out = out[full_blocks.len..];
-            }
-            if (out.len &gt; 0) {
-                self.st.squeeze(self.buf[0..]);
-                @memcpy(out[0..], self.buf[0..out.len]);
-                self.offset = out.len;
-            }
-        }
-
-        /// Return the hash of the absorbed bytes.
-        /// `out` can be of any length, but the function must not be called multiple times (use `squeeze` for that purpose instead).
-        pub fn final(self: *Self, out: []u8) void {
-            self.squeeze(out);
-            self.st.st.clear(0, State.rate);
-        }
-
-        /// Align the input to a block boundary.
-        pub fn fillBlock(self: *Self) void {
-            self.st.fillBlock();
-        }
-    };
-}
-
-/// The cSHAKE extendable output hash function.
-/// cSHAKE is similar to SHAKE, but in addition to the input message, it also takes an optional context (aka customization string).
-pub fn CShake(comptime security_level: u11, comptime fname: ?[]const u8) type {
-    return CShakeLike(security_level, 0x04, 24, fname);
-}
-
-fn CShakeLike(comptime security_level: u11, comptime default_delim: u8, comptime rounds: u5, comptime fname: ?[]const u8) type {
-    return struct {
-        const Shaker = ShakeLike(security_level, default_delim, rounds);
-        shaker: Shaker,
-
-        /// The recommended output length, in bytes.
-        pub const digest_length = Shaker.digest_length;
-        /// The block length, or rate, in bytes.
-        pub const block_length = Shaker.block_length;
-
-        /// cSHAKE options can include a context string.
-        pub const Options = struct { context: ?[]const u8 = null };
-
-        const Self = @This();
-
-        /// Initialize a SHAKE extensible hash function.
-        pub fn init(options: Options) Self {
-            if (fname == null and options.context == null) {
-                return Self{ .shaker = Shaker.init(.{ .delim = 0x1f }) };
-            }
-            var shaker = Shaker.init(.{});
-            comptime assert(Shaker.block_length % 8 == 0);
-            const encoded_rate_len = NistLengthEncoding.encode(.left, block_length / 8);
-            shaker.update(encoded_rate_len.slice());
-            const encoded_zero = comptime NistLengthEncoding.encode(.left, 0);
-            if (fname) |name| {
-                const encoded_fname_len = comptime NistLengthEncoding.encode(.left, name.len);
-                const encoded_fname = comptime encoded_fname_len.slice() ++ name;
-                shaker.update(encoded_fname);
-            } else {
-                shaker.update(encoded_zero.slice());
-            }
-            if (options.context) |context| {
-                const encoded_context_len = NistLengthEncoding.encode(.left, context.len);
-                shaker.update(encoded_context_len.slice());
-                shaker.update(context);
-            } else {
-                shaker.update(encoded_zero.slice());
-            }
-            shaker.st.fillBlock();
-            return Self{ .shaker = shaker };
-        }
-
-        /// Hash a slice of bytes.
-        /// `out` can be any length.
-        pub fn hash(bytes: []const u8, out: []u8, options: Options) void {
-            var st = Self.init(options);
-            st.update(bytes);
-            st.squeeze(out);
-        }
-
-        /// Absorb a slice of bytes into the state.
-        pub fn update(self: *Self, bytes: []const u8) void {
-            self.shaker.update(bytes);
-        }
-
-        /// Squeeze a slice of bytes from the state.
-        /// `out` can be any length, and the function can be called multiple times.
-        pub fn squeeze(self: *Self, out: []u8) void {
-            self.shaker.squeeze(out);
-        }
-
-        /// Return the hash of the absorbed bytes.
-        /// `out` can be of any length, but the function must not be called multiple times (use `squeeze` for that purpose instead).
-        pub fn final(self: *Self, out: []u8) void {
-            self.shaker.final(out);
-        }
-
-        /// Align the input to a block boundary.
-        pub fn fillBlock(self: *Self) void {
-            self.shaker.fillBlock();
-        }
-    };
-}
-
-/// The KMAC extendable output authentication function.
-/// KMAC is a keyed version of the cSHAKE function, with an optional context.
-/// It can be used as an SHA-3 based alternative to HMAC, as well as a generic keyed XoF (extendable output function).
-pub fn KMac(comptime security_level: u11) type {
-    return KMacLike(security_level, 0x04, 24);
-}
-
-fn KMacLike(comptime security_level: u11, comptime default_delim: u8, comptime rounds: u5) type {
-    const CShaker = CShakeLike(security_level, default_delim, rounds, "KMAC");
-
-    return struct {
-        const Self = @This();
-
-        /// The recommended output length, in bytes.
-        pub const mac_length = CShaker.digest_length;
-        /// The minimum output length, in bytes.
-        pub const mac_length_min = 4;
-        /// The recommended key length, in bytes.
-        pub const key_length = security_level / 8;
-        /// The minimum key length, in bytes.
-        pub const key_length_min = 0;
-        /// The block length, or rate, in bytes.
-        pub const block_length = CShaker.block_length;
-
-        cshaker: CShaker,
-        xof_mode: bool = false,
-
-        /// KMAC options can include a context string.
-        pub const Options = struct {
-            context: ?[]const u8 = null,
-        };
-
-        /// Initialize a state for the KMAC function, with an optional context and an arbitrary-long key.
-        /// If the context and key are going to be reused, the structure can be initialized once, and cloned for each message.
-        /// This is more efficient than reinitializing the state for each message at the cost of a small amount of memory.
-        pub fn initWithOptions(key: []const u8, options: Options) Self {
-            var cshaker = CShaker.init(.{ .context = options.context });
-            const encoded_rate_len = NistLengthEncoding.encode(.left, block_length / 8);
-            cshaker.update(encoded_rate_len.slice());
-            const encoded_key_len = NistLengthEncoding.encode(.left, key.len);
-            cshaker.update(encoded_key_len.slice());
-            cshaker.update(key);
-            cshaker.fillBlock();
-            return Self{
-                .cshaker = cshaker,
-            };
-        }
-
-        /// Initialize a state for the KMAC function.
-        /// If the context and key are going to be reused, the structure can be initialized once, and cloned for each message.
-        /// This is more efficient than reinitializing the state for each message at the cost of a small amount of memory.
-        pub fn init(key: []const u8) Self {
-            return initWithOptions(key, .{});
-        }
-
-        /// Add data to the state.
-        pub fn update(self: *Self, b: []const u8) void {
-            self.cshaker.update(b);
-        }
-
-        /// Return an authentication tag for the current state.
-        pub fn final(self: *Self, out: []u8) void {
-            const encoded_out_len = NistLengthEncoding.encode(.right, out.len);
-            self.update(encoded_out_len.slice());
-            self.cshaker.final(out);
-        }
-
-        /// Squeeze a slice of bytes from the state.
-        /// `out` can be any length, and the function can be called multiple times.
-        pub fn squeeze(self: *Self, out: []u8) void {
-            if (!self.xof_mode) {
-                const encoded_out_len = comptime NistLengthEncoding.encode(.right, 0);
-                self.update(encoded_out_len.slice());
-                self.xof_mode = true;
-            }
-            self.cshaker.squeeze(out);
-        }
-
-        /// Return an authentication tag for a message and a key, with an optional context.
-        pub fn createWithOptions(out: []u8, msg: []const u8, key: []const u8, options: Options) void {
-            var ctx = Self.initWithOptions(key, options);
-            ctx.update(msg);
-            ctx.final(out);
-        }
-
-        /// Return an authentication tag for a message and a key.
-        pub fn create(out: []u8, msg: []const u8, key: []const u8) void {
-            var ctx = Self.init(key);
-            ctx.update(msg);
-            ctx.final(out);
-        }
-    };
-}
-
-/// The TupleHash extendable output hash function, with domain-separated inputs.
-/// TupleHash is a secure hash function with a variable output length, based on the cSHAKE function.
-/// It is designed for unambiguously hashing tuples of data.
-///
-/// With most hash functions, calling `update("A")` followed by `update("B")`is identical to `update("AB")`.
-/// With TupleHash, this is not the case: `update("A"); update("B")` is different from `update("AB")`.
-///
-/// Any number of inputs can be hashed, and the output depends on individual inputs and their order.
-pub fn TupleHash(comptime security_level: u11) type {
-    return TupleHashLike(security_level, 0x04, 24);
-}
-
-fn TupleHashLike(comptime security_level: u11, comptime default_delim: u8, comptime rounds: u5) type {
-    const CShaker = CShakeLike(security_level, default_delim, rounds, "TupleHash");
-
-    return struct {
-        const Self = @This();
-
-        /// The output length, in bytes.
-        pub const digest_length = CShaker.digest_length;
-        /// The block length, or rate, in bytes.
-        pub const block_length = CShaker.block_length;
-
-        cshaker: CShaker,
-        xof_mode: bool = false,
-
-        /// TupleHash options can include a context string.
-        pub const Options = struct {
-            context: ?[]const u8 = null,
-        };
-
-        /// Initialize a state for the TupleHash function, with an optional context.
-        /// If the context is going to be reused, the structure can be initialized once, and cloned for each message.
-        /// This is more efficient than reinitializing the state for each message at the cost of a small amount of memory.
-        ///
-        /// A key can be optionally added to the context to create a keyed TupleHash function, similar to KMAC.
-        pub fn initWithOptions(options: Options) Self {
-            const cshaker = CShaker.init(.{ .context = options.context });
-            return Self{
-                .cshaker = cshaker,
-            };
-        }
-
-        /// Initialize a state for the MAC function.
-        pub fn init() Self {
-            return initWithOptions(.{});
-        }
-
-        /// Add data to the state, separated from previous updates.
-        pub fn update(self: *Self, b: []const u8) void {
-            const encoded_b_len = NistLengthEncoding.encode(.left, b.len);
-            self.cshaker.update(encoded_b_len.slice());
-            self.cshaker.update(b);
-        }
-
-        /// Return an authentication tag for the current state.
-        pub fn final(self: *Self, out: []u8) void {
-            const encoded_out_len = NistLengthEncoding.encode(.right, out.len);
-            self.cshaker.update(encoded_out_len.slice());
-            self.cshaker.final(out);
-        }
-
-        /// Align the input to a block boundary.
-        pub fn fillBlock(self: *Self) void {
-            self.cshaker.fillBlock();
-        }
-
-        /// Squeeze a slice of bytes from the state.
-        /// `out` can be any length, and the function can be called multiple times.
-        pub fn squeeze(self: *Self, out: []u8) void {
-            if (!self.xof_mode) {
-                const encoded_out_len = comptime NistLengthEncoding.encode(.right, 0);
-                self.update(encoded_out_len.slice());
-                self.xof_mode = true;
-            }
-            self.cshaker.squeeze(out);
-        }
-    };
-}
-
-/// The NIST SP 800-185 encoded length format.
-pub const NistLengthEncoding = enum {
-    left,
-    right,
-
-    /// A length encoded according to NIST SP 800-185.
-    pub const Length = struct {
-        /// The size of the encoded value, in bytes.
-        len: usize = 0,
-        /// A buffer to store the encoded length.
-        buf: [@sizeOf(usize) + 1]u8 = undefined,
-
-        /// Return the encoded length as a slice.
-        pub fn slice(self: *const Length) []const u8 {
-            return self.buf[0..self.len];
-        }
-    };
-
-    /// Encode a length according to NIST SP 800-185.
-    pub fn encode(comptime encoding: NistLengthEncoding, len: usize) Length {
-        const len_bits = @bitSizeOf(@TypeOf(len)) - @clz(len) + 3;
-        const len_bytes = std.math.divCeil(usize, len_bits, 8) catch unreachable;
-
-        var res = Length{ .len = len_bytes + 1 };
-        if (encoding == .right) {
-            res.buf[len_bytes] = @intCast(len_bytes);
-        }
-        const end = if (encoding == .right) len_bytes - 1 else len_bytes;
-        res.buf[end] = @truncate(len &lt;&lt; 3);
-        var len_ = len &gt;&gt; 5;
-        for (1..len_bytes) |i| {
-            res.buf[end - i] = @truncate(len_);
-            len_ &gt;&gt;= 8;
-        }
-        if (encoding == .left) {
-            res.buf[0] = @intCast(len_bytes);
-        }
-        return res;
-    }
-};
-
-const htest = @import("test.zig");
-
-test {
-    _ = kangarootwelve;
-}
-
-test "sha3-224 single" {
-    try htest.assertEqualHash(Sha3_224, "6b4e03423667dbb73b6e15454f0eb1abd4597f9a1b078e3f5b5a6bc7", "");
-    try htest.assertEqualHash(Sha3_224, "e642824c3f8cf24ad09234ee7d3c766fc9a3a5168d0c94ad73b46fdf", "abc");
-    try htest.assertEqualHash(Sha3_224, "543e6868e1666c1a643630df77367ae5a62a85070a51c14cbf665cbc", "abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu");
-}
-
-test "sha3-224 streaming" {
-    var h = Sha3_224.init(.{});
-    var out: [28]u8 = undefined;
-
-    h.final(out[0..]);
-    try htest.assertEqual("6b4e03423667dbb73b6e15454f0eb1abd4597f9a1b078e3f5b5a6bc7", out[0..]);
-
-    h = Sha3_224.init(.{});
-    h.update("abc");
-    h.final(out[0..]);
-    try htest.assertEqual("e642824c3f8cf24ad09234ee7d3c766fc9a3a5168d0c94ad73b46fdf", out[0..]);
-
-    h = Sha3_224.init(.{});
-    h.update("a");
-    h.update("b");
-    h.update("c");
-    h.final(out[0..]);
-    try htest.assertEqual("e642824c3f8cf24ad09234ee7d3c766fc9a3a5168d0c94ad73b46fdf", out[0..]);
-}
-
-test "sha3-256 single" {
-    try htest.assertEqualHash(Sha3_256, "a7ffc6f8bf1ed76651c14756a061d662f580ff4de43b49fa82d80a4b80f8434a", "");
-    try htest.assertEqualHash(Sha3_256, "3a985da74fe225b2045c172d6bd390bd855f086e3e9d525b46bfe24511431532", "abc");
-    try htest.assertEqualHash(Sha3_256, "916f6061fe879741ca6469b43971dfdb28b1a32dc36cb3254e812be27aad1d18", "abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu");
-}
-
-test "sha3-256 streaming" {
-    var h = Sha3_256.init(.{});
-    var out: [32]u8 = undefined;
-
-    h.final(out[0..]);
-    try htest.assertEqual("a7ffc6f8bf1ed76651c14756a061d662f580ff4de43b49fa82d80a4b80f8434a", out[0..]);
-
-    h = Sha3_256.init(.{});
-    h.update("abc");
-    h.final(out[0..]);
-    try htest.assertEqual("3a985da74fe225b2045c172d6bd390bd855f086e3e9d525b46bfe24511431532", out[0..]);
-
-    h = Sha3_256.init(.{});
-    h.update("a");
-    h.update("b");
-    h.update("c");
-    h.final(out[0..]);
-    try htest.assertEqual("3a985da74fe225b2045c172d6bd390bd855f086e3e9d525b46bfe24511431532", out[0..]);
-}
-
-test "sha3-256 aligned final" {
-    var block = [_]u8{0} ** Sha3_256.block_length;
-    var out: [Sha3_256.digest_length]u8 = undefined;
-
-    var h = Sha3_256.init(.{});
-    h.update(&amp;block);
-    h.final(out[0..]);
-}
-
-test "sha3-384 single" {
-    const h1 = "0c63a75b845e4f7d01107d852e4c2485c51a50aaaa94fc61995e71bbee983a2ac3713831264adb47fb6bd1e058d5f004";
-    try htest.assertEqualHash(Sha3_384, h1, "");
-    const h2 = "ec01498288516fc926459f58e2c6ad8df9b473cb0fc08c2596da7cf0e49be4b298d88cea927ac7f539f1edf228376d25";
-    try htest.assertEqualHash(Sha3_384, h2, "abc");
-    const h3 = "79407d3b5916b59c3e30b09822974791c313fb9ecc849e406f23592d04f625dc8c709b98b43b3852b337216179aa7fc7";
-    try htest.assertEqualHash(Sha3_384, h3, "abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu");
-}
-
-test "sha3-384 streaming" {
-    var h = Sha3_384.init(.{});
-    var out: [48]u8 = undefined;
-
-    const h1 = "0c63a75b845e4f7d01107d852e4c2485c51a50aaaa94fc61995e71bbee983a2ac3713831264adb47fb6bd1e058d5f004";
-    h.final(out[0..]);
-    try htest.assertEqual(h1, out[0..]);
-
-    const h2 = "ec01498288516fc926459f58e2c6ad8df9b473cb0fc08c2596da7cf0e49be4b298d88cea927ac7f539f1edf228376d25";
-    h = Sha3_384.init(.{});
-    h.update("abc");
-    h.final(out[0..]);
-    try htest.assertEqual(h2, out[0..]);
-
-    h = Sha3_384.init(.{});
-    h.update("a");
-    h.update("b");
-    h.update("c");
-    h.final(out[0..]);
-    try htest.assertEqual(h2, out[0..]);
-}
-
-test "sha3-512 single" {
-    if (builtin.cpu.has(.riscv, .v) and builtin.zig_backend == .stage2_llvm) return error.SkipZigTest; // https://github.com/ziglang/zig/issues/25083
-
-    const h1 = "a69f73cca23a9ac5c8b567dc185a756e97c982164fe25859e0d1dcc1475c80a615b2123af1f5f94c11e3e9402c3ac558f500199d95b6d3e301758586281dcd26";
-    try htest.assertEqualHash(Sha3_512, h1, "");
-    const h2 = "b751850b1a57168a5693cd924b6b096e08f621827444f70d884f5d0240d2712e10e116e9192af3c91a7ec57647e3934057340b4cf408d5a56592f8274eec53f0";
-    try htest.assertEqualHash(Sha3_512, h2, "abc");
-    const h3 = "afebb2ef542e6579c50cad06d2e578f9f8dd6881d7dc824d26360feebf18a4fa73e3261122948efcfd492e74e82e2189ed0fb440d187f382270cb455f21dd185";
-    try htest.assertEqualHash(Sha3_512, h3, "abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu");
-}
-
-test "sha3-512 streaming" {
-    var h = Sha3_512.init(.{});
-    var out: [64]u8 = undefined;
-
-    const h1 = "a69f73cca23a9ac5c8b567dc185a756e97c982164fe25859e0d1dcc1475c80a615b2123af1f5f94c11e3e9402c3ac558f500199d95b6d3e301758586281dcd26";
-    h.final(out[0..]);
-    try htest.assertEqual(h1, out[0..]);
-
-    const h2 = "b751850b1a57168a5693cd924b6b096e08f621827444f70d884f5d0240d2712e10e116e9192af3c91a7ec57647e3934057340b4cf408d5a56592f8274eec53f0";
-    h = Sha3_512.init(.{});
-    h.update("abc");
-    h.final(out[0..]);
-    try htest.assertEqual(h2, out[0..]);
-
-    h = Sha3_512.init(.{});
-    h.update("a");
-    h.update("b");
-    h.update("c");
-    h.final(out[0..]);
-    try htest.assertEqual(h2, out[0..]);
-}
-
-test "sha3-512 aligned final" {
-    var block = [_]u8{0} ** Sha3_512.block_length;
-    var out: [Sha3_512.digest_length]u8 = undefined;
-
-    var h = Sha3_512.init(.{});
-    h.update(&amp;block);
-    h.final(out[0..]);
-}
-
-test "keccak-256 single" {
-    try htest.assertEqualHash(Keccak256, "c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470", "");
-    try htest.assertEqualHash(Keccak256, "4e03657aea45a94fc7d47ba826c8d667c0d1e6e33a64a036ec44f58fa12d6c45", "abc");
-    try htest.assertEqualHash(Keccak256, "f519747ed599024f3882238e5ab43960132572b7345fbeb9a90769dafd21ad67", "abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu");
-}
-
-test "keccak-512 single" {
-    try htest.assertEqualHash(Keccak512, "0eab42de4c3ceb9235fc91acffe746b29c29a8c366b7c60e4e67c466f36a4304c00fa9caf9d87976ba469bcbe06713b435f091ef2769fb160cdab33d3670680e", "");
-    try htest.assertEqualHash(Keccak512, "18587dc2ea106b9a1563e32b3312421ca164c7f1f07bc922a9c83d77cea3a1e5d0c69910739025372dc14ac9642629379540c17e2a65b19d77aa511a9d00bb96", "abc");
-    try htest.assertEqualHash(Keccak512, "ac2fb35251825d3aa48468a9948c0a91b8256f6d97d8fa4160faff2dd9dfcc24f3f1db7a983dad13d53439ccac0b37e24037e7b95f80f59f37a2f683c4ba4682", "abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu");
-}
-
-test "SHAKE-128 single" {
-    var out: [10]u8 = undefined;
-    Shake128.hash("hello123", &amp;out, .{});
-    try htest.assertEqual("1b85861510bc4d8e467d", &amp;out);
-}
-
-test "SHAKE-128 multisqueeze" {
-    var out: [10]u8 = undefined;
-    var h = Shake128.init(.{});
-    h.update("hello123");
-    h.squeeze(out[0..4]);
-    h.squeeze(out[4..]);
-    try htest.assertEqual("1b85861510bc4d8e467d", &amp;out);
-}
-
-test "SHAKE-128 multisqueeze with multiple blocks" {
-    var out: [100]u8 = undefined;
-    var out2: [100]u8 = undefined;
-
-    var h = Shake128.init(.{});
-    h.update("hello123");
-    h.squeeze(out[0..50]);
-    h.squeeze(out[50..]);
-
-    var h2 = Shake128.init(.{});
-    h2.update("hello123");
-    h2.squeeze(&amp;out2);
-    try std.testing.expectEqualSlices(u8, &amp;out, &amp;out2);
-}
-
-test "SHAKE-256 single" {
-    var out: [10]u8 = undefined;
-    Shake256.hash("hello123", &amp;out, .{});
-    try htest.assertEqual("ade612ba265f92de4a37", &amp;out);
-}
-
-test "TurboSHAKE-128" {
-    var out: [32]u8 = undefined;
-    TurboShake(128, 0x06).hash("\xff", &amp;out, .{});
-    try htest.assertEqual("8ec9c66465ed0d4a6c35d13506718d687a25cb05c74cca1e42501abd83874a67", &amp;out);
-}
-
-test "SHA-3 with streaming" {
-    var msg: [613]u8 = [613]u8{ 0x97, 0xd1, 0x2d, 0x1a, 0x16, 0x2d, 0x36, 0x4d, 0x20, 0x62, 0x19, 0x0b, 0x14, 0x93, 0xbb, 0xf8, 0x5b, 0xea, 0x04, 0xc2, 0x61, 0x8e, 0xd6, 0x08, 0x81, 0xa1, 0x1d, 0x73, 0x27, 0x48, 0xbf, 0xa4, 0xba, 0xb1, 0x9a, 0x48, 0x9c, 0xf9, 0x9b, 0xff, 0x34, 0x48, 0xa9, 0x75, 0xea, 0xc8, 0xa3, 0x48, 0x24, 0x9d, 0x75, 0x27, 0x48, 0xec, 0x03, 0xb0, 0xbb, 0xdf, 0x33, 0x90, 0xe3, 0x93, 0xed, 0x68, 0x24, 0x39, 0x12, 0xdf, 0xea, 0xee, 0x8c, 0x9f, 0x96, 0xde, 0x42, 0x46, 0x8c, 0x2b, 0x17, 0x83, 0x36, 0xfb, 0xf4, 0xf7, 0xff, 0x79, 0xb9, 0x45, 0x41, 0xc9, 0x56, 0x1a, 0x6b, 0x0c, 0xa4, 0x1a, 0xdd, 0x6b, 0x95, 0xe8, 0x03, 0x0f, 0x09, 0x29, 0x40, 0x1b, 0xea, 0x87, 0xfa, 0xb9, 0x18, 0xa9, 0x95, 0x07, 0x7c, 0x2f, 0x7c, 0x33, 0xfb, 0xc5, 0x11, 0x5e, 0x81, 0x0e, 0xbc, 0xae, 0xec, 0xb3, 0xe1, 0x4a, 0x26, 0x56, 0xe8, 0x5b, 0x11, 0x9d, 0x37, 0x06, 0x9b, 0x34, 0x31, 0x6e, 0xa3, 0xba, 0x41, 0xbc, 0x11, 0xd8, 0xc5, 0x15, 0xc9, 0x30, 0x2c, 0x9b, 0xb6, 0x71, 0xd8, 0x7c, 0xbc, 0x38, 0x2f, 0xd5, 0xbd, 0x30, 0x96, 0xd4, 0xa3, 0x00, 0x77, 0x9d, 0x55, 0x4a, 0x33, 0x53, 0xb6, 0xb3, 0x35, 0x1b, 0xae, 0xe5, 0xdc, 0x22, 0x23, 0x85, 0x95, 0x88, 0xf9, 0x3b, 0xbf, 0x74, 0x13, 0xaa, 0xcb, 0x0a, 0x60, 0x79, 0x13, 0x79, 0xc0, 0x4a, 0x02, 0xdb, 0x1c, 0xc9, 0xff, 0x60, 0x57, 0x9a, 0x70, 0x28, 0x58, 0x60, 0xbc, 0x57, 0x07, 0xc7, 0x47, 0x1a, 0x45, 0x71, 0x76, 0x94, 0xfb, 0x05, 0xad, 0xec, 0x12, 0x29, 0x5a, 0x44, 0x6a, 0x81, 0xd9, 0xc6, 0xf0, 0xb6, 0x9b, 0x97, 0x83, 0x69, 0xfb, 0xdc, 0x0d, 0x4a, 0x67, 0xbc, 0x72, 0xf5, 0x43, 0x5e, 0x9b, 0x13, 0xf2, 0xe4, 0x6d, 0x49, 0xdb, 0x76, 0xcb, 0x42, 0x6a, 0x3c, 0x9f, 0xa1, 0xfe, 0x5e, 0xca, 0x0a, 0xfc, 0xfa, 0x39, 0x27, 0xd1, 0x3c, 0xcb, 0x9a, 0xde, 0x4c, 0x6b, 0x09, 0x8b, 0x49, 0xfd, 0x1e, 0x3d, 0x5e, 0x67, 0x7c, 0x57, 0xad, 0x90, 0xcc, 0x46, 0x5f, 0x5c, 0xae, 0x6a, 0x9c, 0xb2, 0xcd, 0x2c, 0x89, 0x78, 0xcf, 0xf1, 0x49, 0x96, 0x55, 0x1e, 0x04, 0xef, 0x0e, 0x1c, 0xde, 0x6c, 0x96, 0x51, 0x00, 0xee, 0x9a, 0x1f, 0x8d, 0x61, 0xbc, 0xeb, 0xb1, 0xa6, 0xa5, 0x21, 0x8b, 0xa7, 0xf8, 0x25, 0x41, 0x48, 0x62, 0x5b, 0x01, 0x6c, 0x7c, 0x2a, 0xe8, 0xff, 0xf9, 0xf9, 0x1f, 0xe2, 0x79, 0x2e, 0xd1, 0xff, 0xa3, 0x2e, 0x1c, 0x3a, 0x1a, 0x5d, 0x2b, 0x7b, 0x87, 0x25, 0x22, 0xa4, 0x90, 0xea, 0x26, 0x9d, 0xdd, 0x13, 0x60, 0x4c, 0x10, 0x03, 0xf6, 0x99, 0xd3, 0x21, 0x0c, 0x69, 0xc6, 0xd8, 0xc8, 0x9e, 0x94, 0x89, 0x51, 0x21, 0xe3, 0x9a, 0xcd, 0xda, 0x54, 0x72, 0x64, 0xae, 0x94, 0x79, 0x36, 0x81, 0x44, 0x14, 0x6d, 0x3a, 0x0e, 0xa6, 0x30, 0xbf, 0x95, 0x99, 0xa6, 0xf5, 0x7f, 0x4f, 0xef, 0xc6, 0x71, 0x2f, 0x36, 0x13, 0x14, 0xa2, 0x9d, 0xc2, 0x0c, 0x0d, 0x4e, 0xc0, 0x02, 0xd3, 0x6f, 0xee, 0x98, 0x5e, 0x24, 0x31, 0x74, 0x11, 0x96, 0x6e, 0x43, 0x57, 0xe8, 0x8e, 0xa0, 0x8d, 0x3d, 0x79, 0x38, 0x20, 0xc2, 0x0f, 0xb4, 0x75, 0x99, 0x3b, 0xb1, 0xf0, 0xe8, 0xe1, 0xda, 0xf9, 0xd4, 0xe6, 0xd6, 0xf4, 0x8a, 0x32, 0x4a, 0x4a, 0x25, 0xa8, 0xd9, 0x60, 0xd6, 0x33, 0x31, 0x97, 0xb9, 0xb6, 0xed, 0x5f, 0xfc, 0x15, 0xbd, 0x13, 0xc0, 0x3a, 0x3f, 0x1f, 0x2d, 0x09, 0x1d, 0xeb, 0x69, 0x6a, 0xfe, 0xd7, 0x95, 0x3e, 0x8a, 0x4e, 0xe1, 0x6e, 0x61, 0xb2, 0x6c, 0xe3, 0x2b, 0x70, 0x60, 0x7e, 0x8c, 0xe4, 0xdd, 0x27, 0x30, 0x7e, 0x0d, 0xc7, 0xb7, 0x9a, 0x1a, 0x3c, 0xcc, 0xa7, 0x22, 0x77, 0x14, 0x05, 0x50, 0x57, 0x31, 0x1b, 0xc8, 0xbf, 0xce, 0x52, 0xaf, 0x9c, 0x8e, 0x10, 0x2e, 0xd2, 0x16, 0xb6, 0x6e, 0x43, 0x10, 0xaf, 0x8b, 0xde, 0x1d, 0x60, 0xb2, 0x7d, 0xe6, 0x2f, 0x08, 0x10, 0x12, 0x7e, 0xb4, 0x76, 0x45, 0xb6, 0xd8, 0x9b, 0x26, 0x40, 0xa1, 0x63, 0x5c, 0x7a, 0x2a, 0xb1, 0x8c, 0xd6, 0xa4, 0x6f, 0x5a, 0xae, 0x33, 0x7e, 0x6d, 0x71, 0xf5, 0xc8, 0x6d, 0x80, 0x1c, 0x35, 0xfc, 0x3f, 0xc1, 0xa6, 0xc6, 0x1a, 0x15, 0x04, 0x6d, 0x76, 0x38, 0x32, 0x95, 0xb2, 0x51, 0x1a, 0xe9, 0x3e, 0x89, 0x9f, 0x0c, 0x79 };
-    var out: [Sha3_256.digest_length]u8 = undefined;
-
-    Sha3_256.hash(&amp;msg, &amp;out, .{});
-    try htest.assertEqual("5780048dfa381a1d01c747906e4a08711dd34fd712ecd7c6801dd2b38fd81a89", &amp;out);
-
-    var h = Sha3_256.init(.{});
-    h.update(msg[0..64]);
-    h.update(msg[64..613]);
-    h.final(&amp;out);
-    try htest.assertEqual("5780048dfa381a1d01c747906e4a08711dd34fd712ecd7c6801dd2b38fd81a89", &amp;out);
-}
-
-test "cSHAKE-128 with no context nor function name" {
-    var out: [32]u8 = undefined;
-    CShake128.hash("hello123", &amp;out, .{});
-    try htest.assertEqual("1b85861510bc4d8e467d6f8a92270533cbaa7ba5e06c2d2a502854bac468b8b9", &amp;out);
-}
-
-test "cSHAKE-128 with context" {
-    var out: [32]u8 = undefined;
-    CShake128.hash("hello123", &amp;out, .{ .context = "custom" });
-    try htest.assertEqual("7509fa13a6bd3e38ad5c6fac042142c233996e40ebffc86c276f108b3b19cc6a", &amp;out);
-}
-
-test "cSHAKE-128 with context and function" {
-    var out: [32]u8 = undefined;
-    CShake(128, "function").hash("hello123", &amp;out, .{ .context = "custom" });
-    try htest.assertEqual("ad7f4d7db2d96587fcd5047c65d37c368f5366e3afac60bb9b66b0bb95dfb675", &amp;out);
-}
-
-test "cSHAKE-256" {
-    var out: [32]u8 = undefined;
-    CShake256.hash("hello123", &amp;out, .{ .context = "custom" });
-    try htest.assertEqual("dabe027eb1a6cbe3a0542d0560eb4e6b39146dd72ae1bf89c970a61bd93b1813", &amp;out);
-}
-
-test "KMAC-128 with empty key and message" {
-    var out: [KMac128.mac_length]u8 = undefined;
-    const key = "";
-    KMac128.create(&amp;out, "", key);
-    try htest.assertEqual("5c135c615152fb4d9784dd1155f9b6034e013fd77165c327dfa4d36701983ef7", &amp;out);
-}
-
-test "KMAC-128" {
-    var out: [KMac128.mac_length]u8 = undefined;
-    const key = "A KMAC secret key";
-    KMac128.create(&amp;out, "hello123", key);
-    try htest.assertEqual("1fa1c0d761129a83f9a4299ca137674de8373a3cc437799ae4c129e651627f8e", &amp;out);
-}
-
-test "KMAC-128 with a customization string" {
-    var out: [KMac128.mac_length]u8 = undefined;
-    const key = "A KMAC secret key";
-    KMac128.createWithOptions(&amp;out, "hello123", key, .{ .context = "custom" });
-    try htest.assertEqual("c58c6d42dc00a27dfa8e7e08f8c9307cecb5d662ddb11b6c36057fc2e0e068ba", &amp;out);
-}
-
-test "KMACXOF-128" {
-    const key = "A KMAC secret key";
-    var xof = KMac128.init(key);
-    xof.update("hello123");
-    var out: [50]u8 = undefined;
-    xof.squeeze(&amp;out);
-    try htest.assertEqual("628c2fb870d294b3673ac82d9f0d651aae6a5bb8084ea8cd8343cb888d075b9053173200a71f301141069c3c0322527981f7", &amp;out);
-    xof.squeeze(&amp;out);
-    try htest.assertEqual("7b638e178cfdac5727a4ea7694efaa967a65a1d0034501855acff506b4158d187d5a18d668e67b43f2abf61144b20ed4c09f", &amp;out);
-}
-
-test "KMACXOF-256" {
-    const key = "A KMAC secret key";
-    var xof = KMac256.init(key);
-    xof.update("hello123");
-    var out: [50]u8 = undefined;
-    xof.squeeze(&amp;out);
-    try htest.assertEqual("23fc644bc2655ba6fde7b7c11f2804f22e8d8c6bd7db856268bf3370ce2362703f6c7e91916a1b8c116e60edfbcb25613054", &amp;out);
-    xof.squeeze(&amp;out);
-    try htest.assertEqual("ff97251020ff255ee65a1c1f5f78ebe904f61211c39f973f82fbce2b196b9f51c2cb12afe51549a0f1eaf7954e657ba11af3", &amp;out);
-}
-
-test "TupleHash-128" {
-    var st = TupleHash128.init();
-    st.update("hello");
-    st.update("123");
-    var out: [32]u8 = undefined;
-    st.final(&amp;out);
-    try htest.assertEqual("3938d49ade8ec0f0c305ac63497b2d2e8b2f650714f9667cc41816b1c11ffd20", &amp;out);
-}
-
-test "TupleHash-256" {
-    var st = TupleHash256.init();
-    st.update("hello");
-    st.update("123");
-    var out: [64]u8 = undefined;
-    st.final(&amp;out);
-    try htest.assertEqual("2dca563c2882f2ba4f46a441a4c5e13fb97150d1436fe99c7e4e43a2d20d0f1cd3d38483bde4a966930606dfa6c61c4ca6400aeedfb474d1bf0d7f6a70968289", &amp;out);
-}</pre>
+    <pre><a id="L1"></a>const builtin = @import("builtin");
+<a id="L2"></a>const std = @import("std");
+<a id="L3"></a>const assert = std.debug.assert;
+<a id="L4"></a>const math = std.math;
+<a id="L5"></a>const mem = std.mem;
+<a id="L6"></a>
+<a id="L7"></a>const kangarootwelve = @import("kangarootwelve.zig");
+<a id="L8"></a>
+<a id="L9"></a>const KeccakState = std.crypto.core.keccak.State;
+<a id="L10"></a>
+<a id="L11"></a>pub const Sha3_224 = Keccak(1600, 224, 0x06, 24);
+<a id="L12"></a>pub const Sha3_256 = Keccak(1600, 256, 0x06, 24);
+<a id="L13"></a>pub const Sha3_384 = Keccak(1600, 384, 0x06, 24);
+<a id="L14"></a>pub const Sha3_512 = Keccak(1600, 512, 0x06, 24);
+<a id="L15"></a>
+<a id="L16"></a>pub const Keccak256 = Keccak(1600, 256, 0x01, 24);
+<a id="L17"></a>pub const Keccak512 = Keccak(1600, 512, 0x01, 24);
+<a id="L18"></a>
+<a id="L19"></a>pub const Shake128 = Shake(128);
+<a id="L20"></a>pub const Shake256 = Shake(256);
+<a id="L21"></a>
+<a id="L22"></a>pub const CShake128 = CShake(128, null);
+<a id="L23"></a>pub const CShake256 = CShake(256, null);
+<a id="L24"></a>
+<a id="L25"></a>pub const KMac128 = KMac(128);
+<a id="L26"></a>pub const KMac256 = KMac(256);
+<a id="L27"></a>
+<a id="L28"></a>pub const TupleHash128 = TupleHash(128);
+<a id="L29"></a>pub const TupleHash256 = TupleHash(256);
+<a id="L30"></a>
+<a id="L31"></a>pub const KT128 = kangarootwelve.KT128;
+<a id="L32"></a>pub const KT256 = kangarootwelve.KT256;
+<a id="L33"></a>
+<a id="L34"></a>/// TurboSHAKE128 is a XOF (a secure hash function with a variable output length), with a 128 bit security level.
+<a id="L35"></a>/// It is based on the same permutation as SHA3 and SHAKE128, but which much higher performance.
+<a id="L36"></a>/// The delimiter is 0x1f by default, but can be changed for context-separation.
+<a id="L37"></a>/// For a protocol that uses both KangarooTwelve and TurboSHAKE128, it is recommended to avoid using 0x06, 0x07 or 0x0b for the delimiter.
+<a id="L38"></a>pub fn TurboShake128(delim: ?u7) type {
+<a id="L39"></a>    return TurboShake(128, delim);
+<a id="L40"></a>}
+<a id="L41"></a>
+<a id="L42"></a>/// TurboSHAKE256 is a XOF (a secure hash function with a variable output length), with a 256 bit security level.
+<a id="L43"></a>/// It is based on the same permutation as SHA3 and SHAKE256, but which much higher performance.
+<a id="L44"></a>/// The delimiter is 0x1f by default, but can be changed for context-separation.
+<a id="L45"></a>pub fn TurboShake256(comptime delim: ?u7) type {
+<a id="L46"></a>    return TurboShake(256, delim);
+<a id="L47"></a>}
+<a id="L48"></a>
+<a id="L49"></a>/// A generic Keccak hash function.
+<a id="L50"></a>pub fn Keccak(comptime f: u11, comptime output_bits: u11, comptime default_delim: u8, comptime rounds: u5) type {
+<a id="L51"></a>    comptime assert(output_bits &gt; 0 and output_bits * 2 &lt; f and output_bits % 8 == 0); // invalid output length
+<a id="L52"></a>
+<a id="L53"></a>    const State = KeccakState(f, output_bits * 2, rounds);
+<a id="L54"></a>
+<a id="L55"></a>    return struct {
+<a id="L56"></a>        const Self = @This();
+<a id="L57"></a>
+<a id="L58"></a>        st: State,
+<a id="L59"></a>
+<a id="L60"></a>        /// The output length, in bytes.
+<a id="L61"></a>        pub const digest_length = std.math.divCeil(comptime_int, output_bits, 8) catch unreachable;
+<a id="L62"></a>        /// The block length, or rate, in bytes.
+<a id="L63"></a>        pub const block_length = State.rate;
+<a id="L64"></a>        /// The delimiter can be overwritten in the options.
+<a id="L65"></a>        pub const Options = struct { delim: u8 = default_delim };
+<a id="L66"></a>
+<a id="L67"></a>        /// Initialize a Keccak hash function.
+<a id="L68"></a>        pub fn init(options: Options) Self {
+<a id="L69"></a>            return Self{ .st = .{ .delim = options.delim } };
+<a id="L70"></a>        }
+<a id="L71"></a>
+<a id="L72"></a>        /// Hash a slice of bytes.
+<a id="L73"></a>        pub fn hash(bytes: []const u8, out: *[digest_length]u8, options: Options) void {
+<a id="L74"></a>            var st = Self.init(options);
+<a id="L75"></a>            st.update(bytes);
+<a id="L76"></a>            st.final(out);
+<a id="L77"></a>        }
+<a id="L78"></a>
+<a id="L79"></a>        /// Absorb a slice of bytes into the state.
+<a id="L80"></a>        pub fn update(self: *Self, bytes: []const u8) void {
+<a id="L81"></a>            self.st.absorb(bytes);
+<a id="L82"></a>        }
+<a id="L83"></a>
+<a id="L84"></a>        /// Return the hash of the absorbed bytes.
+<a id="L85"></a>        pub fn final(self: *Self, out: *[digest_length]u8) void {
+<a id="L86"></a>            self.st.pad();
+<a id="L87"></a>            self.st.squeeze(out[0..]);
+<a id="L88"></a>        }
+<a id="L89"></a>    };
+<a id="L90"></a>}
+<a id="L91"></a>
+<a id="L92"></a>/// The SHAKE extendable output hash function.
+<a id="L93"></a>pub fn Shake(comptime security_level: u11) type {
+<a id="L94"></a>    return ShakeLike(security_level, 0x1f, 24);
+<a id="L95"></a>}
+<a id="L96"></a>
+<a id="L97"></a>/// The TurboSHAKE extendable output hash function.
+<a id="L98"></a>/// It is based on the same permutation as SHA3 and SHAKE, but which much higher performance.
+<a id="L99"></a>/// The delimiter is 0x1f by default, but can be changed for context-separation.
+<a id="L100"></a>/// https://eprint.iacr.org/2023/342
+<a id="L101"></a>pub fn TurboShake(comptime security_level: u11, comptime delim: ?u7) type {
+<a id="L102"></a>    comptime assert(security_level &lt;= 256);
+<a id="L103"></a>    const d = delim orelse 0x1f;
+<a id="L104"></a>    comptime assert(d &gt;= 0x01); // delimiter must be &gt;= 1
+<a id="L105"></a>    return ShakeLike(security_level, d, 12);
+<a id="L106"></a>}
+<a id="L107"></a>
+<a id="L108"></a>fn ShakeLike(comptime security_level: u11, comptime default_delim: u8, comptime rounds: u5) type {
+<a id="L109"></a>    const f = 1600;
+<a id="L110"></a>    const State = KeccakState(f, security_level * 2, rounds);
+<a id="L111"></a>
+<a id="L112"></a>    return struct {
+<a id="L113"></a>        const Self = @This();
+<a id="L114"></a>
+<a id="L115"></a>        st: State,
+<a id="L116"></a>        buf: [State.rate]u8 = undefined,
+<a id="L117"></a>        offset: usize = 0,
+<a id="L118"></a>        padded: bool = false,
+<a id="L119"></a>
+<a id="L120"></a>        /// The recommended output length, in bytes.
+<a id="L121"></a>        pub const digest_length = security_level / 8 * 2;
+<a id="L122"></a>        /// The block length, or rate, in bytes.
+<a id="L123"></a>        pub const block_length = State.rate;
+<a id="L124"></a>        /// The delimiter can be overwritten in the options.
+<a id="L125"></a>        pub const Options = struct { delim: u8 = default_delim };
+<a id="L126"></a>
+<a id="L127"></a>        /// Initialize a SHAKE extensible hash function.
+<a id="L128"></a>        pub fn init(options: Options) Self {
+<a id="L129"></a>            return Self{ .st = .{ .delim = options.delim } };
+<a id="L130"></a>        }
+<a id="L131"></a>
+<a id="L132"></a>        /// Hash a slice of bytes.
+<a id="L133"></a>        /// `out` can be any length.
+<a id="L134"></a>        pub fn hash(bytes: []const u8, out: []u8, options: Options) void {
+<a id="L135"></a>            var st = Self.init(options);
+<a id="L136"></a>            st.update(bytes);
+<a id="L137"></a>            st.squeeze(out);
+<a id="L138"></a>        }
+<a id="L139"></a>
+<a id="L140"></a>        /// Absorb a slice of bytes into the state.
+<a id="L141"></a>        pub fn update(self: *Self, bytes: []const u8) void {
+<a id="L142"></a>            self.st.absorb(bytes);
+<a id="L143"></a>        }
+<a id="L144"></a>
+<a id="L145"></a>        /// Squeeze a slice of bytes from the state.
+<a id="L146"></a>        /// `out` can be any length, and the function can be called multiple times.
+<a id="L147"></a>        pub fn squeeze(self: *Self, out_: []u8) void {
+<a id="L148"></a>            if (!self.padded) {
+<a id="L149"></a>                self.st.pad();
+<a id="L150"></a>                self.padded = true;
+<a id="L151"></a>            }
+<a id="L152"></a>            var out = out_;
+<a id="L153"></a>            if (self.offset &gt; 0) {
+<a id="L154"></a>                const left = self.buf.len - self.offset;
+<a id="L155"></a>                if (left &gt; 0) {
+<a id="L156"></a>                    const n = @min(left, out.len);
+<a id="L157"></a>                    @memcpy(out[0..n], self.buf[self.offset..][0..n]);
+<a id="L158"></a>                    out = out[n..];
+<a id="L159"></a>                    self.offset += n;
+<a id="L160"></a>                    if (out.len == 0) {
+<a id="L161"></a>                        return;
+<a id="L162"></a>                    }
+<a id="L163"></a>                }
+<a id="L164"></a>            }
+<a id="L165"></a>            const full_blocks = out[0 .. out.len - out.len % State.rate];
+<a id="L166"></a>            if (full_blocks.len &gt; 0) {
+<a id="L167"></a>                self.st.squeeze(full_blocks);
+<a id="L168"></a>                out = out[full_blocks.len..];
+<a id="L169"></a>            }
+<a id="L170"></a>            if (out.len &gt; 0) {
+<a id="L171"></a>                self.st.squeeze(self.buf[0..]);
+<a id="L172"></a>                @memcpy(out[0..], self.buf[0..out.len]);
+<a id="L173"></a>                self.offset = out.len;
+<a id="L174"></a>            }
+<a id="L175"></a>        }
+<a id="L176"></a>
+<a id="L177"></a>        /// Return the hash of the absorbed bytes.
+<a id="L178"></a>        /// `out` can be of any length, but the function must not be called multiple times (use `squeeze` for that purpose instead).
+<a id="L179"></a>        pub fn final(self: *Self, out: []u8) void {
+<a id="L180"></a>            self.squeeze(out);
+<a id="L181"></a>            self.st.st.clear(0, State.rate);
+<a id="L182"></a>        }
+<a id="L183"></a>
+<a id="L184"></a>        /// Align the input to a block boundary.
+<a id="L185"></a>        pub fn fillBlock(self: *Self) void {
+<a id="L186"></a>            self.st.fillBlock();
+<a id="L187"></a>        }
+<a id="L188"></a>    };
+<a id="L189"></a>}
+<a id="L190"></a>
+<a id="L191"></a>/// The cSHAKE extendable output hash function.
+<a id="L192"></a>/// cSHAKE is similar to SHAKE, but in addition to the input message, it also takes an optional context (aka customization string).
+<a id="L193"></a>pub fn CShake(comptime security_level: u11, comptime fname: ?[]const u8) type {
+<a id="L194"></a>    return CShakeLike(security_level, 0x04, 24, fname);
+<a id="L195"></a>}
+<a id="L196"></a>
+<a id="L197"></a>fn CShakeLike(comptime security_level: u11, comptime default_delim: u8, comptime rounds: u5, comptime fname: ?[]const u8) type {
+<a id="L198"></a>    return struct {
+<a id="L199"></a>        const Shaker = ShakeLike(security_level, default_delim, rounds);
+<a id="L200"></a>        shaker: Shaker,
+<a id="L201"></a>
+<a id="L202"></a>        /// The recommended output length, in bytes.
+<a id="L203"></a>        pub const digest_length = Shaker.digest_length;
+<a id="L204"></a>        /// The block length, or rate, in bytes.
+<a id="L205"></a>        pub const block_length = Shaker.block_length;
+<a id="L206"></a>
+<a id="L207"></a>        /// cSHAKE options can include a context string.
+<a id="L208"></a>        pub const Options = struct { context: ?[]const u8 = null };
+<a id="L209"></a>
+<a id="L210"></a>        const Self = @This();
+<a id="L211"></a>
+<a id="L212"></a>        /// Initialize a SHAKE extensible hash function.
+<a id="L213"></a>        pub fn init(options: Options) Self {
+<a id="L214"></a>            if (fname == null and options.context == null) {
+<a id="L215"></a>                return Self{ .shaker = Shaker.init(.{ .delim = 0x1f }) };
+<a id="L216"></a>            }
+<a id="L217"></a>            var shaker = Shaker.init(.{});
+<a id="L218"></a>            comptime assert(Shaker.block_length % 8 == 0);
+<a id="L219"></a>            const encoded_rate_len = NistLengthEncoding.encode(.left, block_length / 8);
+<a id="L220"></a>            shaker.update(encoded_rate_len.slice());
+<a id="L221"></a>            const encoded_zero = comptime NistLengthEncoding.encode(.left, 0);
+<a id="L222"></a>            if (fname) |name| {
+<a id="L223"></a>                const encoded_fname_len = comptime NistLengthEncoding.encode(.left, name.len);
+<a id="L224"></a>                const encoded_fname = comptime encoded_fname_len.slice() ++ name;
+<a id="L225"></a>                shaker.update(encoded_fname);
+<a id="L226"></a>            } else {
+<a id="L227"></a>                shaker.update(encoded_zero.slice());
+<a id="L228"></a>            }
+<a id="L229"></a>            if (options.context) |context| {
+<a id="L230"></a>                const encoded_context_len = NistLengthEncoding.encode(.left, context.len);
+<a id="L231"></a>                shaker.update(encoded_context_len.slice());
+<a id="L232"></a>                shaker.update(context);
+<a id="L233"></a>            } else {
+<a id="L234"></a>                shaker.update(encoded_zero.slice());
+<a id="L235"></a>            }
+<a id="L236"></a>            shaker.st.fillBlock();
+<a id="L237"></a>            return Self{ .shaker = shaker };
+<a id="L238"></a>        }
+<a id="L239"></a>
+<a id="L240"></a>        /// Hash a slice of bytes.
+<a id="L241"></a>        /// `out` can be any length.
+<a id="L242"></a>        pub fn hash(bytes: []const u8, out: []u8, options: Options) void {
+<a id="L243"></a>            var st = Self.init(options);
+<a id="L244"></a>            st.update(bytes);
+<a id="L245"></a>            st.squeeze(out);
+<a id="L246"></a>        }
+<a id="L247"></a>
+<a id="L248"></a>        /// Absorb a slice of bytes into the state.
+<a id="L249"></a>        pub fn update(self: *Self, bytes: []const u8) void {
+<a id="L250"></a>            self.shaker.update(bytes);
+<a id="L251"></a>        }
+<a id="L252"></a>
+<a id="L253"></a>        /// Squeeze a slice of bytes from the state.
+<a id="L254"></a>        /// `out` can be any length, and the function can be called multiple times.
+<a id="L255"></a>        pub fn squeeze(self: *Self, out: []u8) void {
+<a id="L256"></a>            self.shaker.squeeze(out);
+<a id="L257"></a>        }
+<a id="L258"></a>
+<a id="L259"></a>        /// Return the hash of the absorbed bytes.
+<a id="L260"></a>        /// `out` can be of any length, but the function must not be called multiple times (use `squeeze` for that purpose instead).
+<a id="L261"></a>        pub fn final(self: *Self, out: []u8) void {
+<a id="L262"></a>            self.shaker.final(out);
+<a id="L263"></a>        }
+<a id="L264"></a>
+<a id="L265"></a>        /// Align the input to a block boundary.
+<a id="L266"></a>        pub fn fillBlock(self: *Self) void {
+<a id="L267"></a>            self.shaker.fillBlock();
+<a id="L268"></a>        }
+<a id="L269"></a>    };
+<a id="L270"></a>}
+<a id="L271"></a>
+<a id="L272"></a>/// The KMAC extendable output authentication function.
+<a id="L273"></a>/// KMAC is a keyed version of the cSHAKE function, with an optional context.
+<a id="L274"></a>/// It can be used as an SHA-3 based alternative to HMAC, as well as a generic keyed XoF (extendable output function).
+<a id="L275"></a>pub fn KMac(comptime security_level: u11) type {
+<a id="L276"></a>    return KMacLike(security_level, 0x04, 24);
+<a id="L277"></a>}
+<a id="L278"></a>
+<a id="L279"></a>fn KMacLike(comptime security_level: u11, comptime default_delim: u8, comptime rounds: u5) type {
+<a id="L280"></a>    const CShaker = CShakeLike(security_level, default_delim, rounds, "KMAC");
+<a id="L281"></a>
+<a id="L282"></a>    return struct {
+<a id="L283"></a>        const Self = @This();
+<a id="L284"></a>
+<a id="L285"></a>        /// The recommended output length, in bytes.
+<a id="L286"></a>        pub const mac_length = CShaker.digest_length;
+<a id="L287"></a>        /// The minimum output length, in bytes.
+<a id="L288"></a>        pub const mac_length_min = 4;
+<a id="L289"></a>        /// The recommended key length, in bytes.
+<a id="L290"></a>        pub const key_length = security_level / 8;
+<a id="L291"></a>        /// The minimum key length, in bytes.
+<a id="L292"></a>        pub const key_length_min = 0;
+<a id="L293"></a>        /// The block length, or rate, in bytes.
+<a id="L294"></a>        pub const block_length = CShaker.block_length;
+<a id="L295"></a>
+<a id="L296"></a>        cshaker: CShaker,
+<a id="L297"></a>        xof_mode: bool = false,
+<a id="L298"></a>
+<a id="L299"></a>        /// KMAC options can include a context string.
+<a id="L300"></a>        pub const Options = struct {
+<a id="L301"></a>            context: ?[]const u8 = null,
+<a id="L302"></a>        };
+<a id="L303"></a>
+<a id="L304"></a>        /// Initialize a state for the KMAC function, with an optional context and an arbitrary-long key.
+<a id="L305"></a>        /// If the context and key are going to be reused, the structure can be initialized once, and cloned for each message.
+<a id="L306"></a>        /// This is more efficient than reinitializing the state for each message at the cost of a small amount of memory.
+<a id="L307"></a>        pub fn initWithOptions(key: []const u8, options: Options) Self {
+<a id="L308"></a>            var cshaker = CShaker.init(.{ .context = options.context });
+<a id="L309"></a>            const encoded_rate_len = NistLengthEncoding.encode(.left, block_length / 8);
+<a id="L310"></a>            cshaker.update(encoded_rate_len.slice());
+<a id="L311"></a>            const encoded_key_len = NistLengthEncoding.encode(.left, key.len);
+<a id="L312"></a>            cshaker.update(encoded_key_len.slice());
+<a id="L313"></a>            cshaker.update(key);
+<a id="L314"></a>            cshaker.fillBlock();
+<a id="L315"></a>            return Self{
+<a id="L316"></a>                .cshaker = cshaker,
+<a id="L317"></a>            };
+<a id="L318"></a>        }
+<a id="L319"></a>
+<a id="L320"></a>        /// Initialize a state for the KMAC function.
+<a id="L321"></a>        /// If the context and key are going to be reused, the structure can be initialized once, and cloned for each message.
+<a id="L322"></a>        /// This is more efficient than reinitializing the state for each message at the cost of a small amount of memory.
+<a id="L323"></a>        pub fn init(key: []const u8) Self {
+<a id="L324"></a>            return initWithOptions(key, .{});
+<a id="L325"></a>        }
+<a id="L326"></a>
+<a id="L327"></a>        /// Add data to the state.
+<a id="L328"></a>        pub fn update(self: *Self, b: []const u8) void {
+<a id="L329"></a>            self.cshaker.update(b);
+<a id="L330"></a>        }
+<a id="L331"></a>
+<a id="L332"></a>        /// Return an authentication tag for the current state.
+<a id="L333"></a>        pub fn final(self: *Self, out: []u8) void {
+<a id="L334"></a>            const encoded_out_len = NistLengthEncoding.encode(.right, out.len);
+<a id="L335"></a>            self.update(encoded_out_len.slice());
+<a id="L336"></a>            self.cshaker.final(out);
+<a id="L337"></a>        }
+<a id="L338"></a>
+<a id="L339"></a>        /// Squeeze a slice of bytes from the state.
+<a id="L340"></a>        /// `out` can be any length, and the function can be called multiple times.
+<a id="L341"></a>        pub fn squeeze(self: *Self, out: []u8) void {
+<a id="L342"></a>            if (!self.xof_mode) {
+<a id="L343"></a>                const encoded_out_len = comptime NistLengthEncoding.encode(.right, 0);
+<a id="L344"></a>                self.update(encoded_out_len.slice());
+<a id="L345"></a>                self.xof_mode = true;
+<a id="L346"></a>            }
+<a id="L347"></a>            self.cshaker.squeeze(out);
+<a id="L348"></a>        }
+<a id="L349"></a>
+<a id="L350"></a>        /// Return an authentication tag for a message and a key, with an optional context.
+<a id="L351"></a>        pub fn createWithOptions(out: []u8, msg: []const u8, key: []const u8, options: Options) void {
+<a id="L352"></a>            var ctx = Self.initWithOptions(key, options);
+<a id="L353"></a>            ctx.update(msg);
+<a id="L354"></a>            ctx.final(out);
+<a id="L355"></a>        }
+<a id="L356"></a>
+<a id="L357"></a>        /// Return an authentication tag for a message and a key.
+<a id="L358"></a>        pub fn create(out: []u8, msg: []const u8, key: []const u8) void {
+<a id="L359"></a>            var ctx = Self.init(key);
+<a id="L360"></a>            ctx.update(msg);
+<a id="L361"></a>            ctx.final(out);
+<a id="L362"></a>        }
+<a id="L363"></a>    };
+<a id="L364"></a>}
+<a id="L365"></a>
+<a id="L366"></a>/// The TupleHash extendable output hash function, with domain-separated inputs.
+<a id="L367"></a>/// TupleHash is a secure hash function with a variable output length, based on the cSHAKE function.
+<a id="L368"></a>/// It is designed for unambiguously hashing tuples of data.
+<a id="L369"></a>///
+<a id="L370"></a>/// With most hash functions, calling `update("A")` followed by `update("B")`is identical to `update("AB")`.
+<a id="L371"></a>/// With TupleHash, this is not the case: `update("A"); update("B")` is different from `update("AB")`.
+<a id="L372"></a>///
+<a id="L373"></a>/// Any number of inputs can be hashed, and the output depends on individual inputs and their order.
+<a id="L374"></a>pub fn TupleHash(comptime security_level: u11) type {
+<a id="L375"></a>    return TupleHashLike(security_level, 0x04, 24);
+<a id="L376"></a>}
+<a id="L377"></a>
+<a id="L378"></a>fn TupleHashLike(comptime security_level: u11, comptime default_delim: u8, comptime rounds: u5) type {
+<a id="L379"></a>    const CShaker = CShakeLike(security_level, default_delim, rounds, "TupleHash");
+<a id="L380"></a>
+<a id="L381"></a>    return struct {
+<a id="L382"></a>        const Self = @This();
+<a id="L383"></a>
+<a id="L384"></a>        /// The output length, in bytes.
+<a id="L385"></a>        pub const digest_length = CShaker.digest_length;
+<a id="L386"></a>        /// The block length, or rate, in bytes.
+<a id="L387"></a>        pub const block_length = CShaker.block_length;
+<a id="L388"></a>
+<a id="L389"></a>        cshaker: CShaker,
+<a id="L390"></a>        xof_mode: bool = false,
+<a id="L391"></a>
+<a id="L392"></a>        /// TupleHash options can include a context string.
+<a id="L393"></a>        pub const Options = struct {
+<a id="L394"></a>            context: ?[]const u8 = null,
+<a id="L395"></a>        };
+<a id="L396"></a>
+<a id="L397"></a>        /// Initialize a state for the TupleHash function, with an optional context.
+<a id="L398"></a>        /// If the context is going to be reused, the structure can be initialized once, and cloned for each message.
+<a id="L399"></a>        /// This is more efficient than reinitializing the state for each message at the cost of a small amount of memory.
+<a id="L400"></a>        ///
+<a id="L401"></a>        /// A key can be optionally added to the context to create a keyed TupleHash function, similar to KMAC.
+<a id="L402"></a>        pub fn initWithOptions(options: Options) Self {
+<a id="L403"></a>            const cshaker = CShaker.init(.{ .context = options.context });
+<a id="L404"></a>            return Self{
+<a id="L405"></a>                .cshaker = cshaker,
+<a id="L406"></a>            };
+<a id="L407"></a>        }
+<a id="L408"></a>
+<a id="L409"></a>        /// Initialize a state for the MAC function.
+<a id="L410"></a>        pub fn init() Self {
+<a id="L411"></a>            return initWithOptions(.{});
+<a id="L412"></a>        }
+<a id="L413"></a>
+<a id="L414"></a>        /// Add data to the state, separated from previous updates.
+<a id="L415"></a>        pub fn update(self: *Self, b: []const u8) void {
+<a id="L416"></a>            const encoded_b_len = NistLengthEncoding.encode(.left, b.len);
+<a id="L417"></a>            self.cshaker.update(encoded_b_len.slice());
+<a id="L418"></a>            self.cshaker.update(b);
+<a id="L419"></a>        }
+<a id="L420"></a>
+<a id="L421"></a>        /// Return an authentication tag for the current state.
+<a id="L422"></a>        pub fn final(self: *Self, out: []u8) void {
+<a id="L423"></a>            const encoded_out_len = NistLengthEncoding.encode(.right, out.len);
+<a id="L424"></a>            self.cshaker.update(encoded_out_len.slice());
+<a id="L425"></a>            self.cshaker.final(out);
+<a id="L426"></a>        }
+<a id="L427"></a>
+<a id="L428"></a>        /// Align the input to a block boundary.
+<a id="L429"></a>        pub fn fillBlock(self: *Self) void {
+<a id="L430"></a>            self.cshaker.fillBlock();
+<a id="L431"></a>        }
+<a id="L432"></a>
+<a id="L433"></a>        /// Squeeze a slice of bytes from the state.
+<a id="L434"></a>        /// `out` can be any length, and the function can be called multiple times.
+<a id="L435"></a>        pub fn squeeze(self: *Self, out: []u8) void {
+<a id="L436"></a>            if (!self.xof_mode) {
+<a id="L437"></a>                const encoded_out_len = comptime NistLengthEncoding.encode(.right, 0);
+<a id="L438"></a>                self.update(encoded_out_len.slice());
+<a id="L439"></a>                self.xof_mode = true;
+<a id="L440"></a>            }
+<a id="L441"></a>            self.cshaker.squeeze(out);
+<a id="L442"></a>        }
+<a id="L443"></a>    };
+<a id="L444"></a>}
+<a id="L445"></a>
+<a id="L446"></a>/// The NIST SP 800-185 encoded length format.
+<a id="L447"></a>pub const NistLengthEncoding = enum {
+<a id="L448"></a>    left,
+<a id="L449"></a>    right,
+<a id="L450"></a>
+<a id="L451"></a>    /// A length encoded according to NIST SP 800-185.
+<a id="L452"></a>    pub const Length = struct {
+<a id="L453"></a>        /// The size of the encoded value, in bytes.
+<a id="L454"></a>        len: usize = 0,
+<a id="L455"></a>        /// A buffer to store the encoded length.
+<a id="L456"></a>        buf: [@sizeOf(usize) + 1]u8 = undefined,
+<a id="L457"></a>
+<a id="L458"></a>        /// Return the encoded length as a slice.
+<a id="L459"></a>        pub fn slice(self: *const Length) []const u8 {
+<a id="L460"></a>            return self.buf[0..self.len];
+<a id="L461"></a>        }
+<a id="L462"></a>    };
+<a id="L463"></a>
+<a id="L464"></a>    /// Encode a length according to NIST SP 800-185.
+<a id="L465"></a>    pub fn encode(comptime encoding: NistLengthEncoding, len: usize) Length {
+<a id="L466"></a>        const len_bits = @bitSizeOf(@TypeOf(len)) - @clz(len) + 3;
+<a id="L467"></a>        const len_bytes = std.math.divCeil(usize, len_bits, 8) catch unreachable;
+<a id="L468"></a>
+<a id="L469"></a>        var res = Length{ .len = len_bytes + 1 };
+<a id="L470"></a>        if (encoding == .right) {
+<a id="L471"></a>            res.buf[len_bytes] = @intCast(len_bytes);
+<a id="L472"></a>        }
+<a id="L473"></a>        const end = if (encoding == .right) len_bytes - 1 else len_bytes;
+<a id="L474"></a>        res.buf[end] = @truncate(len &lt;&lt; 3);
+<a id="L475"></a>        var len_ = len &gt;&gt; 5;
+<a id="L476"></a>        for (1..len_bytes) |i| {
+<a id="L477"></a>            res.buf[end - i] = @truncate(len_);
+<a id="L478"></a>            len_ &gt;&gt;= 8;
+<a id="L479"></a>        }
+<a id="L480"></a>        if (encoding == .left) {
+<a id="L481"></a>            res.buf[0] = @intCast(len_bytes);
+<a id="L482"></a>        }
+<a id="L483"></a>        return res;
+<a id="L484"></a>    }
+<a id="L485"></a>};
+<a id="L486"></a>
+<a id="L487"></a>const htest = @import("test.zig");
+<a id="L488"></a>
+<a id="L489"></a>test {
+<a id="L490"></a>    _ = kangarootwelve;
+<a id="L491"></a>}
+<a id="L492"></a>
+<a id="L493"></a>test "sha3-224 single" {
+<a id="L494"></a>    try htest.assertEqualHash(Sha3_224, "6b4e03423667dbb73b6e15454f0eb1abd4597f9a1b078e3f5b5a6bc7", "");
+<a id="L495"></a>    try htest.assertEqualHash(Sha3_224, "e642824c3f8cf24ad09234ee7d3c766fc9a3a5168d0c94ad73b46fdf", "abc");
+<a id="L496"></a>    try htest.assertEqualHash(Sha3_224, "543e6868e1666c1a643630df77367ae5a62a85070a51c14cbf665cbc", "abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu");
+<a id="L497"></a>}
+<a id="L498"></a>
+<a id="L499"></a>test "sha3-224 streaming" {
+<a id="L500"></a>    var h = Sha3_224.init(.{});
+<a id="L501"></a>    var out: [28]u8 = undefined;
+<a id="L502"></a>
+<a id="L503"></a>    h.final(out[0..]);
+<a id="L504"></a>    try htest.assertEqual("6b4e03423667dbb73b6e15454f0eb1abd4597f9a1b078e3f5b5a6bc7", out[0..]);
+<a id="L505"></a>
+<a id="L506"></a>    h = Sha3_224.init(.{});
+<a id="L507"></a>    h.update("abc");
+<a id="L508"></a>    h.final(out[0..]);
+<a id="L509"></a>    try htest.assertEqual("e642824c3f8cf24ad09234ee7d3c766fc9a3a5168d0c94ad73b46fdf", out[0..]);
+<a id="L510"></a>
+<a id="L511"></a>    h = Sha3_224.init(.{});
+<a id="L512"></a>    h.update("a");
+<a id="L513"></a>    h.update("b");
+<a id="L514"></a>    h.update("c");
+<a id="L515"></a>    h.final(out[0..]);
+<a id="L516"></a>    try htest.assertEqual("e642824c3f8cf24ad09234ee7d3c766fc9a3a5168d0c94ad73b46fdf", out[0..]);
+<a id="L517"></a>}
+<a id="L518"></a>
+<a id="L519"></a>test "sha3-256 single" {
+<a id="L520"></a>    try htest.assertEqualHash(Sha3_256, "a7ffc6f8bf1ed76651c14756a061d662f580ff4de43b49fa82d80a4b80f8434a", "");
+<a id="L521"></a>    try htest.assertEqualHash(Sha3_256, "3a985da74fe225b2045c172d6bd390bd855f086e3e9d525b46bfe24511431532", "abc");
+<a id="L522"></a>    try htest.assertEqualHash(Sha3_256, "916f6061fe879741ca6469b43971dfdb28b1a32dc36cb3254e812be27aad1d18", "abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu");
+<a id="L523"></a>}
+<a id="L524"></a>
+<a id="L525"></a>test "sha3-256 streaming" {
+<a id="L526"></a>    var h = Sha3_256.init(.{});
+<a id="L527"></a>    var out: [32]u8 = undefined;
+<a id="L528"></a>
+<a id="L529"></a>    h.final(out[0..]);
+<a id="L530"></a>    try htest.assertEqual("a7ffc6f8bf1ed76651c14756a061d662f580ff4de43b49fa82d80a4b80f8434a", out[0..]);
+<a id="L531"></a>
+<a id="L532"></a>    h = Sha3_256.init(.{});
+<a id="L533"></a>    h.update("abc");
+<a id="L534"></a>    h.final(out[0..]);
+<a id="L535"></a>    try htest.assertEqual("3a985da74fe225b2045c172d6bd390bd855f086e3e9d525b46bfe24511431532", out[0..]);
+<a id="L536"></a>
+<a id="L537"></a>    h = Sha3_256.init(.{});
+<a id="L538"></a>    h.update("a");
+<a id="L539"></a>    h.update("b");
+<a id="L540"></a>    h.update("c");
+<a id="L541"></a>    h.final(out[0..]);
+<a id="L542"></a>    try htest.assertEqual("3a985da74fe225b2045c172d6bd390bd855f086e3e9d525b46bfe24511431532", out[0..]);
+<a id="L543"></a>}
+<a id="L544"></a>
+<a id="L545"></a>test "sha3-256 aligned final" {
+<a id="L546"></a>    var block = [_]u8{0} ** Sha3_256.block_length;
+<a id="L547"></a>    var out: [Sha3_256.digest_length]u8 = undefined;
+<a id="L548"></a>
+<a id="L549"></a>    var h = Sha3_256.init(.{});
+<a id="L550"></a>    h.update(&amp;block);
+<a id="L551"></a>    h.final(out[0..]);
+<a id="L552"></a>}
+<a id="L553"></a>
+<a id="L554"></a>test "sha3-384 single" {
+<a id="L555"></a>    const h1 = "0c63a75b845e4f7d01107d852e4c2485c51a50aaaa94fc61995e71bbee983a2ac3713831264adb47fb6bd1e058d5f004";
+<a id="L556"></a>    try htest.assertEqualHash(Sha3_384, h1, "");
+<a id="L557"></a>    const h2 = "ec01498288516fc926459f58e2c6ad8df9b473cb0fc08c2596da7cf0e49be4b298d88cea927ac7f539f1edf228376d25";
+<a id="L558"></a>    try htest.assertEqualHash(Sha3_384, h2, "abc");
+<a id="L559"></a>    const h3 = "79407d3b5916b59c3e30b09822974791c313fb9ecc849e406f23592d04f625dc8c709b98b43b3852b337216179aa7fc7";
+<a id="L560"></a>    try htest.assertEqualHash(Sha3_384, h3, "abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu");
+<a id="L561"></a>}
+<a id="L562"></a>
+<a id="L563"></a>test "sha3-384 streaming" {
+<a id="L564"></a>    var h = Sha3_384.init(.{});
+<a id="L565"></a>    var out: [48]u8 = undefined;
+<a id="L566"></a>
+<a id="L567"></a>    const h1 = "0c63a75b845e4f7d01107d852e4c2485c51a50aaaa94fc61995e71bbee983a2ac3713831264adb47fb6bd1e058d5f004";
+<a id="L568"></a>    h.final(out[0..]);
+<a id="L569"></a>    try htest.assertEqual(h1, out[0..]);
+<a id="L570"></a>
+<a id="L571"></a>    const h2 = "ec01498288516fc926459f58e2c6ad8df9b473cb0fc08c2596da7cf0e49be4b298d88cea927ac7f539f1edf228376d25";
+<a id="L572"></a>    h = Sha3_384.init(.{});
+<a id="L573"></a>    h.update("abc");
+<a id="L574"></a>    h.final(out[0..]);
+<a id="L575"></a>    try htest.assertEqual(h2, out[0..]);
+<a id="L576"></a>
+<a id="L577"></a>    h = Sha3_384.init(.{});
+<a id="L578"></a>    h.update("a");
+<a id="L579"></a>    h.update("b");
+<a id="L580"></a>    h.update("c");
+<a id="L581"></a>    h.final(out[0..]);
+<a id="L582"></a>    try htest.assertEqual(h2, out[0..]);
+<a id="L583"></a>}
+<a id="L584"></a>
+<a id="L585"></a>test "sha3-512 single" {
+<a id="L586"></a>    if (builtin.cpu.has(.riscv, .v) and builtin.zig_backend == .stage2_llvm) return error.SkipZigTest; // https://github.com/ziglang/zig/issues/25083
+<a id="L587"></a>
+<a id="L588"></a>    const h1 = "a69f73cca23a9ac5c8b567dc185a756e97c982164fe25859e0d1dcc1475c80a615b2123af1f5f94c11e3e9402c3ac558f500199d95b6d3e301758586281dcd26";
+<a id="L589"></a>    try htest.assertEqualHash(Sha3_512, h1, "");
+<a id="L590"></a>    const h2 = "b751850b1a57168a5693cd924b6b096e08f621827444f70d884f5d0240d2712e10e116e9192af3c91a7ec57647e3934057340b4cf408d5a56592f8274eec53f0";
+<a id="L591"></a>    try htest.assertEqualHash(Sha3_512, h2, "abc");
+<a id="L592"></a>    const h3 = "afebb2ef542e6579c50cad06d2e578f9f8dd6881d7dc824d26360feebf18a4fa73e3261122948efcfd492e74e82e2189ed0fb440d187f382270cb455f21dd185";
+<a id="L593"></a>    try htest.assertEqualHash(Sha3_512, h3, "abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu");
+<a id="L594"></a>}
+<a id="L595"></a>
+<a id="L596"></a>test "sha3-512 streaming" {
+<a id="L597"></a>    var h = Sha3_512.init(.{});
+<a id="L598"></a>    var out: [64]u8 = undefined;
+<a id="L599"></a>
+<a id="L600"></a>    const h1 = "a69f73cca23a9ac5c8b567dc185a756e97c982164fe25859e0d1dcc1475c80a615b2123af1f5f94c11e3e9402c3ac558f500199d95b6d3e301758586281dcd26";
+<a id="L601"></a>    h.final(out[0..]);
+<a id="L602"></a>    try htest.assertEqual(h1, out[0..]);
+<a id="L603"></a>
+<a id="L604"></a>    const h2 = "b751850b1a57168a5693cd924b6b096e08f621827444f70d884f5d0240d2712e10e116e9192af3c91a7ec57647e3934057340b4cf408d5a56592f8274eec53f0";
+<a id="L605"></a>    h = Sha3_512.init(.{});
+<a id="L606"></a>    h.update("abc");
+<a id="L607"></a>    h.final(out[0..]);
+<a id="L608"></a>    try htest.assertEqual(h2, out[0..]);
+<a id="L609"></a>
+<a id="L610"></a>    h = Sha3_512.init(.{});
+<a id="L611"></a>    h.update("a");
+<a id="L612"></a>    h.update("b");
+<a id="L613"></a>    h.update("c");
+<a id="L614"></a>    h.final(out[0..]);
+<a id="L615"></a>    try htest.assertEqual(h2, out[0..]);
+<a id="L616"></a>}
+<a id="L617"></a>
+<a id="L618"></a>test "sha3-512 aligned final" {
+<a id="L619"></a>    var block = [_]u8{0} ** Sha3_512.block_length;
+<a id="L620"></a>    var out: [Sha3_512.digest_length]u8 = undefined;
+<a id="L621"></a>
+<a id="L622"></a>    var h = Sha3_512.init(.{});
+<a id="L623"></a>    h.update(&amp;block);
+<a id="L624"></a>    h.final(out[0..]);
+<a id="L625"></a>}
+<a id="L626"></a>
+<a id="L627"></a>test "keccak-256 single" {
+<a id="L628"></a>    try htest.assertEqualHash(Keccak256, "c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470", "");
+<a id="L629"></a>    try htest.assertEqualHash(Keccak256, "4e03657aea45a94fc7d47ba826c8d667c0d1e6e33a64a036ec44f58fa12d6c45", "abc");
+<a id="L630"></a>    try htest.assertEqualHash(Keccak256, "f519747ed599024f3882238e5ab43960132572b7345fbeb9a90769dafd21ad67", "abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu");
+<a id="L631"></a>}
+<a id="L632"></a>
+<a id="L633"></a>test "keccak-512 single" {
+<a id="L634"></a>    try htest.assertEqualHash(Keccak512, "0eab42de4c3ceb9235fc91acffe746b29c29a8c366b7c60e4e67c466f36a4304c00fa9caf9d87976ba469bcbe06713b435f091ef2769fb160cdab33d3670680e", "");
+<a id="L635"></a>    try htest.assertEqualHash(Keccak512, "18587dc2ea106b9a1563e32b3312421ca164c7f1f07bc922a9c83d77cea3a1e5d0c69910739025372dc14ac9642629379540c17e2a65b19d77aa511a9d00bb96", "abc");
+<a id="L636"></a>    try htest.assertEqualHash(Keccak512, "ac2fb35251825d3aa48468a9948c0a91b8256f6d97d8fa4160faff2dd9dfcc24f3f1db7a983dad13d53439ccac0b37e24037e7b95f80f59f37a2f683c4ba4682", "abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu");
+<a id="L637"></a>}
+<a id="L638"></a>
+<a id="L639"></a>test "SHAKE-128 single" {
+<a id="L640"></a>    var out: [10]u8 = undefined;
+<a id="L641"></a>    Shake128.hash("hello123", &amp;out, .{});
+<a id="L642"></a>    try htest.assertEqual("1b85861510bc4d8e467d", &amp;out);
+<a id="L643"></a>}
+<a id="L644"></a>
+<a id="L645"></a>test "SHAKE-128 multisqueeze" {
+<a id="L646"></a>    var out: [10]u8 = undefined;
+<a id="L647"></a>    var h = Shake128.init(.{});
+<a id="L648"></a>    h.update("hello123");
+<a id="L649"></a>    h.squeeze(out[0..4]);
+<a id="L650"></a>    h.squeeze(out[4..]);
+<a id="L651"></a>    try htest.assertEqual("1b85861510bc4d8e467d", &amp;out);
+<a id="L652"></a>}
+<a id="L653"></a>
+<a id="L654"></a>test "SHAKE-128 multisqueeze with multiple blocks" {
+<a id="L655"></a>    var out: [100]u8 = undefined;
+<a id="L656"></a>    var out2: [100]u8 = undefined;
+<a id="L657"></a>
+<a id="L658"></a>    var h = Shake128.init(.{});
+<a id="L659"></a>    h.update("hello123");
+<a id="L660"></a>    h.squeeze(out[0..50]);
+<a id="L661"></a>    h.squeeze(out[50..]);
+<a id="L662"></a>
+<a id="L663"></a>    var h2 = Shake128.init(.{});
+<a id="L664"></a>    h2.update("hello123");
+<a id="L665"></a>    h2.squeeze(&amp;out2);
+<a id="L666"></a>    try std.testing.expectEqualSlices(u8, &amp;out, &amp;out2);
+<a id="L667"></a>}
+<a id="L668"></a>
+<a id="L669"></a>test "SHAKE-256 single" {
+<a id="L670"></a>    var out: [10]u8 = undefined;
+<a id="L671"></a>    Shake256.hash("hello123", &amp;out, .{});
+<a id="L672"></a>    try htest.assertEqual("ade612ba265f92de4a37", &amp;out);
+<a id="L673"></a>}
+<a id="L674"></a>
+<a id="L675"></a>test "TurboSHAKE-128" {
+<a id="L676"></a>    var out: [32]u8 = undefined;
+<a id="L677"></a>    TurboShake(128, 0x06).hash("\xff", &amp;out, .{});
+<a id="L678"></a>    try htest.assertEqual("8ec9c66465ed0d4a6c35d13506718d687a25cb05c74cca1e42501abd83874a67", &amp;out);
+<a id="L679"></a>}
+<a id="L680"></a>
+<a id="L681"></a>test "SHA-3 with streaming" {
+<a id="L682"></a>    var msg: [613]u8 = [613]u8{ 0x97, 0xd1, 0x2d, 0x1a, 0x16, 0x2d, 0x36, 0x4d, 0x20, 0x62, 0x19, 0x0b, 0x14, 0x93, 0xbb, 0xf8, 0x5b, 0xea, 0x04, 0xc2, 0x61, 0x8e, 0xd6, 0x08, 0x81, 0xa1, 0x1d, 0x73, 0x27, 0x48, 0xbf, 0xa4, 0xba, 0xb1, 0x9a, 0x48, 0x9c, 0xf9, 0x9b, 0xff, 0x34, 0x48, 0xa9, 0x75, 0xea, 0xc8, 0xa3, 0x48, 0x24, 0x9d, 0x75, 0x27, 0x48, 0xec, 0x03, 0xb0, 0xbb, 0xdf, 0x33, 0x90, 0xe3, 0x93, 0xed, 0x68, 0x24, 0x39, 0x12, 0xdf, 0xea, 0xee, 0x8c, 0x9f, 0x96, 0xde, 0x42, 0x46, 0x8c, 0x2b, 0x17, 0x83, 0x36, 0xfb, 0xf4, 0xf7, 0xff, 0x79, 0xb9, 0x45, 0x41, 0xc9, 0x56, 0x1a, 0x6b, 0x0c, 0xa4, 0x1a, 0xdd, 0x6b, 0x95, 0xe8, 0x03, 0x0f, 0x09, 0x29, 0x40, 0x1b, 0xea, 0x87, 0xfa, 0xb9, 0x18, 0xa9, 0x95, 0x07, 0x7c, 0x2f, 0x7c, 0x33, 0xfb, 0xc5, 0x11, 0x5e, 0x81, 0x0e, 0xbc, 0xae, 0xec, 0xb3, 0xe1, 0x4a, 0x26, 0x56, 0xe8, 0x5b, 0x11, 0x9d, 0x37, 0x06, 0x9b, 0x34, 0x31, 0x6e, 0xa3, 0xba, 0x41, 0xbc, 0x11, 0xd8, 0xc5, 0x15, 0xc9, 0x30, 0x2c, 0x9b, 0xb6, 0x71, 0xd8, 0x7c, 0xbc, 0x38, 0x2f, 0xd5, 0xbd, 0x30, 0x96, 0xd4, 0xa3, 0x00, 0x77, 0x9d, 0x55, 0x4a, 0x33, 0x53, 0xb6, 0xb3, 0x35, 0x1b, 0xae, 0xe5, 0xdc, 0x22, 0x23, 0x85, 0x95, 0x88, 0xf9, 0x3b, 0xbf, 0x74, 0x13, 0xaa, 0xcb, 0x0a, 0x60, 0x79, 0x13, 0x79, 0xc0, 0x4a, 0x02, 0xdb, 0x1c, 0xc9, 0xff, 0x60, 0x57, 0x9a, 0x70, 0x28, 0x58, 0x60, 0xbc, 0x57, 0x07, 0xc7, 0x47, 0x1a, 0x45, 0x71, 0x76, 0x94, 0xfb, 0x05, 0xad, 0xec, 0x12, 0x29, 0x5a, 0x44, 0x6a, 0x81, 0xd9, 0xc6, 0xf0, 0xb6, 0x9b, 0x97, 0x83, 0x69, 0xfb, 0xdc, 0x0d, 0x4a, 0x67, 0xbc, 0x72, 0xf5, 0x43, 0x5e, 0x9b, 0x13, 0xf2, 0xe4, 0x6d, 0x49, 0xdb, 0x76, 0xcb, 0x42, 0x6a, 0x3c, 0x9f, 0xa1, 0xfe, 0x5e, 0xca, 0x0a, 0xfc, 0xfa, 0x39, 0x27, 0xd1, 0x3c, 0xcb, 0x9a, 0xde, 0x4c, 0x6b, 0x09, 0x8b, 0x49, 0xfd, 0x1e, 0x3d, 0x5e, 0x67, 0x7c, 0x57, 0xad, 0x90, 0xcc, 0x46, 0x5f, 0x5c, 0xae, 0x6a, 0x9c, 0xb2, 0xcd, 0x2c, 0x89, 0x78, 0xcf, 0xf1, 0x49, 0x96, 0x55, 0x1e, 0x04, 0xef, 0x0e, 0x1c, 0xde, 0x6c, 0x96, 0x51, 0x00, 0xee, 0x9a, 0x1f, 0x8d, 0x61, 0xbc, 0xeb, 0xb1, 0xa6, 0xa5, 0x21, 0x8b, 0xa7, 0xf8, 0x25, 0x41, 0x48, 0x62, 0x5b, 0x01, 0x6c, 0x7c, 0x2a, 0xe8, 0xff, 0xf9, 0xf9, 0x1f, 0xe2, 0x79, 0x2e, 0xd1, 0xff, 0xa3, 0x2e, 0x1c, 0x3a, 0x1a, 0x5d, 0x2b, 0x7b, 0x87, 0x25, 0x22, 0xa4, 0x90, 0xea, 0x26, 0x9d, 0xdd, 0x13, 0x60, 0x4c, 0x10, 0x03, 0xf6, 0x99, 0xd3, 0x21, 0x0c, 0x69, 0xc6, 0xd8, 0xc8, 0x9e, 0x94, 0x89, 0x51, 0x21, 0xe3, 0x9a, 0xcd, 0xda, 0x54, 0x72, 0x64, 0xae, 0x94, 0x79, 0x36, 0x81, 0x44, 0x14, 0x6d, 0x3a, 0x0e, 0xa6, 0x30, 0xbf, 0x95, 0x99, 0xa6, 0xf5, 0x7f, 0x4f, 0xef, 0xc6, 0x71, 0x2f, 0x36, 0x13, 0x14, 0xa2, 0x9d, 0xc2, 0x0c, 0x0d, 0x4e, 0xc0, 0x02, 0xd3, 0x6f, 0xee, 0x98, 0x5e, 0x24, 0x31, 0x74, 0x11, 0x96, 0x6e, 0x43, 0x57, 0xe8, 0x8e, 0xa0, 0x8d, 0x3d, 0x79, 0x38, 0x20, 0xc2, 0x0f, 0xb4, 0x75, 0x99, 0x3b, 0xb1, 0xf0, 0xe8, 0xe1, 0xda, 0xf9, 0xd4, 0xe6, 0xd6, 0xf4, 0x8a, 0x32, 0x4a, 0x4a, 0x25, 0xa8, 0xd9, 0x60, 0xd6, 0x33, 0x31, 0x97, 0xb9, 0xb6, 0xed, 0x5f, 0xfc, 0x15, 0xbd, 0x13, 0xc0, 0x3a, 0x3f, 0x1f, 0x2d, 0x09, 0x1d, 0xeb, 0x69, 0x6a, 0xfe, 0xd7, 0x95, 0x3e, 0x8a, 0x4e, 0xe1, 0x6e, 0x61, 0xb2, 0x6c, 0xe3, 0x2b, 0x70, 0x60, 0x7e, 0x8c, 0xe4, 0xdd, 0x27, 0x30, 0x7e, 0x0d, 0xc7, 0xb7, 0x9a, 0x1a, 0x3c, 0xcc, 0xa7, 0x22, 0x77, 0x14, 0x05, 0x50, 0x57, 0x31, 0x1b, 0xc8, 0xbf, 0xce, 0x52, 0xaf, 0x9c, 0x8e, 0x10, 0x2e, 0xd2, 0x16, 0xb6, 0x6e, 0x43, 0x10, 0xaf, 0x8b, 0xde, 0x1d, 0x60, 0xb2, 0x7d, 0xe6, 0x2f, 0x08, 0x10, 0x12, 0x7e, 0xb4, 0x76, 0x45, 0xb6, 0xd8, 0x9b, 0x26, 0x40, 0xa1, 0x63, 0x5c, 0x7a, 0x2a, 0xb1, 0x8c, 0xd6, 0xa4, 0x6f, 0x5a, 0xae, 0x33, 0x7e, 0x6d, 0x71, 0xf5, 0xc8, 0x6d, 0x80, 0x1c, 0x35, 0xfc, 0x3f, 0xc1, 0xa6, 0xc6, 0x1a, 0x15, 0x04, 0x6d, 0x76, 0x38, 0x32, 0x95, 0xb2, 0x51, 0x1a, 0xe9, 0x3e, 0x89, 0x9f, 0x0c, 0x79 };
+<a id="L683"></a>    var out: [Sha3_256.digest_length]u8 = undefined;
+<a id="L684"></a>
+<a id="L685"></a>    Sha3_256.hash(&amp;msg, &amp;out, .{});
+<a id="L686"></a>    try htest.assertEqual("5780048dfa381a1d01c747906e4a08711dd34fd712ecd7c6801dd2b38fd81a89", &amp;out);
+<a id="L687"></a>
+<a id="L688"></a>    var h = Sha3_256.init(.{});
+<a id="L689"></a>    h.update(msg[0..64]);
+<a id="L690"></a>    h.update(msg[64..613]);
+<a id="L691"></a>    h.final(&amp;out);
+<a id="L692"></a>    try htest.assertEqual("5780048dfa381a1d01c747906e4a08711dd34fd712ecd7c6801dd2b38fd81a89", &amp;out);
+<a id="L693"></a>}
+<a id="L694"></a>
+<a id="L695"></a>test "cSHAKE-128 with no context nor function name" {
+<a id="L696"></a>    var out: [32]u8 = undefined;
+<a id="L697"></a>    CShake128.hash("hello123", &amp;out, .{});
+<a id="L698"></a>    try htest.assertEqual("1b85861510bc4d8e467d6f8a92270533cbaa7ba5e06c2d2a502854bac468b8b9", &amp;out);
+<a id="L699"></a>}
+<a id="L700"></a>
+<a id="L701"></a>test "cSHAKE-128 with context" {
+<a id="L702"></a>    var out: [32]u8 = undefined;
+<a id="L703"></a>    CShake128.hash("hello123", &amp;out, .{ .context = "custom" });
+<a id="L704"></a>    try htest.assertEqual("7509fa13a6bd3e38ad5c6fac042142c233996e40ebffc86c276f108b3b19cc6a", &amp;out);
+<a id="L705"></a>}
+<a id="L706"></a>
+<a id="L707"></a>test "cSHAKE-128 with context and function" {
+<a id="L708"></a>    var out: [32]u8 = undefined;
+<a id="L709"></a>    CShake(128, "function").hash("hello123", &amp;out, .{ .context = "custom" });
+<a id="L710"></a>    try htest.assertEqual("ad7f4d7db2d96587fcd5047c65d37c368f5366e3afac60bb9b66b0bb95dfb675", &amp;out);
+<a id="L711"></a>}
+<a id="L712"></a>
+<a id="L713"></a>test "cSHAKE-256" {
+<a id="L714"></a>    var out: [32]u8 = undefined;
+<a id="L715"></a>    CShake256.hash("hello123", &amp;out, .{ .context = "custom" });
+<a id="L716"></a>    try htest.assertEqual("dabe027eb1a6cbe3a0542d0560eb4e6b39146dd72ae1bf89c970a61bd93b1813", &amp;out);
+<a id="L717"></a>}
+<a id="L718"></a>
+<a id="L719"></a>test "KMAC-128 with empty key and message" {
+<a id="L720"></a>    var out: [KMac128.mac_length]u8 = undefined;
+<a id="L721"></a>    const key = "";
+<a id="L722"></a>    KMac128.create(&amp;out, "", key);
+<a id="L723"></a>    try htest.assertEqual("5c135c615152fb4d9784dd1155f9b6034e013fd77165c327dfa4d36701983ef7", &amp;out);
+<a id="L724"></a>}
+<a id="L725"></a>
+<a id="L726"></a>test "KMAC-128" {
+<a id="L727"></a>    var out: [KMac128.mac_length]u8 = undefined;
+<a id="L728"></a>    const key = "A KMAC secret key";
+<a id="L729"></a>    KMac128.create(&amp;out, "hello123", key);
+<a id="L730"></a>    try htest.assertEqual("1fa1c0d761129a83f9a4299ca137674de8373a3cc437799ae4c129e651627f8e", &amp;out);
+<a id="L731"></a>}
+<a id="L732"></a>
+<a id="L733"></a>test "KMAC-128 with a customization string" {
+<a id="L734"></a>    var out: [KMac128.mac_length]u8 = undefined;
+<a id="L735"></a>    const key = "A KMAC secret key";
+<a id="L736"></a>    KMac128.createWithOptions(&amp;out, "hello123", key, .{ .context = "custom" });
+<a id="L737"></a>    try htest.assertEqual("c58c6d42dc00a27dfa8e7e08f8c9307cecb5d662ddb11b6c36057fc2e0e068ba", &amp;out);
+<a id="L738"></a>}
+<a id="L739"></a>
+<a id="L740"></a>test "KMACXOF-128" {
+<a id="L741"></a>    const key = "A KMAC secret key";
+<a id="L742"></a>    var xof = KMac128.init(key);
+<a id="L743"></a>    xof.update("hello123");
+<a id="L744"></a>    var out: [50]u8 = undefined;
+<a id="L745"></a>    xof.squeeze(&amp;out);
+<a id="L746"></a>    try htest.assertEqual("628c2fb870d294b3673ac82d9f0d651aae6a5bb8084ea8cd8343cb888d075b9053173200a71f301141069c3c0322527981f7", &amp;out);
+<a id="L747"></a>    xof.squeeze(&amp;out);
+<a id="L748"></a>    try htest.assertEqual("7b638e178cfdac5727a4ea7694efaa967a65a1d0034501855acff506b4158d187d5a18d668e67b43f2abf61144b20ed4c09f", &amp;out);
+<a id="L749"></a>}
+<a id="L750"></a>
+<a id="L751"></a>test "KMACXOF-256" {
+<a id="L752"></a>    const key = "A KMAC secret key";
+<a id="L753"></a>    var xof = KMac256.init(key);
+<a id="L754"></a>    xof.update("hello123");
+<a id="L755"></a>    var out: [50]u8 = undefined;
+<a id="L756"></a>    xof.squeeze(&amp;out);
+<a id="L757"></a>    try htest.assertEqual("23fc644bc2655ba6fde7b7c11f2804f22e8d8c6bd7db856268bf3370ce2362703f6c7e91916a1b8c116e60edfbcb25613054", &amp;out);
+<a id="L758"></a>    xof.squeeze(&amp;out);
+<a id="L759"></a>    try htest.assertEqual("ff97251020ff255ee65a1c1f5f78ebe904f61211c39f973f82fbce2b196b9f51c2cb12afe51549a0f1eaf7954e657ba11af3", &amp;out);
+<a id="L760"></a>}
+<a id="L761"></a>
+<a id="L762"></a>test "TupleHash-128" {
+<a id="L763"></a>    var st = TupleHash128.init();
+<a id="L764"></a>    st.update("hello");
+<a id="L765"></a>    st.update("123");
+<a id="L766"></a>    var out: [32]u8 = undefined;
+<a id="L767"></a>    st.final(&amp;out);
+<a id="L768"></a>    try htest.assertEqual("3938d49ade8ec0f0c305ac63497b2d2e8b2f650714f9667cc41816b1c11ffd20", &amp;out);
+<a id="L769"></a>}
+<a id="L770"></a>
+<a id="L771"></a>test "TupleHash-256" {
+<a id="L772"></a>    var st = TupleHash256.init();
+<a id="L773"></a>    st.update("hello");
+<a id="L774"></a>    st.update("123");
+<a id="L775"></a>    var out: [64]u8 = undefined;
+<a id="L776"></a>    st.final(&amp;out);
+<a id="L777"></a>    try htest.assertEqual("2dca563c2882f2ba4f46a441a4c5e13fb97150d1436fe99c7e4e43a2d20d0f1cd3d38483bde4a966930606dfa6c61c4ca6400aeedfb474d1bf0d7f6a70968289", &amp;out);
+<a id="L778"></a>}
+</pre>
 </body>
 </html>

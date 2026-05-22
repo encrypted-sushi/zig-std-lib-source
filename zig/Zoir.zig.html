@@ -2,280 +2,283 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Source: zig-0.16.0-std/zig/Zoir.zig</title>
+    <title>Source: zig/Zoir.zig</title>
     <style>
         body { background: #1e1e1e; color: #d4d4d4; font-family: monospace; padding: 20px; }
         pre { white-space: pre-wrap; word-wrap: break-word; }
         .header { border-bottom: 1px solid #444; padding-bottom: 10px; margin-bottom: 20px; }
         a { color: #569cd6; }
+        a[id] { color: inherit; text-decoration: none; }
+        :target { background: #3a3a00; }
     </style>
 </head>
 <body>
     <div class="header">
-        <a href="/">Index</a> | <strong>File: zig-0.16.0-std/zig/Zoir.zig</strong>
+        <a href="/">Index</a> | <strong>File: zig/Zoir.zig</strong>
     </div>
-    <pre>//! Zig Object Intermediate Representation.
-//! Simplified AST for the ZON (Zig Object Notation) format.
-//! `ZonGen` converts `Ast` to `Zoir`.
-const Zoir = @This();
-
-const std = @import("std");
-const Io = std.Io;
-const assert = std.debug.assert;
-const Allocator = std.mem.Allocator;
-const Ast = std.zig.Ast;
-
-nodes: std.MultiArrayList(Node.Repr).Slice,
-extra: []u32,
-limbs: []std.math.big.Limb,
-string_bytes: []u8,
-
-compile_errors: []Zoir.CompileError,
-error_notes: []Zoir.CompileError.Note,
-
-/// The data stored at byte offset 0 when ZOIR is stored in a file.
-pub const Header = extern struct {
-    nodes_len: u32,
-    extra_len: u32,
-    limbs_len: u32,
-    string_bytes_len: u32,
-    compile_errors_len: u32,
-    error_notes_len: u32,
-
-    /// We could leave this as padding, however it triggers a Valgrind warning because
-    /// we read and write undefined bytes to the file system. This is harmless, but
-    /// it's essentially free to have a zero field here and makes the warning go away,
-    /// making it more likely that following Valgrind warnings will be taken seriously.
-    unused: u64 = 0,
-
-    stat_inode: Io.File.INode,
-    stat_size: u64,
-    stat_mtime: i128,
-
-    comptime {
-        // Check that `unused` is working as expected
-        assert(std.meta.hasUniqueRepresentation(Header));
-    }
-};
-
-pub fn hasCompileErrors(zoir: Zoir) bool {
-    if (zoir.compile_errors.len &gt; 0) {
-        assert(zoir.nodes.len == 0);
-        assert(zoir.extra.len == 0);
-        assert(zoir.limbs.len == 0);
-        return true;
-    } else {
-        assert(zoir.error_notes.len == 0);
-        return false;
-    }
-}
-
-pub fn deinit(zoir: Zoir, gpa: Allocator) void {
-    var nodes = zoir.nodes;
-    nodes.deinit(gpa);
-
-    gpa.free(zoir.extra);
-    gpa.free(zoir.limbs);
-    gpa.free(zoir.string_bytes);
-    gpa.free(zoir.compile_errors);
-    gpa.free(zoir.error_notes);
-}
-
-pub const Node = union(enum) {
-    /// A literal `true` value.
-    true,
-    /// A literal `false` value.
-    false,
-    /// A literal `null` value.
-    null,
-    /// A literal `inf` value.
-    pos_inf,
-    /// A literal `-inf` value.
-    neg_inf,
-    /// A literal `nan` value.
-    nan,
-    /// An integer literal.
-    int_literal: union(enum) {
-        small: i32,
-        big: std.math.big.int.Const,
-    },
-    /// A floating-point literal.
-    float_literal: f128,
-    /// A Unicode codepoint literal.
-    char_literal: u21,
-    /// An enum literal. The string is the literal, i.e. `foo` for `.foo`.
-    enum_literal: NullTerminatedString,
-    /// A string literal.
-    string_literal: []const u8,
-    /// An empty struct/array literal, i.e. `.{}`.
-    empty_literal,
-    /// An array literal. The `Range` gives the elements of the array literal.
-    array_literal: Node.Index.Range,
-    /// A struct literal. `names.len` is always equal to `vals.len`.
-    struct_literal: struct {
-        names: []const NullTerminatedString,
-        vals: Node.Index.Range,
-    },
-
-    pub const Index = enum(u32) {
-        root = 0,
-        _,
-
-        pub fn get(idx: Index, zoir: Zoir) Node {
-            const repr = zoir.nodes.get(@intFromEnum(idx));
-            return switch (repr.tag) {
-                .true =&gt; .true,
-                .false =&gt; .false,
-                .null =&gt; .null,
-                .pos_inf =&gt; .pos_inf,
-                .neg_inf =&gt; .neg_inf,
-                .nan =&gt; .nan,
-                .int_literal_small =&gt; .{ .int_literal = .{ .small = @bitCast(repr.data) } },
-                .int_literal_pos, .int_literal_neg =&gt; .{ .int_literal = .{ .big = .{
-                    .limbs = l: {
-                        const limb_count, const limbs_idx = zoir.extra[repr.data..][0..2].*;
-                        break :l zoir.limbs[limbs_idx..][0..limb_count];
-                    },
-                    .positive = switch (repr.tag) {
-                        .int_literal_pos =&gt; true,
-                        .int_literal_neg =&gt; false,
-                        else =&gt; unreachable,
-                    },
-                } } },
-                .float_literal_small =&gt; .{ .float_literal = @as(f32, @bitCast(repr.data)) },
-                .float_literal =&gt; .{ .float_literal = @bitCast(zoir.extra[repr.data..][0..4].*) },
-                .char_literal =&gt; .{ .char_literal = @intCast(repr.data) },
-                .enum_literal =&gt; .{ .enum_literal = @enumFromInt(repr.data) },
-                .string_literal =&gt; .{ .string_literal = s: {
-                    const start, const len = zoir.extra[repr.data..][0..2].*;
-                    break :s zoir.string_bytes[start..][0..len];
-                } },
-                .string_literal_null =&gt; .{ .string_literal = NullTerminatedString.get(@enumFromInt(repr.data), zoir) },
-                .empty_literal =&gt; .empty_literal,
-                .array_literal =&gt; .{ .array_literal = a: {
-                    const elem_count, const first_elem = zoir.extra[repr.data..][0..2].*;
-                    break :a .{ .start = @enumFromInt(first_elem), .len = elem_count };
-                } },
-                .struct_literal =&gt; .{ .struct_literal = s: {
-                    const elem_count, const first_elem = zoir.extra[repr.data..][0..2].*;
-                    const field_names = zoir.extra[repr.data + 2 ..][0..elem_count];
-                    break :s .{
-                        .names = @ptrCast(field_names),
-                        .vals = .{ .start = @enumFromInt(first_elem), .len = elem_count },
-                    };
-                } },
-            };
-        }
-
-        pub fn getAstNode(idx: Index, zoir: Zoir) std.zig.Ast.Node.Index {
-            return zoir.nodes.items(.ast_node)[@intFromEnum(idx)];
-        }
-
-        pub const Range = struct {
-            start: Index,
-            len: u32,
-
-            pub fn at(r: Range, i: u32) Index {
-                assert(i &lt; r.len);
-                return @enumFromInt(@intFromEnum(r.start) + i);
-            }
-        };
-    };
-
-    pub const Repr = struct {
-        tag: Tag,
-        data: u32,
-        ast_node: std.zig.Ast.Node.Index,
-
-        pub const Tag = enum(u8) {
-            /// `data` is ignored.
-            true,
-            /// `data` is ignored.
-            false,
-            /// `data` is ignored.
-            null,
-            /// `data` is ignored.
-            pos_inf,
-            /// `data` is ignored.
-            neg_inf,
-            /// `data` is ignored.
-            nan,
-            /// `data` is the `i32` value.
-            int_literal_small,
-            /// `data` is index into `extra` of:
-            /// * `limb_count: u32`
-            /// * `limbs_idx: u32`
-            int_literal_pos,
-            /// Identical to `int_literal_pos`, except the value is negative.
-            int_literal_neg,
-            /// `data` is the `f32` value.
-            float_literal_small,
-            /// `data` is index into `extra` of 4 elements which are a bitcast `f128`.
-            float_literal,
-            /// `data` is the `u32` value.
-            char_literal,
-            /// `data` is a `NullTerminatedString`.
-            enum_literal,
-            /// `data` is index into `extra` of:
-            /// * `start: u32`
-            /// * `len: u32`
-            string_literal,
-            /// Null-terminated string literal,
-            /// `data` is a `NullTerminatedString`.
-            string_literal_null,
-            /// An empty struct/array literal, `.{}`.
-            /// `data` is ignored.
-            empty_literal,
-            /// `data` is index into `extra` of:
-            /// * `elem_count: u32`
-            /// * `first_elem: Node.Index`
-            /// The nodes `first_elem .. first_elem + elem_count` are the children.
-            array_literal,
-            /// `data` is index into `extra` of:
-            /// * `elem_count: u32`
-            /// * `first_elem: Node.Index`
-            /// * `field_name: NullTerminatedString` for each `elem_count`
-            /// The nodes `first_elem .. first_elem + elem_count` are the children.
-            struct_literal,
-        };
-    };
-};
-
-pub const NullTerminatedString = enum(u32) {
-    _,
-    pub fn get(nts: NullTerminatedString, zoir: Zoir) [:0]const u8 {
-        const idx = std.mem.findScalar(u8, zoir.string_bytes[@intFromEnum(nts)..], 0).?;
-        return zoir.string_bytes[@intFromEnum(nts)..][0..idx :0];
-    }
-};
-
-pub const CompileError = extern struct {
-    msg: NullTerminatedString,
-    token: Ast.OptionalTokenIndex,
-    /// If `token == .none`, this is an `Ast.Node.Index`.
-    /// Otherwise, this is a byte offset into `token`.
-    node_or_offset: u32,
-
-    /// Ignored if `note_count == 0`.
-    first_note: u32,
-    note_count: u32,
-
-    pub fn getNotes(err: CompileError, zoir: Zoir) []const Note {
-        return zoir.error_notes[err.first_note..][0..err.note_count];
-    }
-
-    pub const Note = extern struct {
-        msg: NullTerminatedString,
-        token: Ast.OptionalTokenIndex,
-        /// If `token == .none`, this is an `Ast.Node.Index`.
-        /// Otherwise, this is a byte offset into `token`.
-        node_or_offset: u32,
-    };
-
-    comptime {
-        assert(std.meta.hasUniqueRepresentation(CompileError));
-        assert(std.meta.hasUniqueRepresentation(Note));
-    }
-};</pre>
+    <pre><a id="L1"></a>//! Zig Object Intermediate Representation.
+<a id="L2"></a>//! Simplified AST for the ZON (Zig Object Notation) format.
+<a id="L3"></a>//! `ZonGen` converts `Ast` to `Zoir`.
+<a id="L4"></a>const Zoir = @This();
+<a id="L5"></a>
+<a id="L6"></a>const std = @import("std");
+<a id="L7"></a>const Io = std.Io;
+<a id="L8"></a>const assert = std.debug.assert;
+<a id="L9"></a>const Allocator = std.mem.Allocator;
+<a id="L10"></a>const Ast = std.zig.Ast;
+<a id="L11"></a>
+<a id="L12"></a>nodes: std.MultiArrayList(Node.Repr).Slice,
+<a id="L13"></a>extra: []u32,
+<a id="L14"></a>limbs: []std.math.big.Limb,
+<a id="L15"></a>string_bytes: []u8,
+<a id="L16"></a>
+<a id="L17"></a>compile_errors: []Zoir.CompileError,
+<a id="L18"></a>error_notes: []Zoir.CompileError.Note,
+<a id="L19"></a>
+<a id="L20"></a>/// The data stored at byte offset 0 when ZOIR is stored in a file.
+<a id="L21"></a>pub const Header = extern struct {
+<a id="L22"></a>    nodes_len: u32,
+<a id="L23"></a>    extra_len: u32,
+<a id="L24"></a>    limbs_len: u32,
+<a id="L25"></a>    string_bytes_len: u32,
+<a id="L26"></a>    compile_errors_len: u32,
+<a id="L27"></a>    error_notes_len: u32,
+<a id="L28"></a>
+<a id="L29"></a>    /// We could leave this as padding, however it triggers a Valgrind warning because
+<a id="L30"></a>    /// we read and write undefined bytes to the file system. This is harmless, but
+<a id="L31"></a>    /// it's essentially free to have a zero field here and makes the warning go away,
+<a id="L32"></a>    /// making it more likely that following Valgrind warnings will be taken seriously.
+<a id="L33"></a>    unused: u64 = 0,
+<a id="L34"></a>
+<a id="L35"></a>    stat_inode: Io.File.INode,
+<a id="L36"></a>    stat_size: u64,
+<a id="L37"></a>    stat_mtime: i128,
+<a id="L38"></a>
+<a id="L39"></a>    comptime {
+<a id="L40"></a>        // Check that `unused` is working as expected
+<a id="L41"></a>        assert(std.meta.hasUniqueRepresentation(Header));
+<a id="L42"></a>    }
+<a id="L43"></a>};
+<a id="L44"></a>
+<a id="L45"></a>pub fn hasCompileErrors(zoir: Zoir) bool {
+<a id="L46"></a>    if (zoir.compile_errors.len &gt; 0) {
+<a id="L47"></a>        assert(zoir.nodes.len == 0);
+<a id="L48"></a>        assert(zoir.extra.len == 0);
+<a id="L49"></a>        assert(zoir.limbs.len == 0);
+<a id="L50"></a>        return true;
+<a id="L51"></a>    } else {
+<a id="L52"></a>        assert(zoir.error_notes.len == 0);
+<a id="L53"></a>        return false;
+<a id="L54"></a>    }
+<a id="L55"></a>}
+<a id="L56"></a>
+<a id="L57"></a>pub fn deinit(zoir: Zoir, gpa: Allocator) void {
+<a id="L58"></a>    var nodes = zoir.nodes;
+<a id="L59"></a>    nodes.deinit(gpa);
+<a id="L60"></a>
+<a id="L61"></a>    gpa.free(zoir.extra);
+<a id="L62"></a>    gpa.free(zoir.limbs);
+<a id="L63"></a>    gpa.free(zoir.string_bytes);
+<a id="L64"></a>    gpa.free(zoir.compile_errors);
+<a id="L65"></a>    gpa.free(zoir.error_notes);
+<a id="L66"></a>}
+<a id="L67"></a>
+<a id="L68"></a>pub const Node = union(enum) {
+<a id="L69"></a>    /// A literal `true` value.
+<a id="L70"></a>    true,
+<a id="L71"></a>    /// A literal `false` value.
+<a id="L72"></a>    false,
+<a id="L73"></a>    /// A literal `null` value.
+<a id="L74"></a>    null,
+<a id="L75"></a>    /// A literal `inf` value.
+<a id="L76"></a>    pos_inf,
+<a id="L77"></a>    /// A literal `-inf` value.
+<a id="L78"></a>    neg_inf,
+<a id="L79"></a>    /// A literal `nan` value.
+<a id="L80"></a>    nan,
+<a id="L81"></a>    /// An integer literal.
+<a id="L82"></a>    int_literal: union(enum) {
+<a id="L83"></a>        small: i32,
+<a id="L84"></a>        big: std.math.big.int.Const,
+<a id="L85"></a>    },
+<a id="L86"></a>    /// A floating-point literal.
+<a id="L87"></a>    float_literal: f128,
+<a id="L88"></a>    /// A Unicode codepoint literal.
+<a id="L89"></a>    char_literal: u21,
+<a id="L90"></a>    /// An enum literal. The string is the literal, i.e. `foo` for `.foo`.
+<a id="L91"></a>    enum_literal: NullTerminatedString,
+<a id="L92"></a>    /// A string literal.
+<a id="L93"></a>    string_literal: []const u8,
+<a id="L94"></a>    /// An empty struct/array literal, i.e. `.{}`.
+<a id="L95"></a>    empty_literal,
+<a id="L96"></a>    /// An array literal. The `Range` gives the elements of the array literal.
+<a id="L97"></a>    array_literal: Node.Index.Range,
+<a id="L98"></a>    /// A struct literal. `names.len` is always equal to `vals.len`.
+<a id="L99"></a>    struct_literal: struct {
+<a id="L100"></a>        names: []const NullTerminatedString,
+<a id="L101"></a>        vals: Node.Index.Range,
+<a id="L102"></a>    },
+<a id="L103"></a>
+<a id="L104"></a>    pub const Index = enum(u32) {
+<a id="L105"></a>        root = 0,
+<a id="L106"></a>        _,
+<a id="L107"></a>
+<a id="L108"></a>        pub fn get(idx: Index, zoir: Zoir) Node {
+<a id="L109"></a>            const repr = zoir.nodes.get(@intFromEnum(idx));
+<a id="L110"></a>            return switch (repr.tag) {
+<a id="L111"></a>                .true =&gt; .true,
+<a id="L112"></a>                .false =&gt; .false,
+<a id="L113"></a>                .null =&gt; .null,
+<a id="L114"></a>                .pos_inf =&gt; .pos_inf,
+<a id="L115"></a>                .neg_inf =&gt; .neg_inf,
+<a id="L116"></a>                .nan =&gt; .nan,
+<a id="L117"></a>                .int_literal_small =&gt; .{ .int_literal = .{ .small = @bitCast(repr.data) } },
+<a id="L118"></a>                .int_literal_pos, .int_literal_neg =&gt; .{ .int_literal = .{ .big = .{
+<a id="L119"></a>                    .limbs = l: {
+<a id="L120"></a>                        const limb_count, const limbs_idx = zoir.extra[repr.data..][0..2].*;
+<a id="L121"></a>                        break :l zoir.limbs[limbs_idx..][0..limb_count];
+<a id="L122"></a>                    },
+<a id="L123"></a>                    .positive = switch (repr.tag) {
+<a id="L124"></a>                        .int_literal_pos =&gt; true,
+<a id="L125"></a>                        .int_literal_neg =&gt; false,
+<a id="L126"></a>                        else =&gt; unreachable,
+<a id="L127"></a>                    },
+<a id="L128"></a>                } } },
+<a id="L129"></a>                .float_literal_small =&gt; .{ .float_literal = @as(f32, @bitCast(repr.data)) },
+<a id="L130"></a>                .float_literal =&gt; .{ .float_literal = @bitCast(zoir.extra[repr.data..][0..4].*) },
+<a id="L131"></a>                .char_literal =&gt; .{ .char_literal = @intCast(repr.data) },
+<a id="L132"></a>                .enum_literal =&gt; .{ .enum_literal = @enumFromInt(repr.data) },
+<a id="L133"></a>                .string_literal =&gt; .{ .string_literal = s: {
+<a id="L134"></a>                    const start, const len = zoir.extra[repr.data..][0..2].*;
+<a id="L135"></a>                    break :s zoir.string_bytes[start..][0..len];
+<a id="L136"></a>                } },
+<a id="L137"></a>                .string_literal_null =&gt; .{ .string_literal = NullTerminatedString.get(@enumFromInt(repr.data), zoir) },
+<a id="L138"></a>                .empty_literal =&gt; .empty_literal,
+<a id="L139"></a>                .array_literal =&gt; .{ .array_literal = a: {
+<a id="L140"></a>                    const elem_count, const first_elem = zoir.extra[repr.data..][0..2].*;
+<a id="L141"></a>                    break :a .{ .start = @enumFromInt(first_elem), .len = elem_count };
+<a id="L142"></a>                } },
+<a id="L143"></a>                .struct_literal =&gt; .{ .struct_literal = s: {
+<a id="L144"></a>                    const elem_count, const first_elem = zoir.extra[repr.data..][0..2].*;
+<a id="L145"></a>                    const field_names = zoir.extra[repr.data + 2 ..][0..elem_count];
+<a id="L146"></a>                    break :s .{
+<a id="L147"></a>                        .names = @ptrCast(field_names),
+<a id="L148"></a>                        .vals = .{ .start = @enumFromInt(first_elem), .len = elem_count },
+<a id="L149"></a>                    };
+<a id="L150"></a>                } },
+<a id="L151"></a>            };
+<a id="L152"></a>        }
+<a id="L153"></a>
+<a id="L154"></a>        pub fn getAstNode(idx: Index, zoir: Zoir) std.zig.Ast.Node.Index {
+<a id="L155"></a>            return zoir.nodes.items(.ast_node)[@intFromEnum(idx)];
+<a id="L156"></a>        }
+<a id="L157"></a>
+<a id="L158"></a>        pub const Range = struct {
+<a id="L159"></a>            start: Index,
+<a id="L160"></a>            len: u32,
+<a id="L161"></a>
+<a id="L162"></a>            pub fn at(r: Range, i: u32) Index {
+<a id="L163"></a>                assert(i &lt; r.len);
+<a id="L164"></a>                return @enumFromInt(@intFromEnum(r.start) + i);
+<a id="L165"></a>            }
+<a id="L166"></a>        };
+<a id="L167"></a>    };
+<a id="L168"></a>
+<a id="L169"></a>    pub const Repr = struct {
+<a id="L170"></a>        tag: Tag,
+<a id="L171"></a>        data: u32,
+<a id="L172"></a>        ast_node: std.zig.Ast.Node.Index,
+<a id="L173"></a>
+<a id="L174"></a>        pub const Tag = enum(u8) {
+<a id="L175"></a>            /// `data` is ignored.
+<a id="L176"></a>            true,
+<a id="L177"></a>            /// `data` is ignored.
+<a id="L178"></a>            false,
+<a id="L179"></a>            /// `data` is ignored.
+<a id="L180"></a>            null,
+<a id="L181"></a>            /// `data` is ignored.
+<a id="L182"></a>            pos_inf,
+<a id="L183"></a>            /// `data` is ignored.
+<a id="L184"></a>            neg_inf,
+<a id="L185"></a>            /// `data` is ignored.
+<a id="L186"></a>            nan,
+<a id="L187"></a>            /// `data` is the `i32` value.
+<a id="L188"></a>            int_literal_small,
+<a id="L189"></a>            /// `data` is index into `extra` of:
+<a id="L190"></a>            /// * `limb_count: u32`
+<a id="L191"></a>            /// * `limbs_idx: u32`
+<a id="L192"></a>            int_literal_pos,
+<a id="L193"></a>            /// Identical to `int_literal_pos`, except the value is negative.
+<a id="L194"></a>            int_literal_neg,
+<a id="L195"></a>            /// `data` is the `f32` value.
+<a id="L196"></a>            float_literal_small,
+<a id="L197"></a>            /// `data` is index into `extra` of 4 elements which are a bitcast `f128`.
+<a id="L198"></a>            float_literal,
+<a id="L199"></a>            /// `data` is the `u32` value.
+<a id="L200"></a>            char_literal,
+<a id="L201"></a>            /// `data` is a `NullTerminatedString`.
+<a id="L202"></a>            enum_literal,
+<a id="L203"></a>            /// `data` is index into `extra` of:
+<a id="L204"></a>            /// * `start: u32`
+<a id="L205"></a>            /// * `len: u32`
+<a id="L206"></a>            string_literal,
+<a id="L207"></a>            /// Null-terminated string literal,
+<a id="L208"></a>            /// `data` is a `NullTerminatedString`.
+<a id="L209"></a>            string_literal_null,
+<a id="L210"></a>            /// An empty struct/array literal, `.{}`.
+<a id="L211"></a>            /// `data` is ignored.
+<a id="L212"></a>            empty_literal,
+<a id="L213"></a>            /// `data` is index into `extra` of:
+<a id="L214"></a>            /// * `elem_count: u32`
+<a id="L215"></a>            /// * `first_elem: Node.Index`
+<a id="L216"></a>            /// The nodes `first_elem .. first_elem + elem_count` are the children.
+<a id="L217"></a>            array_literal,
+<a id="L218"></a>            /// `data` is index into `extra` of:
+<a id="L219"></a>            /// * `elem_count: u32`
+<a id="L220"></a>            /// * `first_elem: Node.Index`
+<a id="L221"></a>            /// * `field_name: NullTerminatedString` for each `elem_count`
+<a id="L222"></a>            /// The nodes `first_elem .. first_elem + elem_count` are the children.
+<a id="L223"></a>            struct_literal,
+<a id="L224"></a>        };
+<a id="L225"></a>    };
+<a id="L226"></a>};
+<a id="L227"></a>
+<a id="L228"></a>pub const NullTerminatedString = enum(u32) {
+<a id="L229"></a>    _,
+<a id="L230"></a>    pub fn get(nts: NullTerminatedString, zoir: Zoir) [:0]const u8 {
+<a id="L231"></a>        const idx = std.mem.findScalar(u8, zoir.string_bytes[@intFromEnum(nts)..], 0).?;
+<a id="L232"></a>        return zoir.string_bytes[@intFromEnum(nts)..][0..idx :0];
+<a id="L233"></a>    }
+<a id="L234"></a>};
+<a id="L235"></a>
+<a id="L236"></a>pub const CompileError = extern struct {
+<a id="L237"></a>    msg: NullTerminatedString,
+<a id="L238"></a>    token: Ast.OptionalTokenIndex,
+<a id="L239"></a>    /// If `token == .none`, this is an `Ast.Node.Index`.
+<a id="L240"></a>    /// Otherwise, this is a byte offset into `token`.
+<a id="L241"></a>    node_or_offset: u32,
+<a id="L242"></a>
+<a id="L243"></a>    /// Ignored if `note_count == 0`.
+<a id="L244"></a>    first_note: u32,
+<a id="L245"></a>    note_count: u32,
+<a id="L246"></a>
+<a id="L247"></a>    pub fn getNotes(err: CompileError, zoir: Zoir) []const Note {
+<a id="L248"></a>        return zoir.error_notes[err.first_note..][0..err.note_count];
+<a id="L249"></a>    }
+<a id="L250"></a>
+<a id="L251"></a>    pub const Note = extern struct {
+<a id="L252"></a>        msg: NullTerminatedString,
+<a id="L253"></a>        token: Ast.OptionalTokenIndex,
+<a id="L254"></a>        /// If `token == .none`, this is an `Ast.Node.Index`.
+<a id="L255"></a>        /// Otherwise, this is a byte offset into `token`.
+<a id="L256"></a>        node_or_offset: u32,
+<a id="L257"></a>    };
+<a id="L258"></a>
+<a id="L259"></a>    comptime {
+<a id="L260"></a>        assert(std.meta.hasUniqueRepresentation(CompileError));
+<a id="L261"></a>        assert(std.meta.hasUniqueRepresentation(Note));
+<a id="L262"></a>    }
+<a id="L263"></a>};
+</pre>
 </body>
 </html>

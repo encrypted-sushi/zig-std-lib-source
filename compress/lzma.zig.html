@@ -2,777 +2,780 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Source: zig-0.16.0-std/compress/lzma.zig</title>
+    <title>Source: compress/lzma.zig</title>
     <style>
         body { background: #1e1e1e; color: #d4d4d4; font-family: monospace; padding: 20px; }
         pre { white-space: pre-wrap; word-wrap: break-word; }
         .header { border-bottom: 1px solid #444; padding-bottom: 10px; margin-bottom: 20px; }
         a { color: #569cd6; }
+        a[id] { color: inherit; text-decoration: none; }
+        :target { background: #3a3a00; }
     </style>
 </head>
 <body>
     <div class="header">
-        <a href="/">Index</a> | <strong>File: zig-0.16.0-std/compress/lzma.zig</strong>
+        <a href="/">Index</a> | <strong>File: compress/lzma.zig</strong>
     </div>
-    <pre>const std = @import("../std.zig");
-const math = std.math;
-const mem = std.mem;
-const Allocator = std.mem.Allocator;
-const assert = std.debug.assert;
-const ArrayList = std.ArrayList;
-const Writer = std.Io.Writer;
-const Reader = std.Io.Reader;
-
-pub const RangeDecoder = struct {
-    range: u32,
-    code: u32,
-
-    pub fn init(reader: *Reader) !RangeDecoder {
-        var counter: u64 = 0;
-        return initCounting(reader, &amp;counter);
-    }
-
-    pub fn initCounting(reader: *Reader, n_read: *u64) !RangeDecoder {
-        const reserved = try reader.takeByte();
-        n_read.* += 1;
-        if (reserved != 0) return error.InvalidRangeCode;
-        const code = try reader.takeInt(u32, .big);
-        n_read.* += 4;
-        return .{
-            .range = 0xFFFF_FFFF,
-            .code = code,
-        };
-    }
-
-    pub fn isFinished(self: RangeDecoder) bool {
-        return self.code == 0;
-    }
-
-    fn normalize(self: *RangeDecoder, reader: *Reader, n_read: *u64) !void {
-        if (self.range &lt; 0x0100_0000) {
-            self.range &lt;&lt;= 8;
-            self.code = (self.code &lt;&lt; 8) ^ @as(u32, try reader.takeByte());
-            n_read.* += 1;
-        }
-    }
-
-    fn getBit(self: *RangeDecoder, reader: *Reader, n_read: *u64) !bool {
-        self.range &gt;&gt;= 1;
-
-        const bit = self.code &gt;= self.range;
-        if (bit) self.code -= self.range;
-
-        try self.normalize(reader, n_read);
-        return bit;
-    }
-
-    pub fn get(self: *RangeDecoder, reader: *Reader, count: usize, n_read: *u64) !u32 {
-        var result: u32 = 0;
-        for (0..count) |_| {
-            result = (result &lt;&lt; 1) ^ @intFromBool(try self.getBit(reader, n_read));
-        }
-        return result;
-    }
-
-    pub fn decodeBit(self: *RangeDecoder, reader: *Reader, prob: *u16, n_read: *u64) !bool {
-        const bound = (self.range &gt;&gt; 11) * prob.*;
-
-        if (self.code &lt; bound) {
-            prob.* += (0x800 - prob.*) &gt;&gt; 5;
-            self.range = bound;
-
-            try self.normalize(reader, n_read);
-            return false;
-        } else {
-            prob.* -= prob.* &gt;&gt; 5;
-            self.code -= bound;
-            self.range -= bound;
-
-            try self.normalize(reader, n_read);
-            return true;
-        }
-    }
-
-    fn parseBitTree(
-        self: *RangeDecoder,
-        reader: *Reader,
-        num_bits: u5,
-        probs: []u16,
-        n_read: *u64,
-    ) !u32 {
-        var tmp: u32 = 1;
-        var i: @TypeOf(num_bits) = 0;
-        while (i &lt; num_bits) : (i += 1) {
-            const bit = try self.decodeBit(reader, &amp;probs[tmp], n_read);
-            tmp = (tmp &lt;&lt; 1) ^ @intFromBool(bit);
-        }
-        return tmp - (@as(u32, 1) &lt;&lt; num_bits);
-    }
-
-    pub fn parseReverseBitTree(
-        self: *RangeDecoder,
-        reader: *Reader,
-        num_bits: u5,
-        probs: []u16,
-        offset: usize,
-        n_read: *u64,
-    ) !u32 {
-        var result: u32 = 0;
-        var tmp: usize = 1;
-        var i: @TypeOf(num_bits) = 0;
-        while (i &lt; num_bits) : (i += 1) {
-            const bit = @intFromBool(try self.decodeBit(reader, &amp;probs[offset + tmp], n_read));
-            tmp = (tmp &lt;&lt; 1) ^ bit;
-            result ^= @as(u32, bit) &lt;&lt; i;
-        }
-        return result;
-    }
-};
-
-pub const Decode = struct {
-    properties: Properties,
-    literal_probs: Vec2d,
-    pos_slot_decoder: [4]BitTree(6),
-    align_decoder: BitTree(4),
-    pos_decoders: [115]u16,
-    is_match: [192]u16,
-    is_rep: [12]u16,
-    is_rep_g0: [12]u16,
-    is_rep_g1: [12]u16,
-    is_rep_g2: [12]u16,
-    is_rep_0long: [192]u16,
-    state: usize,
-    rep: [4]usize,
-    len_decoder: LenDecoder,
-    rep_len_decoder: LenDecoder,
-
-    pub fn init(gpa: Allocator, properties: Properties) !Decode {
-        return .{
-            .properties = properties,
-            .literal_probs = try Vec2d.init(gpa, 0x400, @as(usize, 1) &lt;&lt; (properties.lc + properties.lp), 0x300),
-            .pos_slot_decoder = @splat(.{}),
-            .align_decoder = .{},
-            .pos_decoders = @splat(0x400),
-            .is_match = @splat(0x400),
-            .is_rep = @splat(0x400),
-            .is_rep_g0 = @splat(0x400),
-            .is_rep_g1 = @splat(0x400),
-            .is_rep_g2 = @splat(0x400),
-            .is_rep_0long = @splat(0x400),
-            .state = 0,
-            .rep = @splat(0),
-            .len_decoder = .{},
-            .rep_len_decoder = .{},
-        };
-    }
-
-    pub fn deinit(self: *Decode, gpa: Allocator) void {
-        self.literal_probs.deinit(gpa);
-        self.* = undefined;
-    }
-
-    pub fn resetState(self: *Decode, gpa: Allocator, new_props: Properties) !void {
-        new_props.validate();
-        if (self.properties.lc + self.properties.lp == new_props.lc + new_props.lp) {
-            self.literal_probs.fill(0x400);
-        } else {
-            self.literal_probs.deinit(gpa);
-            self.literal_probs = try Vec2d.init(gpa, 0x400, @as(usize, 1) &lt;&lt; (new_props.lc + new_props.lp), 0x300);
-        }
-
-        self.properties = new_props;
-        for (&amp;self.pos_slot_decoder) |*t| t.reset();
-        self.align_decoder.reset();
-        self.pos_decoders = @splat(0x400);
-        self.is_match = @splat(0x400);
-        self.is_rep = @splat(0x400);
-        self.is_rep_g0 = @splat(0x400);
-        self.is_rep_g1 = @splat(0x400);
-        self.is_rep_g2 = @splat(0x400);
-        self.is_rep_0long = @splat(0x400);
-        self.state = 0;
-        self.rep = @splat(0);
-        self.len_decoder.reset();
-        self.rep_len_decoder.reset();
-    }
-
-    pub fn process(
-        self: *Decode,
-        reader: *Reader,
-        allocating: *Writer.Allocating,
-        /// `CircularBuffer` or `std.compress.lzma2.AccumBuffer`.
-        buffer: anytype,
-        decoder: *RangeDecoder,
-        n_read: *u64,
-    ) !ProcessingStatus {
-        const gpa = allocating.allocator;
-        const writer = &amp;allocating.writer;
-        const pos_state = buffer.len &amp; ((@as(usize, 1) &lt;&lt; self.properties.pb) - 1);
-
-        if (!try decoder.decodeBit(reader, &amp;self.is_match[(self.state &lt;&lt; 4) + pos_state], n_read)) {
-            const byte: u8 = try self.decodeLiteral(reader, buffer, decoder, n_read);
-
-            try buffer.appendLiteral(gpa, byte, writer);
-
-            self.state = if (self.state &lt; 4)
-                0
-            else if (self.state &lt; 10)
-                self.state - 3
-            else
-                self.state - 6;
-            return .more;
-        }
-
-        var len: usize = undefined;
-        if (try decoder.decodeBit(reader, &amp;self.is_rep[self.state], n_read)) {
-            if (!try decoder.decodeBit(reader, &amp;self.is_rep_g0[self.state], n_read)) {
-                if (!try decoder.decodeBit(reader, &amp;self.is_rep_0long[(self.state &lt;&lt; 4) + pos_state], n_read)) {
-                    self.state = if (self.state &lt; 7) 9 else 11;
-                    const dist = self.rep[0] + 1;
-                    try buffer.appendLz(gpa, 1, dist, writer);
-                    return .more;
-                }
-            } else {
-                const idx: usize = if (!try decoder.decodeBit(reader, &amp;self.is_rep_g1[self.state], n_read))
-                    1
-                else if (!try decoder.decodeBit(reader, &amp;self.is_rep_g2[self.state], n_read))
-                    2
-                else
-                    3;
-                const dist = self.rep[idx];
-                var i = idx;
-                while (i &gt; 0) : (i -= 1) {
-                    self.rep[i] = self.rep[i - 1];
-                }
-                self.rep[0] = dist;
-            }
-
-            len = try self.rep_len_decoder.decode(reader, decoder, pos_state, n_read);
-
-            self.state = if (self.state &lt; 7) 8 else 11;
-        } else {
-            self.rep[3] = self.rep[2];
-            self.rep[2] = self.rep[1];
-            self.rep[1] = self.rep[0];
-
-            len = try self.len_decoder.decode(reader, decoder, pos_state, n_read);
-
-            self.state = if (self.state &lt; 7) 7 else 10;
-
-            const rep_0 = try self.decodeDistance(reader, decoder, len, n_read);
-
-            self.rep[0] = rep_0;
-            if (self.rep[0] == 0xFFFF_FFFF) {
-                if (decoder.isFinished()) {
-                    return .finished;
-                }
-                return error.CorruptInput;
-            }
-        }
-
-        len += 2;
-
-        const dist = self.rep[0] + 1;
-        try buffer.appendLz(gpa, len, dist, writer);
-
-        return .more;
-    }
-
-    fn decodeLiteral(
-        self: *Decode,
-        reader: *Reader,
-        /// `CircularBuffer` or `std.compress.lzma2.AccumBuffer`.
-        buffer: anytype,
-        decoder: *RangeDecoder,
-        n_read: *u64,
-    ) !u8 {
-        const def_prev_byte = 0;
-        const prev_byte = @as(usize, buffer.lastOr(def_prev_byte));
-
-        var result: usize = 1;
-        const lit_state = ((buffer.len &amp; ((@as(usize, 1) &lt;&lt; self.properties.lp) - 1)) &lt;&lt; self.properties.lc) +
-            (prev_byte &gt;&gt; (8 - self.properties.lc));
-        const probs = try self.literal_probs.get(lit_state);
-
-        if (self.state &gt;= 7) {
-            var match_byte = @as(usize, try buffer.lastN(self.rep[0] + 1));
-
-            while (result &lt; 0x100) {
-                const match_bit = (match_byte &gt;&gt; 7) &amp; 1;
-                match_byte &lt;&lt;= 1;
-                const bit = @intFromBool(try decoder.decodeBit(
-                    reader,
-                    &amp;probs[((@as(usize, 1) + match_bit) &lt;&lt; 8) + result],
-                    n_read,
-                ));
-                result = (result &lt;&lt; 1) ^ bit;
-                if (match_bit != bit) {
-                    break;
-                }
-            }
-        }
-
-        while (result &lt; 0x100) {
-            result = (result &lt;&lt; 1) ^ @intFromBool(try decoder.decodeBit(reader, &amp;probs[result], n_read));
-        }
-
-        return @truncate(result - 0x100);
-    }
-
-    fn decodeDistance(
-        self: *Decode,
-        reader: *Reader,
-        decoder: *RangeDecoder,
-        length: usize,
-        n_read: *u64,
-    ) !usize {
-        const len_state = if (length &gt; 3) 3 else length;
-
-        const pos_slot: usize = try self.pos_slot_decoder[len_state].parse(reader, decoder, n_read);
-        if (pos_slot &lt; 4) return pos_slot;
-
-        const num_direct_bits = @as(u5, @intCast((pos_slot &gt;&gt; 1) - 1));
-        var result = (2 ^ (pos_slot &amp; 1)) &lt;&lt; num_direct_bits;
-
-        if (pos_slot &lt; 14) {
-            result += try decoder.parseReverseBitTree(
-                reader,
-                num_direct_bits,
-                &amp;self.pos_decoders,
-                result - pos_slot,
-                n_read,
-            );
-        } else {
-            result += @as(usize, try decoder.get(reader, num_direct_bits - 4, n_read)) &lt;&lt; 4;
-            result += try self.align_decoder.parseReverse(reader, decoder, n_read);
-        }
-
-        return result;
-    }
-
-    /// A circular buffer for LZ sequences
-    pub const CircularBuffer = struct {
-        /// Circular buffer
-        buf: ArrayList(u8),
-        /// Length of the buffer
-        dict_size: usize,
-        /// Buffer memory limit
-        mem_limit: usize,
-        /// Current position
-        cursor: usize,
-        /// Total number of bytes sent through the buffer
-        len: usize,
-
-        pub fn init(dict_size: usize, mem_limit: usize) CircularBuffer {
-            return .{
-                .buf = .empty,
-                .dict_size = dict_size,
-                .mem_limit = mem_limit,
-                .cursor = 0,
-                .len = 0,
-            };
-        }
-
-        pub fn get(self: CircularBuffer, index: usize) u8 {
-            return if (0 &lt;= index and index &lt; self.buf.items.len) self.buf.items[index] else 0;
-        }
-
-        pub fn set(self: *CircularBuffer, gpa: Allocator, index: usize, value: u8) !void {
-            if (index &gt;= self.mem_limit) {
-                return error.CorruptInput;
-            }
-            try self.buf.ensureTotalCapacity(gpa, index + 1);
-            while (self.buf.items.len &lt; index) {
-                self.buf.appendAssumeCapacity(0);
-            }
-            self.buf.appendAssumeCapacity(value);
-        }
-
-        /// Retrieve the last byte or return a default
-        pub fn lastOr(self: CircularBuffer, lit: u8) u8 {
-            return if (self.len == 0)
-                lit
-            else
-                self.get((self.dict_size + self.cursor - 1) % self.dict_size);
-        }
-
-        /// Retrieve the n-th last byte
-        pub fn lastN(self: CircularBuffer, dist: usize) !u8 {
-            if (dist &gt; self.dict_size or dist &gt; self.len) {
-                return error.CorruptInput;
-            }
-
-            const offset = (self.dict_size + self.cursor - dist) % self.dict_size;
-            return self.get(offset);
-        }
-
-        /// Append a literal
-        pub fn appendLiteral(
-            self: *CircularBuffer,
-            gpa: Allocator,
-            lit: u8,
-            writer: *Writer,
-        ) !void {
-            try self.set(gpa, self.cursor, lit);
-            self.cursor += 1;
-            self.len += 1;
-
-            // Flush the circular buffer to the output
-            if (self.cursor == self.dict_size) {
-                try writer.writeAll(self.buf.items);
-                self.cursor = 0;
-            }
-        }
-
-        /// Fetch an LZ sequence (length, distance) from inside the buffer
-        pub fn appendLz(
-            self: *CircularBuffer,
-            gpa: Allocator,
-            len: usize,
-            dist: usize,
-            writer: *Writer,
-        ) !void {
-            if (dist &gt; self.dict_size or dist &gt; self.len) {
-                return error.CorruptInput;
-            }
-
-            var offset = (self.dict_size + self.cursor - dist) % self.dict_size;
-            var i: usize = 0;
-            while (i &lt; len) : (i += 1) {
-                const x = self.get(offset);
-                try self.appendLiteral(gpa, x, writer);
-                offset += 1;
-                if (offset == self.dict_size) {
-                    offset = 0;
-                }
-            }
-        }
-
-        pub fn finish(self: *CircularBuffer, writer: *Writer) !void {
-            if (self.cursor &gt; 0) {
-                try writer.writeAll(self.buf.items[0..self.cursor]);
-                self.cursor = 0;
-            }
-        }
-
-        pub fn deinit(self: *CircularBuffer, gpa: Allocator) void {
-            self.buf.deinit(gpa);
-            self.* = undefined;
-        }
-    };
-
-    pub fn BitTree(comptime num_bits: usize) type {
-        return struct {
-            probs: [1 &lt;&lt; num_bits]u16 = @splat(0x400),
-
-            pub fn parse(self: *@This(), reader: *Reader, decoder: *RangeDecoder, n_read: *u64) !u32 {
-                return decoder.parseBitTree(reader, num_bits, &amp;self.probs, n_read);
-            }
-
-            pub fn parseReverse(
-                self: *@This(),
-                reader: *Reader,
-                decoder: *RangeDecoder,
-                n_read: *u64,
-            ) !u32 {
-                return decoder.parseReverseBitTree(reader, num_bits, &amp;self.probs, 0, n_read);
-            }
-
-            pub fn reset(self: *@This()) void {
-                @memset(&amp;self.probs, 0x400);
-            }
-        };
-    }
-
-    pub const LenDecoder = struct {
-        choice: u16 = 0x400,
-        choice2: u16 = 0x400,
-        low_coder: [16]BitTree(3) = @splat(.{}),
-        mid_coder: [16]BitTree(3) = @splat(.{}),
-        high_coder: BitTree(8) = .{},
-
-        pub fn decode(
-            self: *LenDecoder,
-            reader: *Reader,
-            decoder: *RangeDecoder,
-            pos_state: usize,
-            n_read: *u64,
-        ) !usize {
-            if (!try decoder.decodeBit(reader, &amp;self.choice, n_read)) {
-                return @as(usize, try self.low_coder[pos_state].parse(reader, decoder, n_read));
-            } else if (!try decoder.decodeBit(reader, &amp;self.choice2, n_read)) {
-                return @as(usize, try self.mid_coder[pos_state].parse(reader, decoder, n_read)) + 8;
-            } else {
-                return @as(usize, try self.high_coder.parse(reader, decoder, n_read)) + 16;
-            }
-        }
-
-        pub fn reset(self: *LenDecoder) void {
-            self.choice = 0x400;
-            self.choice2 = 0x400;
-            for (&amp;self.low_coder) |*t| t.reset();
-            for (&amp;self.mid_coder) |*t| t.reset();
-            self.high_coder.reset();
-        }
-    };
-
-    pub const Vec2d = struct {
-        data: []u16,
-        cols: usize,
-
-        pub fn init(gpa: Allocator, value: u16, w: usize, h: usize) !Vec2d {
-            const len = try math.mul(usize, w, h);
-            const data = try gpa.alloc(u16, len);
-            @memset(data, value);
-            return .{
-                .data = data,
-                .cols = h,
-            };
-        }
-
-        pub fn deinit(v: *Vec2d, gpa: Allocator) void {
-            gpa.free(v.data);
-            v.* = undefined;
-        }
-
-        pub fn fill(v: *Vec2d, value: u16) void {
-            @memset(v.data, value);
-        }
-
-        fn get(v: Vec2d, row: usize) ![]u16 {
-            const start_row = try math.mul(usize, row, v.cols);
-            const end_row = try math.add(usize, start_row, v.cols);
-            return v.data[start_row..end_row];
-        }
-    };
-
-    pub const Options = struct {
-        unpacked_size: UnpackedSize = .read_from_header,
-        mem_limit: ?usize = null,
-        allow_incomplete: bool = false,
-    };
-
-    pub const UnpackedSize = union(enum) {
-        read_from_header,
-        read_header_but_use_provided: ?u64,
-        use_provided: ?u64,
-    };
-
-    const ProcessingStatus = enum {
-        more,
-        finished,
-    };
-
-    pub const Properties = struct {
-        lc: u4,
-        lp: u3,
-        pb: u3,
-
-        fn validate(self: Properties) void {
-            assert(self.lc &lt;= 8);
-            assert(self.lp &lt;= 4);
-            assert(self.pb &lt;= 4);
-        }
-    };
-
-    pub const Params = struct {
-        properties: Properties,
-        dict_size: u32,
-        unpacked_size: ?u64,
-
-        pub fn readHeader(reader: *Reader, options: Options) !Params {
-            var props = try reader.takeByte();
-            if (props &gt;= 225) return error.CorruptInput;
-
-            const lc: u4 = @intCast(props % 9);
-            props /= 9;
-            const lp: u3 = @intCast(props % 5);
-            props /= 5;
-            const pb: u3 = @intCast(props);
-
-            const dict_size_provided = try reader.takeInt(u32, .little);
-            const dict_size = @max(0x1000, dict_size_provided);
-
-            const unpacked_size = switch (options.unpacked_size) {
-                .read_from_header =&gt; blk: {
-                    const unpacked_size_provided = try reader.takeInt(u64, .little);
-                    const marker_mandatory = unpacked_size_provided == 0xFFFF_FFFF_FFFF_FFFF;
-                    break :blk if (marker_mandatory) null else unpacked_size_provided;
-                },
-                .read_header_but_use_provided =&gt; |x| blk: {
-                    _ = try reader.takeInt(u64, .little);
-                    break :blk x;
-                },
-                .use_provided =&gt; |x| x,
-            };
-
-            return .{
-                .properties = .{ .lc = lc, .lp = lp, .pb = pb },
-                .dict_size = dict_size,
-                .unpacked_size = unpacked_size,
-            };
-        }
-    };
-};
-
-pub const Decompress = struct {
-    gpa: Allocator,
-    input: *Reader,
-    reader: Reader,
-    buffer: Decode.CircularBuffer,
-    range_decoder: RangeDecoder,
-    decode: Decode,
-    err: ?Error,
-    unpacked_size: ?u64,
-
-    pub const Error = error{
-        OutOfMemory,
-        ReadFailed,
-        CorruptInput,
-        DecompressedSizeMismatch,
-        EndOfStream,
-        Overflow,
-    };
-
-    /// Takes ownership of `buffer` which may be resized with `gpa`.
-    ///
-    /// LZMA was explicitly designed to take advantage of large heap memory
-    /// being available, with a dictionary size anywhere from 4K to 4G. Thus,
-    /// this API dynamically allocates the dictionary as-needed.
-    pub fn initParams(
-        input: *Reader,
-        gpa: Allocator,
-        buffer: []u8,
-        params: Decode.Params,
-        mem_limit: usize,
-    ) !Decompress {
-        return .{
-            .gpa = gpa,
-            .input = input,
-            .buffer = Decode.CircularBuffer.init(params.dict_size, mem_limit),
-            .range_decoder = try RangeDecoder.init(input),
-            .decode = try Decode.init(gpa, params.properties),
-            .reader = .{
-                .buffer = buffer,
-                .vtable = &amp;.{
-                    .readVec = readVec,
-                    .stream = stream,
-                    .discard = discard,
-                },
-                .seek = 0,
-                .end = 0,
-            },
-            .err = null,
-            .unpacked_size = params.unpacked_size,
-        };
-    }
-
-    /// Takes ownership of `buffer` which may be resized with `gpa`.
-    ///
-    /// LZMA was explicitly designed to take advantage of large heap memory
-    /// being available, with a dictionary size anywhere from 4K to 4G. Thus,
-    /// this API dynamically allocates the dictionary as-needed.
-    pub fn initOptions(
-        input: *Reader,
-        gpa: Allocator,
-        buffer: []u8,
-        options: Decode.Options,
-        mem_limit: usize,
-    ) !Decompress {
-        const params = try Decode.Params.readHeader(input, options);
-        return initParams(input, gpa, buffer, params, mem_limit);
-    }
-
-    /// Reclaim ownership of the buffer passed to `init`.
-    pub fn takeBuffer(d: *Decompress) []u8 {
-        const buffer = d.reader.buffer;
-        d.reader.buffer = &amp;.{};
-        return buffer;
-    }
-
-    pub fn deinit(d: *Decompress) void {
-        const gpa = d.gpa;
-        gpa.free(d.reader.buffer);
-        d.buffer.deinit(gpa);
-        d.decode.deinit(gpa);
-        d.* = undefined;
-    }
-
-    fn readVec(r: *Reader, data: [][]u8) Reader.Error!usize {
-        _ = data;
-        return readIndirect(r);
-    }
-
-    fn stream(r: *Reader, w: *Writer, limit: std.Io.Limit) Reader.StreamError!usize {
-        _ = w;
-        _ = limit;
-        return readIndirect(r);
-    }
-
-    fn discard(r: *Reader, limit: std.Io.Limit) Reader.Error!usize {
-        const d: *Decompress = @alignCast(@fieldParentPtr("reader", r));
-        _ = d;
-        _ = limit;
-        @panic("TODO");
-    }
-
-    fn readIndirect(r: *Reader) Reader.Error!usize {
-        const d: *Decompress = @alignCast(@fieldParentPtr("reader", r));
-        const gpa = d.gpa;
-        var allocating = Writer.Allocating.initOwnedSlice(gpa, r.buffer);
-        allocating.writer.end = r.end;
-        defer {
-            r.buffer = allocating.writer.buffer;
-            r.end = allocating.writer.end;
-        }
-        if (d.decode.state == math.maxInt(usize)) return error.EndOfStream;
-
-        process_next: {
-            if (d.unpacked_size) |unpacked_size| {
-                if (d.buffer.len &gt;= unpacked_size) break :process_next;
-            } else if (d.range_decoder.isFinished()) {
-                break :process_next;
-            }
-            var n_read: u64 = 0;
-            switch (d.decode.process(d.input, &amp;allocating, &amp;d.buffer, &amp;d.range_decoder, &amp;n_read) catch |err| switch (err) {
-                error.WriteFailed =&gt; {
-                    d.err = error.OutOfMemory;
-                    return error.ReadFailed;
-                },
-                error.EndOfStream =&gt; {
-                    d.err = error.EndOfStream;
-                    return error.ReadFailed;
-                },
-                else =&gt; |e| {
-                    d.err = e;
-                    return error.ReadFailed;
-                },
-            }) {
-                .more =&gt; return 0,
-                .finished =&gt; break :process_next,
-            }
-        }
-
-        if (d.unpacked_size) |unpacked_size| {
-            if (d.buffer.len != unpacked_size) {
-                d.err = error.DecompressedSizeMismatch;
-                return error.ReadFailed;
-            }
-        }
-
-        d.buffer.finish(&amp;allocating.writer) catch |err| switch (err) {
-            error.WriteFailed =&gt; {
-                d.err = error.OutOfMemory;
-                return error.ReadFailed;
-            },
-        };
-        d.decode.state = math.maxInt(usize);
-        return 0;
-    }
-};
-
-test {
-    _ = @import("lzma/test.zig");
-}</pre>
+    <pre><a id="L1"></a>const std = @import("../std.zig");
+<a id="L2"></a>const math = std.math;
+<a id="L3"></a>const mem = std.mem;
+<a id="L4"></a>const Allocator = std.mem.Allocator;
+<a id="L5"></a>const assert = std.debug.assert;
+<a id="L6"></a>const ArrayList = std.ArrayList;
+<a id="L7"></a>const Writer = std.Io.Writer;
+<a id="L8"></a>const Reader = std.Io.Reader;
+<a id="L9"></a>
+<a id="L10"></a>pub const RangeDecoder = struct {
+<a id="L11"></a>    range: u32,
+<a id="L12"></a>    code: u32,
+<a id="L13"></a>
+<a id="L14"></a>    pub fn init(reader: *Reader) !RangeDecoder {
+<a id="L15"></a>        var counter: u64 = 0;
+<a id="L16"></a>        return initCounting(reader, &amp;counter);
+<a id="L17"></a>    }
+<a id="L18"></a>
+<a id="L19"></a>    pub fn initCounting(reader: *Reader, n_read: *u64) !RangeDecoder {
+<a id="L20"></a>        const reserved = try reader.takeByte();
+<a id="L21"></a>        n_read.* += 1;
+<a id="L22"></a>        if (reserved != 0) return error.InvalidRangeCode;
+<a id="L23"></a>        const code = try reader.takeInt(u32, .big);
+<a id="L24"></a>        n_read.* += 4;
+<a id="L25"></a>        return .{
+<a id="L26"></a>            .range = 0xFFFF_FFFF,
+<a id="L27"></a>            .code = code,
+<a id="L28"></a>        };
+<a id="L29"></a>    }
+<a id="L30"></a>
+<a id="L31"></a>    pub fn isFinished(self: RangeDecoder) bool {
+<a id="L32"></a>        return self.code == 0;
+<a id="L33"></a>    }
+<a id="L34"></a>
+<a id="L35"></a>    fn normalize(self: *RangeDecoder, reader: *Reader, n_read: *u64) !void {
+<a id="L36"></a>        if (self.range &lt; 0x0100_0000) {
+<a id="L37"></a>            self.range &lt;&lt;= 8;
+<a id="L38"></a>            self.code = (self.code &lt;&lt; 8) ^ @as(u32, try reader.takeByte());
+<a id="L39"></a>            n_read.* += 1;
+<a id="L40"></a>        }
+<a id="L41"></a>    }
+<a id="L42"></a>
+<a id="L43"></a>    fn getBit(self: *RangeDecoder, reader: *Reader, n_read: *u64) !bool {
+<a id="L44"></a>        self.range &gt;&gt;= 1;
+<a id="L45"></a>
+<a id="L46"></a>        const bit = self.code &gt;= self.range;
+<a id="L47"></a>        if (bit) self.code -= self.range;
+<a id="L48"></a>
+<a id="L49"></a>        try self.normalize(reader, n_read);
+<a id="L50"></a>        return bit;
+<a id="L51"></a>    }
+<a id="L52"></a>
+<a id="L53"></a>    pub fn get(self: *RangeDecoder, reader: *Reader, count: usize, n_read: *u64) !u32 {
+<a id="L54"></a>        var result: u32 = 0;
+<a id="L55"></a>        for (0..count) |_| {
+<a id="L56"></a>            result = (result &lt;&lt; 1) ^ @intFromBool(try self.getBit(reader, n_read));
+<a id="L57"></a>        }
+<a id="L58"></a>        return result;
+<a id="L59"></a>    }
+<a id="L60"></a>
+<a id="L61"></a>    pub fn decodeBit(self: *RangeDecoder, reader: *Reader, prob: *u16, n_read: *u64) !bool {
+<a id="L62"></a>        const bound = (self.range &gt;&gt; 11) * prob.*;
+<a id="L63"></a>
+<a id="L64"></a>        if (self.code &lt; bound) {
+<a id="L65"></a>            prob.* += (0x800 - prob.*) &gt;&gt; 5;
+<a id="L66"></a>            self.range = bound;
+<a id="L67"></a>
+<a id="L68"></a>            try self.normalize(reader, n_read);
+<a id="L69"></a>            return false;
+<a id="L70"></a>        } else {
+<a id="L71"></a>            prob.* -= prob.* &gt;&gt; 5;
+<a id="L72"></a>            self.code -= bound;
+<a id="L73"></a>            self.range -= bound;
+<a id="L74"></a>
+<a id="L75"></a>            try self.normalize(reader, n_read);
+<a id="L76"></a>            return true;
+<a id="L77"></a>        }
+<a id="L78"></a>    }
+<a id="L79"></a>
+<a id="L80"></a>    fn parseBitTree(
+<a id="L81"></a>        self: *RangeDecoder,
+<a id="L82"></a>        reader: *Reader,
+<a id="L83"></a>        num_bits: u5,
+<a id="L84"></a>        probs: []u16,
+<a id="L85"></a>        n_read: *u64,
+<a id="L86"></a>    ) !u32 {
+<a id="L87"></a>        var tmp: u32 = 1;
+<a id="L88"></a>        var i: @TypeOf(num_bits) = 0;
+<a id="L89"></a>        while (i &lt; num_bits) : (i += 1) {
+<a id="L90"></a>            const bit = try self.decodeBit(reader, &amp;probs[tmp], n_read);
+<a id="L91"></a>            tmp = (tmp &lt;&lt; 1) ^ @intFromBool(bit);
+<a id="L92"></a>        }
+<a id="L93"></a>        return tmp - (@as(u32, 1) &lt;&lt; num_bits);
+<a id="L94"></a>    }
+<a id="L95"></a>
+<a id="L96"></a>    pub fn parseReverseBitTree(
+<a id="L97"></a>        self: *RangeDecoder,
+<a id="L98"></a>        reader: *Reader,
+<a id="L99"></a>        num_bits: u5,
+<a id="L100"></a>        probs: []u16,
+<a id="L101"></a>        offset: usize,
+<a id="L102"></a>        n_read: *u64,
+<a id="L103"></a>    ) !u32 {
+<a id="L104"></a>        var result: u32 = 0;
+<a id="L105"></a>        var tmp: usize = 1;
+<a id="L106"></a>        var i: @TypeOf(num_bits) = 0;
+<a id="L107"></a>        while (i &lt; num_bits) : (i += 1) {
+<a id="L108"></a>            const bit = @intFromBool(try self.decodeBit(reader, &amp;probs[offset + tmp], n_read));
+<a id="L109"></a>            tmp = (tmp &lt;&lt; 1) ^ bit;
+<a id="L110"></a>            result ^= @as(u32, bit) &lt;&lt; i;
+<a id="L111"></a>        }
+<a id="L112"></a>        return result;
+<a id="L113"></a>    }
+<a id="L114"></a>};
+<a id="L115"></a>
+<a id="L116"></a>pub const Decode = struct {
+<a id="L117"></a>    properties: Properties,
+<a id="L118"></a>    literal_probs: Vec2d,
+<a id="L119"></a>    pos_slot_decoder: [4]BitTree(6),
+<a id="L120"></a>    align_decoder: BitTree(4),
+<a id="L121"></a>    pos_decoders: [115]u16,
+<a id="L122"></a>    is_match: [192]u16,
+<a id="L123"></a>    is_rep: [12]u16,
+<a id="L124"></a>    is_rep_g0: [12]u16,
+<a id="L125"></a>    is_rep_g1: [12]u16,
+<a id="L126"></a>    is_rep_g2: [12]u16,
+<a id="L127"></a>    is_rep_0long: [192]u16,
+<a id="L128"></a>    state: usize,
+<a id="L129"></a>    rep: [4]usize,
+<a id="L130"></a>    len_decoder: LenDecoder,
+<a id="L131"></a>    rep_len_decoder: LenDecoder,
+<a id="L132"></a>
+<a id="L133"></a>    pub fn init(gpa: Allocator, properties: Properties) !Decode {
+<a id="L134"></a>        return .{
+<a id="L135"></a>            .properties = properties,
+<a id="L136"></a>            .literal_probs = try Vec2d.init(gpa, 0x400, @as(usize, 1) &lt;&lt; (properties.lc + properties.lp), 0x300),
+<a id="L137"></a>            .pos_slot_decoder = @splat(.{}),
+<a id="L138"></a>            .align_decoder = .{},
+<a id="L139"></a>            .pos_decoders = @splat(0x400),
+<a id="L140"></a>            .is_match = @splat(0x400),
+<a id="L141"></a>            .is_rep = @splat(0x400),
+<a id="L142"></a>            .is_rep_g0 = @splat(0x400),
+<a id="L143"></a>            .is_rep_g1 = @splat(0x400),
+<a id="L144"></a>            .is_rep_g2 = @splat(0x400),
+<a id="L145"></a>            .is_rep_0long = @splat(0x400),
+<a id="L146"></a>            .state = 0,
+<a id="L147"></a>            .rep = @splat(0),
+<a id="L148"></a>            .len_decoder = .{},
+<a id="L149"></a>            .rep_len_decoder = .{},
+<a id="L150"></a>        };
+<a id="L151"></a>    }
+<a id="L152"></a>
+<a id="L153"></a>    pub fn deinit(self: *Decode, gpa: Allocator) void {
+<a id="L154"></a>        self.literal_probs.deinit(gpa);
+<a id="L155"></a>        self.* = undefined;
+<a id="L156"></a>    }
+<a id="L157"></a>
+<a id="L158"></a>    pub fn resetState(self: *Decode, gpa: Allocator, new_props: Properties) !void {
+<a id="L159"></a>        new_props.validate();
+<a id="L160"></a>        if (self.properties.lc + self.properties.lp == new_props.lc + new_props.lp) {
+<a id="L161"></a>            self.literal_probs.fill(0x400);
+<a id="L162"></a>        } else {
+<a id="L163"></a>            self.literal_probs.deinit(gpa);
+<a id="L164"></a>            self.literal_probs = try Vec2d.init(gpa, 0x400, @as(usize, 1) &lt;&lt; (new_props.lc + new_props.lp), 0x300);
+<a id="L165"></a>        }
+<a id="L166"></a>
+<a id="L167"></a>        self.properties = new_props;
+<a id="L168"></a>        for (&amp;self.pos_slot_decoder) |*t| t.reset();
+<a id="L169"></a>        self.align_decoder.reset();
+<a id="L170"></a>        self.pos_decoders = @splat(0x400);
+<a id="L171"></a>        self.is_match = @splat(0x400);
+<a id="L172"></a>        self.is_rep = @splat(0x400);
+<a id="L173"></a>        self.is_rep_g0 = @splat(0x400);
+<a id="L174"></a>        self.is_rep_g1 = @splat(0x400);
+<a id="L175"></a>        self.is_rep_g2 = @splat(0x400);
+<a id="L176"></a>        self.is_rep_0long = @splat(0x400);
+<a id="L177"></a>        self.state = 0;
+<a id="L178"></a>        self.rep = @splat(0);
+<a id="L179"></a>        self.len_decoder.reset();
+<a id="L180"></a>        self.rep_len_decoder.reset();
+<a id="L181"></a>    }
+<a id="L182"></a>
+<a id="L183"></a>    pub fn process(
+<a id="L184"></a>        self: *Decode,
+<a id="L185"></a>        reader: *Reader,
+<a id="L186"></a>        allocating: *Writer.Allocating,
+<a id="L187"></a>        /// `CircularBuffer` or `std.compress.lzma2.AccumBuffer`.
+<a id="L188"></a>        buffer: anytype,
+<a id="L189"></a>        decoder: *RangeDecoder,
+<a id="L190"></a>        n_read: *u64,
+<a id="L191"></a>    ) !ProcessingStatus {
+<a id="L192"></a>        const gpa = allocating.allocator;
+<a id="L193"></a>        const writer = &amp;allocating.writer;
+<a id="L194"></a>        const pos_state = buffer.len &amp; ((@as(usize, 1) &lt;&lt; self.properties.pb) - 1);
+<a id="L195"></a>
+<a id="L196"></a>        if (!try decoder.decodeBit(reader, &amp;self.is_match[(self.state &lt;&lt; 4) + pos_state], n_read)) {
+<a id="L197"></a>            const byte: u8 = try self.decodeLiteral(reader, buffer, decoder, n_read);
+<a id="L198"></a>
+<a id="L199"></a>            try buffer.appendLiteral(gpa, byte, writer);
+<a id="L200"></a>
+<a id="L201"></a>            self.state = if (self.state &lt; 4)
+<a id="L202"></a>                0
+<a id="L203"></a>            else if (self.state &lt; 10)
+<a id="L204"></a>                self.state - 3
+<a id="L205"></a>            else
+<a id="L206"></a>                self.state - 6;
+<a id="L207"></a>            return .more;
+<a id="L208"></a>        }
+<a id="L209"></a>
+<a id="L210"></a>        var len: usize = undefined;
+<a id="L211"></a>        if (try decoder.decodeBit(reader, &amp;self.is_rep[self.state], n_read)) {
+<a id="L212"></a>            if (!try decoder.decodeBit(reader, &amp;self.is_rep_g0[self.state], n_read)) {
+<a id="L213"></a>                if (!try decoder.decodeBit(reader, &amp;self.is_rep_0long[(self.state &lt;&lt; 4) + pos_state], n_read)) {
+<a id="L214"></a>                    self.state = if (self.state &lt; 7) 9 else 11;
+<a id="L215"></a>                    const dist = self.rep[0] + 1;
+<a id="L216"></a>                    try buffer.appendLz(gpa, 1, dist, writer);
+<a id="L217"></a>                    return .more;
+<a id="L218"></a>                }
+<a id="L219"></a>            } else {
+<a id="L220"></a>                const idx: usize = if (!try decoder.decodeBit(reader, &amp;self.is_rep_g1[self.state], n_read))
+<a id="L221"></a>                    1
+<a id="L222"></a>                else if (!try decoder.decodeBit(reader, &amp;self.is_rep_g2[self.state], n_read))
+<a id="L223"></a>                    2
+<a id="L224"></a>                else
+<a id="L225"></a>                    3;
+<a id="L226"></a>                const dist = self.rep[idx];
+<a id="L227"></a>                var i = idx;
+<a id="L228"></a>                while (i &gt; 0) : (i -= 1) {
+<a id="L229"></a>                    self.rep[i] = self.rep[i - 1];
+<a id="L230"></a>                }
+<a id="L231"></a>                self.rep[0] = dist;
+<a id="L232"></a>            }
+<a id="L233"></a>
+<a id="L234"></a>            len = try self.rep_len_decoder.decode(reader, decoder, pos_state, n_read);
+<a id="L235"></a>
+<a id="L236"></a>            self.state = if (self.state &lt; 7) 8 else 11;
+<a id="L237"></a>        } else {
+<a id="L238"></a>            self.rep[3] = self.rep[2];
+<a id="L239"></a>            self.rep[2] = self.rep[1];
+<a id="L240"></a>            self.rep[1] = self.rep[0];
+<a id="L241"></a>
+<a id="L242"></a>            len = try self.len_decoder.decode(reader, decoder, pos_state, n_read);
+<a id="L243"></a>
+<a id="L244"></a>            self.state = if (self.state &lt; 7) 7 else 10;
+<a id="L245"></a>
+<a id="L246"></a>            const rep_0 = try self.decodeDistance(reader, decoder, len, n_read);
+<a id="L247"></a>
+<a id="L248"></a>            self.rep[0] = rep_0;
+<a id="L249"></a>            if (self.rep[0] == 0xFFFF_FFFF) {
+<a id="L250"></a>                if (decoder.isFinished()) {
+<a id="L251"></a>                    return .finished;
+<a id="L252"></a>                }
+<a id="L253"></a>                return error.CorruptInput;
+<a id="L254"></a>            }
+<a id="L255"></a>        }
+<a id="L256"></a>
+<a id="L257"></a>        len += 2;
+<a id="L258"></a>
+<a id="L259"></a>        const dist = self.rep[0] + 1;
+<a id="L260"></a>        try buffer.appendLz(gpa, len, dist, writer);
+<a id="L261"></a>
+<a id="L262"></a>        return .more;
+<a id="L263"></a>    }
+<a id="L264"></a>
+<a id="L265"></a>    fn decodeLiteral(
+<a id="L266"></a>        self: *Decode,
+<a id="L267"></a>        reader: *Reader,
+<a id="L268"></a>        /// `CircularBuffer` or `std.compress.lzma2.AccumBuffer`.
+<a id="L269"></a>        buffer: anytype,
+<a id="L270"></a>        decoder: *RangeDecoder,
+<a id="L271"></a>        n_read: *u64,
+<a id="L272"></a>    ) !u8 {
+<a id="L273"></a>        const def_prev_byte = 0;
+<a id="L274"></a>        const prev_byte = @as(usize, buffer.lastOr(def_prev_byte));
+<a id="L275"></a>
+<a id="L276"></a>        var result: usize = 1;
+<a id="L277"></a>        const lit_state = ((buffer.len &amp; ((@as(usize, 1) &lt;&lt; self.properties.lp) - 1)) &lt;&lt; self.properties.lc) +
+<a id="L278"></a>            (prev_byte &gt;&gt; (8 - self.properties.lc));
+<a id="L279"></a>        const probs = try self.literal_probs.get(lit_state);
+<a id="L280"></a>
+<a id="L281"></a>        if (self.state &gt;= 7) {
+<a id="L282"></a>            var match_byte = @as(usize, try buffer.lastN(self.rep[0] + 1));
+<a id="L283"></a>
+<a id="L284"></a>            while (result &lt; 0x100) {
+<a id="L285"></a>                const match_bit = (match_byte &gt;&gt; 7) &amp; 1;
+<a id="L286"></a>                match_byte &lt;&lt;= 1;
+<a id="L287"></a>                const bit = @intFromBool(try decoder.decodeBit(
+<a id="L288"></a>                    reader,
+<a id="L289"></a>                    &amp;probs[((@as(usize, 1) + match_bit) &lt;&lt; 8) + result],
+<a id="L290"></a>                    n_read,
+<a id="L291"></a>                ));
+<a id="L292"></a>                result = (result &lt;&lt; 1) ^ bit;
+<a id="L293"></a>                if (match_bit != bit) {
+<a id="L294"></a>                    break;
+<a id="L295"></a>                }
+<a id="L296"></a>            }
+<a id="L297"></a>        }
+<a id="L298"></a>
+<a id="L299"></a>        while (result &lt; 0x100) {
+<a id="L300"></a>            result = (result &lt;&lt; 1) ^ @intFromBool(try decoder.decodeBit(reader, &amp;probs[result], n_read));
+<a id="L301"></a>        }
+<a id="L302"></a>
+<a id="L303"></a>        return @truncate(result - 0x100);
+<a id="L304"></a>    }
+<a id="L305"></a>
+<a id="L306"></a>    fn decodeDistance(
+<a id="L307"></a>        self: *Decode,
+<a id="L308"></a>        reader: *Reader,
+<a id="L309"></a>        decoder: *RangeDecoder,
+<a id="L310"></a>        length: usize,
+<a id="L311"></a>        n_read: *u64,
+<a id="L312"></a>    ) !usize {
+<a id="L313"></a>        const len_state = if (length &gt; 3) 3 else length;
+<a id="L314"></a>
+<a id="L315"></a>        const pos_slot: usize = try self.pos_slot_decoder[len_state].parse(reader, decoder, n_read);
+<a id="L316"></a>        if (pos_slot &lt; 4) return pos_slot;
+<a id="L317"></a>
+<a id="L318"></a>        const num_direct_bits = @as(u5, @intCast((pos_slot &gt;&gt; 1) - 1));
+<a id="L319"></a>        var result = (2 ^ (pos_slot &amp; 1)) &lt;&lt; num_direct_bits;
+<a id="L320"></a>
+<a id="L321"></a>        if (pos_slot &lt; 14) {
+<a id="L322"></a>            result += try decoder.parseReverseBitTree(
+<a id="L323"></a>                reader,
+<a id="L324"></a>                num_direct_bits,
+<a id="L325"></a>                &amp;self.pos_decoders,
+<a id="L326"></a>                result - pos_slot,
+<a id="L327"></a>                n_read,
+<a id="L328"></a>            );
+<a id="L329"></a>        } else {
+<a id="L330"></a>            result += @as(usize, try decoder.get(reader, num_direct_bits - 4, n_read)) &lt;&lt; 4;
+<a id="L331"></a>            result += try self.align_decoder.parseReverse(reader, decoder, n_read);
+<a id="L332"></a>        }
+<a id="L333"></a>
+<a id="L334"></a>        return result;
+<a id="L335"></a>    }
+<a id="L336"></a>
+<a id="L337"></a>    /// A circular buffer for LZ sequences
+<a id="L338"></a>    pub const CircularBuffer = struct {
+<a id="L339"></a>        /// Circular buffer
+<a id="L340"></a>        buf: ArrayList(u8),
+<a id="L341"></a>        /// Length of the buffer
+<a id="L342"></a>        dict_size: usize,
+<a id="L343"></a>        /// Buffer memory limit
+<a id="L344"></a>        mem_limit: usize,
+<a id="L345"></a>        /// Current position
+<a id="L346"></a>        cursor: usize,
+<a id="L347"></a>        /// Total number of bytes sent through the buffer
+<a id="L348"></a>        len: usize,
+<a id="L349"></a>
+<a id="L350"></a>        pub fn init(dict_size: usize, mem_limit: usize) CircularBuffer {
+<a id="L351"></a>            return .{
+<a id="L352"></a>                .buf = .empty,
+<a id="L353"></a>                .dict_size = dict_size,
+<a id="L354"></a>                .mem_limit = mem_limit,
+<a id="L355"></a>                .cursor = 0,
+<a id="L356"></a>                .len = 0,
+<a id="L357"></a>            };
+<a id="L358"></a>        }
+<a id="L359"></a>
+<a id="L360"></a>        pub fn get(self: CircularBuffer, index: usize) u8 {
+<a id="L361"></a>            return if (0 &lt;= index and index &lt; self.buf.items.len) self.buf.items[index] else 0;
+<a id="L362"></a>        }
+<a id="L363"></a>
+<a id="L364"></a>        pub fn set(self: *CircularBuffer, gpa: Allocator, index: usize, value: u8) !void {
+<a id="L365"></a>            if (index &gt;= self.mem_limit) {
+<a id="L366"></a>                return error.CorruptInput;
+<a id="L367"></a>            }
+<a id="L368"></a>            try self.buf.ensureTotalCapacity(gpa, index + 1);
+<a id="L369"></a>            while (self.buf.items.len &lt; index) {
+<a id="L370"></a>                self.buf.appendAssumeCapacity(0);
+<a id="L371"></a>            }
+<a id="L372"></a>            self.buf.appendAssumeCapacity(value);
+<a id="L373"></a>        }
+<a id="L374"></a>
+<a id="L375"></a>        /// Retrieve the last byte or return a default
+<a id="L376"></a>        pub fn lastOr(self: CircularBuffer, lit: u8) u8 {
+<a id="L377"></a>            return if (self.len == 0)
+<a id="L378"></a>                lit
+<a id="L379"></a>            else
+<a id="L380"></a>                self.get((self.dict_size + self.cursor - 1) % self.dict_size);
+<a id="L381"></a>        }
+<a id="L382"></a>
+<a id="L383"></a>        /// Retrieve the n-th last byte
+<a id="L384"></a>        pub fn lastN(self: CircularBuffer, dist: usize) !u8 {
+<a id="L385"></a>            if (dist &gt; self.dict_size or dist &gt; self.len) {
+<a id="L386"></a>                return error.CorruptInput;
+<a id="L387"></a>            }
+<a id="L388"></a>
+<a id="L389"></a>            const offset = (self.dict_size + self.cursor - dist) % self.dict_size;
+<a id="L390"></a>            return self.get(offset);
+<a id="L391"></a>        }
+<a id="L392"></a>
+<a id="L393"></a>        /// Append a literal
+<a id="L394"></a>        pub fn appendLiteral(
+<a id="L395"></a>            self: *CircularBuffer,
+<a id="L396"></a>            gpa: Allocator,
+<a id="L397"></a>            lit: u8,
+<a id="L398"></a>            writer: *Writer,
+<a id="L399"></a>        ) !void {
+<a id="L400"></a>            try self.set(gpa, self.cursor, lit);
+<a id="L401"></a>            self.cursor += 1;
+<a id="L402"></a>            self.len += 1;
+<a id="L403"></a>
+<a id="L404"></a>            // Flush the circular buffer to the output
+<a id="L405"></a>            if (self.cursor == self.dict_size) {
+<a id="L406"></a>                try writer.writeAll(self.buf.items);
+<a id="L407"></a>                self.cursor = 0;
+<a id="L408"></a>            }
+<a id="L409"></a>        }
+<a id="L410"></a>
+<a id="L411"></a>        /// Fetch an LZ sequence (length, distance) from inside the buffer
+<a id="L412"></a>        pub fn appendLz(
+<a id="L413"></a>            self: *CircularBuffer,
+<a id="L414"></a>            gpa: Allocator,
+<a id="L415"></a>            len: usize,
+<a id="L416"></a>            dist: usize,
+<a id="L417"></a>            writer: *Writer,
+<a id="L418"></a>        ) !void {
+<a id="L419"></a>            if (dist &gt; self.dict_size or dist &gt; self.len) {
+<a id="L420"></a>                return error.CorruptInput;
+<a id="L421"></a>            }
+<a id="L422"></a>
+<a id="L423"></a>            var offset = (self.dict_size + self.cursor - dist) % self.dict_size;
+<a id="L424"></a>            var i: usize = 0;
+<a id="L425"></a>            while (i &lt; len) : (i += 1) {
+<a id="L426"></a>                const x = self.get(offset);
+<a id="L427"></a>                try self.appendLiteral(gpa, x, writer);
+<a id="L428"></a>                offset += 1;
+<a id="L429"></a>                if (offset == self.dict_size) {
+<a id="L430"></a>                    offset = 0;
+<a id="L431"></a>                }
+<a id="L432"></a>            }
+<a id="L433"></a>        }
+<a id="L434"></a>
+<a id="L435"></a>        pub fn finish(self: *CircularBuffer, writer: *Writer) !void {
+<a id="L436"></a>            if (self.cursor &gt; 0) {
+<a id="L437"></a>                try writer.writeAll(self.buf.items[0..self.cursor]);
+<a id="L438"></a>                self.cursor = 0;
+<a id="L439"></a>            }
+<a id="L440"></a>        }
+<a id="L441"></a>
+<a id="L442"></a>        pub fn deinit(self: *CircularBuffer, gpa: Allocator) void {
+<a id="L443"></a>            self.buf.deinit(gpa);
+<a id="L444"></a>            self.* = undefined;
+<a id="L445"></a>        }
+<a id="L446"></a>    };
+<a id="L447"></a>
+<a id="L448"></a>    pub fn BitTree(comptime num_bits: usize) type {
+<a id="L449"></a>        return struct {
+<a id="L450"></a>            probs: [1 &lt;&lt; num_bits]u16 = @splat(0x400),
+<a id="L451"></a>
+<a id="L452"></a>            pub fn parse(self: *@This(), reader: *Reader, decoder: *RangeDecoder, n_read: *u64) !u32 {
+<a id="L453"></a>                return decoder.parseBitTree(reader, num_bits, &amp;self.probs, n_read);
+<a id="L454"></a>            }
+<a id="L455"></a>
+<a id="L456"></a>            pub fn parseReverse(
+<a id="L457"></a>                self: *@This(),
+<a id="L458"></a>                reader: *Reader,
+<a id="L459"></a>                decoder: *RangeDecoder,
+<a id="L460"></a>                n_read: *u64,
+<a id="L461"></a>            ) !u32 {
+<a id="L462"></a>                return decoder.parseReverseBitTree(reader, num_bits, &amp;self.probs, 0, n_read);
+<a id="L463"></a>            }
+<a id="L464"></a>
+<a id="L465"></a>            pub fn reset(self: *@This()) void {
+<a id="L466"></a>                @memset(&amp;self.probs, 0x400);
+<a id="L467"></a>            }
+<a id="L468"></a>        };
+<a id="L469"></a>    }
+<a id="L470"></a>
+<a id="L471"></a>    pub const LenDecoder = struct {
+<a id="L472"></a>        choice: u16 = 0x400,
+<a id="L473"></a>        choice2: u16 = 0x400,
+<a id="L474"></a>        low_coder: [16]BitTree(3) = @splat(.{}),
+<a id="L475"></a>        mid_coder: [16]BitTree(3) = @splat(.{}),
+<a id="L476"></a>        high_coder: BitTree(8) = .{},
+<a id="L477"></a>
+<a id="L478"></a>        pub fn decode(
+<a id="L479"></a>            self: *LenDecoder,
+<a id="L480"></a>            reader: *Reader,
+<a id="L481"></a>            decoder: *RangeDecoder,
+<a id="L482"></a>            pos_state: usize,
+<a id="L483"></a>            n_read: *u64,
+<a id="L484"></a>        ) !usize {
+<a id="L485"></a>            if (!try decoder.decodeBit(reader, &amp;self.choice, n_read)) {
+<a id="L486"></a>                return @as(usize, try self.low_coder[pos_state].parse(reader, decoder, n_read));
+<a id="L487"></a>            } else if (!try decoder.decodeBit(reader, &amp;self.choice2, n_read)) {
+<a id="L488"></a>                return @as(usize, try self.mid_coder[pos_state].parse(reader, decoder, n_read)) + 8;
+<a id="L489"></a>            } else {
+<a id="L490"></a>                return @as(usize, try self.high_coder.parse(reader, decoder, n_read)) + 16;
+<a id="L491"></a>            }
+<a id="L492"></a>        }
+<a id="L493"></a>
+<a id="L494"></a>        pub fn reset(self: *LenDecoder) void {
+<a id="L495"></a>            self.choice = 0x400;
+<a id="L496"></a>            self.choice2 = 0x400;
+<a id="L497"></a>            for (&amp;self.low_coder) |*t| t.reset();
+<a id="L498"></a>            for (&amp;self.mid_coder) |*t| t.reset();
+<a id="L499"></a>            self.high_coder.reset();
+<a id="L500"></a>        }
+<a id="L501"></a>    };
+<a id="L502"></a>
+<a id="L503"></a>    pub const Vec2d = struct {
+<a id="L504"></a>        data: []u16,
+<a id="L505"></a>        cols: usize,
+<a id="L506"></a>
+<a id="L507"></a>        pub fn init(gpa: Allocator, value: u16, w: usize, h: usize) !Vec2d {
+<a id="L508"></a>            const len = try math.mul(usize, w, h);
+<a id="L509"></a>            const data = try gpa.alloc(u16, len);
+<a id="L510"></a>            @memset(data, value);
+<a id="L511"></a>            return .{
+<a id="L512"></a>                .data = data,
+<a id="L513"></a>                .cols = h,
+<a id="L514"></a>            };
+<a id="L515"></a>        }
+<a id="L516"></a>
+<a id="L517"></a>        pub fn deinit(v: *Vec2d, gpa: Allocator) void {
+<a id="L518"></a>            gpa.free(v.data);
+<a id="L519"></a>            v.* = undefined;
+<a id="L520"></a>        }
+<a id="L521"></a>
+<a id="L522"></a>        pub fn fill(v: *Vec2d, value: u16) void {
+<a id="L523"></a>            @memset(v.data, value);
+<a id="L524"></a>        }
+<a id="L525"></a>
+<a id="L526"></a>        fn get(v: Vec2d, row: usize) ![]u16 {
+<a id="L527"></a>            const start_row = try math.mul(usize, row, v.cols);
+<a id="L528"></a>            const end_row = try math.add(usize, start_row, v.cols);
+<a id="L529"></a>            return v.data[start_row..end_row];
+<a id="L530"></a>        }
+<a id="L531"></a>    };
+<a id="L532"></a>
+<a id="L533"></a>    pub const Options = struct {
+<a id="L534"></a>        unpacked_size: UnpackedSize = .read_from_header,
+<a id="L535"></a>        mem_limit: ?usize = null,
+<a id="L536"></a>        allow_incomplete: bool = false,
+<a id="L537"></a>    };
+<a id="L538"></a>
+<a id="L539"></a>    pub const UnpackedSize = union(enum) {
+<a id="L540"></a>        read_from_header,
+<a id="L541"></a>        read_header_but_use_provided: ?u64,
+<a id="L542"></a>        use_provided: ?u64,
+<a id="L543"></a>    };
+<a id="L544"></a>
+<a id="L545"></a>    const ProcessingStatus = enum {
+<a id="L546"></a>        more,
+<a id="L547"></a>        finished,
+<a id="L548"></a>    };
+<a id="L549"></a>
+<a id="L550"></a>    pub const Properties = struct {
+<a id="L551"></a>        lc: u4,
+<a id="L552"></a>        lp: u3,
+<a id="L553"></a>        pb: u3,
+<a id="L554"></a>
+<a id="L555"></a>        fn validate(self: Properties) void {
+<a id="L556"></a>            assert(self.lc &lt;= 8);
+<a id="L557"></a>            assert(self.lp &lt;= 4);
+<a id="L558"></a>            assert(self.pb &lt;= 4);
+<a id="L559"></a>        }
+<a id="L560"></a>    };
+<a id="L561"></a>
+<a id="L562"></a>    pub const Params = struct {
+<a id="L563"></a>        properties: Properties,
+<a id="L564"></a>        dict_size: u32,
+<a id="L565"></a>        unpacked_size: ?u64,
+<a id="L566"></a>
+<a id="L567"></a>        pub fn readHeader(reader: *Reader, options: Options) !Params {
+<a id="L568"></a>            var props = try reader.takeByte();
+<a id="L569"></a>            if (props &gt;= 225) return error.CorruptInput;
+<a id="L570"></a>
+<a id="L571"></a>            const lc: u4 = @intCast(props % 9);
+<a id="L572"></a>            props /= 9;
+<a id="L573"></a>            const lp: u3 = @intCast(props % 5);
+<a id="L574"></a>            props /= 5;
+<a id="L575"></a>            const pb: u3 = @intCast(props);
+<a id="L576"></a>
+<a id="L577"></a>            const dict_size_provided = try reader.takeInt(u32, .little);
+<a id="L578"></a>            const dict_size = @max(0x1000, dict_size_provided);
+<a id="L579"></a>
+<a id="L580"></a>            const unpacked_size = switch (options.unpacked_size) {
+<a id="L581"></a>                .read_from_header =&gt; blk: {
+<a id="L582"></a>                    const unpacked_size_provided = try reader.takeInt(u64, .little);
+<a id="L583"></a>                    const marker_mandatory = unpacked_size_provided == 0xFFFF_FFFF_FFFF_FFFF;
+<a id="L584"></a>                    break :blk if (marker_mandatory) null else unpacked_size_provided;
+<a id="L585"></a>                },
+<a id="L586"></a>                .read_header_but_use_provided =&gt; |x| blk: {
+<a id="L587"></a>                    _ = try reader.takeInt(u64, .little);
+<a id="L588"></a>                    break :blk x;
+<a id="L589"></a>                },
+<a id="L590"></a>                .use_provided =&gt; |x| x,
+<a id="L591"></a>            };
+<a id="L592"></a>
+<a id="L593"></a>            return .{
+<a id="L594"></a>                .properties = .{ .lc = lc, .lp = lp, .pb = pb },
+<a id="L595"></a>                .dict_size = dict_size,
+<a id="L596"></a>                .unpacked_size = unpacked_size,
+<a id="L597"></a>            };
+<a id="L598"></a>        }
+<a id="L599"></a>    };
+<a id="L600"></a>};
+<a id="L601"></a>
+<a id="L602"></a>pub const Decompress = struct {
+<a id="L603"></a>    gpa: Allocator,
+<a id="L604"></a>    input: *Reader,
+<a id="L605"></a>    reader: Reader,
+<a id="L606"></a>    buffer: Decode.CircularBuffer,
+<a id="L607"></a>    range_decoder: RangeDecoder,
+<a id="L608"></a>    decode: Decode,
+<a id="L609"></a>    err: ?Error,
+<a id="L610"></a>    unpacked_size: ?u64,
+<a id="L611"></a>
+<a id="L612"></a>    pub const Error = error{
+<a id="L613"></a>        OutOfMemory,
+<a id="L614"></a>        ReadFailed,
+<a id="L615"></a>        CorruptInput,
+<a id="L616"></a>        DecompressedSizeMismatch,
+<a id="L617"></a>        EndOfStream,
+<a id="L618"></a>        Overflow,
+<a id="L619"></a>    };
+<a id="L620"></a>
+<a id="L621"></a>    /// Takes ownership of `buffer` which may be resized with `gpa`.
+<a id="L622"></a>    ///
+<a id="L623"></a>    /// LZMA was explicitly designed to take advantage of large heap memory
+<a id="L624"></a>    /// being available, with a dictionary size anywhere from 4K to 4G. Thus,
+<a id="L625"></a>    /// this API dynamically allocates the dictionary as-needed.
+<a id="L626"></a>    pub fn initParams(
+<a id="L627"></a>        input: *Reader,
+<a id="L628"></a>        gpa: Allocator,
+<a id="L629"></a>        buffer: []u8,
+<a id="L630"></a>        params: Decode.Params,
+<a id="L631"></a>        mem_limit: usize,
+<a id="L632"></a>    ) !Decompress {
+<a id="L633"></a>        return .{
+<a id="L634"></a>            .gpa = gpa,
+<a id="L635"></a>            .input = input,
+<a id="L636"></a>            .buffer = Decode.CircularBuffer.init(params.dict_size, mem_limit),
+<a id="L637"></a>            .range_decoder = try RangeDecoder.init(input),
+<a id="L638"></a>            .decode = try Decode.init(gpa, params.properties),
+<a id="L639"></a>            .reader = .{
+<a id="L640"></a>                .buffer = buffer,
+<a id="L641"></a>                .vtable = &amp;.{
+<a id="L642"></a>                    .readVec = readVec,
+<a id="L643"></a>                    .stream = stream,
+<a id="L644"></a>                    .discard = discard,
+<a id="L645"></a>                },
+<a id="L646"></a>                .seek = 0,
+<a id="L647"></a>                .end = 0,
+<a id="L648"></a>            },
+<a id="L649"></a>            .err = null,
+<a id="L650"></a>            .unpacked_size = params.unpacked_size,
+<a id="L651"></a>        };
+<a id="L652"></a>    }
+<a id="L653"></a>
+<a id="L654"></a>    /// Takes ownership of `buffer` which may be resized with `gpa`.
+<a id="L655"></a>    ///
+<a id="L656"></a>    /// LZMA was explicitly designed to take advantage of large heap memory
+<a id="L657"></a>    /// being available, with a dictionary size anywhere from 4K to 4G. Thus,
+<a id="L658"></a>    /// this API dynamically allocates the dictionary as-needed.
+<a id="L659"></a>    pub fn initOptions(
+<a id="L660"></a>        input: *Reader,
+<a id="L661"></a>        gpa: Allocator,
+<a id="L662"></a>        buffer: []u8,
+<a id="L663"></a>        options: Decode.Options,
+<a id="L664"></a>        mem_limit: usize,
+<a id="L665"></a>    ) !Decompress {
+<a id="L666"></a>        const params = try Decode.Params.readHeader(input, options);
+<a id="L667"></a>        return initParams(input, gpa, buffer, params, mem_limit);
+<a id="L668"></a>    }
+<a id="L669"></a>
+<a id="L670"></a>    /// Reclaim ownership of the buffer passed to `init`.
+<a id="L671"></a>    pub fn takeBuffer(d: *Decompress) []u8 {
+<a id="L672"></a>        const buffer = d.reader.buffer;
+<a id="L673"></a>        d.reader.buffer = &amp;.{};
+<a id="L674"></a>        return buffer;
+<a id="L675"></a>    }
+<a id="L676"></a>
+<a id="L677"></a>    pub fn deinit(d: *Decompress) void {
+<a id="L678"></a>        const gpa = d.gpa;
+<a id="L679"></a>        gpa.free(d.reader.buffer);
+<a id="L680"></a>        d.buffer.deinit(gpa);
+<a id="L681"></a>        d.decode.deinit(gpa);
+<a id="L682"></a>        d.* = undefined;
+<a id="L683"></a>    }
+<a id="L684"></a>
+<a id="L685"></a>    fn readVec(r: *Reader, data: [][]u8) Reader.Error!usize {
+<a id="L686"></a>        _ = data;
+<a id="L687"></a>        return readIndirect(r);
+<a id="L688"></a>    }
+<a id="L689"></a>
+<a id="L690"></a>    fn stream(r: *Reader, w: *Writer, limit: std.Io.Limit) Reader.StreamError!usize {
+<a id="L691"></a>        _ = w;
+<a id="L692"></a>        _ = limit;
+<a id="L693"></a>        return readIndirect(r);
+<a id="L694"></a>    }
+<a id="L695"></a>
+<a id="L696"></a>    fn discard(r: *Reader, limit: std.Io.Limit) Reader.Error!usize {
+<a id="L697"></a>        const d: *Decompress = @alignCast(@fieldParentPtr("reader", r));
+<a id="L698"></a>        _ = d;
+<a id="L699"></a>        _ = limit;
+<a id="L700"></a>        @panic("TODO");
+<a id="L701"></a>    }
+<a id="L702"></a>
+<a id="L703"></a>    fn readIndirect(r: *Reader) Reader.Error!usize {
+<a id="L704"></a>        const d: *Decompress = @alignCast(@fieldParentPtr("reader", r));
+<a id="L705"></a>        const gpa = d.gpa;
+<a id="L706"></a>        var allocating = Writer.Allocating.initOwnedSlice(gpa, r.buffer);
+<a id="L707"></a>        allocating.writer.end = r.end;
+<a id="L708"></a>        defer {
+<a id="L709"></a>            r.buffer = allocating.writer.buffer;
+<a id="L710"></a>            r.end = allocating.writer.end;
+<a id="L711"></a>        }
+<a id="L712"></a>        if (d.decode.state == math.maxInt(usize)) return error.EndOfStream;
+<a id="L713"></a>
+<a id="L714"></a>        process_next: {
+<a id="L715"></a>            if (d.unpacked_size) |unpacked_size| {
+<a id="L716"></a>                if (d.buffer.len &gt;= unpacked_size) break :process_next;
+<a id="L717"></a>            } else if (d.range_decoder.isFinished()) {
+<a id="L718"></a>                break :process_next;
+<a id="L719"></a>            }
+<a id="L720"></a>            var n_read: u64 = 0;
+<a id="L721"></a>            switch (d.decode.process(d.input, &amp;allocating, &amp;d.buffer, &amp;d.range_decoder, &amp;n_read) catch |err| switch (err) {
+<a id="L722"></a>                error.WriteFailed =&gt; {
+<a id="L723"></a>                    d.err = error.OutOfMemory;
+<a id="L724"></a>                    return error.ReadFailed;
+<a id="L725"></a>                },
+<a id="L726"></a>                error.EndOfStream =&gt; {
+<a id="L727"></a>                    d.err = error.EndOfStream;
+<a id="L728"></a>                    return error.ReadFailed;
+<a id="L729"></a>                },
+<a id="L730"></a>                else =&gt; |e| {
+<a id="L731"></a>                    d.err = e;
+<a id="L732"></a>                    return error.ReadFailed;
+<a id="L733"></a>                },
+<a id="L734"></a>            }) {
+<a id="L735"></a>                .more =&gt; return 0,
+<a id="L736"></a>                .finished =&gt; break :process_next,
+<a id="L737"></a>            }
+<a id="L738"></a>        }
+<a id="L739"></a>
+<a id="L740"></a>        if (d.unpacked_size) |unpacked_size| {
+<a id="L741"></a>            if (d.buffer.len != unpacked_size) {
+<a id="L742"></a>                d.err = error.DecompressedSizeMismatch;
+<a id="L743"></a>                return error.ReadFailed;
+<a id="L744"></a>            }
+<a id="L745"></a>        }
+<a id="L746"></a>
+<a id="L747"></a>        d.buffer.finish(&amp;allocating.writer) catch |err| switch (err) {
+<a id="L748"></a>            error.WriteFailed =&gt; {
+<a id="L749"></a>                d.err = error.OutOfMemory;
+<a id="L750"></a>                return error.ReadFailed;
+<a id="L751"></a>            },
+<a id="L752"></a>        };
+<a id="L753"></a>        d.decode.state = math.maxInt(usize);
+<a id="L754"></a>        return 0;
+<a id="L755"></a>    }
+<a id="L756"></a>};
+<a id="L757"></a>
+<a id="L758"></a>test {
+<a id="L759"></a>    _ = @import("lzma/test.zig");
+<a id="L760"></a>}
+</pre>
 </body>
 </html>

@@ -2,286 +2,289 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Source: zig-0.16.0-std/Io/File/MultiReader.zig</title>
+    <title>Source: Io/File/MultiReader.zig</title>
     <style>
         body { background: #1e1e1e; color: #d4d4d4; font-family: monospace; padding: 20px; }
         pre { white-space: pre-wrap; word-wrap: break-word; }
         .header { border-bottom: 1px solid #444; padding-bottom: 10px; margin-bottom: 20px; }
         a { color: #569cd6; }
+        a[id] { color: inherit; text-decoration: none; }
+        :target { background: #3a3a00; }
     </style>
 </head>
 <body>
     <div class="header">
-        <a href="/">Index</a> | <strong>File: zig-0.16.0-std/Io/File/MultiReader.zig</strong>
+        <a href="/">Index</a> | <strong>File: Io/File/MultiReader.zig</strong>
     </div>
-    <pre>const MultiReader = @This();
-
-const std = @import("../../std.zig");
-const Io = std.Io;
-const File = Io.File;
-const Allocator = std.mem.Allocator;
-const assert = std.debug.assert;
-
-gpa: Allocator,
-streams: *Streams,
-batch: Io.Batch,
-
-pub const Context = struct {
-    mr: *MultiReader,
-    fr: File.Reader,
-    vec: [1][]u8,
-    err: ?Error,
-};
-
-pub const Error = UnendingError || error{EndOfStream};
-pub const UnendingError = Allocator.Error || File.Reader.Error || Io.ConcurrentError;
-
-/// Trailing:
-/// * `contexts: [len]Context`
-/// * `storage: [len]Io.Operation.Storage`
-pub const Streams = extern struct {
-    len: u32,
-
-    pub fn contexts(s: *Streams) []Context {
-        const base: usize = @intFromPtr(s);
-        const ptr: [*]Context = @ptrFromInt(std.mem.alignForward(usize, base + @sizeOf(Streams), @alignOf(Context)));
-        return ptr[0..s.len];
-    }
-
-    pub fn storage(s: *Streams) []Io.Operation.Storage {
-        const prev = contexts(s);
-        const end = prev.ptr + prev.len;
-        const ptr: [*]Io.Operation.Storage = @ptrFromInt(std.mem.alignForward(usize, @intFromPtr(end), @alignOf(Io.Operation.Storage)));
-        return ptr[0..s.len];
-    }
-};
-
-pub fn Buffer(comptime n: usize) type {
-    return extern struct {
-        len: u32,
-        contexts: [n][@sizeOf(Context)]u8 align(@alignOf(Context)),
-        storage: [n][@sizeOf(Io.Operation.Storage)]u8 align(@alignOf(Io.Operation.Storage)),
-
-        pub fn toStreams(b: *@This()) *Streams {
-            b.len = n;
-            return @ptrCast(b);
-        }
-    };
-}
-
-/// See `Streams.Buffer` for convenience API to obtain the `streams` parameter.
-pub fn init(mr: *MultiReader, gpa: Allocator, io: Io, streams: *Streams, files: []const File) void {
-    const contexts = streams.contexts();
-    for (contexts, files) |*context, file| context.* = .{
-        .mr = mr,
-        .fr = .{
-            .io = io,
-            .file = file,
-            .mode = .streaming,
-            .interface = .{
-                .vtable = &amp;.{
-                    .stream = stream,
-                    .discard = discard,
-                    .readVec = readVec,
-                    .rebase = rebase,
-                },
-                .buffer = &amp;.{},
-                .seek = 0,
-                .end = 0,
-            },
-        },
-        .vec = .{&amp;.{}},
-        .err = null,
-    };
-    mr.* = .{
-        .gpa = gpa,
-        .streams = streams,
-        .batch = .init(streams.storage()),
-    };
-    for (contexts, 0..) |*context, i| {
-        const r = &amp;context.fr.interface;
-        rebaseGrowing(mr, context, 1) catch |err| {
-            context.err = err;
-            continue;
-        };
-        context.vec[0] = r.buffer;
-        mr.batch.addAt(@intCast(i), .{ .file_read_streaming = .{
-            .file = context.fr.file,
-            .data = &amp;context.vec,
-        } });
-    }
-}
-
-pub fn deinit(mr: *MultiReader) void {
-    const gpa = mr.gpa;
-    const contexts = mr.streams.contexts();
-    const io = contexts[0].fr.io;
-    mr.batch.cancel(io);
-    for (contexts) |*context| {
-        gpa.free(context.fr.interface.buffer);
-    }
-}
-
-pub fn fileReader(mr: *MultiReader, index: usize) *File.Reader {
-    return &amp;mr.streams.contexts()[index].fr;
-}
-
-pub fn reader(mr: *MultiReader, index: usize) *Io.Reader {
-    return &amp;mr.streams.contexts()[index].fr.interface;
-}
-
-/// Checks for errors in all streams, prioritizing `error.Canceled` if it
-/// occurred anywhere, and ignoring `error.EndOfStream`.
-pub fn checkAnyError(mr: *const MultiReader) UnendingError!void {
-    const contexts = mr.streams.contexts();
-    var other: UnendingError!void = {};
-    for (contexts) |*context| {
-        if (context.err) |err| switch (err) {
-            error.Canceled =&gt; |e| return e,
-            error.EndOfStream =&gt; continue,
-            else =&gt; |e| other = e,
-        };
-    }
-    return other;
-}
-
-pub fn toOwnedSlice(mr: *MultiReader, index: usize) Allocator.Error![]u8 {
-    const gpa = mr.gpa;
-    const r: *Io.Reader = reader(mr, index);
-    if (r.seek == 0) {
-        const new = try gpa.realloc(r.buffer, r.end);
-        r.buffer = &amp;.{};
-        r.end = 0;
-        return new;
-    }
-    const new = try gpa.dupe(u8, r.buffered());
-    gpa.free(r.buffer);
-    r.buffer = &amp;.{};
-    r.seek = 0;
-    r.end = 0;
-    return new;
-}
-
-fn stream(r: *Io.Reader, w: *Io.Writer, limit: Io.Limit) Io.Reader.StreamError!usize {
-    _ = limit;
-    _ = w;
-    const fr: *File.Reader = @alignCast(@fieldParentPtr("interface", r));
-    const context: *Context = @fieldParentPtr("fr", fr);
-    try fillUntimed(context, 1);
-    return 0;
-}
-
-fn discard(r: *Io.Reader, limit: Io.Limit) Io.Reader.Error!usize {
-    _ = limit;
-    const fr: *File.Reader = @alignCast(@fieldParentPtr("interface", r));
-    const context: *Context = @fieldParentPtr("fr", fr);
-    try fillUntimed(context, 1);
-    return 0;
-}
-
-fn readVec(r: *Io.Reader, data: [][]u8) Io.Reader.Error!usize {
-    _ = data;
-    const fr: *File.Reader = @alignCast(@fieldParentPtr("interface", r));
-    const context: *Context = @fieldParentPtr("fr", fr);
-    try fillUntimed(context, 1);
-    return 0;
-}
-
-fn rebase(r: *Io.Reader, capacity: usize) Io.Reader.RebaseError!void {
-    const fr: *File.Reader = @alignCast(@fieldParentPtr("interface", r));
-    const context: *Context = @fieldParentPtr("fr", fr);
-    try fillUntimed(context, capacity);
-}
-
-fn fillUntimed(context: *Context, capacity: usize) Io.Reader.Error!void {
-    fill(context.mr, capacity, .none) catch |err| switch (err) {
-        error.Timeout =&gt; unreachable,
-        error.Canceled, error.ConcurrencyUnavailable =&gt; |e| {
-            context.err = e;
-            return error.ReadFailed;
-        },
-        error.EndOfStream =&gt; |e| return e,
-    };
-    if (context.err) |err| switch (err) {
-        error.EndOfStream =&gt; |e| return e,
-        else =&gt; return error.ReadFailed,
-    };
-}
-
-pub const FillError = Io.Batch.AwaitConcurrentError || error{
-    /// `fill` was called when all streams already have failed or reached the
-    /// end.
-    EndOfStream,
-};
-
-/// Wait until at least one stream receives more data.
-pub fn fill(mr: *MultiReader, unused_capacity: usize, timeout: Io.Timeout) FillError!void {
-    const contexts = mr.streams.contexts();
-    const io = contexts[0].fr.io;
-    var any_completed = false;
-
-    try mr.batch.awaitConcurrent(io, timeout);
-
-    while (mr.batch.next()) |operation| {
-        any_completed = true;
-        const context = &amp;contexts[operation.index];
-        const n = operation.result.file_read_streaming catch |err| {
-            context.err = err;
-            continue;
-        };
-        const r = &amp;context.fr.interface;
-        r.end += n;
-        if (r.buffer.len - r.end &lt; unused_capacity) {
-            rebaseGrowing(mr, context, r.bufferedLen() + unused_capacity) catch |err| {
-                context.err = err;
-                continue;
-            };
-            assert(r.seek == 0);
-        }
-        context.vec[0] = r.buffer[r.end..];
-        mr.batch.addAt(operation.index, .{ .file_read_streaming = .{
-            .file = context.fr.file,
-            .data = &amp;context.vec,
-        } });
-    }
-
-    if (!any_completed) return error.EndOfStream;
-}
-
-/// Wait until all streams fail or reach the end.
-pub fn fillRemaining(mr: *MultiReader, timeout: Io.Timeout) Io.Batch.AwaitConcurrentError!void {
-    while (fill(mr, 1, timeout)) |_| {} else |err| switch (err) {
-        error.EndOfStream =&gt; return,
-        else =&gt; |e| return e,
-    }
-}
-
-fn rebaseGrowing(mr: *MultiReader, context: *Context, capacity: usize) Allocator.Error!void {
-    const gpa = mr.gpa;
-    const r = &amp;context.fr.interface;
-    if (r.buffer.len &gt;= capacity) {
-        const data = r.buffer[r.seek..r.end];
-        @memmove(r.buffer[0..data.len], data);
-        r.seek = 0;
-        r.end = data.len;
-    } else {
-        const adjusted_capacity = std.ArrayList(u8).growCapacity(capacity);
-
-        if (r.seek == 0) {
-            if (gpa.remap(r.buffer, adjusted_capacity)) |new_memory| {
-                r.buffer = new_memory;
-                return;
-            }
-        }
-
-        const data = r.buffer[r.seek..r.end];
-        const new = try gpa.alloc(u8, adjusted_capacity);
-        @memcpy(new[0..data.len], data);
-        gpa.free(r.buffer);
-        r.buffer = new;
-        r.seek = 0;
-        r.end = data.len;
-    }
-}</pre>
+    <pre><a id="L1"></a>const MultiReader = @This();
+<a id="L2"></a>
+<a id="L3"></a>const std = @import("../../std.zig");
+<a id="L4"></a>const Io = std.Io;
+<a id="L5"></a>const File = Io.File;
+<a id="L6"></a>const Allocator = std.mem.Allocator;
+<a id="L7"></a>const assert = std.debug.assert;
+<a id="L8"></a>
+<a id="L9"></a>gpa: Allocator,
+<a id="L10"></a>streams: *Streams,
+<a id="L11"></a>batch: Io.Batch,
+<a id="L12"></a>
+<a id="L13"></a>pub const Context = struct {
+<a id="L14"></a>    mr: *MultiReader,
+<a id="L15"></a>    fr: File.Reader,
+<a id="L16"></a>    vec: [1][]u8,
+<a id="L17"></a>    err: ?Error,
+<a id="L18"></a>};
+<a id="L19"></a>
+<a id="L20"></a>pub const Error = UnendingError || error{EndOfStream};
+<a id="L21"></a>pub const UnendingError = Allocator.Error || File.Reader.Error || Io.ConcurrentError;
+<a id="L22"></a>
+<a id="L23"></a>/// Trailing:
+<a id="L24"></a>/// * `contexts: [len]Context`
+<a id="L25"></a>/// * `storage: [len]Io.Operation.Storage`
+<a id="L26"></a>pub const Streams = extern struct {
+<a id="L27"></a>    len: u32,
+<a id="L28"></a>
+<a id="L29"></a>    pub fn contexts(s: *Streams) []Context {
+<a id="L30"></a>        const base: usize = @intFromPtr(s);
+<a id="L31"></a>        const ptr: [*]Context = @ptrFromInt(std.mem.alignForward(usize, base + @sizeOf(Streams), @alignOf(Context)));
+<a id="L32"></a>        return ptr[0..s.len];
+<a id="L33"></a>    }
+<a id="L34"></a>
+<a id="L35"></a>    pub fn storage(s: *Streams) []Io.Operation.Storage {
+<a id="L36"></a>        const prev = contexts(s);
+<a id="L37"></a>        const end = prev.ptr + prev.len;
+<a id="L38"></a>        const ptr: [*]Io.Operation.Storage = @ptrFromInt(std.mem.alignForward(usize, @intFromPtr(end), @alignOf(Io.Operation.Storage)));
+<a id="L39"></a>        return ptr[0..s.len];
+<a id="L40"></a>    }
+<a id="L41"></a>};
+<a id="L42"></a>
+<a id="L43"></a>pub fn Buffer(comptime n: usize) type {
+<a id="L44"></a>    return extern struct {
+<a id="L45"></a>        len: u32,
+<a id="L46"></a>        contexts: [n][@sizeOf(Context)]u8 align(@alignOf(Context)),
+<a id="L47"></a>        storage: [n][@sizeOf(Io.Operation.Storage)]u8 align(@alignOf(Io.Operation.Storage)),
+<a id="L48"></a>
+<a id="L49"></a>        pub fn toStreams(b: *@This()) *Streams {
+<a id="L50"></a>            b.len = n;
+<a id="L51"></a>            return @ptrCast(b);
+<a id="L52"></a>        }
+<a id="L53"></a>    };
+<a id="L54"></a>}
+<a id="L55"></a>
+<a id="L56"></a>/// See `Streams.Buffer` for convenience API to obtain the `streams` parameter.
+<a id="L57"></a>pub fn init(mr: *MultiReader, gpa: Allocator, io: Io, streams: *Streams, files: []const File) void {
+<a id="L58"></a>    const contexts = streams.contexts();
+<a id="L59"></a>    for (contexts, files) |*context, file| context.* = .{
+<a id="L60"></a>        .mr = mr,
+<a id="L61"></a>        .fr = .{
+<a id="L62"></a>            .io = io,
+<a id="L63"></a>            .file = file,
+<a id="L64"></a>            .mode = .streaming,
+<a id="L65"></a>            .interface = .{
+<a id="L66"></a>                .vtable = &amp;.{
+<a id="L67"></a>                    .stream = stream,
+<a id="L68"></a>                    .discard = discard,
+<a id="L69"></a>                    .readVec = readVec,
+<a id="L70"></a>                    .rebase = rebase,
+<a id="L71"></a>                },
+<a id="L72"></a>                .buffer = &amp;.{},
+<a id="L73"></a>                .seek = 0,
+<a id="L74"></a>                .end = 0,
+<a id="L75"></a>            },
+<a id="L76"></a>        },
+<a id="L77"></a>        .vec = .{&amp;.{}},
+<a id="L78"></a>        .err = null,
+<a id="L79"></a>    };
+<a id="L80"></a>    mr.* = .{
+<a id="L81"></a>        .gpa = gpa,
+<a id="L82"></a>        .streams = streams,
+<a id="L83"></a>        .batch = .init(streams.storage()),
+<a id="L84"></a>    };
+<a id="L85"></a>    for (contexts, 0..) |*context, i| {
+<a id="L86"></a>        const r = &amp;context.fr.interface;
+<a id="L87"></a>        rebaseGrowing(mr, context, 1) catch |err| {
+<a id="L88"></a>            context.err = err;
+<a id="L89"></a>            continue;
+<a id="L90"></a>        };
+<a id="L91"></a>        context.vec[0] = r.buffer;
+<a id="L92"></a>        mr.batch.addAt(@intCast(i), .{ .file_read_streaming = .{
+<a id="L93"></a>            .file = context.fr.file,
+<a id="L94"></a>            .data = &amp;context.vec,
+<a id="L95"></a>        } });
+<a id="L96"></a>    }
+<a id="L97"></a>}
+<a id="L98"></a>
+<a id="L99"></a>pub fn deinit(mr: *MultiReader) void {
+<a id="L100"></a>    const gpa = mr.gpa;
+<a id="L101"></a>    const contexts = mr.streams.contexts();
+<a id="L102"></a>    const io = contexts[0].fr.io;
+<a id="L103"></a>    mr.batch.cancel(io);
+<a id="L104"></a>    for (contexts) |*context| {
+<a id="L105"></a>        gpa.free(context.fr.interface.buffer);
+<a id="L106"></a>    }
+<a id="L107"></a>}
+<a id="L108"></a>
+<a id="L109"></a>pub fn fileReader(mr: *MultiReader, index: usize) *File.Reader {
+<a id="L110"></a>    return &amp;mr.streams.contexts()[index].fr;
+<a id="L111"></a>}
+<a id="L112"></a>
+<a id="L113"></a>pub fn reader(mr: *MultiReader, index: usize) *Io.Reader {
+<a id="L114"></a>    return &amp;mr.streams.contexts()[index].fr.interface;
+<a id="L115"></a>}
+<a id="L116"></a>
+<a id="L117"></a>/// Checks for errors in all streams, prioritizing `error.Canceled` if it
+<a id="L118"></a>/// occurred anywhere, and ignoring `error.EndOfStream`.
+<a id="L119"></a>pub fn checkAnyError(mr: *const MultiReader) UnendingError!void {
+<a id="L120"></a>    const contexts = mr.streams.contexts();
+<a id="L121"></a>    var other: UnendingError!void = {};
+<a id="L122"></a>    for (contexts) |*context| {
+<a id="L123"></a>        if (context.err) |err| switch (err) {
+<a id="L124"></a>            error.Canceled =&gt; |e| return e,
+<a id="L125"></a>            error.EndOfStream =&gt; continue,
+<a id="L126"></a>            else =&gt; |e| other = e,
+<a id="L127"></a>        };
+<a id="L128"></a>    }
+<a id="L129"></a>    return other;
+<a id="L130"></a>}
+<a id="L131"></a>
+<a id="L132"></a>pub fn toOwnedSlice(mr: *MultiReader, index: usize) Allocator.Error![]u8 {
+<a id="L133"></a>    const gpa = mr.gpa;
+<a id="L134"></a>    const r: *Io.Reader = reader(mr, index);
+<a id="L135"></a>    if (r.seek == 0) {
+<a id="L136"></a>        const new = try gpa.realloc(r.buffer, r.end);
+<a id="L137"></a>        r.buffer = &amp;.{};
+<a id="L138"></a>        r.end = 0;
+<a id="L139"></a>        return new;
+<a id="L140"></a>    }
+<a id="L141"></a>    const new = try gpa.dupe(u8, r.buffered());
+<a id="L142"></a>    gpa.free(r.buffer);
+<a id="L143"></a>    r.buffer = &amp;.{};
+<a id="L144"></a>    r.seek = 0;
+<a id="L145"></a>    r.end = 0;
+<a id="L146"></a>    return new;
+<a id="L147"></a>}
+<a id="L148"></a>
+<a id="L149"></a>fn stream(r: *Io.Reader, w: *Io.Writer, limit: Io.Limit) Io.Reader.StreamError!usize {
+<a id="L150"></a>    _ = limit;
+<a id="L151"></a>    _ = w;
+<a id="L152"></a>    const fr: *File.Reader = @alignCast(@fieldParentPtr("interface", r));
+<a id="L153"></a>    const context: *Context = @fieldParentPtr("fr", fr);
+<a id="L154"></a>    try fillUntimed(context, 1);
+<a id="L155"></a>    return 0;
+<a id="L156"></a>}
+<a id="L157"></a>
+<a id="L158"></a>fn discard(r: *Io.Reader, limit: Io.Limit) Io.Reader.Error!usize {
+<a id="L159"></a>    _ = limit;
+<a id="L160"></a>    const fr: *File.Reader = @alignCast(@fieldParentPtr("interface", r));
+<a id="L161"></a>    const context: *Context = @fieldParentPtr("fr", fr);
+<a id="L162"></a>    try fillUntimed(context, 1);
+<a id="L163"></a>    return 0;
+<a id="L164"></a>}
+<a id="L165"></a>
+<a id="L166"></a>fn readVec(r: *Io.Reader, data: [][]u8) Io.Reader.Error!usize {
+<a id="L167"></a>    _ = data;
+<a id="L168"></a>    const fr: *File.Reader = @alignCast(@fieldParentPtr("interface", r));
+<a id="L169"></a>    const context: *Context = @fieldParentPtr("fr", fr);
+<a id="L170"></a>    try fillUntimed(context, 1);
+<a id="L171"></a>    return 0;
+<a id="L172"></a>}
+<a id="L173"></a>
+<a id="L174"></a>fn rebase(r: *Io.Reader, capacity: usize) Io.Reader.RebaseError!void {
+<a id="L175"></a>    const fr: *File.Reader = @alignCast(@fieldParentPtr("interface", r));
+<a id="L176"></a>    const context: *Context = @fieldParentPtr("fr", fr);
+<a id="L177"></a>    try fillUntimed(context, capacity);
+<a id="L178"></a>}
+<a id="L179"></a>
+<a id="L180"></a>fn fillUntimed(context: *Context, capacity: usize) Io.Reader.Error!void {
+<a id="L181"></a>    fill(context.mr, capacity, .none) catch |err| switch (err) {
+<a id="L182"></a>        error.Timeout =&gt; unreachable,
+<a id="L183"></a>        error.Canceled, error.ConcurrencyUnavailable =&gt; |e| {
+<a id="L184"></a>            context.err = e;
+<a id="L185"></a>            return error.ReadFailed;
+<a id="L186"></a>        },
+<a id="L187"></a>        error.EndOfStream =&gt; |e| return e,
+<a id="L188"></a>    };
+<a id="L189"></a>    if (context.err) |err| switch (err) {
+<a id="L190"></a>        error.EndOfStream =&gt; |e| return e,
+<a id="L191"></a>        else =&gt; return error.ReadFailed,
+<a id="L192"></a>    };
+<a id="L193"></a>}
+<a id="L194"></a>
+<a id="L195"></a>pub const FillError = Io.Batch.AwaitConcurrentError || error{
+<a id="L196"></a>    /// `fill` was called when all streams already have failed or reached the
+<a id="L197"></a>    /// end.
+<a id="L198"></a>    EndOfStream,
+<a id="L199"></a>};
+<a id="L200"></a>
+<a id="L201"></a>/// Wait until at least one stream receives more data.
+<a id="L202"></a>pub fn fill(mr: *MultiReader, unused_capacity: usize, timeout: Io.Timeout) FillError!void {
+<a id="L203"></a>    const contexts = mr.streams.contexts();
+<a id="L204"></a>    const io = contexts[0].fr.io;
+<a id="L205"></a>    var any_completed = false;
+<a id="L206"></a>
+<a id="L207"></a>    try mr.batch.awaitConcurrent(io, timeout);
+<a id="L208"></a>
+<a id="L209"></a>    while (mr.batch.next()) |operation| {
+<a id="L210"></a>        any_completed = true;
+<a id="L211"></a>        const context = &amp;contexts[operation.index];
+<a id="L212"></a>        const n = operation.result.file_read_streaming catch |err| {
+<a id="L213"></a>            context.err = err;
+<a id="L214"></a>            continue;
+<a id="L215"></a>        };
+<a id="L216"></a>        const r = &amp;context.fr.interface;
+<a id="L217"></a>        r.end += n;
+<a id="L218"></a>        if (r.buffer.len - r.end &lt; unused_capacity) {
+<a id="L219"></a>            rebaseGrowing(mr, context, r.bufferedLen() + unused_capacity) catch |err| {
+<a id="L220"></a>                context.err = err;
+<a id="L221"></a>                continue;
+<a id="L222"></a>            };
+<a id="L223"></a>            assert(r.seek == 0);
+<a id="L224"></a>        }
+<a id="L225"></a>        context.vec[0] = r.buffer[r.end..];
+<a id="L226"></a>        mr.batch.addAt(operation.index, .{ .file_read_streaming = .{
+<a id="L227"></a>            .file = context.fr.file,
+<a id="L228"></a>            .data = &amp;context.vec,
+<a id="L229"></a>        } });
+<a id="L230"></a>    }
+<a id="L231"></a>
+<a id="L232"></a>    if (!any_completed) return error.EndOfStream;
+<a id="L233"></a>}
+<a id="L234"></a>
+<a id="L235"></a>/// Wait until all streams fail or reach the end.
+<a id="L236"></a>pub fn fillRemaining(mr: *MultiReader, timeout: Io.Timeout) Io.Batch.AwaitConcurrentError!void {
+<a id="L237"></a>    while (fill(mr, 1, timeout)) |_| {} else |err| switch (err) {
+<a id="L238"></a>        error.EndOfStream =&gt; return,
+<a id="L239"></a>        else =&gt; |e| return e,
+<a id="L240"></a>    }
+<a id="L241"></a>}
+<a id="L242"></a>
+<a id="L243"></a>fn rebaseGrowing(mr: *MultiReader, context: *Context, capacity: usize) Allocator.Error!void {
+<a id="L244"></a>    const gpa = mr.gpa;
+<a id="L245"></a>    const r = &amp;context.fr.interface;
+<a id="L246"></a>    if (r.buffer.len &gt;= capacity) {
+<a id="L247"></a>        const data = r.buffer[r.seek..r.end];
+<a id="L248"></a>        @memmove(r.buffer[0..data.len], data);
+<a id="L249"></a>        r.seek = 0;
+<a id="L250"></a>        r.end = data.len;
+<a id="L251"></a>    } else {
+<a id="L252"></a>        const adjusted_capacity = std.ArrayList(u8).growCapacity(capacity);
+<a id="L253"></a>
+<a id="L254"></a>        if (r.seek == 0) {
+<a id="L255"></a>            if (gpa.remap(r.buffer, adjusted_capacity)) |new_memory| {
+<a id="L256"></a>                r.buffer = new_memory;
+<a id="L257"></a>                return;
+<a id="L258"></a>            }
+<a id="L259"></a>        }
+<a id="L260"></a>
+<a id="L261"></a>        const data = r.buffer[r.seek..r.end];
+<a id="L262"></a>        const new = try gpa.alloc(u8, adjusted_capacity);
+<a id="L263"></a>        @memcpy(new[0..data.len], data);
+<a id="L264"></a>        gpa.free(r.buffer);
+<a id="L265"></a>        r.buffer = new;
+<a id="L266"></a>        r.seek = 0;
+<a id="L267"></a>        r.end = data.len;
+<a id="L268"></a>    }
+<a id="L269"></a>}
+</pre>
 </body>
 </html>

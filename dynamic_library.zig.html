@@ -2,634 +2,637 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Source: zig-0.16.0-std/dynamic_library.zig</title>
+    <title>Source: dynamic_library.zig</title>
     <style>
         body { background: #1e1e1e; color: #d4d4d4; font-family: monospace; padding: 20px; }
         pre { white-space: pre-wrap; word-wrap: break-word; }
         .header { border-bottom: 1px solid #444; padding-bottom: 10px; margin-bottom: 20px; }
         a { color: #569cd6; }
+        a[id] { color: inherit; text-decoration: none; }
+        :target { background: #3a3a00; }
     </style>
 </head>
 <body>
     <div class="header">
-        <a href="/">Index</a> | <strong>File: zig-0.16.0-std/dynamic_library.zig</strong>
+        <a href="/">Index</a> | <strong>File: dynamic_library.zig</strong>
     </div>
-    <pre>const builtin = @import("builtin");
-const native_os = builtin.os.tag;
-
-const std = @import("std.zig");
-const Io = std.Io;
-const mem = std.mem;
-const testing = std.testing;
-const elf = std.elf;
-const windows = std.os.windows;
-const posix = std.posix;
-
-/// Cross-platform dynamic library loading and symbol lookup.
-/// Platform-specific functionality is available through the `inner` field.
-pub const DynLib = struct {
-    const InnerType = switch (native_os) {
-        .linux =&gt; if (!builtin.link_libc or builtin.abi == .musl and builtin.link_mode == .static)
-            ElfDynLib
-        else
-            DlDynLib,
-        .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos, .freebsd, .netbsd, .openbsd, .dragonfly, .illumos =&gt; DlDynLib,
-        else =&gt; struct {
-            const open = @compileError("unsupported platform");
-            const openZ = @compileError("unsupported platform");
-        },
-    };
-
-    inner: InnerType,
-
-    pub const Error = ElfDynLibError || DlDynLibError;
-
-    /// Trusts the file. Malicious file will be able to execute arbitrary code.
-    pub fn open(path: []const u8) Error!DynLib {
-        if (InnerType == ElfDynLib) {
-            return .{ .inner = try InnerType.open(path, null) };
-        } else {
-            return .{ .inner = try InnerType.open(path) };
-        }
-    }
-
-    /// Trusts the file. Malicious file will be able to execute arbitrary code.
-    pub fn openZ(path_c: [*:0]const u8) Error!DynLib {
-        if (InnerType == ElfDynLib) {
-            return .{ .inner = try InnerType.openZ(path_c, null) };
-        } else {
-            return .{ .inner = try InnerType.openZ(path_c) };
-        }
-    }
-
-    /// Trusts the file.
-    pub fn close(self: *DynLib) void {
-        return self.inner.close();
-    }
-
-    pub fn lookup(self: *DynLib, comptime T: type, name: [:0]const u8) ?T {
-        return self.inner.lookup(T, name);
-    }
-};
-
-// The link_map structure is not completely specified beside the fields
-// reported below, any libc is free to store additional data in the remaining
-// space.
-// An iterator is provided in order to traverse the linked list in a idiomatic
-// fashion.
-const LinkMap = extern struct {
-    addr: usize,
-    name: [*:0]const u8,
-    ld: ?*elf.Dyn,
-    next: ?*LinkMap,
-    prev: ?*LinkMap,
-
-    pub const Iterator = struct {
-        current: ?*LinkMap,
-
-        pub fn end(self: *Iterator) bool {
-            return self.current == null;
-        }
-
-        pub fn next(self: *Iterator) ?*LinkMap {
-            if (self.current) |it| {
-                self.current = it.next;
-                return it;
-            }
-            return null;
-        }
-    };
-};
-
-const RDebug = extern struct {
-    version: i32,
-    map: ?*LinkMap,
-    brk: usize,
-    ldbase: usize,
-};
-
-/// TODO fix comparisons of extern symbol pointers so we don't need this helper function.
-pub fn get_DYNAMIC() ?[*]const elf.Dyn {
-    return @extern([*]const elf.Dyn, .{
-        .name = "_DYNAMIC",
-        .linkage = .weak,
-        .visibility = .hidden,
-    });
-}
-
-pub fn linkmap_iterator() error{InvalidExe}!LinkMap.Iterator {
-    const _DYNAMIC = get_DYNAMIC() orelse {
-        // No PT_DYNAMIC means this is a statically-linked non-PIE program.
-        return .{ .current = null };
-    };
-
-    const link_map_ptr = init: {
-        var i: usize = 0;
-        while (_DYNAMIC[i].d_tag != elf.DT_NULL) : (i += 1) {
-            switch (_DYNAMIC[i].d_tag) {
-                elf.DT_DEBUG =&gt; {
-                    const ptr = @as(?*RDebug, @ptrFromInt(_DYNAMIC[i].d_val));
-                    if (ptr) |r_debug| {
-                        if (r_debug.version != 1) return error.InvalidExe;
-                        break :init r_debug.map;
-                    }
-                },
-                elf.DT_PLTGOT =&gt; {
-                    const ptr = @as(?[*]usize, @ptrFromInt(_DYNAMIC[i].d_val));
-                    if (ptr) |got_table| {
-                        // The address to the link_map structure is stored in
-                        // the second slot
-                        break :init @as(?*LinkMap, @ptrFromInt(got_table[1]));
-                    }
-                },
-                else =&gt; {},
-            }
-        }
-        return .{ .current = null };
-    };
-
-    return .{ .current = link_map_ptr };
-}
-
-/// Separated to avoid referencing `ElfDynLib`, because its field types may not
-/// be valid on other targets.
-const ElfDynLibError = error{
-    FileTooBig,
-    NotElfFile,
-    NotDynamicLibrary,
-    MissingDynamicLinkingInformation,
-    ElfStringSectionNotFound,
-    ElfSymSectionNotFound,
-    ElfHashTableNotFound,
-    Canceled,
-    Streaming,
-} || Io.File.OpenError || posix.MMapError;
-
-pub const ElfDynLib = struct {
-    strings: [*:0]u8,
-    syms: [*]elf.Sym,
-    hash_table: HashTable,
-    versym: ?[*]elf.Versym,
-    verdef: ?*elf.Verdef,
-    memory: []align(std.heap.page_size_min) u8,
-
-    pub const Error = ElfDynLibError;
-
-    const HashTable = union(enum) {
-        dt_hash: [*]posix.Elf_Symndx,
-        dt_gnu_hash: *elf.gnu_hash.Header,
-    };
-
-    fn openPath(io: Io, path: []const u8) !Io.Dir {
-        if (path.len == 0) return error.NotDir;
-        var parts = std.mem.tokenizeScalar(u8, path, '/');
-        var parent = if (path[0] == '/') try Io.Dir.cwd().openDir(io, "/", .{}) else Io.Dir.cwd();
-        while (parts.next()) |part| {
-            const child = try parent.openDir(io, part, .{});
-            parent.close(io);
-            parent = child;
-        }
-        return parent;
-    }
-
-    fn resolveFromSearchPath(io: Io, search_path: []const u8, file_name: []const u8, delim: u8) ?Io.File {
-        var paths = std.mem.tokenizeScalar(u8, search_path, delim);
-        while (paths.next()) |p| {
-            var dir = openPath(io, p) catch continue;
-            defer dir.close(io);
-            return dir.openFile(io, file_name, .{}) catch continue;
-        }
-        return null;
-    }
-
-    fn resolveFromParent(io: Io, dir_path: []const u8, file_name: []const u8) ?Io.File {
-        var dir = Io.Dir.cwd().openDir(io, dir_path, .{}) catch return null;
-        defer dir.close(io);
-        return dir.openFile(io, file_name, .{}) catch null;
-    }
-
-    // This implements enough to be able to load system libraries in general
-    // Places where it differs from dlopen:
-    // - DT_RPATH of the calling binary is not used as a search path
-    // - DT_RUNPATH of the calling binary is not used as a search path
-    // - /etc/ld.so.cache is not read
-    fn resolveFromName(io: Io, path_or_name: []const u8, LD_LIBRARY_PATH: ?[]const u8) !Io.File {
-        // If filename contains a slash ("/"), then it is interpreted as a (relative or absolute) pathname
-        if (std.mem.findScalarPos(u8, path_or_name, 0, '/')) |_| {
-            return Io.Dir.cwd().openFile(io, path_or_name, .{});
-        }
-
-        // Only read LD_LIBRARY_PATH if the binary is not setuid/setgid
-        if (std.os.linux.geteuid() == std.os.linux.getuid() and
-            std.os.linux.getegid() == std.os.linux.getgid())
-        {
-            if (LD_LIBRARY_PATH) |ld_library_path| {
-                if (resolveFromSearchPath(io, ld_library_path, path_or_name, ':')) |file| {
-                    return file;
-                }
-            }
-        }
-
-        // Lastly the directories /lib and /usr/lib are searched (in this exact order)
-        if (resolveFromParent(io, "/lib", path_or_name)) |file| return file;
-        if (resolveFromParent(io, "/usr/lib", path_or_name)) |file| return file;
-        return error.FileNotFound;
-    }
-
-    /// Trusts the file. Malicious file will be able to execute arbitrary code.
-    pub fn open(path: []const u8, LD_LIBRARY_PATH: ?[]const u8) Error!ElfDynLib {
-        const io = std.Options.debug_io;
-
-        const file = try resolveFromName(io, path, LD_LIBRARY_PATH);
-        defer file.close(io);
-
-        const stat = try file.stat(io);
-        const size = std.math.cast(usize, stat.size) orelse return error.FileTooBig;
-
-        const page_size = std.heap.pageSize();
-
-        // This one is to read the ELF info. We do more mmapping later
-        // corresponding to the actual LOAD sections.
-        const file_bytes = try posix.mmap(
-            null,
-            mem.alignForward(usize, size, page_size),
-            .{ .READ = true },
-            .{ .TYPE = .PRIVATE },
-            file.handle,
-            0,
-        );
-        defer posix.munmap(file_bytes);
-
-        const eh = @as(*elf.Ehdr, @ptrCast(file_bytes.ptr));
-        if (!mem.eql(u8, eh.e_ident[0..4], elf.MAGIC)) return error.NotElfFile;
-        if (eh.e_type != elf.ET.DYN) return error.NotDynamicLibrary;
-
-        const elf_addr = @intFromPtr(file_bytes.ptr);
-
-        // Iterate over the program header entries to find out the
-        // dynamic vector as well as the total size of the virtual memory.
-        var maybe_dynv: ?[*]usize = null;
-        var virt_addr_end: usize = 0;
-        {
-            var i: usize = 0;
-            var ph_addr: usize = elf_addr + eh.e_phoff;
-            while (i &lt; eh.e_phnum) : ({
-                i += 1;
-                ph_addr += eh.e_phentsize;
-            }) {
-                const ph = @as(*elf.Phdr, @ptrFromInt(ph_addr));
-                switch (ph.p_type) {
-                    elf.PT_LOAD =&gt; virt_addr_end = @max(virt_addr_end, ph.p_vaddr + ph.p_memsz),
-                    elf.PT_DYNAMIC =&gt; maybe_dynv = @as([*]usize, @ptrFromInt(elf_addr + ph.p_offset)),
-                    else =&gt; {},
-                }
-            }
-        }
-        const dynv = maybe_dynv orelse return error.MissingDynamicLinkingInformation;
-
-        // Reserve the entire range (with no permissions) so that we can do MAP.FIXED below.
-        const all_loaded_mem = try posix.mmap(
-            null,
-            virt_addr_end,
-            .{},
-            .{ .TYPE = .PRIVATE, .ANONYMOUS = true },
-            -1,
-            0,
-        );
-        errdefer posix.munmap(all_loaded_mem);
-
-        const base = @intFromPtr(all_loaded_mem.ptr);
-
-        // Now iterate again and actually load all the program sections.
-        {
-            var i: usize = 0;
-            var ph_addr: usize = elf_addr + eh.e_phoff;
-            while (i &lt; eh.e_phnum) : ({
-                i += 1;
-                ph_addr += eh.e_phentsize;
-            }) {
-                const ph = @as(*elf.Phdr, @ptrFromInt(ph_addr));
-                switch (ph.p_type) {
-                    elf.PT_LOAD =&gt; {
-                        // The VirtAddr may not be page-aligned; in such case there will be
-                        // extra nonsense mapped before/after the VirtAddr,MemSiz
-                        const aligned_addr = (base + ph.p_vaddr) &amp; ~(@as(usize, page_size) - 1);
-                        const extra_bytes = (base + ph.p_vaddr) - aligned_addr;
-                        const extended_memsz = mem.alignForward(usize, ph.p_memsz + extra_bytes, page_size);
-                        const ptr = @as([*]align(std.heap.page_size_min) u8, @ptrFromInt(aligned_addr));
-                        const prot = elfToProt(ph.p_flags);
-                        if ((ph.p_flags &amp; elf.PF_W) == 0) {
-                            // If it does not need write access, it can be mapped from the fd.
-                            _ = try posix.mmap(
-                                ptr,
-                                extended_memsz,
-                                prot,
-                                .{ .TYPE = .PRIVATE, .FIXED = true },
-                                file.handle,
-                                ph.p_offset - extra_bytes,
-                            );
-                        } else {
-                            const sect_mem = try posix.mmap(
-                                ptr,
-                                extended_memsz,
-                                prot,
-                                .{ .TYPE = .PRIVATE, .FIXED = true, .ANONYMOUS = true },
-                                -1,
-                                0,
-                            );
-                            @memcpy(sect_mem[0..ph.p_filesz], file_bytes[0..ph.p_filesz]);
-                        }
-                    },
-                    else =&gt; {},
-                }
-            }
-        }
-
-        var maybe_strings: ?[*:0]u8 = null;
-        var maybe_syms: ?[*]elf.Sym = null;
-        var maybe_hashtab: ?[*]posix.Elf_Symndx = null;
-        var maybe_gnu_hash: ?*elf.gnu_hash.Header = null;
-        var maybe_versym: ?[*]elf.Versym = null;
-        var maybe_verdef: ?*elf.Verdef = null;
-
-        {
-            var i: usize = 0;
-            while (dynv[i] != 0) : (i += 2) {
-                const p = base + dynv[i + 1];
-                switch (dynv[i]) {
-                    elf.DT_STRTAB =&gt; maybe_strings = @ptrFromInt(p),
-                    elf.DT_SYMTAB =&gt; maybe_syms = @ptrFromInt(p),
-                    elf.DT_HASH =&gt; maybe_hashtab = @ptrFromInt(p),
-                    elf.DT_GNU_HASH =&gt; maybe_gnu_hash = @ptrFromInt(p),
-                    elf.DT_VERSYM =&gt; maybe_versym = @ptrFromInt(p),
-                    elf.DT_VERDEF =&gt; maybe_verdef = @ptrFromInt(p),
-                    else =&gt; {},
-                }
-            }
-        }
-
-        const hash_table: HashTable = if (maybe_gnu_hash) |gnu_hash|
-            .{ .dt_gnu_hash = gnu_hash }
-        else if (maybe_hashtab) |hashtab|
-            .{ .dt_hash = hashtab }
-        else
-            return error.ElfHashTableNotFound;
-
-        return .{
-            .memory = all_loaded_mem,
-            .strings = maybe_strings orelse return error.ElfStringSectionNotFound,
-            .syms = maybe_syms orelse return error.ElfSymSectionNotFound,
-            .hash_table = hash_table,
-            .versym = maybe_versym,
-            .verdef = maybe_verdef,
-        };
-    }
-
-    /// Trusts the file. Malicious file will be able to execute arbitrary code.
-    pub fn openZ(path_c: [*:0]const u8, LD_LIBRARY_PATH: ?[]const u8) Error!ElfDynLib {
-        return open(mem.sliceTo(path_c, 0), LD_LIBRARY_PATH);
-    }
-
-    /// Trusts the file
-    pub fn close(self: *ElfDynLib) void {
-        posix.munmap(self.memory);
-        self.* = undefined;
-    }
-
-    pub fn lookup(self: *const ElfDynLib, comptime T: type, name: [:0]const u8) ?T {
-        if (self.lookupAddress("", name)) |symbol| {
-            return @as(T, @ptrFromInt(symbol));
-        } else {
-            return null;
-        }
-    }
-
-    pub const GnuHashSection32 = struct {
-        symoffset: u32,
-        bloom_shift: u32,
-        bloom: []u32,
-        buckets: []u32,
-        chain: [*]elf.gnu_hash.ChainEntry,
-
-        pub fn fromPtr(header: *elf.gnu_hash.Header) @This() {
-            const header_offset = @intFromPtr(header);
-            const bloom_offset = header_offset + @sizeOf(elf.gnu_hash.Header);
-            const buckets_offset = bloom_offset + header.bloom_size * @sizeOf(u32);
-            const chain_offset = buckets_offset + header.nbuckets * @sizeOf(u32);
-
-            const bloom_ptr: [*]u32 = @ptrFromInt(bloom_offset);
-            const buckets_ptr: [*]u32 = @ptrFromInt(buckets_offset);
-            const chain_ptr: [*]elf.gnu_hash.ChainEntry = @ptrFromInt(chain_offset);
-
-            return .{
-                .symoffset = header.symoffset,
-                .bloom_shift = header.bloom_shift,
-                .bloom = bloom_ptr[0..header.bloom_size],
-                .buckets = buckets_ptr[0..header.nbuckets],
-                .chain = chain_ptr,
-            };
-        }
-    };
-
-    pub const GnuHashSection64 = struct {
-        symoffset: u32,
-        bloom_shift: u32,
-        bloom: []u64,
-        buckets: []u32,
-        chain: [*]elf.gnu_hash.ChainEntry,
-
-        pub fn fromPtr(header: *elf.gnu_hash.Header) @This() {
-            const header_offset = @intFromPtr(header);
-            const bloom_offset = header_offset + @sizeOf(elf.gnu_hash.Header);
-            const buckets_offset = bloom_offset + header.bloom_size * @sizeOf(u64);
-            const chain_offset = buckets_offset + header.nbuckets * @sizeOf(u32);
-
-            const bloom_ptr: [*]u64 = @ptrFromInt(bloom_offset);
-            const buckets_ptr: [*]u32 = @ptrFromInt(buckets_offset);
-            const chain_ptr: [*]elf.gnu_hash.ChainEntry = @ptrFromInt(chain_offset);
-
-            return .{
-                .symoffset = header.symoffset,
-                .bloom_shift = header.bloom_shift,
-                .bloom = bloom_ptr[0..header.bloom_size],
-                .buckets = buckets_ptr[0..header.nbuckets],
-                .chain = chain_ptr,
-            };
-        }
-    };
-
-    /// ElfDynLib specific
-    /// Returns the address of the symbol
-    pub fn lookupAddress(self: *const ElfDynLib, vername: []const u8, name: []const u8) ?usize {
-        const maybe_versym = if (self.verdef == null) null else self.versym;
-
-        const OK_TYPES = (1 &lt;&lt; elf.STT_NOTYPE | 1 &lt;&lt; elf.STT_OBJECT | 1 &lt;&lt; elf.STT_FUNC | 1 &lt;&lt; elf.STT_COMMON);
-        const OK_BINDS = (1 &lt;&lt; elf.STB_GLOBAL | 1 &lt;&lt; elf.STB_WEAK | 1 &lt;&lt; elf.STB_GNU_UNIQUE);
-
-        switch (self.hash_table) {
-            .dt_hash =&gt; |hashtab| {
-                var i: usize = 0;
-                while (i &lt; hashtab[1]) : (i += 1) {
-                    if (0 == (@as(u32, 1) &lt;&lt; @as(u5, @intCast(self.syms[i].st_info &amp; 0xf)) &amp; OK_TYPES)) continue;
-                    if (0 == (@as(u32, 1) &lt;&lt; @as(u5, @intCast(self.syms[i].st_info &gt;&gt; 4)) &amp; OK_BINDS)) continue;
-                    if (0 == self.syms[i].st_shndx) continue;
-                    if (!mem.eql(u8, name, mem.sliceTo(self.strings + self.syms[i].st_name, 0))) continue;
-                    if (maybe_versym) |versym| {
-                        if (!checkver(self.verdef.?, versym[i], vername, self.strings))
-                            continue;
-                    }
-                    return @intFromPtr(self.memory.ptr) + self.syms[i].st_value;
-                }
-            },
-            .dt_gnu_hash =&gt; |gnu_hash_header| {
-                const GnuHashSection = switch (@bitSizeOf(usize)) {
-                    32 =&gt; GnuHashSection32,
-                    64 =&gt; GnuHashSection64,
-                    else =&gt; |bit_size| @compileError("Unsupported bit size " ++ bit_size),
-                };
-
-                const gnu_hash_section: GnuHashSection = .fromPtr(gnu_hash_header);
-                const hash = elf.gnu_hash.calculate(name);
-
-                const bloom_index = (hash / @bitSizeOf(usize)) % gnu_hash_header.bloom_size;
-                const bloom_val = gnu_hash_section.bloom[bloom_index];
-
-                const bit_index_0 = hash % @bitSizeOf(usize);
-                const bit_index_1 = (hash &gt;&gt; @intCast(gnu_hash_header.bloom_shift)) % @bitSizeOf(usize);
-
-                const one: usize = 1;
-                const bit_mask: usize = (one &lt;&lt; @intCast(bit_index_0)) | (one &lt;&lt; @intCast(bit_index_1));
-
-                if (bloom_val &amp; bit_mask != bit_mask) {
-                    // Symbol is not in bloom filter, so it definitely isn't here.
-                    return null;
-                }
-
-                const bucket_index = hash % gnu_hash_header.nbuckets;
-                const chain_index = gnu_hash_section.buckets[bucket_index] - gnu_hash_header.symoffset;
-
-                const chains = gnu_hash_section.chain;
-                const hash_as_entry: elf.gnu_hash.ChainEntry = @bitCast(hash);
-
-                var current_index = chain_index;
-                var at_end_of_chain = false;
-                while (!at_end_of_chain) : (current_index += 1) {
-                    const current_entry = chains[current_index];
-                    at_end_of_chain = current_entry.end_of_chain;
-
-                    if (current_entry.hash != hash_as_entry.hash) continue;
-
-                    // check that symbol matches
-                    const symbol_index = current_index + gnu_hash_header.symoffset;
-                    const symbol = self.syms[symbol_index];
-
-                    if (0 == (@as(u32, 1) &lt;&lt; @as(u5, @intCast(symbol.st_info &amp; 0xf)) &amp; OK_TYPES)) continue;
-                    if (0 == (@as(u32, 1) &lt;&lt; @as(u5, @intCast(symbol.st_info &gt;&gt; 4)) &amp; OK_BINDS)) continue;
-                    if (0 == symbol.st_shndx) continue;
-
-                    const symbol_name = mem.sliceTo(self.strings + symbol.st_name, 0);
-                    if (!mem.eql(u8, name, symbol_name)) {
-                        continue;
-                    }
-
-                    if (maybe_versym) |versym| {
-                        if (!checkver(self.verdef.?, versym[symbol_index], vername, self.strings)) {
-                            continue;
-                        }
-                    }
-
-                    return @intFromPtr(self.memory.ptr) + symbol.st_value;
-                }
-            },
-        }
-
-        return null;
-    }
-
-    fn elfToProt(elf_prot: u64) posix.PROT {
-        return .{
-            .READ = (elf_prot &amp; elf.PF_R) != 0,
-            .WRITE = (elf_prot &amp; elf.PF_W) != 0,
-            .EXEC = (elf_prot &amp; elf.PF_X) != 0,
-        };
-    }
-};
-
-fn checkver(def_arg: *elf.Verdef, vsym_arg: elf.Versym, vername: []const u8, strings: [*:0]u8) bool {
-    var def = def_arg;
-    const vsym_index = vsym_arg.VERSION;
-    while (true) {
-        if (0 == (def.flags &amp; elf.VER_FLG_BASE) and @intFromEnum(def.ndx) == vsym_index) break;
-        if (def.next == 0) return false;
-        def = @ptrFromInt(@intFromPtr(def) + def.next);
-    }
-    const aux: *elf.Verdaux = @ptrFromInt(@intFromPtr(def) + def.aux);
-    return mem.eql(u8, vername, mem.sliceTo(strings + aux.name, 0));
-}
-
-test "ElfDynLib" {
-    if (native_os != .linux) return error.SkipZigTest;
-    try testing.expectError(error.FileNotFound, ElfDynLib.open("invalid_so.so", null));
-    try testing.expectError(error.FileNotFound, ElfDynLib.openZ("invalid_so.so", null));
-}
-
-/// Separated to avoid referencing `DlDynLib`, because its field types may not
-/// be valid on other targets.
-const DlDynLibError = error{ FileNotFound, NameTooLong };
-
-pub const DlDynLib = struct {
-    pub const Error = DlDynLibError;
-
-    handle: *anyopaque,
-
-    pub fn open(path: []const u8) Error!DlDynLib {
-        const path_c = try posix.toPosixPath(path);
-        return openZ(&amp;path_c);
-    }
-
-    pub fn openZ(path_c: [*:0]const u8) Error!DlDynLib {
-        return .{
-            .handle = std.c.dlopen(path_c, .{ .LAZY = true }) orelse {
-                return error.FileNotFound;
-            },
-        };
-    }
-
-    pub fn close(self: *DlDynLib) void {
-        switch (posix.errno(std.c.dlclose(self.handle))) {
-            .SUCCESS =&gt; return,
-            else =&gt; unreachable,
-        }
-        self.* = undefined;
-    }
-
-    pub fn lookup(self: *DlDynLib, comptime T: type, name: [:0]const u8) ?T {
-        // dlsym (and other dl-functions) secretly take shadow parameter - return address on stack
-        // https://gcc.gnu.org/bugzilla/show_bug.cgi?id=66826
-        if (@call(.never_tail, std.c.dlsym, .{ self.handle, name.ptr })) |symbol| {
-            return @as(T, @ptrCast(@alignCast(symbol)));
-        } else {
-            return null;
-        }
-    }
-
-    /// DlDynLib specific
-    /// Returns human readable string describing most recent error than occurred from `lookup`
-    /// or `null` if no error has occurred since initialization or when `getError` was last called.
-    pub fn getError() ?[:0]const u8 {
-        return mem.span(std.c.dlerror());
-    }
-};
-
-test "dynamic_library" {
-    const libname = switch (native_os) {
-        .linux, .freebsd, .openbsd, .illumos =&gt; "invalid_so.so",
-        .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos =&gt; "invalid_dylib.dylib",
-        else =&gt; return error.SkipZigTest,
-    };
-
-    try testing.expectError(error.FileNotFound, DynLib.open(libname));
-    try testing.expectError(error.FileNotFound, DynLib.openZ(libname.ptr));
-}</pre>
+    <pre><a id="L1"></a>const builtin = @import("builtin");
+<a id="L2"></a>const native_os = builtin.os.tag;
+<a id="L3"></a>
+<a id="L4"></a>const std = @import("std.zig");
+<a id="L5"></a>const Io = std.Io;
+<a id="L6"></a>const mem = std.mem;
+<a id="L7"></a>const testing = std.testing;
+<a id="L8"></a>const elf = std.elf;
+<a id="L9"></a>const windows = std.os.windows;
+<a id="L10"></a>const posix = std.posix;
+<a id="L11"></a>
+<a id="L12"></a>/// Cross-platform dynamic library loading and symbol lookup.
+<a id="L13"></a>/// Platform-specific functionality is available through the `inner` field.
+<a id="L14"></a>pub const DynLib = struct {
+<a id="L15"></a>    const InnerType = switch (native_os) {
+<a id="L16"></a>        .linux =&gt; if (!builtin.link_libc or builtin.abi == .musl and builtin.link_mode == .static)
+<a id="L17"></a>            ElfDynLib
+<a id="L18"></a>        else
+<a id="L19"></a>            DlDynLib,
+<a id="L20"></a>        .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos, .freebsd, .netbsd, .openbsd, .dragonfly, .illumos =&gt; DlDynLib,
+<a id="L21"></a>        else =&gt; struct {
+<a id="L22"></a>            const open = @compileError("unsupported platform");
+<a id="L23"></a>            const openZ = @compileError("unsupported platform");
+<a id="L24"></a>        },
+<a id="L25"></a>    };
+<a id="L26"></a>
+<a id="L27"></a>    inner: InnerType,
+<a id="L28"></a>
+<a id="L29"></a>    pub const Error = ElfDynLibError || DlDynLibError;
+<a id="L30"></a>
+<a id="L31"></a>    /// Trusts the file. Malicious file will be able to execute arbitrary code.
+<a id="L32"></a>    pub fn open(path: []const u8) Error!DynLib {
+<a id="L33"></a>        if (InnerType == ElfDynLib) {
+<a id="L34"></a>            return .{ .inner = try InnerType.open(path, null) };
+<a id="L35"></a>        } else {
+<a id="L36"></a>            return .{ .inner = try InnerType.open(path) };
+<a id="L37"></a>        }
+<a id="L38"></a>    }
+<a id="L39"></a>
+<a id="L40"></a>    /// Trusts the file. Malicious file will be able to execute arbitrary code.
+<a id="L41"></a>    pub fn openZ(path_c: [*:0]const u8) Error!DynLib {
+<a id="L42"></a>        if (InnerType == ElfDynLib) {
+<a id="L43"></a>            return .{ .inner = try InnerType.openZ(path_c, null) };
+<a id="L44"></a>        } else {
+<a id="L45"></a>            return .{ .inner = try InnerType.openZ(path_c) };
+<a id="L46"></a>        }
+<a id="L47"></a>    }
+<a id="L48"></a>
+<a id="L49"></a>    /// Trusts the file.
+<a id="L50"></a>    pub fn close(self: *DynLib) void {
+<a id="L51"></a>        return self.inner.close();
+<a id="L52"></a>    }
+<a id="L53"></a>
+<a id="L54"></a>    pub fn lookup(self: *DynLib, comptime T: type, name: [:0]const u8) ?T {
+<a id="L55"></a>        return self.inner.lookup(T, name);
+<a id="L56"></a>    }
+<a id="L57"></a>};
+<a id="L58"></a>
+<a id="L59"></a>// The link_map structure is not completely specified beside the fields
+<a id="L60"></a>// reported below, any libc is free to store additional data in the remaining
+<a id="L61"></a>// space.
+<a id="L62"></a>// An iterator is provided in order to traverse the linked list in a idiomatic
+<a id="L63"></a>// fashion.
+<a id="L64"></a>const LinkMap = extern struct {
+<a id="L65"></a>    addr: usize,
+<a id="L66"></a>    name: [*:0]const u8,
+<a id="L67"></a>    ld: ?*elf.Dyn,
+<a id="L68"></a>    next: ?*LinkMap,
+<a id="L69"></a>    prev: ?*LinkMap,
+<a id="L70"></a>
+<a id="L71"></a>    pub const Iterator = struct {
+<a id="L72"></a>        current: ?*LinkMap,
+<a id="L73"></a>
+<a id="L74"></a>        pub fn end(self: *Iterator) bool {
+<a id="L75"></a>            return self.current == null;
+<a id="L76"></a>        }
+<a id="L77"></a>
+<a id="L78"></a>        pub fn next(self: *Iterator) ?*LinkMap {
+<a id="L79"></a>            if (self.current) |it| {
+<a id="L80"></a>                self.current = it.next;
+<a id="L81"></a>                return it;
+<a id="L82"></a>            }
+<a id="L83"></a>            return null;
+<a id="L84"></a>        }
+<a id="L85"></a>    };
+<a id="L86"></a>};
+<a id="L87"></a>
+<a id="L88"></a>const RDebug = extern struct {
+<a id="L89"></a>    version: i32,
+<a id="L90"></a>    map: ?*LinkMap,
+<a id="L91"></a>    brk: usize,
+<a id="L92"></a>    ldbase: usize,
+<a id="L93"></a>};
+<a id="L94"></a>
+<a id="L95"></a>/// TODO fix comparisons of extern symbol pointers so we don't need this helper function.
+<a id="L96"></a>pub fn get_DYNAMIC() ?[*]const elf.Dyn {
+<a id="L97"></a>    return @extern([*]const elf.Dyn, .{
+<a id="L98"></a>        .name = "_DYNAMIC",
+<a id="L99"></a>        .linkage = .weak,
+<a id="L100"></a>        .visibility = .hidden,
+<a id="L101"></a>    });
+<a id="L102"></a>}
+<a id="L103"></a>
+<a id="L104"></a>pub fn linkmap_iterator() error{InvalidExe}!LinkMap.Iterator {
+<a id="L105"></a>    const _DYNAMIC = get_DYNAMIC() orelse {
+<a id="L106"></a>        // No PT_DYNAMIC means this is a statically-linked non-PIE program.
+<a id="L107"></a>        return .{ .current = null };
+<a id="L108"></a>    };
+<a id="L109"></a>
+<a id="L110"></a>    const link_map_ptr = init: {
+<a id="L111"></a>        var i: usize = 0;
+<a id="L112"></a>        while (_DYNAMIC[i].d_tag != elf.DT_NULL) : (i += 1) {
+<a id="L113"></a>            switch (_DYNAMIC[i].d_tag) {
+<a id="L114"></a>                elf.DT_DEBUG =&gt; {
+<a id="L115"></a>                    const ptr = @as(?*RDebug, @ptrFromInt(_DYNAMIC[i].d_val));
+<a id="L116"></a>                    if (ptr) |r_debug| {
+<a id="L117"></a>                        if (r_debug.version != 1) return error.InvalidExe;
+<a id="L118"></a>                        break :init r_debug.map;
+<a id="L119"></a>                    }
+<a id="L120"></a>                },
+<a id="L121"></a>                elf.DT_PLTGOT =&gt; {
+<a id="L122"></a>                    const ptr = @as(?[*]usize, @ptrFromInt(_DYNAMIC[i].d_val));
+<a id="L123"></a>                    if (ptr) |got_table| {
+<a id="L124"></a>                        // The address to the link_map structure is stored in
+<a id="L125"></a>                        // the second slot
+<a id="L126"></a>                        break :init @as(?*LinkMap, @ptrFromInt(got_table[1]));
+<a id="L127"></a>                    }
+<a id="L128"></a>                },
+<a id="L129"></a>                else =&gt; {},
+<a id="L130"></a>            }
+<a id="L131"></a>        }
+<a id="L132"></a>        return .{ .current = null };
+<a id="L133"></a>    };
+<a id="L134"></a>
+<a id="L135"></a>    return .{ .current = link_map_ptr };
+<a id="L136"></a>}
+<a id="L137"></a>
+<a id="L138"></a>/// Separated to avoid referencing `ElfDynLib`, because its field types may not
+<a id="L139"></a>/// be valid on other targets.
+<a id="L140"></a>const ElfDynLibError = error{
+<a id="L141"></a>    FileTooBig,
+<a id="L142"></a>    NotElfFile,
+<a id="L143"></a>    NotDynamicLibrary,
+<a id="L144"></a>    MissingDynamicLinkingInformation,
+<a id="L145"></a>    ElfStringSectionNotFound,
+<a id="L146"></a>    ElfSymSectionNotFound,
+<a id="L147"></a>    ElfHashTableNotFound,
+<a id="L148"></a>    Canceled,
+<a id="L149"></a>    Streaming,
+<a id="L150"></a>} || Io.File.OpenError || posix.MMapError;
+<a id="L151"></a>
+<a id="L152"></a>pub const ElfDynLib = struct {
+<a id="L153"></a>    strings: [*:0]u8,
+<a id="L154"></a>    syms: [*]elf.Sym,
+<a id="L155"></a>    hash_table: HashTable,
+<a id="L156"></a>    versym: ?[*]elf.Versym,
+<a id="L157"></a>    verdef: ?*elf.Verdef,
+<a id="L158"></a>    memory: []align(std.heap.page_size_min) u8,
+<a id="L159"></a>
+<a id="L160"></a>    pub const Error = ElfDynLibError;
+<a id="L161"></a>
+<a id="L162"></a>    const HashTable = union(enum) {
+<a id="L163"></a>        dt_hash: [*]posix.Elf_Symndx,
+<a id="L164"></a>        dt_gnu_hash: *elf.gnu_hash.Header,
+<a id="L165"></a>    };
+<a id="L166"></a>
+<a id="L167"></a>    fn openPath(io: Io, path: []const u8) !Io.Dir {
+<a id="L168"></a>        if (path.len == 0) return error.NotDir;
+<a id="L169"></a>        var parts = std.mem.tokenizeScalar(u8, path, '/');
+<a id="L170"></a>        var parent = if (path[0] == '/') try Io.Dir.cwd().openDir(io, "/", .{}) else Io.Dir.cwd();
+<a id="L171"></a>        while (parts.next()) |part| {
+<a id="L172"></a>            const child = try parent.openDir(io, part, .{});
+<a id="L173"></a>            parent.close(io);
+<a id="L174"></a>            parent = child;
+<a id="L175"></a>        }
+<a id="L176"></a>        return parent;
+<a id="L177"></a>    }
+<a id="L178"></a>
+<a id="L179"></a>    fn resolveFromSearchPath(io: Io, search_path: []const u8, file_name: []const u8, delim: u8) ?Io.File {
+<a id="L180"></a>        var paths = std.mem.tokenizeScalar(u8, search_path, delim);
+<a id="L181"></a>        while (paths.next()) |p| {
+<a id="L182"></a>            var dir = openPath(io, p) catch continue;
+<a id="L183"></a>            defer dir.close(io);
+<a id="L184"></a>            return dir.openFile(io, file_name, .{}) catch continue;
+<a id="L185"></a>        }
+<a id="L186"></a>        return null;
+<a id="L187"></a>    }
+<a id="L188"></a>
+<a id="L189"></a>    fn resolveFromParent(io: Io, dir_path: []const u8, file_name: []const u8) ?Io.File {
+<a id="L190"></a>        var dir = Io.Dir.cwd().openDir(io, dir_path, .{}) catch return null;
+<a id="L191"></a>        defer dir.close(io);
+<a id="L192"></a>        return dir.openFile(io, file_name, .{}) catch null;
+<a id="L193"></a>    }
+<a id="L194"></a>
+<a id="L195"></a>    // This implements enough to be able to load system libraries in general
+<a id="L196"></a>    // Places where it differs from dlopen:
+<a id="L197"></a>    // - DT_RPATH of the calling binary is not used as a search path
+<a id="L198"></a>    // - DT_RUNPATH of the calling binary is not used as a search path
+<a id="L199"></a>    // - /etc/ld.so.cache is not read
+<a id="L200"></a>    fn resolveFromName(io: Io, path_or_name: []const u8, LD_LIBRARY_PATH: ?[]const u8) !Io.File {
+<a id="L201"></a>        // If filename contains a slash ("/"), then it is interpreted as a (relative or absolute) pathname
+<a id="L202"></a>        if (std.mem.findScalarPos(u8, path_or_name, 0, '/')) |_| {
+<a id="L203"></a>            return Io.Dir.cwd().openFile(io, path_or_name, .{});
+<a id="L204"></a>        }
+<a id="L205"></a>
+<a id="L206"></a>        // Only read LD_LIBRARY_PATH if the binary is not setuid/setgid
+<a id="L207"></a>        if (std.os.linux.geteuid() == std.os.linux.getuid() and
+<a id="L208"></a>            std.os.linux.getegid() == std.os.linux.getgid())
+<a id="L209"></a>        {
+<a id="L210"></a>            if (LD_LIBRARY_PATH) |ld_library_path| {
+<a id="L211"></a>                if (resolveFromSearchPath(io, ld_library_path, path_or_name, ':')) |file| {
+<a id="L212"></a>                    return file;
+<a id="L213"></a>                }
+<a id="L214"></a>            }
+<a id="L215"></a>        }
+<a id="L216"></a>
+<a id="L217"></a>        // Lastly the directories /lib and /usr/lib are searched (in this exact order)
+<a id="L218"></a>        if (resolveFromParent(io, "/lib", path_or_name)) |file| return file;
+<a id="L219"></a>        if (resolveFromParent(io, "/usr/lib", path_or_name)) |file| return file;
+<a id="L220"></a>        return error.FileNotFound;
+<a id="L221"></a>    }
+<a id="L222"></a>
+<a id="L223"></a>    /// Trusts the file. Malicious file will be able to execute arbitrary code.
+<a id="L224"></a>    pub fn open(path: []const u8, LD_LIBRARY_PATH: ?[]const u8) Error!ElfDynLib {
+<a id="L225"></a>        const io = std.Options.debug_io;
+<a id="L226"></a>
+<a id="L227"></a>        const file = try resolveFromName(io, path, LD_LIBRARY_PATH);
+<a id="L228"></a>        defer file.close(io);
+<a id="L229"></a>
+<a id="L230"></a>        const stat = try file.stat(io);
+<a id="L231"></a>        const size = std.math.cast(usize, stat.size) orelse return error.FileTooBig;
+<a id="L232"></a>
+<a id="L233"></a>        const page_size = std.heap.pageSize();
+<a id="L234"></a>
+<a id="L235"></a>        // This one is to read the ELF info. We do more mmapping later
+<a id="L236"></a>        // corresponding to the actual LOAD sections.
+<a id="L237"></a>        const file_bytes = try posix.mmap(
+<a id="L238"></a>            null,
+<a id="L239"></a>            mem.alignForward(usize, size, page_size),
+<a id="L240"></a>            .{ .READ = true },
+<a id="L241"></a>            .{ .TYPE = .PRIVATE },
+<a id="L242"></a>            file.handle,
+<a id="L243"></a>            0,
+<a id="L244"></a>        );
+<a id="L245"></a>        defer posix.munmap(file_bytes);
+<a id="L246"></a>
+<a id="L247"></a>        const eh = @as(*elf.Ehdr, @ptrCast(file_bytes.ptr));
+<a id="L248"></a>        if (!mem.eql(u8, eh.e_ident[0..4], elf.MAGIC)) return error.NotElfFile;
+<a id="L249"></a>        if (eh.e_type != elf.ET.DYN) return error.NotDynamicLibrary;
+<a id="L250"></a>
+<a id="L251"></a>        const elf_addr = @intFromPtr(file_bytes.ptr);
+<a id="L252"></a>
+<a id="L253"></a>        // Iterate over the program header entries to find out the
+<a id="L254"></a>        // dynamic vector as well as the total size of the virtual memory.
+<a id="L255"></a>        var maybe_dynv: ?[*]usize = null;
+<a id="L256"></a>        var virt_addr_end: usize = 0;
+<a id="L257"></a>        {
+<a id="L258"></a>            var i: usize = 0;
+<a id="L259"></a>            var ph_addr: usize = elf_addr + eh.e_phoff;
+<a id="L260"></a>            while (i &lt; eh.e_phnum) : ({
+<a id="L261"></a>                i += 1;
+<a id="L262"></a>                ph_addr += eh.e_phentsize;
+<a id="L263"></a>            }) {
+<a id="L264"></a>                const ph = @as(*elf.Phdr, @ptrFromInt(ph_addr));
+<a id="L265"></a>                switch (ph.p_type) {
+<a id="L266"></a>                    elf.PT_LOAD =&gt; virt_addr_end = @max(virt_addr_end, ph.p_vaddr + ph.p_memsz),
+<a id="L267"></a>                    elf.PT_DYNAMIC =&gt; maybe_dynv = @as([*]usize, @ptrFromInt(elf_addr + ph.p_offset)),
+<a id="L268"></a>                    else =&gt; {},
+<a id="L269"></a>                }
+<a id="L270"></a>            }
+<a id="L271"></a>        }
+<a id="L272"></a>        const dynv = maybe_dynv orelse return error.MissingDynamicLinkingInformation;
+<a id="L273"></a>
+<a id="L274"></a>        // Reserve the entire range (with no permissions) so that we can do MAP.FIXED below.
+<a id="L275"></a>        const all_loaded_mem = try posix.mmap(
+<a id="L276"></a>            null,
+<a id="L277"></a>            virt_addr_end,
+<a id="L278"></a>            .{},
+<a id="L279"></a>            .{ .TYPE = .PRIVATE, .ANONYMOUS = true },
+<a id="L280"></a>            -1,
+<a id="L281"></a>            0,
+<a id="L282"></a>        );
+<a id="L283"></a>        errdefer posix.munmap(all_loaded_mem);
+<a id="L284"></a>
+<a id="L285"></a>        const base = @intFromPtr(all_loaded_mem.ptr);
+<a id="L286"></a>
+<a id="L287"></a>        // Now iterate again and actually load all the program sections.
+<a id="L288"></a>        {
+<a id="L289"></a>            var i: usize = 0;
+<a id="L290"></a>            var ph_addr: usize = elf_addr + eh.e_phoff;
+<a id="L291"></a>            while (i &lt; eh.e_phnum) : ({
+<a id="L292"></a>                i += 1;
+<a id="L293"></a>                ph_addr += eh.e_phentsize;
+<a id="L294"></a>            }) {
+<a id="L295"></a>                const ph = @as(*elf.Phdr, @ptrFromInt(ph_addr));
+<a id="L296"></a>                switch (ph.p_type) {
+<a id="L297"></a>                    elf.PT_LOAD =&gt; {
+<a id="L298"></a>                        // The VirtAddr may not be page-aligned; in such case there will be
+<a id="L299"></a>                        // extra nonsense mapped before/after the VirtAddr,MemSiz
+<a id="L300"></a>                        const aligned_addr = (base + ph.p_vaddr) &amp; ~(@as(usize, page_size) - 1);
+<a id="L301"></a>                        const extra_bytes = (base + ph.p_vaddr) - aligned_addr;
+<a id="L302"></a>                        const extended_memsz = mem.alignForward(usize, ph.p_memsz + extra_bytes, page_size);
+<a id="L303"></a>                        const ptr = @as([*]align(std.heap.page_size_min) u8, @ptrFromInt(aligned_addr));
+<a id="L304"></a>                        const prot = elfToProt(ph.p_flags);
+<a id="L305"></a>                        if ((ph.p_flags &amp; elf.PF_W) == 0) {
+<a id="L306"></a>                            // If it does not need write access, it can be mapped from the fd.
+<a id="L307"></a>                            _ = try posix.mmap(
+<a id="L308"></a>                                ptr,
+<a id="L309"></a>                                extended_memsz,
+<a id="L310"></a>                                prot,
+<a id="L311"></a>                                .{ .TYPE = .PRIVATE, .FIXED = true },
+<a id="L312"></a>                                file.handle,
+<a id="L313"></a>                                ph.p_offset - extra_bytes,
+<a id="L314"></a>                            );
+<a id="L315"></a>                        } else {
+<a id="L316"></a>                            const sect_mem = try posix.mmap(
+<a id="L317"></a>                                ptr,
+<a id="L318"></a>                                extended_memsz,
+<a id="L319"></a>                                prot,
+<a id="L320"></a>                                .{ .TYPE = .PRIVATE, .FIXED = true, .ANONYMOUS = true },
+<a id="L321"></a>                                -1,
+<a id="L322"></a>                                0,
+<a id="L323"></a>                            );
+<a id="L324"></a>                            @memcpy(sect_mem[0..ph.p_filesz], file_bytes[0..ph.p_filesz]);
+<a id="L325"></a>                        }
+<a id="L326"></a>                    },
+<a id="L327"></a>                    else =&gt; {},
+<a id="L328"></a>                }
+<a id="L329"></a>            }
+<a id="L330"></a>        }
+<a id="L331"></a>
+<a id="L332"></a>        var maybe_strings: ?[*:0]u8 = null;
+<a id="L333"></a>        var maybe_syms: ?[*]elf.Sym = null;
+<a id="L334"></a>        var maybe_hashtab: ?[*]posix.Elf_Symndx = null;
+<a id="L335"></a>        var maybe_gnu_hash: ?*elf.gnu_hash.Header = null;
+<a id="L336"></a>        var maybe_versym: ?[*]elf.Versym = null;
+<a id="L337"></a>        var maybe_verdef: ?*elf.Verdef = null;
+<a id="L338"></a>
+<a id="L339"></a>        {
+<a id="L340"></a>            var i: usize = 0;
+<a id="L341"></a>            while (dynv[i] != 0) : (i += 2) {
+<a id="L342"></a>                const p = base + dynv[i + 1];
+<a id="L343"></a>                switch (dynv[i]) {
+<a id="L344"></a>                    elf.DT_STRTAB =&gt; maybe_strings = @ptrFromInt(p),
+<a id="L345"></a>                    elf.DT_SYMTAB =&gt; maybe_syms = @ptrFromInt(p),
+<a id="L346"></a>                    elf.DT_HASH =&gt; maybe_hashtab = @ptrFromInt(p),
+<a id="L347"></a>                    elf.DT_GNU_HASH =&gt; maybe_gnu_hash = @ptrFromInt(p),
+<a id="L348"></a>                    elf.DT_VERSYM =&gt; maybe_versym = @ptrFromInt(p),
+<a id="L349"></a>                    elf.DT_VERDEF =&gt; maybe_verdef = @ptrFromInt(p),
+<a id="L350"></a>                    else =&gt; {},
+<a id="L351"></a>                }
+<a id="L352"></a>            }
+<a id="L353"></a>        }
+<a id="L354"></a>
+<a id="L355"></a>        const hash_table: HashTable = if (maybe_gnu_hash) |gnu_hash|
+<a id="L356"></a>            .{ .dt_gnu_hash = gnu_hash }
+<a id="L357"></a>        else if (maybe_hashtab) |hashtab|
+<a id="L358"></a>            .{ .dt_hash = hashtab }
+<a id="L359"></a>        else
+<a id="L360"></a>            return error.ElfHashTableNotFound;
+<a id="L361"></a>
+<a id="L362"></a>        return .{
+<a id="L363"></a>            .memory = all_loaded_mem,
+<a id="L364"></a>            .strings = maybe_strings orelse return error.ElfStringSectionNotFound,
+<a id="L365"></a>            .syms = maybe_syms orelse return error.ElfSymSectionNotFound,
+<a id="L366"></a>            .hash_table = hash_table,
+<a id="L367"></a>            .versym = maybe_versym,
+<a id="L368"></a>            .verdef = maybe_verdef,
+<a id="L369"></a>        };
+<a id="L370"></a>    }
+<a id="L371"></a>
+<a id="L372"></a>    /// Trusts the file. Malicious file will be able to execute arbitrary code.
+<a id="L373"></a>    pub fn openZ(path_c: [*:0]const u8, LD_LIBRARY_PATH: ?[]const u8) Error!ElfDynLib {
+<a id="L374"></a>        return open(mem.sliceTo(path_c, 0), LD_LIBRARY_PATH);
+<a id="L375"></a>    }
+<a id="L376"></a>
+<a id="L377"></a>    /// Trusts the file
+<a id="L378"></a>    pub fn close(self: *ElfDynLib) void {
+<a id="L379"></a>        posix.munmap(self.memory);
+<a id="L380"></a>        self.* = undefined;
+<a id="L381"></a>    }
+<a id="L382"></a>
+<a id="L383"></a>    pub fn lookup(self: *const ElfDynLib, comptime T: type, name: [:0]const u8) ?T {
+<a id="L384"></a>        if (self.lookupAddress("", name)) |symbol| {
+<a id="L385"></a>            return @as(T, @ptrFromInt(symbol));
+<a id="L386"></a>        } else {
+<a id="L387"></a>            return null;
+<a id="L388"></a>        }
+<a id="L389"></a>    }
+<a id="L390"></a>
+<a id="L391"></a>    pub const GnuHashSection32 = struct {
+<a id="L392"></a>        symoffset: u32,
+<a id="L393"></a>        bloom_shift: u32,
+<a id="L394"></a>        bloom: []u32,
+<a id="L395"></a>        buckets: []u32,
+<a id="L396"></a>        chain: [*]elf.gnu_hash.ChainEntry,
+<a id="L397"></a>
+<a id="L398"></a>        pub fn fromPtr(header: *elf.gnu_hash.Header) @This() {
+<a id="L399"></a>            const header_offset = @intFromPtr(header);
+<a id="L400"></a>            const bloom_offset = header_offset + @sizeOf(elf.gnu_hash.Header);
+<a id="L401"></a>            const buckets_offset = bloom_offset + header.bloom_size * @sizeOf(u32);
+<a id="L402"></a>            const chain_offset = buckets_offset + header.nbuckets * @sizeOf(u32);
+<a id="L403"></a>
+<a id="L404"></a>            const bloom_ptr: [*]u32 = @ptrFromInt(bloom_offset);
+<a id="L405"></a>            const buckets_ptr: [*]u32 = @ptrFromInt(buckets_offset);
+<a id="L406"></a>            const chain_ptr: [*]elf.gnu_hash.ChainEntry = @ptrFromInt(chain_offset);
+<a id="L407"></a>
+<a id="L408"></a>            return .{
+<a id="L409"></a>                .symoffset = header.symoffset,
+<a id="L410"></a>                .bloom_shift = header.bloom_shift,
+<a id="L411"></a>                .bloom = bloom_ptr[0..header.bloom_size],
+<a id="L412"></a>                .buckets = buckets_ptr[0..header.nbuckets],
+<a id="L413"></a>                .chain = chain_ptr,
+<a id="L414"></a>            };
+<a id="L415"></a>        }
+<a id="L416"></a>    };
+<a id="L417"></a>
+<a id="L418"></a>    pub const GnuHashSection64 = struct {
+<a id="L419"></a>        symoffset: u32,
+<a id="L420"></a>        bloom_shift: u32,
+<a id="L421"></a>        bloom: []u64,
+<a id="L422"></a>        buckets: []u32,
+<a id="L423"></a>        chain: [*]elf.gnu_hash.ChainEntry,
+<a id="L424"></a>
+<a id="L425"></a>        pub fn fromPtr(header: *elf.gnu_hash.Header) @This() {
+<a id="L426"></a>            const header_offset = @intFromPtr(header);
+<a id="L427"></a>            const bloom_offset = header_offset + @sizeOf(elf.gnu_hash.Header);
+<a id="L428"></a>            const buckets_offset = bloom_offset + header.bloom_size * @sizeOf(u64);
+<a id="L429"></a>            const chain_offset = buckets_offset + header.nbuckets * @sizeOf(u32);
+<a id="L430"></a>
+<a id="L431"></a>            const bloom_ptr: [*]u64 = @ptrFromInt(bloom_offset);
+<a id="L432"></a>            const buckets_ptr: [*]u32 = @ptrFromInt(buckets_offset);
+<a id="L433"></a>            const chain_ptr: [*]elf.gnu_hash.ChainEntry = @ptrFromInt(chain_offset);
+<a id="L434"></a>
+<a id="L435"></a>            return .{
+<a id="L436"></a>                .symoffset = header.symoffset,
+<a id="L437"></a>                .bloom_shift = header.bloom_shift,
+<a id="L438"></a>                .bloom = bloom_ptr[0..header.bloom_size],
+<a id="L439"></a>                .buckets = buckets_ptr[0..header.nbuckets],
+<a id="L440"></a>                .chain = chain_ptr,
+<a id="L441"></a>            };
+<a id="L442"></a>        }
+<a id="L443"></a>    };
+<a id="L444"></a>
+<a id="L445"></a>    /// ElfDynLib specific
+<a id="L446"></a>    /// Returns the address of the symbol
+<a id="L447"></a>    pub fn lookupAddress(self: *const ElfDynLib, vername: []const u8, name: []const u8) ?usize {
+<a id="L448"></a>        const maybe_versym = if (self.verdef == null) null else self.versym;
+<a id="L449"></a>
+<a id="L450"></a>        const OK_TYPES = (1 &lt;&lt; elf.STT_NOTYPE | 1 &lt;&lt; elf.STT_OBJECT | 1 &lt;&lt; elf.STT_FUNC | 1 &lt;&lt; elf.STT_COMMON);
+<a id="L451"></a>        const OK_BINDS = (1 &lt;&lt; elf.STB_GLOBAL | 1 &lt;&lt; elf.STB_WEAK | 1 &lt;&lt; elf.STB_GNU_UNIQUE);
+<a id="L452"></a>
+<a id="L453"></a>        switch (self.hash_table) {
+<a id="L454"></a>            .dt_hash =&gt; |hashtab| {
+<a id="L455"></a>                var i: usize = 0;
+<a id="L456"></a>                while (i &lt; hashtab[1]) : (i += 1) {
+<a id="L457"></a>                    if (0 == (@as(u32, 1) &lt;&lt; @as(u5, @intCast(self.syms[i].st_info &amp; 0xf)) &amp; OK_TYPES)) continue;
+<a id="L458"></a>                    if (0 == (@as(u32, 1) &lt;&lt; @as(u5, @intCast(self.syms[i].st_info &gt;&gt; 4)) &amp; OK_BINDS)) continue;
+<a id="L459"></a>                    if (0 == self.syms[i].st_shndx) continue;
+<a id="L460"></a>                    if (!mem.eql(u8, name, mem.sliceTo(self.strings + self.syms[i].st_name, 0))) continue;
+<a id="L461"></a>                    if (maybe_versym) |versym| {
+<a id="L462"></a>                        if (!checkver(self.verdef.?, versym[i], vername, self.strings))
+<a id="L463"></a>                            continue;
+<a id="L464"></a>                    }
+<a id="L465"></a>                    return @intFromPtr(self.memory.ptr) + self.syms[i].st_value;
+<a id="L466"></a>                }
+<a id="L467"></a>            },
+<a id="L468"></a>            .dt_gnu_hash =&gt; |gnu_hash_header| {
+<a id="L469"></a>                const GnuHashSection = switch (@bitSizeOf(usize)) {
+<a id="L470"></a>                    32 =&gt; GnuHashSection32,
+<a id="L471"></a>                    64 =&gt; GnuHashSection64,
+<a id="L472"></a>                    else =&gt; |bit_size| @compileError("Unsupported bit size " ++ bit_size),
+<a id="L473"></a>                };
+<a id="L474"></a>
+<a id="L475"></a>                const gnu_hash_section: GnuHashSection = .fromPtr(gnu_hash_header);
+<a id="L476"></a>                const hash = elf.gnu_hash.calculate(name);
+<a id="L477"></a>
+<a id="L478"></a>                const bloom_index = (hash / @bitSizeOf(usize)) % gnu_hash_header.bloom_size;
+<a id="L479"></a>                const bloom_val = gnu_hash_section.bloom[bloom_index];
+<a id="L480"></a>
+<a id="L481"></a>                const bit_index_0 = hash % @bitSizeOf(usize);
+<a id="L482"></a>                const bit_index_1 = (hash &gt;&gt; @intCast(gnu_hash_header.bloom_shift)) % @bitSizeOf(usize);
+<a id="L483"></a>
+<a id="L484"></a>                const one: usize = 1;
+<a id="L485"></a>                const bit_mask: usize = (one &lt;&lt; @intCast(bit_index_0)) | (one &lt;&lt; @intCast(bit_index_1));
+<a id="L486"></a>
+<a id="L487"></a>                if (bloom_val &amp; bit_mask != bit_mask) {
+<a id="L488"></a>                    // Symbol is not in bloom filter, so it definitely isn't here.
+<a id="L489"></a>                    return null;
+<a id="L490"></a>                }
+<a id="L491"></a>
+<a id="L492"></a>                const bucket_index = hash % gnu_hash_header.nbuckets;
+<a id="L493"></a>                const chain_index = gnu_hash_section.buckets[bucket_index] - gnu_hash_header.symoffset;
+<a id="L494"></a>
+<a id="L495"></a>                const chains = gnu_hash_section.chain;
+<a id="L496"></a>                const hash_as_entry: elf.gnu_hash.ChainEntry = @bitCast(hash);
+<a id="L497"></a>
+<a id="L498"></a>                var current_index = chain_index;
+<a id="L499"></a>                var at_end_of_chain = false;
+<a id="L500"></a>                while (!at_end_of_chain) : (current_index += 1) {
+<a id="L501"></a>                    const current_entry = chains[current_index];
+<a id="L502"></a>                    at_end_of_chain = current_entry.end_of_chain;
+<a id="L503"></a>
+<a id="L504"></a>                    if (current_entry.hash != hash_as_entry.hash) continue;
+<a id="L505"></a>
+<a id="L506"></a>                    // check that symbol matches
+<a id="L507"></a>                    const symbol_index = current_index + gnu_hash_header.symoffset;
+<a id="L508"></a>                    const symbol = self.syms[symbol_index];
+<a id="L509"></a>
+<a id="L510"></a>                    if (0 == (@as(u32, 1) &lt;&lt; @as(u5, @intCast(symbol.st_info &amp; 0xf)) &amp; OK_TYPES)) continue;
+<a id="L511"></a>                    if (0 == (@as(u32, 1) &lt;&lt; @as(u5, @intCast(symbol.st_info &gt;&gt; 4)) &amp; OK_BINDS)) continue;
+<a id="L512"></a>                    if (0 == symbol.st_shndx) continue;
+<a id="L513"></a>
+<a id="L514"></a>                    const symbol_name = mem.sliceTo(self.strings + symbol.st_name, 0);
+<a id="L515"></a>                    if (!mem.eql(u8, name, symbol_name)) {
+<a id="L516"></a>                        continue;
+<a id="L517"></a>                    }
+<a id="L518"></a>
+<a id="L519"></a>                    if (maybe_versym) |versym| {
+<a id="L520"></a>                        if (!checkver(self.verdef.?, versym[symbol_index], vername, self.strings)) {
+<a id="L521"></a>                            continue;
+<a id="L522"></a>                        }
+<a id="L523"></a>                    }
+<a id="L524"></a>
+<a id="L525"></a>                    return @intFromPtr(self.memory.ptr) + symbol.st_value;
+<a id="L526"></a>                }
+<a id="L527"></a>            },
+<a id="L528"></a>        }
+<a id="L529"></a>
+<a id="L530"></a>        return null;
+<a id="L531"></a>    }
+<a id="L532"></a>
+<a id="L533"></a>    fn elfToProt(elf_prot: u64) posix.PROT {
+<a id="L534"></a>        return .{
+<a id="L535"></a>            .READ = (elf_prot &amp; elf.PF_R) != 0,
+<a id="L536"></a>            .WRITE = (elf_prot &amp; elf.PF_W) != 0,
+<a id="L537"></a>            .EXEC = (elf_prot &amp; elf.PF_X) != 0,
+<a id="L538"></a>        };
+<a id="L539"></a>    }
+<a id="L540"></a>};
+<a id="L541"></a>
+<a id="L542"></a>fn checkver(def_arg: *elf.Verdef, vsym_arg: elf.Versym, vername: []const u8, strings: [*:0]u8) bool {
+<a id="L543"></a>    var def = def_arg;
+<a id="L544"></a>    const vsym_index = vsym_arg.VERSION;
+<a id="L545"></a>    while (true) {
+<a id="L546"></a>        if (0 == (def.flags &amp; elf.VER_FLG_BASE) and @intFromEnum(def.ndx) == vsym_index) break;
+<a id="L547"></a>        if (def.next == 0) return false;
+<a id="L548"></a>        def = @ptrFromInt(@intFromPtr(def) + def.next);
+<a id="L549"></a>    }
+<a id="L550"></a>    const aux: *elf.Verdaux = @ptrFromInt(@intFromPtr(def) + def.aux);
+<a id="L551"></a>    return mem.eql(u8, vername, mem.sliceTo(strings + aux.name, 0));
+<a id="L552"></a>}
+<a id="L553"></a>
+<a id="L554"></a>test "ElfDynLib" {
+<a id="L555"></a>    if (native_os != .linux) return error.SkipZigTest;
+<a id="L556"></a>    try testing.expectError(error.FileNotFound, ElfDynLib.open("invalid_so.so", null));
+<a id="L557"></a>    try testing.expectError(error.FileNotFound, ElfDynLib.openZ("invalid_so.so", null));
+<a id="L558"></a>}
+<a id="L559"></a>
+<a id="L560"></a>/// Separated to avoid referencing `DlDynLib`, because its field types may not
+<a id="L561"></a>/// be valid on other targets.
+<a id="L562"></a>const DlDynLibError = error{ FileNotFound, NameTooLong };
+<a id="L563"></a>
+<a id="L564"></a>pub const DlDynLib = struct {
+<a id="L565"></a>    pub const Error = DlDynLibError;
+<a id="L566"></a>
+<a id="L567"></a>    handle: *anyopaque,
+<a id="L568"></a>
+<a id="L569"></a>    pub fn open(path: []const u8) Error!DlDynLib {
+<a id="L570"></a>        const path_c = try posix.toPosixPath(path);
+<a id="L571"></a>        return openZ(&amp;path_c);
+<a id="L572"></a>    }
+<a id="L573"></a>
+<a id="L574"></a>    pub fn openZ(path_c: [*:0]const u8) Error!DlDynLib {
+<a id="L575"></a>        return .{
+<a id="L576"></a>            .handle = std.c.dlopen(path_c, .{ .LAZY = true }) orelse {
+<a id="L577"></a>                return error.FileNotFound;
+<a id="L578"></a>            },
+<a id="L579"></a>        };
+<a id="L580"></a>    }
+<a id="L581"></a>
+<a id="L582"></a>    pub fn close(self: *DlDynLib) void {
+<a id="L583"></a>        switch (posix.errno(std.c.dlclose(self.handle))) {
+<a id="L584"></a>            .SUCCESS =&gt; return,
+<a id="L585"></a>            else =&gt; unreachable,
+<a id="L586"></a>        }
+<a id="L587"></a>        self.* = undefined;
+<a id="L588"></a>    }
+<a id="L589"></a>
+<a id="L590"></a>    pub fn lookup(self: *DlDynLib, comptime T: type, name: [:0]const u8) ?T {
+<a id="L591"></a>        // dlsym (and other dl-functions) secretly take shadow parameter - return address on stack
+<a id="L592"></a>        // https://gcc.gnu.org/bugzilla/show_bug.cgi?id=66826
+<a id="L593"></a>        if (@call(.never_tail, std.c.dlsym, .{ self.handle, name.ptr })) |symbol| {
+<a id="L594"></a>            return @as(T, @ptrCast(@alignCast(symbol)));
+<a id="L595"></a>        } else {
+<a id="L596"></a>            return null;
+<a id="L597"></a>        }
+<a id="L598"></a>    }
+<a id="L599"></a>
+<a id="L600"></a>    /// DlDynLib specific
+<a id="L601"></a>    /// Returns human readable string describing most recent error than occurred from `lookup`
+<a id="L602"></a>    /// or `null` if no error has occurred since initialization or when `getError` was last called.
+<a id="L603"></a>    pub fn getError() ?[:0]const u8 {
+<a id="L604"></a>        return mem.span(std.c.dlerror());
+<a id="L605"></a>    }
+<a id="L606"></a>};
+<a id="L607"></a>
+<a id="L608"></a>test "dynamic_library" {
+<a id="L609"></a>    const libname = switch (native_os) {
+<a id="L610"></a>        .linux, .freebsd, .openbsd, .illumos =&gt; "invalid_so.so",
+<a id="L611"></a>        .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos =&gt; "invalid_dylib.dylib",
+<a id="L612"></a>        else =&gt; return error.SkipZigTest,
+<a id="L613"></a>    };
+<a id="L614"></a>
+<a id="L615"></a>    try testing.expectError(error.FileNotFound, DynLib.open(libname));
+<a id="L616"></a>    try testing.expectError(error.FileNotFound, DynLib.openZ(libname.ptr));
+<a id="L617"></a>}
+</pre>
 </body>
 </html>

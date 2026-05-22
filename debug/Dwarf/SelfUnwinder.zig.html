@@ -2,351 +2,354 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Source: zig-0.16.0-std/debug/Dwarf/SelfUnwinder.zig</title>
+    <title>Source: debug/Dwarf/SelfUnwinder.zig</title>
     <style>
         body { background: #1e1e1e; color: #d4d4d4; font-family: monospace; padding: 20px; }
         pre { white-space: pre-wrap; word-wrap: break-word; }
         .header { border-bottom: 1px solid #444; padding-bottom: 10px; margin-bottom: 20px; }
         a { color: #569cd6; }
+        a[id] { color: inherit; text-decoration: none; }
+        :target { background: #3a3a00; }
     </style>
 </head>
 <body>
     <div class="header">
-        <a href="/">Index</a> | <strong>File: zig-0.16.0-std/debug/Dwarf/SelfUnwinder.zig</strong>
+        <a href="/">Index</a> | <strong>File: debug/Dwarf/SelfUnwinder.zig</strong>
     </div>
-    <pre>//! Implements stack unwinding based on `Dwarf.Unwind`. The caller is responsible for providing the
-//! initialized `Dwarf.Unwind` from the `.debug_frame` (or equivalent) section; this type handles
-//! computing and applying the CFI register rules to evolve a `std.debug.cpu_context.Native` through
-//! stack frames, hence performing the virtual unwind.
-//!
-//! Notably, this type is a valid implementation of `std.debug.SelfInfo.UnwindContext`.
-
-/// The state of the CPU in the current stack frame.
-cpu_state: std.debug.cpu_context.Native,
-/// The value of the Program Counter in this frame. This is almost the same as the value of the IP
-/// register in `cpu_state`, but may be off by one because the IP is typically a *return* address.
-pc: usize,
-
-cfi_vm: Dwarf.Unwind.VirtualMachine,
-expr_vm: Dwarf.expression.StackMachine(.{ .call_frame_context = true }),
-
-pub const CacheEntry = struct {
-    const max_rules = 32;
-
-    pc: usize,
-    cie: *const Dwarf.Unwind.CommonInformationEntry,
-    cfa_rule: Dwarf.Unwind.VirtualMachine.CfaRule,
-    num_rules: u8,
-    rules_regs: [max_rules]u16,
-    rules: [max_rules]Dwarf.Unwind.VirtualMachine.RegisterRule,
-
-    pub fn find(entries: []const CacheEntry, pc: usize) ?*const CacheEntry {
-        assert(pc != 0);
-        const idx = std.hash.int(pc) % entries.len;
-        const entry = &amp;entries[idx];
-        return if (entry.pc == pc) entry else null;
-    }
-
-    pub fn populate(entry: *const CacheEntry, entries: []CacheEntry) void {
-        const idx = std.hash.int(entry.pc) % entries.len;
-        entries[idx] = entry.*;
-    }
-
-    pub const empty: CacheEntry = .{
-        .pc = 0,
-        .cie = undefined,
-        .cfa_rule = undefined,
-        .num_rules = undefined,
-        .rules_regs = undefined,
-        .rules = undefined,
-    };
-};
-
-pub fn init(cpu_context: *const std.debug.cpu_context.Native) SelfUnwinder {
-    return .{
-        .cpu_state = cpu_context.*,
-        .pc = stripInstructionPtrAuthCode(cpu_context.getPc()),
-        .cfi_vm = .{},
-        .expr_vm = .{},
-    };
-}
-
-pub fn deinit(unwinder: *SelfUnwinder) void {
-    const gpa = std.debug.getDebugInfoAllocator();
-    unwinder.cfi_vm.deinit(gpa);
-    unwinder.expr_vm.deinit(gpa);
-    unwinder.* = undefined;
-}
-
-pub fn getFp(unwinder: *const SelfUnwinder) usize {
-    return unwinder.cpu_state.getFp();
-}
-
-/// Compute the rule set for the address `unwinder.pc` from the information in `unwind`. The caller
-/// may store the returned rule set in a simple fixed-size cache keyed on the `pc` field to avoid
-/// frequently recomputing register rules when unwinding many times.
-///
-/// To actually apply the computed rules, see `next`.
-pub fn computeRules(
-    unwinder: *SelfUnwinder,
-    gpa: Allocator,
-    unwind: *const Dwarf.Unwind,
-    load_offset: usize,
-    explicit_fde_offset: ?usize,
-) !CacheEntry {
-    assert(unwinder.pc != 0);
-
-    const pc_vaddr = unwinder.pc - load_offset;
-
-    const fde_offset = explicit_fde_offset orelse try unwind.lookupPc(
-        pc_vaddr,
-        @sizeOf(usize),
-        native_endian,
-    ) orelse return error.MissingDebugInfo;
-    const cie, const fde = try unwind.getFde(fde_offset, native_endian);
-
-    // `lookupPc` can return false positives, so check if the FDE *actually* includes the pc
-    if (pc_vaddr &lt; fde.pc_begin or pc_vaddr &gt;= fde.pc_begin + fde.pc_range) {
-        return error.MissingDebugInfo;
-    }
-
-    unwinder.cfi_vm.reset();
-    const row = try unwinder.cfi_vm.runTo(gpa, pc_vaddr, cie, &amp;fde, @sizeOf(usize), native_endian);
-
-    var entry: CacheEntry = .{
-        .pc = unwinder.pc,
-        .cie = cie,
-        .cfa_rule = row.cfa,
-        .num_rules = undefined,
-        .rules_regs = undefined,
-        .rules = undefined,
-    };
-    var i: usize = 0;
-    for (unwinder.cfi_vm.rowColumns(&amp;row)) |col| {
-        if (i == CacheEntry.max_rules) return error.UnsupportedDebugInfo;
-
-        _ = unwinder.cpu_state.dwarfRegisterBytes(col.register) catch |err| switch (err) {
-            // Reading an unsupported register during unwinding will result in an error, so there is
-            // no point wasting a rule slot in the cache entry for it.
-            error.UnsupportedRegister =&gt; continue,
-            error.InvalidRegister =&gt; return error.InvalidDebugInfo,
-        };
-        entry.rules_regs[i] = col.register;
-        entry.rules[i] = col.rule;
-        i += 1;
-    }
-    entry.num_rules = @intCast(i);
-    return entry;
-}
-
-/// Applies the register rules given in `cache_entry` to the current state of `unwinder`. The caller
-/// is responsible for ensuring that `cache_entry` contains the correct rule set for `unwinder.pc`.
-///
-/// `unwinder.cpu_state` and `unwinder.pc` are updated to refer to the next frame, and this frame's
-/// return address is returned as a `usize`.
-pub fn next(unwinder: *SelfUnwinder, gpa: Allocator, cache_entry: *const CacheEntry) std.debug.SelfInfoError!usize {
-    return unwinder.nextInner(gpa, cache_entry) catch |err| switch (err) {
-        error.OutOfMemory,
-        error.InvalidDebugInfo,
-        =&gt; |e| return e,
-
-        error.UnsupportedRegister,
-        error.UnimplementedExpressionCall,
-        error.UnimplementedOpcode,
-        error.UnimplementedUserOpcode,
-        error.UnimplementedTypedComparison,
-        error.UnimplementedTypeConversion,
-        error.UnknownExpressionOpcode,
-        =&gt; return error.UnsupportedDebugInfo,
-
-        error.ReadFailed,
-        error.EndOfStream,
-        error.Overflow,
-        error.IncompatibleRegisterSize,
-        error.InvalidRegister,
-        error.IncompleteExpressionContext,
-        error.InvalidCFAOpcode,
-        error.InvalidExpression,
-        error.InvalidFrameBase,
-        error.InvalidIntegralTypeSize,
-        error.InvalidSubExpression,
-        error.InvalidTypeLength,
-        error.TruncatedIntegralType,
-        error.DivisionByZero,
-        =&gt; return error.InvalidDebugInfo,
-    };
-}
-
-fn nextInner(unwinder: *SelfUnwinder, gpa: Allocator, cache_entry: *const CacheEntry) !usize {
-    const format = cache_entry.cie.format;
-
-    const cfa = switch (cache_entry.cfa_rule) {
-        .none =&gt; return error.InvalidDebugInfo,
-        .reg_off =&gt; |ro| cfa: {
-            const ptr = try regNative(&amp;unwinder.cpu_state, ro.register);
-            break :cfa try applyOffset(ptr.*, ro.offset);
-        },
-        .expression =&gt; |expr| cfa: {
-            // On most implemented architectures, the CFA is defined to be the previous frame's SP.
-            //
-            // On s390x, it's defined to be SP + 160 (ELF ABI s390x Supplement §1.6.3); however,
-            // what this actually means is that there will be a `def_cfa r15 + 160`, so nothing
-            // special for us to do.
-            const prev_cfa_val = (try regNative(&amp;unwinder.cpu_state, sp_reg_num)).*;
-            unwinder.expr_vm.reset();
-            const value = try unwinder.expr_vm.run(expr, gpa, .{
-                .format = format,
-                .cpu_context = &amp;unwinder.cpu_state,
-            }, prev_cfa_val) orelse return error.InvalidDebugInfo;
-            switch (value) {
-                .generic =&gt; |g| break :cfa g,
-                else =&gt; return error.InvalidDebugInfo,
-            }
-        },
-    };
-
-    // Create a copy of the CPU state, to which we will apply the new rules.
-    var new_cpu_state = unwinder.cpu_state;
-
-    // On all implemented architectures, the CFA is defined to be the previous frame's SP
-    (try regNative(&amp;new_cpu_state, sp_reg_num)).* = cfa;
-
-    const return_address_register = cache_entry.cie.return_address_register;
-    var has_return_address = true;
-
-    const rules_len = cache_entry.num_rules;
-    for (cache_entry.rules_regs[0..rules_len], cache_entry.rules[0..rules_len]) |register, rule| {
-        const new_val: union(enum) {
-            same,
-            undefined,
-            val: usize,
-            bytes: []const u8,
-        } = switch (rule) {
-            .default =&gt; val: {
-                // The way things are supposed to work is that `.undefined` is the default rule
-                // unless an ABI says otherwise (e.g. aarch64, s390x).
-                //
-                // Unfortunately, at some point, a decision was made to have libgcc's unwinder
-                // assume `.same` as the default for all registers. Compilers then started depending
-                // on this, and the practice was carried forward to LLVM's libunwind and some of its
-                // backends.
-                break :val .same;
-            },
-            .undefined =&gt; .undefined,
-            .same_value =&gt; .same,
-            .offset =&gt; |offset| val: {
-                const ptr: *const usize = @ptrFromInt(try applyOffset(cfa, offset));
-                break :val .{ .val = ptr.* };
-            },
-            .val_offset =&gt; |offset| .{ .val = try applyOffset(cfa, offset) },
-            .register =&gt; |r| .{ .bytes = try unwinder.cpu_state.dwarfRegisterBytes(r) },
-            .expression =&gt; |expr| val: {
-                unwinder.expr_vm.reset();
-                const value = try unwinder.expr_vm.run(expr, gpa, .{
-                    .format = format,
-                    .cpu_context = &amp;unwinder.cpu_state,
-                }, cfa) orelse return error.InvalidDebugInfo;
-                const ptr: *const usize = switch (value) {
-                    .generic =&gt; |addr| @ptrFromInt(addr),
-                    else =&gt; return error.InvalidDebugInfo,
-                };
-                break :val .{ .val = ptr.* };
-            },
-            .val_expression =&gt; |expr| val: {
-                unwinder.expr_vm.reset();
-                const value = try unwinder.expr_vm.run(expr, gpa, .{
-                    .format = format,
-                    .cpu_context = &amp;unwinder.cpu_state,
-                }, cfa) orelse return error.InvalidDebugInfo;
-                switch (value) {
-                    .generic =&gt; |val| break :val .{ .val = val },
-                    else =&gt; return error.InvalidDebugInfo,
-                }
-            },
-        };
-        switch (new_val) {
-            .same =&gt; {},
-            .undefined =&gt; {
-                const dest = try new_cpu_state.dwarfRegisterBytes(@intCast(register));
-                @memset(dest, undefined);
-
-                // If the return address register is explicitly set to `.undefined`, it means that
-                // there are no more frames to unwind.
-                if (register == return_address_register) {
-                    has_return_address = false;
-                }
-            },
-            .val =&gt; |val| {
-                const dest = try new_cpu_state.dwarfRegisterBytes(@intCast(register));
-                if (dest.len != @sizeOf(usize)) return error.InvalidDebugInfo;
-                const dest_ptr: *align(1) usize = @ptrCast(dest);
-                dest_ptr.* = val;
-            },
-            .bytes =&gt; |src| {
-                const dest = try new_cpu_state.dwarfRegisterBytes(@intCast(register));
-                if (dest.len != src.len) return error.InvalidDebugInfo;
-                @memcpy(dest, src);
-            },
-        }
-    }
-
-    const return_address = if (has_return_address)
-        stripInstructionPtrAuthCode((try regNative(&amp;new_cpu_state, return_address_register)).*)
-    else
-        0;
-
-    (try regNative(&amp;new_cpu_state, ip_reg_num)).* = return_address;
-
-    // The new CPU state is complete; flush changes.
-    unwinder.cpu_state = new_cpu_state;
-
-    // The caller will subtract 1 from the return address to get an address corresponding to the
-    // function call. However, if this is a signal frame, that's actually incorrect, because the
-    // "return address" we have is the instruction which triggered the signal (if the signal
-    // handler returned, the instruction would be re-run). Compensate for this by incrementing
-    // the address in that case.
-    const adjusted_ret_addr = if (cache_entry.cie.is_signal_frame) return_address +| 1 else return_address;
-
-    // We also want to do that same subtraction here to get the PC for the next frame's FDE.
-    // This is because if the callee was noreturn, then the function call might be the caller's
-    // last instruction, so `return_address` might actually point outside of it!
-    unwinder.pc = adjusted_ret_addr -| 1;
-
-    return adjusted_ret_addr;
-}
-
-pub fn regNative(ctx: *std.debug.cpu_context.Native, num: u16) error{
-    InvalidRegister,
-    UnsupportedRegister,
-    IncompatibleRegisterSize,
-}!*align(1) usize {
-    const bytes = try ctx.dwarfRegisterBytes(num);
-    if (bytes.len != @sizeOf(usize)) return error.IncompatibleRegisterSize;
-    return @ptrCast(bytes);
-}
-
-/// Since register rules are applied (usually) during a panic,
-/// checked addition / subtraction is used so that we can return
-/// an error and fall back to FP-based unwinding.
-fn applyOffset(base: usize, offset: i64) !usize {
-    return if (offset &gt;= 0)
-        try std.math.add(usize, base, @as(usize, @intCast(offset)))
-    else
-        try std.math.sub(usize, base, @as(usize, @intCast(-offset)));
-}
-
-const ip_reg_num = Dwarf.ipRegNum(builtin.target.cpu.arch).?;
-const sp_reg_num = Dwarf.spRegNum(builtin.target.cpu.arch);
-
-const std = @import("std");
-const Allocator = std.mem.Allocator;
-const Dwarf = std.debug.Dwarf;
-const assert = std.debug.assert;
-const stripInstructionPtrAuthCode = std.debug.stripInstructionPtrAuthCode;
-
-const builtin = @import("builtin");
-const native_endian = builtin.target.cpu.arch.endian();
-
-const SelfUnwinder = @This();</pre>
+    <pre><a id="L1"></a>//! Implements stack unwinding based on `Dwarf.Unwind`. The caller is responsible for providing the
+<a id="L2"></a>//! initialized `Dwarf.Unwind` from the `.debug_frame` (or equivalent) section; this type handles
+<a id="L3"></a>//! computing and applying the CFI register rules to evolve a `std.debug.cpu_context.Native` through
+<a id="L4"></a>//! stack frames, hence performing the virtual unwind.
+<a id="L5"></a>//!
+<a id="L6"></a>//! Notably, this type is a valid implementation of `std.debug.SelfInfo.UnwindContext`.
+<a id="L7"></a>
+<a id="L8"></a>/// The state of the CPU in the current stack frame.
+<a id="L9"></a>cpu_state: std.debug.cpu_context.Native,
+<a id="L10"></a>/// The value of the Program Counter in this frame. This is almost the same as the value of the IP
+<a id="L11"></a>/// register in `cpu_state`, but may be off by one because the IP is typically a *return* address.
+<a id="L12"></a>pc: usize,
+<a id="L13"></a>
+<a id="L14"></a>cfi_vm: Dwarf.Unwind.VirtualMachine,
+<a id="L15"></a>expr_vm: Dwarf.expression.StackMachine(.{ .call_frame_context = true }),
+<a id="L16"></a>
+<a id="L17"></a>pub const CacheEntry = struct {
+<a id="L18"></a>    const max_rules = 32;
+<a id="L19"></a>
+<a id="L20"></a>    pc: usize,
+<a id="L21"></a>    cie: *const Dwarf.Unwind.CommonInformationEntry,
+<a id="L22"></a>    cfa_rule: Dwarf.Unwind.VirtualMachine.CfaRule,
+<a id="L23"></a>    num_rules: u8,
+<a id="L24"></a>    rules_regs: [max_rules]u16,
+<a id="L25"></a>    rules: [max_rules]Dwarf.Unwind.VirtualMachine.RegisterRule,
+<a id="L26"></a>
+<a id="L27"></a>    pub fn find(entries: []const CacheEntry, pc: usize) ?*const CacheEntry {
+<a id="L28"></a>        assert(pc != 0);
+<a id="L29"></a>        const idx = std.hash.int(pc) % entries.len;
+<a id="L30"></a>        const entry = &amp;entries[idx];
+<a id="L31"></a>        return if (entry.pc == pc) entry else null;
+<a id="L32"></a>    }
+<a id="L33"></a>
+<a id="L34"></a>    pub fn populate(entry: *const CacheEntry, entries: []CacheEntry) void {
+<a id="L35"></a>        const idx = std.hash.int(entry.pc) % entries.len;
+<a id="L36"></a>        entries[idx] = entry.*;
+<a id="L37"></a>    }
+<a id="L38"></a>
+<a id="L39"></a>    pub const empty: CacheEntry = .{
+<a id="L40"></a>        .pc = 0,
+<a id="L41"></a>        .cie = undefined,
+<a id="L42"></a>        .cfa_rule = undefined,
+<a id="L43"></a>        .num_rules = undefined,
+<a id="L44"></a>        .rules_regs = undefined,
+<a id="L45"></a>        .rules = undefined,
+<a id="L46"></a>    };
+<a id="L47"></a>};
+<a id="L48"></a>
+<a id="L49"></a>pub fn init(cpu_context: *const std.debug.cpu_context.Native) SelfUnwinder {
+<a id="L50"></a>    return .{
+<a id="L51"></a>        .cpu_state = cpu_context.*,
+<a id="L52"></a>        .pc = stripInstructionPtrAuthCode(cpu_context.getPc()),
+<a id="L53"></a>        .cfi_vm = .{},
+<a id="L54"></a>        .expr_vm = .{},
+<a id="L55"></a>    };
+<a id="L56"></a>}
+<a id="L57"></a>
+<a id="L58"></a>pub fn deinit(unwinder: *SelfUnwinder) void {
+<a id="L59"></a>    const gpa = std.debug.getDebugInfoAllocator();
+<a id="L60"></a>    unwinder.cfi_vm.deinit(gpa);
+<a id="L61"></a>    unwinder.expr_vm.deinit(gpa);
+<a id="L62"></a>    unwinder.* = undefined;
+<a id="L63"></a>}
+<a id="L64"></a>
+<a id="L65"></a>pub fn getFp(unwinder: *const SelfUnwinder) usize {
+<a id="L66"></a>    return unwinder.cpu_state.getFp();
+<a id="L67"></a>}
+<a id="L68"></a>
+<a id="L69"></a>/// Compute the rule set for the address `unwinder.pc` from the information in `unwind`. The caller
+<a id="L70"></a>/// may store the returned rule set in a simple fixed-size cache keyed on the `pc` field to avoid
+<a id="L71"></a>/// frequently recomputing register rules when unwinding many times.
+<a id="L72"></a>///
+<a id="L73"></a>/// To actually apply the computed rules, see `next`.
+<a id="L74"></a>pub fn computeRules(
+<a id="L75"></a>    unwinder: *SelfUnwinder,
+<a id="L76"></a>    gpa: Allocator,
+<a id="L77"></a>    unwind: *const Dwarf.Unwind,
+<a id="L78"></a>    load_offset: usize,
+<a id="L79"></a>    explicit_fde_offset: ?usize,
+<a id="L80"></a>) !CacheEntry {
+<a id="L81"></a>    assert(unwinder.pc != 0);
+<a id="L82"></a>
+<a id="L83"></a>    const pc_vaddr = unwinder.pc - load_offset;
+<a id="L84"></a>
+<a id="L85"></a>    const fde_offset = explicit_fde_offset orelse try unwind.lookupPc(
+<a id="L86"></a>        pc_vaddr,
+<a id="L87"></a>        @sizeOf(usize),
+<a id="L88"></a>        native_endian,
+<a id="L89"></a>    ) orelse return error.MissingDebugInfo;
+<a id="L90"></a>    const cie, const fde = try unwind.getFde(fde_offset, native_endian);
+<a id="L91"></a>
+<a id="L92"></a>    // `lookupPc` can return false positives, so check if the FDE *actually* includes the pc
+<a id="L93"></a>    if (pc_vaddr &lt; fde.pc_begin or pc_vaddr &gt;= fde.pc_begin + fde.pc_range) {
+<a id="L94"></a>        return error.MissingDebugInfo;
+<a id="L95"></a>    }
+<a id="L96"></a>
+<a id="L97"></a>    unwinder.cfi_vm.reset();
+<a id="L98"></a>    const row = try unwinder.cfi_vm.runTo(gpa, pc_vaddr, cie, &amp;fde, @sizeOf(usize), native_endian);
+<a id="L99"></a>
+<a id="L100"></a>    var entry: CacheEntry = .{
+<a id="L101"></a>        .pc = unwinder.pc,
+<a id="L102"></a>        .cie = cie,
+<a id="L103"></a>        .cfa_rule = row.cfa,
+<a id="L104"></a>        .num_rules = undefined,
+<a id="L105"></a>        .rules_regs = undefined,
+<a id="L106"></a>        .rules = undefined,
+<a id="L107"></a>    };
+<a id="L108"></a>    var i: usize = 0;
+<a id="L109"></a>    for (unwinder.cfi_vm.rowColumns(&amp;row)) |col| {
+<a id="L110"></a>        if (i == CacheEntry.max_rules) return error.UnsupportedDebugInfo;
+<a id="L111"></a>
+<a id="L112"></a>        _ = unwinder.cpu_state.dwarfRegisterBytes(col.register) catch |err| switch (err) {
+<a id="L113"></a>            // Reading an unsupported register during unwinding will result in an error, so there is
+<a id="L114"></a>            // no point wasting a rule slot in the cache entry for it.
+<a id="L115"></a>            error.UnsupportedRegister =&gt; continue,
+<a id="L116"></a>            error.InvalidRegister =&gt; return error.InvalidDebugInfo,
+<a id="L117"></a>        };
+<a id="L118"></a>        entry.rules_regs[i] = col.register;
+<a id="L119"></a>        entry.rules[i] = col.rule;
+<a id="L120"></a>        i += 1;
+<a id="L121"></a>    }
+<a id="L122"></a>    entry.num_rules = @intCast(i);
+<a id="L123"></a>    return entry;
+<a id="L124"></a>}
+<a id="L125"></a>
+<a id="L126"></a>/// Applies the register rules given in `cache_entry` to the current state of `unwinder`. The caller
+<a id="L127"></a>/// is responsible for ensuring that `cache_entry` contains the correct rule set for `unwinder.pc`.
+<a id="L128"></a>///
+<a id="L129"></a>/// `unwinder.cpu_state` and `unwinder.pc` are updated to refer to the next frame, and this frame's
+<a id="L130"></a>/// return address is returned as a `usize`.
+<a id="L131"></a>pub fn next(unwinder: *SelfUnwinder, gpa: Allocator, cache_entry: *const CacheEntry) std.debug.SelfInfoError!usize {
+<a id="L132"></a>    return unwinder.nextInner(gpa, cache_entry) catch |err| switch (err) {
+<a id="L133"></a>        error.OutOfMemory,
+<a id="L134"></a>        error.InvalidDebugInfo,
+<a id="L135"></a>        =&gt; |e| return e,
+<a id="L136"></a>
+<a id="L137"></a>        error.UnsupportedRegister,
+<a id="L138"></a>        error.UnimplementedExpressionCall,
+<a id="L139"></a>        error.UnimplementedOpcode,
+<a id="L140"></a>        error.UnimplementedUserOpcode,
+<a id="L141"></a>        error.UnimplementedTypedComparison,
+<a id="L142"></a>        error.UnimplementedTypeConversion,
+<a id="L143"></a>        error.UnknownExpressionOpcode,
+<a id="L144"></a>        =&gt; return error.UnsupportedDebugInfo,
+<a id="L145"></a>
+<a id="L146"></a>        error.ReadFailed,
+<a id="L147"></a>        error.EndOfStream,
+<a id="L148"></a>        error.Overflow,
+<a id="L149"></a>        error.IncompatibleRegisterSize,
+<a id="L150"></a>        error.InvalidRegister,
+<a id="L151"></a>        error.IncompleteExpressionContext,
+<a id="L152"></a>        error.InvalidCFAOpcode,
+<a id="L153"></a>        error.InvalidExpression,
+<a id="L154"></a>        error.InvalidFrameBase,
+<a id="L155"></a>        error.InvalidIntegralTypeSize,
+<a id="L156"></a>        error.InvalidSubExpression,
+<a id="L157"></a>        error.InvalidTypeLength,
+<a id="L158"></a>        error.TruncatedIntegralType,
+<a id="L159"></a>        error.DivisionByZero,
+<a id="L160"></a>        =&gt; return error.InvalidDebugInfo,
+<a id="L161"></a>    };
+<a id="L162"></a>}
+<a id="L163"></a>
+<a id="L164"></a>fn nextInner(unwinder: *SelfUnwinder, gpa: Allocator, cache_entry: *const CacheEntry) !usize {
+<a id="L165"></a>    const format = cache_entry.cie.format;
+<a id="L166"></a>
+<a id="L167"></a>    const cfa = switch (cache_entry.cfa_rule) {
+<a id="L168"></a>        .none =&gt; return error.InvalidDebugInfo,
+<a id="L169"></a>        .reg_off =&gt; |ro| cfa: {
+<a id="L170"></a>            const ptr = try regNative(&amp;unwinder.cpu_state, ro.register);
+<a id="L171"></a>            break :cfa try applyOffset(ptr.*, ro.offset);
+<a id="L172"></a>        },
+<a id="L173"></a>        .expression =&gt; |expr| cfa: {
+<a id="L174"></a>            // On most implemented architectures, the CFA is defined to be the previous frame's SP.
+<a id="L175"></a>            //
+<a id="L176"></a>            // On s390x, it's defined to be SP + 160 (ELF ABI s390x Supplement §1.6.3); however,
+<a id="L177"></a>            // what this actually means is that there will be a `def_cfa r15 + 160`, so nothing
+<a id="L178"></a>            // special for us to do.
+<a id="L179"></a>            const prev_cfa_val = (try regNative(&amp;unwinder.cpu_state, sp_reg_num)).*;
+<a id="L180"></a>            unwinder.expr_vm.reset();
+<a id="L181"></a>            const value = try unwinder.expr_vm.run(expr, gpa, .{
+<a id="L182"></a>                .format = format,
+<a id="L183"></a>                .cpu_context = &amp;unwinder.cpu_state,
+<a id="L184"></a>            }, prev_cfa_val) orelse return error.InvalidDebugInfo;
+<a id="L185"></a>            switch (value) {
+<a id="L186"></a>                .generic =&gt; |g| break :cfa g,
+<a id="L187"></a>                else =&gt; return error.InvalidDebugInfo,
+<a id="L188"></a>            }
+<a id="L189"></a>        },
+<a id="L190"></a>    };
+<a id="L191"></a>
+<a id="L192"></a>    // Create a copy of the CPU state, to which we will apply the new rules.
+<a id="L193"></a>    var new_cpu_state = unwinder.cpu_state;
+<a id="L194"></a>
+<a id="L195"></a>    // On all implemented architectures, the CFA is defined to be the previous frame's SP
+<a id="L196"></a>    (try regNative(&amp;new_cpu_state, sp_reg_num)).* = cfa;
+<a id="L197"></a>
+<a id="L198"></a>    const return_address_register = cache_entry.cie.return_address_register;
+<a id="L199"></a>    var has_return_address = true;
+<a id="L200"></a>
+<a id="L201"></a>    const rules_len = cache_entry.num_rules;
+<a id="L202"></a>    for (cache_entry.rules_regs[0..rules_len], cache_entry.rules[0..rules_len]) |register, rule| {
+<a id="L203"></a>        const new_val: union(enum) {
+<a id="L204"></a>            same,
+<a id="L205"></a>            undefined,
+<a id="L206"></a>            val: usize,
+<a id="L207"></a>            bytes: []const u8,
+<a id="L208"></a>        } = switch (rule) {
+<a id="L209"></a>            .default =&gt; val: {
+<a id="L210"></a>                // The way things are supposed to work is that `.undefined` is the default rule
+<a id="L211"></a>                // unless an ABI says otherwise (e.g. aarch64, s390x).
+<a id="L212"></a>                //
+<a id="L213"></a>                // Unfortunately, at some point, a decision was made to have libgcc's unwinder
+<a id="L214"></a>                // assume `.same` as the default for all registers. Compilers then started depending
+<a id="L215"></a>                // on this, and the practice was carried forward to LLVM's libunwind and some of its
+<a id="L216"></a>                // backends.
+<a id="L217"></a>                break :val .same;
+<a id="L218"></a>            },
+<a id="L219"></a>            .undefined =&gt; .undefined,
+<a id="L220"></a>            .same_value =&gt; .same,
+<a id="L221"></a>            .offset =&gt; |offset| val: {
+<a id="L222"></a>                const ptr: *const usize = @ptrFromInt(try applyOffset(cfa, offset));
+<a id="L223"></a>                break :val .{ .val = ptr.* };
+<a id="L224"></a>            },
+<a id="L225"></a>            .val_offset =&gt; |offset| .{ .val = try applyOffset(cfa, offset) },
+<a id="L226"></a>            .register =&gt; |r| .{ .bytes = try unwinder.cpu_state.dwarfRegisterBytes(r) },
+<a id="L227"></a>            .expression =&gt; |expr| val: {
+<a id="L228"></a>                unwinder.expr_vm.reset();
+<a id="L229"></a>                const value = try unwinder.expr_vm.run(expr, gpa, .{
+<a id="L230"></a>                    .format = format,
+<a id="L231"></a>                    .cpu_context = &amp;unwinder.cpu_state,
+<a id="L232"></a>                }, cfa) orelse return error.InvalidDebugInfo;
+<a id="L233"></a>                const ptr: *const usize = switch (value) {
+<a id="L234"></a>                    .generic =&gt; |addr| @ptrFromInt(addr),
+<a id="L235"></a>                    else =&gt; return error.InvalidDebugInfo,
+<a id="L236"></a>                };
+<a id="L237"></a>                break :val .{ .val = ptr.* };
+<a id="L238"></a>            },
+<a id="L239"></a>            .val_expression =&gt; |expr| val: {
+<a id="L240"></a>                unwinder.expr_vm.reset();
+<a id="L241"></a>                const value = try unwinder.expr_vm.run(expr, gpa, .{
+<a id="L242"></a>                    .format = format,
+<a id="L243"></a>                    .cpu_context = &amp;unwinder.cpu_state,
+<a id="L244"></a>                }, cfa) orelse return error.InvalidDebugInfo;
+<a id="L245"></a>                switch (value) {
+<a id="L246"></a>                    .generic =&gt; |val| break :val .{ .val = val },
+<a id="L247"></a>                    else =&gt; return error.InvalidDebugInfo,
+<a id="L248"></a>                }
+<a id="L249"></a>            },
+<a id="L250"></a>        };
+<a id="L251"></a>        switch (new_val) {
+<a id="L252"></a>            .same =&gt; {},
+<a id="L253"></a>            .undefined =&gt; {
+<a id="L254"></a>                const dest = try new_cpu_state.dwarfRegisterBytes(@intCast(register));
+<a id="L255"></a>                @memset(dest, undefined);
+<a id="L256"></a>
+<a id="L257"></a>                // If the return address register is explicitly set to `.undefined`, it means that
+<a id="L258"></a>                // there are no more frames to unwind.
+<a id="L259"></a>                if (register == return_address_register) {
+<a id="L260"></a>                    has_return_address = false;
+<a id="L261"></a>                }
+<a id="L262"></a>            },
+<a id="L263"></a>            .val =&gt; |val| {
+<a id="L264"></a>                const dest = try new_cpu_state.dwarfRegisterBytes(@intCast(register));
+<a id="L265"></a>                if (dest.len != @sizeOf(usize)) return error.InvalidDebugInfo;
+<a id="L266"></a>                const dest_ptr: *align(1) usize = @ptrCast(dest);
+<a id="L267"></a>                dest_ptr.* = val;
+<a id="L268"></a>            },
+<a id="L269"></a>            .bytes =&gt; |src| {
+<a id="L270"></a>                const dest = try new_cpu_state.dwarfRegisterBytes(@intCast(register));
+<a id="L271"></a>                if (dest.len != src.len) return error.InvalidDebugInfo;
+<a id="L272"></a>                @memcpy(dest, src);
+<a id="L273"></a>            },
+<a id="L274"></a>        }
+<a id="L275"></a>    }
+<a id="L276"></a>
+<a id="L277"></a>    const return_address = if (has_return_address)
+<a id="L278"></a>        stripInstructionPtrAuthCode((try regNative(&amp;new_cpu_state, return_address_register)).*)
+<a id="L279"></a>    else
+<a id="L280"></a>        0;
+<a id="L281"></a>
+<a id="L282"></a>    (try regNative(&amp;new_cpu_state, ip_reg_num)).* = return_address;
+<a id="L283"></a>
+<a id="L284"></a>    // The new CPU state is complete; flush changes.
+<a id="L285"></a>    unwinder.cpu_state = new_cpu_state;
+<a id="L286"></a>
+<a id="L287"></a>    // The caller will subtract 1 from the return address to get an address corresponding to the
+<a id="L288"></a>    // function call. However, if this is a signal frame, that's actually incorrect, because the
+<a id="L289"></a>    // "return address" we have is the instruction which triggered the signal (if the signal
+<a id="L290"></a>    // handler returned, the instruction would be re-run). Compensate for this by incrementing
+<a id="L291"></a>    // the address in that case.
+<a id="L292"></a>    const adjusted_ret_addr = if (cache_entry.cie.is_signal_frame) return_address +| 1 else return_address;
+<a id="L293"></a>
+<a id="L294"></a>    // We also want to do that same subtraction here to get the PC for the next frame's FDE.
+<a id="L295"></a>    // This is because if the callee was noreturn, then the function call might be the caller's
+<a id="L296"></a>    // last instruction, so `return_address` might actually point outside of it!
+<a id="L297"></a>    unwinder.pc = adjusted_ret_addr -| 1;
+<a id="L298"></a>
+<a id="L299"></a>    return adjusted_ret_addr;
+<a id="L300"></a>}
+<a id="L301"></a>
+<a id="L302"></a>pub fn regNative(ctx: *std.debug.cpu_context.Native, num: u16) error{
+<a id="L303"></a>    InvalidRegister,
+<a id="L304"></a>    UnsupportedRegister,
+<a id="L305"></a>    IncompatibleRegisterSize,
+<a id="L306"></a>}!*align(1) usize {
+<a id="L307"></a>    const bytes = try ctx.dwarfRegisterBytes(num);
+<a id="L308"></a>    if (bytes.len != @sizeOf(usize)) return error.IncompatibleRegisterSize;
+<a id="L309"></a>    return @ptrCast(bytes);
+<a id="L310"></a>}
+<a id="L311"></a>
+<a id="L312"></a>/// Since register rules are applied (usually) during a panic,
+<a id="L313"></a>/// checked addition / subtraction is used so that we can return
+<a id="L314"></a>/// an error and fall back to FP-based unwinding.
+<a id="L315"></a>fn applyOffset(base: usize, offset: i64) !usize {
+<a id="L316"></a>    return if (offset &gt;= 0)
+<a id="L317"></a>        try std.math.add(usize, base, @as(usize, @intCast(offset)))
+<a id="L318"></a>    else
+<a id="L319"></a>        try std.math.sub(usize, base, @as(usize, @intCast(-offset)));
+<a id="L320"></a>}
+<a id="L321"></a>
+<a id="L322"></a>const ip_reg_num = Dwarf.ipRegNum(builtin.target.cpu.arch).?;
+<a id="L323"></a>const sp_reg_num = Dwarf.spRegNum(builtin.target.cpu.arch);
+<a id="L324"></a>
+<a id="L325"></a>const std = @import("std");
+<a id="L326"></a>const Allocator = std.mem.Allocator;
+<a id="L327"></a>const Dwarf = std.debug.Dwarf;
+<a id="L328"></a>const assert = std.debug.assert;
+<a id="L329"></a>const stripInstructionPtrAuthCode = std.debug.stripInstructionPtrAuthCode;
+<a id="L330"></a>
+<a id="L331"></a>const builtin = @import("builtin");
+<a id="L332"></a>const native_endian = builtin.target.cpu.arch.endian();
+<a id="L333"></a>
+<a id="L334"></a>const SelfUnwinder = @This();
+</pre>
 </body>
 </html>

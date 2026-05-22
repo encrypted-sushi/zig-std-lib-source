@@ -2,365 +2,368 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Source: zig-0.16.0-std/heap/BrkAllocator.zig</title>
+    <title>Source: heap/BrkAllocator.zig</title>
     <style>
         body { background: #1e1e1e; color: #d4d4d4; font-family: monospace; padding: 20px; }
         pre { white-space: pre-wrap; word-wrap: break-word; }
         .header { border-bottom: 1px solid #444; padding-bottom: 10px; margin-bottom: 20px; }
         a { color: #569cd6; }
+        a[id] { color: inherit; text-decoration: none; }
+        :target { background: #3a3a00; }
     </style>
 </head>
 <body>
     <div class="header">
-        <a href="/">Index</a> | <strong>File: zig-0.16.0-std/heap/BrkAllocator.zig</strong>
+        <a href="/">Index</a> | <strong>File: heap/BrkAllocator.zig</strong>
     </div>
-    <pre>//! Supports single-threaded targets that have a sbrk-like primitive which includes
-//! Linux and WebAssembly.
-//!
-//! On Linux, assumes exclusive access to the brk syscall.
-const BrkAllocator = @This();
-const builtin = @import("builtin");
-
-const std = @import("../std.zig");
-const Allocator = std.mem.Allocator;
-const Alignment = std.mem.Alignment;
-const assert = std.debug.assert;
-const math = std.math;
-
-comptime {
-    if (!builtin.single_threaded) @compileError("unsupported");
-}
-
-next_addrs: [size_class_count]usize = @splat(0),
-/// For each size class, points to the freed pointer.
-frees: [size_class_count]usize = @splat(0),
-/// For each big size class, points to the freed pointer.
-big_frees: [big_size_class_count]usize = @splat(0),
-prev_brk: usize = 0,
-
-var global: BrkAllocator = .{};
-
-pub const vtable: Allocator.VTable = .{
-    .alloc = alloc,
-    .resize = resize,
-    .remap = remap,
-    .free = free,
-};
-
-pub const Error = Allocator.Error;
-
-const max_usize = math.maxInt(usize);
-const ushift = math.Log2Int(usize);
-const bigpage_size: comptime_int = @max(64 * 1024, std.heap.page_size_max);
-const bigpage_count = max_usize / bigpage_size;
-
-/// Because of storing free list pointers, the minimum size class is 3.
-const min_class = math.log2(math.ceilPowerOfTwoAssert(usize, 1 + @sizeOf(usize)));
-const size_class_count = math.log2(bigpage_size) - min_class;
-/// 0 - 1 bigpage
-/// 1 - 2 bigpages
-/// 2 - 4 bigpages
-/// etc.
-const big_size_class_count = math.log2(bigpage_count);
-
-fn alloc(ctx: *anyopaque, len: usize, alignment: Alignment, return_address: usize) ?[*]u8 {
-    _ = ctx;
-    _ = return_address;
-    // Make room for the freelist next pointer.
-    const actual_len = @max(len +| @sizeOf(usize), alignment.toByteUnits());
-    const slot_size = math.ceilPowerOfTwo(usize, actual_len) catch return null;
-    const class = math.log2(slot_size) - min_class;
-    if (class &lt; size_class_count) {
-        const addr = a: {
-            const top_free_ptr = global.frees[class];
-            if (top_free_ptr != 0) {
-                const node: *usize = @ptrFromInt(top_free_ptr + (slot_size - @sizeOf(usize)));
-                global.frees[class] = node.*;
-                break :a top_free_ptr;
-            }
-
-            const next_addr = global.next_addrs[class];
-            if (next_addr % bigpage_size == 0) {
-                const addr = allocBigPages(1);
-                if (addr == 0) return null;
-                //std.debug.print("allocated fresh slot_size={d} class={d} addr=0x{x}\n", .{
-                //    slot_size, class, addr,
-                //});
-                global.next_addrs[class] = addr + slot_size;
-                break :a addr;
-            } else {
-                global.next_addrs[class] = next_addr + slot_size;
-                break :a next_addr;
-            }
-        };
-        return @ptrFromInt(addr);
-    }
-    const bigpages_needed = bigPagesNeeded(actual_len);
-    return @ptrFromInt(allocBigPages(bigpages_needed));
-}
-
-fn resize(
-    ctx: *anyopaque,
-    buf: []u8,
-    alignment: Alignment,
-    new_len: usize,
-    return_address: usize,
-) bool {
-    _ = ctx;
-    _ = return_address;
-    // We don't want to move anything from one size class to another, but we
-    // can recover bytes in between powers of two.
-    const buf_align = alignment.toByteUnits();
-    const old_actual_len = @max(buf.len + @sizeOf(usize), buf_align);
-    const new_actual_len = @max(new_len +| @sizeOf(usize), buf_align);
-    const old_small_slot_size = math.ceilPowerOfTwoAssert(usize, old_actual_len);
-    const old_small_class = math.log2(old_small_slot_size) - min_class;
-    if (old_small_class &lt; size_class_count) {
-        const new_small_slot_size = math.ceilPowerOfTwo(usize, new_actual_len) catch return false;
-        return old_small_slot_size == new_small_slot_size;
-    } else {
-        const old_bigpages_needed = bigPagesNeeded(old_actual_len);
-        const old_big_slot_pages = math.ceilPowerOfTwoAssert(usize, old_bigpages_needed);
-        const new_bigpages_needed = bigPagesNeeded(new_actual_len);
-        const new_big_slot_pages = math.ceilPowerOfTwo(usize, new_bigpages_needed) catch return false;
-        return old_big_slot_pages == new_big_slot_pages;
-    }
-}
-
-fn remap(
-    context: *anyopaque,
-    memory: []u8,
-    alignment: Alignment,
-    new_len: usize,
-    return_address: usize,
-) ?[*]u8 {
-    return if (resize(context, memory, alignment, new_len, return_address)) memory.ptr else null;
-}
-
-fn free(
-    ctx: *anyopaque,
-    buf: []u8,
-    alignment: Alignment,
-    return_address: usize,
-) void {
-    _ = ctx;
-    _ = return_address;
-    const buf_align = alignment.toByteUnits();
-    const actual_len = @max(buf.len + @sizeOf(usize), buf_align);
-    const slot_size = math.ceilPowerOfTwoAssert(usize, actual_len);
-    const class = math.log2(slot_size) - min_class;
-    const addr = @intFromPtr(buf.ptr);
-    if (class &lt; size_class_count) {
-        const node: *usize = @ptrFromInt(addr + (slot_size - @sizeOf(usize)));
-        node.* = global.frees[class];
-        global.frees[class] = addr;
-    } else {
-        const bigpages_needed = bigPagesNeeded(actual_len);
-        const pow2_pages = math.ceilPowerOfTwoAssert(usize, bigpages_needed);
-        const big_slot_size_bytes = pow2_pages * bigpage_size;
-        const node: *usize = @ptrFromInt(addr + (big_slot_size_bytes - @sizeOf(usize)));
-        const big_class = math.log2(pow2_pages);
-        node.* = global.big_frees[big_class];
-        global.big_frees[big_class] = addr;
-    }
-}
-
-inline fn bigPagesNeeded(byte_count: usize) usize {
-    return (byte_count + (bigpage_size + (@sizeOf(usize) - 1))) / bigpage_size;
-}
-
-fn allocBigPages(n: usize) usize {
-    const pow2_pages = math.ceilPowerOfTwoAssert(usize, n);
-    const slot_size_bytes = pow2_pages * bigpage_size;
-    const class = math.log2(pow2_pages);
-
-    const top_free_ptr = global.big_frees[class];
-    if (top_free_ptr != 0) {
-        const node: *usize = @ptrFromInt(top_free_ptr + (slot_size_bytes - @sizeOf(usize)));
-        global.big_frees[class] = node.*;
-        return top_free_ptr;
-    }
-
-    if (builtin.cpu.arch.isWasm()) {
-        comptime assert(std.heap.page_size_max == std.heap.page_size_min);
-        const page_size = std.heap.page_size_max;
-        const pages_per_bigpage = bigpage_size / page_size;
-        const page_index = @wasmMemoryGrow(0, pow2_pages * pages_per_bigpage);
-        if (page_index == -1) return 0;
-        return @as(usize, @intCast(page_index)) * page_size;
-    } else if (builtin.os.tag == .linux) {
-        const prev_brk = global.prev_brk;
-        const start_brk = if (prev_brk == 0)
-            std.mem.alignForward(usize, std.os.linux.brk(0), bigpage_size)
-        else
-            prev_brk;
-        const end_brk = start_brk + pow2_pages * bigpage_size;
-        const new_prev_brk = std.os.linux.brk(end_brk);
-        global.prev_brk = new_prev_brk;
-        if (new_prev_brk != end_brk) return 0;
-        return start_brk;
-    } else {
-        @compileError("no sbrk-like OS primitive available");
-    }
-}
-
-const test_ally: Allocator = .{
-    .ptr = undefined,
-    .vtable = &amp;vtable,
-};
-
-test "small allocations - free in same order" {
-    var list: [513]*u64 = undefined;
-
-    var i: usize = 0;
-    while (i &lt; 513) : (i += 1) {
-        const ptr = try test_ally.create(u64);
-        list[i] = ptr;
-    }
-
-    for (list) |ptr| {
-        test_ally.destroy(ptr);
-    }
-}
-
-test "small allocations - free in reverse order" {
-    var list: [513]*u64 = undefined;
-
-    var i: usize = 0;
-    while (i &lt; 513) : (i += 1) {
-        const ptr = try test_ally.create(u64);
-        list[i] = ptr;
-    }
-
-    i = list.len;
-    while (i &gt; 0) {
-        i -= 1;
-        const ptr = list[i];
-        test_ally.destroy(ptr);
-    }
-}
-
-test "large allocations" {
-    const ptr1 = try test_ally.alloc(u64, 42768);
-    const ptr2 = try test_ally.alloc(u64, 52768);
-    test_ally.free(ptr1);
-    const ptr3 = try test_ally.alloc(u64, 62768);
-    test_ally.free(ptr3);
-    test_ally.free(ptr2);
-}
-
-test "very large allocation" {
-    try std.testing.expectError(error.OutOfMemory, test_ally.alloc(u8, math.maxInt(usize)));
-}
-
-test "realloc" {
-    var slice = try test_ally.alignedAlloc(u8, .of(u32), 1);
-    defer test_ally.free(slice);
-    slice[0] = 0x12;
-
-    // This reallocation should keep its pointer address.
-    const old_slice = slice;
-    slice = try test_ally.realloc(slice, 2);
-    try std.testing.expect(old_slice.ptr == slice.ptr);
-    try std.testing.expect(slice[0] == 0x12);
-    slice[1] = 0x34;
-
-    // This requires upgrading to a larger size class
-    slice = try test_ally.realloc(slice, 17);
-    try std.testing.expect(slice[0] == 0x12);
-    try std.testing.expect(slice[1] == 0x34);
-}
-
-test "shrink" {
-    var slice = try test_ally.alloc(u8, 20);
-    defer test_ally.free(slice);
-
-    @memset(slice, 0x11);
-
-    try std.testing.expect(test_ally.resize(slice, 17));
-    slice = slice[0..17];
-
-    for (slice) |b| {
-        try std.testing.expect(b == 0x11);
-    }
-
-    try std.testing.expect(test_ally.resize(slice, 16));
-    slice = slice[0..16];
-
-    for (slice) |b| {
-        try std.testing.expect(b == 0x11);
-    }
-}
-
-test "large object - grow" {
-    if (builtin.os.tag == .linux) return error.SkipZigTest;
-
-    var slice1 = try test_ally.alloc(u8, bigpage_size * 2 - 20);
-    defer test_ally.free(slice1);
-
-    const old = slice1;
-    slice1 = try test_ally.realloc(slice1, bigpage_size * 2 - 10);
-    try std.testing.expectEqual(slice1.ptr, old.ptr);
-
-    slice1 = try test_ally.realloc(slice1, bigpage_size * 2);
-    slice1 = try test_ally.realloc(slice1, bigpage_size * 2 + 1);
-}
-
-test "realloc small object to large object" {
-    var slice = try test_ally.alloc(u8, 70);
-    defer test_ally.free(slice);
-    slice[0] = 0x12;
-    slice[60] = 0x34;
-
-    // This requires upgrading to a large object
-    const large_object_size = bigpage_size * 2 + 50;
-    slice = try test_ally.realloc(slice, large_object_size);
-    try std.testing.expect(slice[0] == 0x12);
-    try std.testing.expect(slice[60] == 0x34);
-}
-
-test "shrink large object to large object" {
-    var slice = try test_ally.alloc(u8, bigpage_size * 2 + 50);
-    defer test_ally.free(slice);
-    slice[0] = 0x12;
-    slice[60] = 0x34;
-
-    try std.testing.expect(test_ally.resize(slice, bigpage_size * 2 + 1));
-    slice = slice[0 .. bigpage_size * 2 + 1];
-    try std.testing.expect(slice[0] == 0x12);
-    try std.testing.expect(slice[60] == 0x34);
-
-    try std.testing.expect(test_ally.resize(slice, bigpage_size * 2 + 1));
-    try std.testing.expect(slice[0] == 0x12);
-    try std.testing.expect(slice[60] == 0x34);
-
-    slice = try test_ally.realloc(slice, bigpage_size * 2);
-    try std.testing.expect(slice[0] == 0x12);
-    try std.testing.expect(slice[60] == 0x34);
-}
-
-test "realloc large object to small object" {
-    var slice = try test_ally.alloc(u8, bigpage_size * 2 + 50);
-    defer test_ally.free(slice);
-    slice[0] = 0x12;
-    slice[16] = 0x34;
-
-    slice = try test_ally.realloc(slice, 19);
-    try std.testing.expect(slice[0] == 0x12);
-    try std.testing.expect(slice[16] == 0x34);
-}
-
-test "objects of size 1024 and 2048" {
-    const slice = try test_ally.alloc(u8, 1025);
-    const slice2 = try test_ally.alloc(u8, 3000);
-
-    test_ally.free(slice);
-    test_ally.free(slice2);
-}
-
-test "standard allocator tests" {
-    try std.heap.testAllocator(test_ally);
-    try std.heap.testAllocatorAligned(test_ally);
-}</pre>
+    <pre><a id="L1"></a>//! Supports single-threaded targets that have a sbrk-like primitive which includes
+<a id="L2"></a>//! Linux and WebAssembly.
+<a id="L3"></a>//!
+<a id="L4"></a>//! On Linux, assumes exclusive access to the brk syscall.
+<a id="L5"></a>const BrkAllocator = @This();
+<a id="L6"></a>const builtin = @import("builtin");
+<a id="L7"></a>
+<a id="L8"></a>const std = @import("../std.zig");
+<a id="L9"></a>const Allocator = std.mem.Allocator;
+<a id="L10"></a>const Alignment = std.mem.Alignment;
+<a id="L11"></a>const assert = std.debug.assert;
+<a id="L12"></a>const math = std.math;
+<a id="L13"></a>
+<a id="L14"></a>comptime {
+<a id="L15"></a>    if (!builtin.single_threaded) @compileError("unsupported");
+<a id="L16"></a>}
+<a id="L17"></a>
+<a id="L18"></a>next_addrs: [size_class_count]usize = @splat(0),
+<a id="L19"></a>/// For each size class, points to the freed pointer.
+<a id="L20"></a>frees: [size_class_count]usize = @splat(0),
+<a id="L21"></a>/// For each big size class, points to the freed pointer.
+<a id="L22"></a>big_frees: [big_size_class_count]usize = @splat(0),
+<a id="L23"></a>prev_brk: usize = 0,
+<a id="L24"></a>
+<a id="L25"></a>var global: BrkAllocator = .{};
+<a id="L26"></a>
+<a id="L27"></a>pub const vtable: Allocator.VTable = .{
+<a id="L28"></a>    .alloc = alloc,
+<a id="L29"></a>    .resize = resize,
+<a id="L30"></a>    .remap = remap,
+<a id="L31"></a>    .free = free,
+<a id="L32"></a>};
+<a id="L33"></a>
+<a id="L34"></a>pub const Error = Allocator.Error;
+<a id="L35"></a>
+<a id="L36"></a>const max_usize = math.maxInt(usize);
+<a id="L37"></a>const ushift = math.Log2Int(usize);
+<a id="L38"></a>const bigpage_size: comptime_int = @max(64 * 1024, std.heap.page_size_max);
+<a id="L39"></a>const bigpage_count = max_usize / bigpage_size;
+<a id="L40"></a>
+<a id="L41"></a>/// Because of storing free list pointers, the minimum size class is 3.
+<a id="L42"></a>const min_class = math.log2(math.ceilPowerOfTwoAssert(usize, 1 + @sizeOf(usize)));
+<a id="L43"></a>const size_class_count = math.log2(bigpage_size) - min_class;
+<a id="L44"></a>/// 0 - 1 bigpage
+<a id="L45"></a>/// 1 - 2 bigpages
+<a id="L46"></a>/// 2 - 4 bigpages
+<a id="L47"></a>/// etc.
+<a id="L48"></a>const big_size_class_count = math.log2(bigpage_count);
+<a id="L49"></a>
+<a id="L50"></a>fn alloc(ctx: *anyopaque, len: usize, alignment: Alignment, return_address: usize) ?[*]u8 {
+<a id="L51"></a>    _ = ctx;
+<a id="L52"></a>    _ = return_address;
+<a id="L53"></a>    // Make room for the freelist next pointer.
+<a id="L54"></a>    const actual_len = @max(len +| @sizeOf(usize), alignment.toByteUnits());
+<a id="L55"></a>    const slot_size = math.ceilPowerOfTwo(usize, actual_len) catch return null;
+<a id="L56"></a>    const class = math.log2(slot_size) - min_class;
+<a id="L57"></a>    if (class &lt; size_class_count) {
+<a id="L58"></a>        const addr = a: {
+<a id="L59"></a>            const top_free_ptr = global.frees[class];
+<a id="L60"></a>            if (top_free_ptr != 0) {
+<a id="L61"></a>                const node: *usize = @ptrFromInt(top_free_ptr + (slot_size - @sizeOf(usize)));
+<a id="L62"></a>                global.frees[class] = node.*;
+<a id="L63"></a>                break :a top_free_ptr;
+<a id="L64"></a>            }
+<a id="L65"></a>
+<a id="L66"></a>            const next_addr = global.next_addrs[class];
+<a id="L67"></a>            if (next_addr % bigpage_size == 0) {
+<a id="L68"></a>                const addr = allocBigPages(1);
+<a id="L69"></a>                if (addr == 0) return null;
+<a id="L70"></a>                //std.debug.print("allocated fresh slot_size={d} class={d} addr=0x{x}\n", .{
+<a id="L71"></a>                //    slot_size, class, addr,
+<a id="L72"></a>                //});
+<a id="L73"></a>                global.next_addrs[class] = addr + slot_size;
+<a id="L74"></a>                break :a addr;
+<a id="L75"></a>            } else {
+<a id="L76"></a>                global.next_addrs[class] = next_addr + slot_size;
+<a id="L77"></a>                break :a next_addr;
+<a id="L78"></a>            }
+<a id="L79"></a>        };
+<a id="L80"></a>        return @ptrFromInt(addr);
+<a id="L81"></a>    }
+<a id="L82"></a>    const bigpages_needed = bigPagesNeeded(actual_len);
+<a id="L83"></a>    return @ptrFromInt(allocBigPages(bigpages_needed));
+<a id="L84"></a>}
+<a id="L85"></a>
+<a id="L86"></a>fn resize(
+<a id="L87"></a>    ctx: *anyopaque,
+<a id="L88"></a>    buf: []u8,
+<a id="L89"></a>    alignment: Alignment,
+<a id="L90"></a>    new_len: usize,
+<a id="L91"></a>    return_address: usize,
+<a id="L92"></a>) bool {
+<a id="L93"></a>    _ = ctx;
+<a id="L94"></a>    _ = return_address;
+<a id="L95"></a>    // We don't want to move anything from one size class to another, but we
+<a id="L96"></a>    // can recover bytes in between powers of two.
+<a id="L97"></a>    const buf_align = alignment.toByteUnits();
+<a id="L98"></a>    const old_actual_len = @max(buf.len + @sizeOf(usize), buf_align);
+<a id="L99"></a>    const new_actual_len = @max(new_len +| @sizeOf(usize), buf_align);
+<a id="L100"></a>    const old_small_slot_size = math.ceilPowerOfTwoAssert(usize, old_actual_len);
+<a id="L101"></a>    const old_small_class = math.log2(old_small_slot_size) - min_class;
+<a id="L102"></a>    if (old_small_class &lt; size_class_count) {
+<a id="L103"></a>        const new_small_slot_size = math.ceilPowerOfTwo(usize, new_actual_len) catch return false;
+<a id="L104"></a>        return old_small_slot_size == new_small_slot_size;
+<a id="L105"></a>    } else {
+<a id="L106"></a>        const old_bigpages_needed = bigPagesNeeded(old_actual_len);
+<a id="L107"></a>        const old_big_slot_pages = math.ceilPowerOfTwoAssert(usize, old_bigpages_needed);
+<a id="L108"></a>        const new_bigpages_needed = bigPagesNeeded(new_actual_len);
+<a id="L109"></a>        const new_big_slot_pages = math.ceilPowerOfTwo(usize, new_bigpages_needed) catch return false;
+<a id="L110"></a>        return old_big_slot_pages == new_big_slot_pages;
+<a id="L111"></a>    }
+<a id="L112"></a>}
+<a id="L113"></a>
+<a id="L114"></a>fn remap(
+<a id="L115"></a>    context: *anyopaque,
+<a id="L116"></a>    memory: []u8,
+<a id="L117"></a>    alignment: Alignment,
+<a id="L118"></a>    new_len: usize,
+<a id="L119"></a>    return_address: usize,
+<a id="L120"></a>) ?[*]u8 {
+<a id="L121"></a>    return if (resize(context, memory, alignment, new_len, return_address)) memory.ptr else null;
+<a id="L122"></a>}
+<a id="L123"></a>
+<a id="L124"></a>fn free(
+<a id="L125"></a>    ctx: *anyopaque,
+<a id="L126"></a>    buf: []u8,
+<a id="L127"></a>    alignment: Alignment,
+<a id="L128"></a>    return_address: usize,
+<a id="L129"></a>) void {
+<a id="L130"></a>    _ = ctx;
+<a id="L131"></a>    _ = return_address;
+<a id="L132"></a>    const buf_align = alignment.toByteUnits();
+<a id="L133"></a>    const actual_len = @max(buf.len + @sizeOf(usize), buf_align);
+<a id="L134"></a>    const slot_size = math.ceilPowerOfTwoAssert(usize, actual_len);
+<a id="L135"></a>    const class = math.log2(slot_size) - min_class;
+<a id="L136"></a>    const addr = @intFromPtr(buf.ptr);
+<a id="L137"></a>    if (class &lt; size_class_count) {
+<a id="L138"></a>        const node: *usize = @ptrFromInt(addr + (slot_size - @sizeOf(usize)));
+<a id="L139"></a>        node.* = global.frees[class];
+<a id="L140"></a>        global.frees[class] = addr;
+<a id="L141"></a>    } else {
+<a id="L142"></a>        const bigpages_needed = bigPagesNeeded(actual_len);
+<a id="L143"></a>        const pow2_pages = math.ceilPowerOfTwoAssert(usize, bigpages_needed);
+<a id="L144"></a>        const big_slot_size_bytes = pow2_pages * bigpage_size;
+<a id="L145"></a>        const node: *usize = @ptrFromInt(addr + (big_slot_size_bytes - @sizeOf(usize)));
+<a id="L146"></a>        const big_class = math.log2(pow2_pages);
+<a id="L147"></a>        node.* = global.big_frees[big_class];
+<a id="L148"></a>        global.big_frees[big_class] = addr;
+<a id="L149"></a>    }
+<a id="L150"></a>}
+<a id="L151"></a>
+<a id="L152"></a>inline fn bigPagesNeeded(byte_count: usize) usize {
+<a id="L153"></a>    return (byte_count + (bigpage_size + (@sizeOf(usize) - 1))) / bigpage_size;
+<a id="L154"></a>}
+<a id="L155"></a>
+<a id="L156"></a>fn allocBigPages(n: usize) usize {
+<a id="L157"></a>    const pow2_pages = math.ceilPowerOfTwoAssert(usize, n);
+<a id="L158"></a>    const slot_size_bytes = pow2_pages * bigpage_size;
+<a id="L159"></a>    const class = math.log2(pow2_pages);
+<a id="L160"></a>
+<a id="L161"></a>    const top_free_ptr = global.big_frees[class];
+<a id="L162"></a>    if (top_free_ptr != 0) {
+<a id="L163"></a>        const node: *usize = @ptrFromInt(top_free_ptr + (slot_size_bytes - @sizeOf(usize)));
+<a id="L164"></a>        global.big_frees[class] = node.*;
+<a id="L165"></a>        return top_free_ptr;
+<a id="L166"></a>    }
+<a id="L167"></a>
+<a id="L168"></a>    if (builtin.cpu.arch.isWasm()) {
+<a id="L169"></a>        comptime assert(std.heap.page_size_max == std.heap.page_size_min);
+<a id="L170"></a>        const page_size = std.heap.page_size_max;
+<a id="L171"></a>        const pages_per_bigpage = bigpage_size / page_size;
+<a id="L172"></a>        const page_index = @wasmMemoryGrow(0, pow2_pages * pages_per_bigpage);
+<a id="L173"></a>        if (page_index == -1) return 0;
+<a id="L174"></a>        return @as(usize, @intCast(page_index)) * page_size;
+<a id="L175"></a>    } else if (builtin.os.tag == .linux) {
+<a id="L176"></a>        const prev_brk = global.prev_brk;
+<a id="L177"></a>        const start_brk = if (prev_brk == 0)
+<a id="L178"></a>            std.mem.alignForward(usize, std.os.linux.brk(0), bigpage_size)
+<a id="L179"></a>        else
+<a id="L180"></a>            prev_brk;
+<a id="L181"></a>        const end_brk = start_brk + pow2_pages * bigpage_size;
+<a id="L182"></a>        const new_prev_brk = std.os.linux.brk(end_brk);
+<a id="L183"></a>        global.prev_brk = new_prev_brk;
+<a id="L184"></a>        if (new_prev_brk != end_brk) return 0;
+<a id="L185"></a>        return start_brk;
+<a id="L186"></a>    } else {
+<a id="L187"></a>        @compileError("no sbrk-like OS primitive available");
+<a id="L188"></a>    }
+<a id="L189"></a>}
+<a id="L190"></a>
+<a id="L191"></a>const test_ally: Allocator = .{
+<a id="L192"></a>    .ptr = undefined,
+<a id="L193"></a>    .vtable = &amp;vtable,
+<a id="L194"></a>};
+<a id="L195"></a>
+<a id="L196"></a>test "small allocations - free in same order" {
+<a id="L197"></a>    var list: [513]*u64 = undefined;
+<a id="L198"></a>
+<a id="L199"></a>    var i: usize = 0;
+<a id="L200"></a>    while (i &lt; 513) : (i += 1) {
+<a id="L201"></a>        const ptr = try test_ally.create(u64);
+<a id="L202"></a>        list[i] = ptr;
+<a id="L203"></a>    }
+<a id="L204"></a>
+<a id="L205"></a>    for (list) |ptr| {
+<a id="L206"></a>        test_ally.destroy(ptr);
+<a id="L207"></a>    }
+<a id="L208"></a>}
+<a id="L209"></a>
+<a id="L210"></a>test "small allocations - free in reverse order" {
+<a id="L211"></a>    var list: [513]*u64 = undefined;
+<a id="L212"></a>
+<a id="L213"></a>    var i: usize = 0;
+<a id="L214"></a>    while (i &lt; 513) : (i += 1) {
+<a id="L215"></a>        const ptr = try test_ally.create(u64);
+<a id="L216"></a>        list[i] = ptr;
+<a id="L217"></a>    }
+<a id="L218"></a>
+<a id="L219"></a>    i = list.len;
+<a id="L220"></a>    while (i &gt; 0) {
+<a id="L221"></a>        i -= 1;
+<a id="L222"></a>        const ptr = list[i];
+<a id="L223"></a>        test_ally.destroy(ptr);
+<a id="L224"></a>    }
+<a id="L225"></a>}
+<a id="L226"></a>
+<a id="L227"></a>test "large allocations" {
+<a id="L228"></a>    const ptr1 = try test_ally.alloc(u64, 42768);
+<a id="L229"></a>    const ptr2 = try test_ally.alloc(u64, 52768);
+<a id="L230"></a>    test_ally.free(ptr1);
+<a id="L231"></a>    const ptr3 = try test_ally.alloc(u64, 62768);
+<a id="L232"></a>    test_ally.free(ptr3);
+<a id="L233"></a>    test_ally.free(ptr2);
+<a id="L234"></a>}
+<a id="L235"></a>
+<a id="L236"></a>test "very large allocation" {
+<a id="L237"></a>    try std.testing.expectError(error.OutOfMemory, test_ally.alloc(u8, math.maxInt(usize)));
+<a id="L238"></a>}
+<a id="L239"></a>
+<a id="L240"></a>test "realloc" {
+<a id="L241"></a>    var slice = try test_ally.alignedAlloc(u8, .of(u32), 1);
+<a id="L242"></a>    defer test_ally.free(slice);
+<a id="L243"></a>    slice[0] = 0x12;
+<a id="L244"></a>
+<a id="L245"></a>    // This reallocation should keep its pointer address.
+<a id="L246"></a>    const old_slice = slice;
+<a id="L247"></a>    slice = try test_ally.realloc(slice, 2);
+<a id="L248"></a>    try std.testing.expect(old_slice.ptr == slice.ptr);
+<a id="L249"></a>    try std.testing.expect(slice[0] == 0x12);
+<a id="L250"></a>    slice[1] = 0x34;
+<a id="L251"></a>
+<a id="L252"></a>    // This requires upgrading to a larger size class
+<a id="L253"></a>    slice = try test_ally.realloc(slice, 17);
+<a id="L254"></a>    try std.testing.expect(slice[0] == 0x12);
+<a id="L255"></a>    try std.testing.expect(slice[1] == 0x34);
+<a id="L256"></a>}
+<a id="L257"></a>
+<a id="L258"></a>test "shrink" {
+<a id="L259"></a>    var slice = try test_ally.alloc(u8, 20);
+<a id="L260"></a>    defer test_ally.free(slice);
+<a id="L261"></a>
+<a id="L262"></a>    @memset(slice, 0x11);
+<a id="L263"></a>
+<a id="L264"></a>    try std.testing.expect(test_ally.resize(slice, 17));
+<a id="L265"></a>    slice = slice[0..17];
+<a id="L266"></a>
+<a id="L267"></a>    for (slice) |b| {
+<a id="L268"></a>        try std.testing.expect(b == 0x11);
+<a id="L269"></a>    }
+<a id="L270"></a>
+<a id="L271"></a>    try std.testing.expect(test_ally.resize(slice, 16));
+<a id="L272"></a>    slice = slice[0..16];
+<a id="L273"></a>
+<a id="L274"></a>    for (slice) |b| {
+<a id="L275"></a>        try std.testing.expect(b == 0x11);
+<a id="L276"></a>    }
+<a id="L277"></a>}
+<a id="L278"></a>
+<a id="L279"></a>test "large object - grow" {
+<a id="L280"></a>    if (builtin.os.tag == .linux) return error.SkipZigTest;
+<a id="L281"></a>
+<a id="L282"></a>    var slice1 = try test_ally.alloc(u8, bigpage_size * 2 - 20);
+<a id="L283"></a>    defer test_ally.free(slice1);
+<a id="L284"></a>
+<a id="L285"></a>    const old = slice1;
+<a id="L286"></a>    slice1 = try test_ally.realloc(slice1, bigpage_size * 2 - 10);
+<a id="L287"></a>    try std.testing.expectEqual(slice1.ptr, old.ptr);
+<a id="L288"></a>
+<a id="L289"></a>    slice1 = try test_ally.realloc(slice1, bigpage_size * 2);
+<a id="L290"></a>    slice1 = try test_ally.realloc(slice1, bigpage_size * 2 + 1);
+<a id="L291"></a>}
+<a id="L292"></a>
+<a id="L293"></a>test "realloc small object to large object" {
+<a id="L294"></a>    var slice = try test_ally.alloc(u8, 70);
+<a id="L295"></a>    defer test_ally.free(slice);
+<a id="L296"></a>    slice[0] = 0x12;
+<a id="L297"></a>    slice[60] = 0x34;
+<a id="L298"></a>
+<a id="L299"></a>    // This requires upgrading to a large object
+<a id="L300"></a>    const large_object_size = bigpage_size * 2 + 50;
+<a id="L301"></a>    slice = try test_ally.realloc(slice, large_object_size);
+<a id="L302"></a>    try std.testing.expect(slice[0] == 0x12);
+<a id="L303"></a>    try std.testing.expect(slice[60] == 0x34);
+<a id="L304"></a>}
+<a id="L305"></a>
+<a id="L306"></a>test "shrink large object to large object" {
+<a id="L307"></a>    var slice = try test_ally.alloc(u8, bigpage_size * 2 + 50);
+<a id="L308"></a>    defer test_ally.free(slice);
+<a id="L309"></a>    slice[0] = 0x12;
+<a id="L310"></a>    slice[60] = 0x34;
+<a id="L311"></a>
+<a id="L312"></a>    try std.testing.expect(test_ally.resize(slice, bigpage_size * 2 + 1));
+<a id="L313"></a>    slice = slice[0 .. bigpage_size * 2 + 1];
+<a id="L314"></a>    try std.testing.expect(slice[0] == 0x12);
+<a id="L315"></a>    try std.testing.expect(slice[60] == 0x34);
+<a id="L316"></a>
+<a id="L317"></a>    try std.testing.expect(test_ally.resize(slice, bigpage_size * 2 + 1));
+<a id="L318"></a>    try std.testing.expect(slice[0] == 0x12);
+<a id="L319"></a>    try std.testing.expect(slice[60] == 0x34);
+<a id="L320"></a>
+<a id="L321"></a>    slice = try test_ally.realloc(slice, bigpage_size * 2);
+<a id="L322"></a>    try std.testing.expect(slice[0] == 0x12);
+<a id="L323"></a>    try std.testing.expect(slice[60] == 0x34);
+<a id="L324"></a>}
+<a id="L325"></a>
+<a id="L326"></a>test "realloc large object to small object" {
+<a id="L327"></a>    var slice = try test_ally.alloc(u8, bigpage_size * 2 + 50);
+<a id="L328"></a>    defer test_ally.free(slice);
+<a id="L329"></a>    slice[0] = 0x12;
+<a id="L330"></a>    slice[16] = 0x34;
+<a id="L331"></a>
+<a id="L332"></a>    slice = try test_ally.realloc(slice, 19);
+<a id="L333"></a>    try std.testing.expect(slice[0] == 0x12);
+<a id="L334"></a>    try std.testing.expect(slice[16] == 0x34);
+<a id="L335"></a>}
+<a id="L336"></a>
+<a id="L337"></a>test "objects of size 1024 and 2048" {
+<a id="L338"></a>    const slice = try test_ally.alloc(u8, 1025);
+<a id="L339"></a>    const slice2 = try test_ally.alloc(u8, 3000);
+<a id="L340"></a>
+<a id="L341"></a>    test_ally.free(slice);
+<a id="L342"></a>    test_ally.free(slice2);
+<a id="L343"></a>}
+<a id="L344"></a>
+<a id="L345"></a>test "standard allocator tests" {
+<a id="L346"></a>    try std.heap.testAllocator(test_ally);
+<a id="L347"></a>    try std.heap.testAllocatorAligned(test_ally);
+<a id="L348"></a>}
+</pre>
 </body>
 </html>

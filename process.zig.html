@@ -2,1131 +2,1134 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Source: zig-0.16.0-std/process.zig</title>
+    <title>Source: process.zig</title>
     <style>
         body { background: #1e1e1e; color: #d4d4d4; font-family: monospace; padding: 20px; }
         pre { white-space: pre-wrap; word-wrap: break-word; }
         .header { border-bottom: 1px solid #444; padding-bottom: 10px; margin-bottom: 20px; }
         a { color: #569cd6; }
+        a[id] { color: inherit; text-decoration: none; }
+        :target { background: #3a3a00; }
     </style>
 </head>
 <body>
     <div class="header">
-        <a href="/">Index</a> | <strong>File: zig-0.16.0-std/process.zig</strong>
+        <a href="/">Index</a> | <strong>File: process.zig</strong>
     </div>
-    <pre>const builtin = @import("builtin");
-const native_os = builtin.os.tag;
-
-const std = @import("std.zig");
-const Io = std.Io;
-const File = std.Io.File;
-const fs = std.fs;
-const mem = std.mem;
-const math = std.math;
-const Allocator = std.mem.Allocator;
-const assert = std.debug.assert;
-const testing = std.testing;
-const posix = std.posix;
-const windows = std.os.windows;
-const unicode = std.unicode;
-const max_path_bytes = std.fs.max_path_bytes;
-
-pub const Child = @import("process/Child.zig");
-pub const Args = @import("process/Args.zig");
-pub const Environ = @import("process/Environ.zig");
-pub const Preopens = @import("process/Preopens.zig");
-
-/// A standard set of pre-initialized useful APIs for programs to take
-/// advantage of. This is the type of the first parameter of the main function.
-/// Applications wanting more flexibility can accept `Init.Minimal` instead.
-///
-/// Completion of https://github.com/ziglang/zig/issues/24510 will also allow
-/// the second parameter of the main function to be a custom struct that
-/// contain auto-parsed CLI arguments.
-pub const Init = struct {
-    /// `Init` is a superset of `Minimal`; the latter is included here.
-    minimal: Minimal,
-    /// Permanent storage for the entire process, cleaned automatically on
-    /// exit. Threadsafe.
-    arena: *std.heap.ArenaAllocator,
-    /// A default-selected general purpose allocator for temporary heap
-    /// allocations. Debug mode will set up leak checking if possible.
-    /// Threadsafe.
-    gpa: Allocator,
-    /// An appropriate default Io implementation based on the target
-    /// configuration. Debug mode will set up leak checking if possible.
-    io: Io,
-    /// Environment variables, initialized with `gpa`. Not threadsafe.
-    environ_map: *Environ.Map,
-    /// Named files that have been provided by the parent process. This is
-    /// mainly useful on WASI, but can be used on other systems to mimic the
-    /// behavior with respect to stdio.
-    preopens: Preopens,
-
-    /// Alternative to `Init` as the first parameter of the main function.
-    pub const Minimal = struct {
-        /// Environment variables.
-        environ: Environ,
-        /// Command line arguments.
-        args: Args,
-    };
-};
-
-pub const CurrentPathError = error{
-    NameTooLong,
-    /// Not possible on Windows. Always returned on WASI.
-    CurrentDirUnlinked,
-} || Io.Cancelable || Io.UnexpectedError;
-
-/// On Windows, the result is encoded as [WTF-8](https://wtf-8.codeberg.page/).
-/// On other platforms, the result is an opaque sequence of bytes with no
-/// particular encoding.
-pub fn currentPath(io: Io, buffer: []u8) CurrentPathError!usize {
-    return io.vtable.processCurrentPath(io.userdata, buffer);
-}
-
-pub const CurrentPathAllocError = Allocator.Error || error{
-    /// Not possible on Windows. Always returned on WASI.
-    CurrentDirUnlinked,
-} || Io.Cancelable || Io.UnexpectedError;
-
-/// On Windows, the result is encoded as [WTF-8](https://wtf-8.codeberg.page/).
-/// On other platforms, the result is an opaque sequence of bytes with no
-/// particular encoding.
-///
-/// Caller owns returned memory.
-pub fn currentPathAlloc(io: Io, allocator: Allocator) CurrentPathAllocError![:0]u8 {
-    var buffer: [max_path_bytes]u8 = undefined;
-    const n = currentPath(io, &amp;buffer) catch |err| switch (err) {
-        error.NameTooLong =&gt; unreachable,
-        else =&gt; |e| return e,
-    };
-    return allocator.dupeZ(u8, buffer[0..n]);
-}
-
-test currentPathAlloc {
-    const cwd = try currentPathAlloc(testing.io, testing.allocator);
-    testing.allocator.free(cwd);
-}
-
-pub const UserInfo = struct {
-    uid: posix.uid_t,
-    gid: posix.gid_t,
-};
-
-/// POSIX function which gets a uid from username.
-pub fn getUserInfo(name: []const u8) !UserInfo {
-    return switch (native_os) {
-        .linux,
-        .driverkit,
-        .ios,
-        .maccatalyst,
-        .macos,
-        .tvos,
-        .visionos,
-        .watchos,
-        .freebsd,
-        .netbsd,
-        .openbsd,
-        .haiku,
-        .illumos,
-        .serenity,
-        =&gt; posixGetUserInfo(name),
-        else =&gt; @compileError("Unsupported OS"),
-    };
-}
-
-/// TODO this reads /etc/passwd. But sometimes the user/id mapping is in something else
-/// like NIS, AD, etc. See `man nss` or look at an strace for `id myuser`.
-pub fn posixGetUserInfo(io: Io, name: []const u8) !UserInfo {
-    const file = try Io.Dir.openFileAbsolute(io, "/etc/passwd", .{});
-    defer file.close(io);
-    var buffer: [4096]u8 = undefined;
-    var file_reader = file.reader(&amp;buffer);
-    return posixGetUserInfoPasswdStream(name, &amp;file_reader.interface) catch |err| switch (err) {
-        error.ReadFailed =&gt; return file_reader.err.?,
-        error.EndOfStream =&gt; return error.UserNotFound,
-        error.CorruptPasswordFile =&gt; return error.CorruptPasswordFile,
-    };
-}
-
-fn posixGetUserInfoPasswdStream(name: []const u8, reader: *std.Io.Reader) !UserInfo {
-    const State = enum {
-        start,
-        wait_for_next_line,
-        skip_password,
-        read_user_id,
-        read_group_id,
-    };
-
-    var name_index: usize = 0;
-    var uid: posix.uid_t = 0;
-    var gid: posix.gid_t = 0;
-
-    sw: switch (State.start) {
-        .start =&gt; switch (try reader.takeByte()) {
-            ':' =&gt; {
-                if (name_index == name.len) {
-                    continue :sw .skip_password;
-                } else {
-                    continue :sw .wait_for_next_line;
-                }
-            },
-            '\n' =&gt; return error.CorruptPasswordFile,
-            else =&gt; |byte| {
-                if (name_index == name.len or name[name_index] != byte) {
-                    continue :sw .wait_for_next_line;
-                }
-                name_index += 1;
-                continue :sw .start;
-            },
-        },
-        .wait_for_next_line =&gt; switch (try reader.takeByte()) {
-            '\n' =&gt; {
-                name_index = 0;
-                continue :sw .start;
-            },
-            else =&gt; continue :sw .wait_for_next_line,
-        },
-        .skip_password =&gt; switch (try reader.takeByte()) {
-            '\n' =&gt; return error.CorruptPasswordFile,
-            ':' =&gt; {
-                continue :sw .read_user_id;
-            },
-            else =&gt; continue :sw .skip_password,
-        },
-        .read_user_id =&gt; switch (try reader.takeByte()) {
-            ':' =&gt; {
-                continue :sw .read_group_id;
-            },
-            '\n' =&gt; return error.CorruptPasswordFile,
-            else =&gt; |byte| {
-                const digit = switch (byte) {
-                    '0'...'9' =&gt; byte - '0',
-                    else =&gt; return error.CorruptPasswordFile,
-                };
-                {
-                    const ov = @mulWithOverflow(uid, 10);
-                    if (ov[1] != 0) return error.CorruptPasswordFile;
-                    uid = ov[0];
-                }
-                {
-                    const ov = @addWithOverflow(uid, digit);
-                    if (ov[1] != 0) return error.CorruptPasswordFile;
-                    uid = ov[0];
-                }
-                continue :sw .read_user_id;
-            },
-        },
-        .read_group_id =&gt; switch (try reader.takeByte()) {
-            '\n', ':' =&gt; return .{
-                .uid = uid,
-                .gid = gid,
-            },
-            else =&gt; |byte| {
-                const digit = switch (byte) {
-                    '0'...'9' =&gt; byte - '0',
-                    else =&gt; return error.CorruptPasswordFile,
-                };
-                {
-                    const ov = @mulWithOverflow(gid, 10);
-                    if (ov[1] != 0) return error.CorruptPasswordFile;
-                    gid = ov[0];
-                }
-                {
-                    const ov = @addWithOverflow(gid, digit);
-                    if (ov[1] != 0) return error.CorruptPasswordFile;
-                    gid = ov[0];
-                }
-                continue :sw .read_group_id;
-            },
-        },
-    }
-    comptime unreachable;
-}
-
-pub fn getBaseAddress() usize {
-    switch (native_os) {
-        .linux =&gt; {
-            const phdrs = std.posix.getSelfPhdrs();
-            var base: usize = 0;
-            for (phdrs) |phdr| switch (phdr.type) {
-                .LOAD =&gt; return base + phdr.vaddr,
-                .PHDR =&gt; base = @intFromPtr(phdrs.ptr) - phdr.vaddr,
-                else =&gt; {},
-            } else unreachable;
-        },
-        .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos =&gt; {
-            return @intFromPtr(&amp;std.c._mh_execute_header);
-        },
-        .windows =&gt; return @intFromPtr(windows.peb().ImageBaseAddress),
-        else =&gt; @compileError("Unsupported OS"),
-    }
-}
-
-/// Tells whether the target operating system supports replacing the current
-/// process image. If this is `false` then calling `replace` or `replaceFile`
-/// functions will return `error.OperationUnsupported`.
-pub const can_replace = switch (native_os) {
-    .windows, .haiku, .wasi =&gt; false,
-    else =&gt; true,
-};
-
-/// Tells whether spawning child processes is supported.
-pub const can_spawn = switch (native_os) {
-    .wasi, .ios, .tvos, .visionos, .watchos =&gt; false,
-    else =&gt; true,
-};
-
-pub const ReplaceError = error{
-    /// The target operating system cannot replace the process image with a new
-    /// one.
-    OperationUnsupported,
-    SystemResources,
-    AccessDenied,
-    PermissionDenied,
-    InvalidExe,
-    FileSystem,
-    IsDir,
-    FileNotFound,
-    NotDir,
-    FileBusy,
-    ProcessFdQuotaExceeded,
-    SystemFdQuotaExceeded,
-} || Allocator.Error || Io.Dir.PathNameError || Io.Cancelable || Io.UnexpectedError;
-
-pub const ReplaceOptions = struct {
-    argv: []const []const u8,
-    expand_arg0: ArgExpansion = .no_expand,
-    /// Replaces the environment when provided. The PATH value from here is
-    /// never used to resolve `argv[0]`.
-    environ_map: ?*const Environ.Map = null,
-};
-
-/// Replaces the current process image with the executed process. If this
-/// function succeeds, it does not return.
-///
-/// `argv[0]` is the name of the process to replace the current one with. If it
-/// is not already a file path (i.e. it contains '/'), it is resolved into a
-/// file path based on PATH from the parent environment.
-///
-/// It is illegal to call this function in a fork() child.
-pub fn replace(io: Io, options: ReplaceOptions) ReplaceError {
-    return io.vtable.processReplace(io.userdata, options);
-}
-
-/// Replaces the current process image with the executed process. If this
-/// function succeeds, it does not return.
-///
-/// `argv[0]` is the file path of the process to replace the current one with,
-/// relative to `dir`. It is *always* treated as a file path, even if it does
-/// not contain '/'.
-///
-/// It is illegal to call this function in a fork() child.
-pub fn replacePath(io: Io, dir: Io.Dir, options: ReplaceOptions) ReplaceError {
-    return io.vtable.processReplacePath(io.userdata, dir, options);
-}
-
-pub const ArgExpansion = enum { expand, no_expand };
-
-/// File name extensions supported natively by `CreateProcess()` on Windows.
-pub const WindowsExtension = enum { bat, cmd, com, exe };
-
-pub const SpawnError = error{
-    /// The operating system does not support creating child processes.
-    OperationUnsupported,
-    OutOfMemory,
-    /// POSIX-only. `StdIo.ignore` was selected and opening `/dev/null` returned ENODEV.
-    NoDevice,
-    /// Windows-only. `cwd` or `argv` was provided and it was invalid WTF-8.
-    /// https://wtf-8.codeberg.page/
-    InvalidWtf8,
-    /// Windows-only. NUL (U+0000), LF (U+000A), CR (U+000D) are not allowed
-    /// within arguments when executing a `.bat`/`.cmd` script.
-    /// - NUL/LF signifiies end of arguments, so anything afterwards
-    ///   would be lost after execution.
-    /// - CR is stripped by `cmd.exe`, so any CR codepoints
-    ///   would be lost after execution.
-    InvalidBatchScriptArg,
-    SystemResources,
-    AccessDenied,
-    PermissionDenied,
-    InvalidExe,
-    FileSystem,
-    IsDir,
-    FileNotFound,
-    NotDir,
-    FileBusy,
-    ProcessFdQuotaExceeded,
-    SystemFdQuotaExceeded,
-    ResourceLimitReached,
-    InvalidUserId,
-    InvalidProcessGroupId,
-    SymLinkLoop,
-    InvalidName,
-    /// An attempt was made to change the process group ID of one of the
-    /// children of the calling process and the child had already performed an
-    /// image replacement.
-    ProcessAlreadyExec,
-    /// On Windows, the volume does not contain a recognized file system. File
-    /// system drivers might not be loaded, or the volume may be corrupt.
-    UnrecognizedVolume,
-} || Io.File.OpenError || Io.Dir.PathNameError || Io.Cancelable || Io.UnexpectedError;
-
-pub const SpawnOptions = struct {
-    argv: []const []const u8,
-
-    /// Set to change the current working directory when spawning the child process.
-    cwd: Child.Cwd = .inherit,
-    /// Replaces the child environment when provided. The PATH value from here
-    /// is not used to resolve `argv[0]`; that resolution always uses parent
-    /// environment.
-    environ_map: ?*const Environ.Map = null,
-    expand_arg0: ArgExpansion = .no_expand,
-    /// When populated, a pipe will be created for the child process to
-    /// communicate progress back to the parent. The file descriptor of the
-    /// write end of the pipe will be specified in the `ZIG_PROGRESS`
-    /// environment variable inside the child process. The progress reported by
-    /// the child will be attached to this progress node in the parent process.
-    ///
-    /// The child's progress tree will be grafted into the parent's progress tree,
-    /// by substituting this node with the child's root node.
-    progress_node: std.Progress.Node = std.Progress.Node.none,
-
-    stdin: StdIo = .inherit,
-    stdout: StdIo = .inherit,
-    stderr: StdIo = .inherit,
-
-    /// Set to true to obtain rusage information for the child process.
-    /// Depending on the target platform and implementation status, the
-    /// requested statistics may or may not be available. If they are
-    /// available, then the `resource_usage_statistics` field will be populated
-    /// after calling `wait`.
-    /// On Linux and Darwin, this obtains rusage statistics from wait4().
-    request_resource_usage_statistics: bool = false,
-
-    /// Set to change the user id when spawning the child process.
-    uid: ?posix.uid_t = null,
-    /// Set to change the group id when spawning the child process.
-    gid: ?posix.gid_t = null,
-    /// Set to change the process group id when spawning the child process.
-    pgid: ?posix.pid_t = null,
-
-    /// Start child process in suspended state.
-    /// For Posix systems it's started as if SIGSTOP was sent.
-    start_suspended: bool = false,
-    /// Windows-only. Sets the CREATE_NO_WINDOW flag in CreateProcess.
-    create_no_window: bool = false,
-    /// Darwin-only. Disable ASLR for the child process.
-    disable_aslr: bool = false,
-
-    /// Behavior of the child process's standard input, output, and error streams.
-    pub const StdIo = union(enum) {
-        /// Inherit the corresponding stream from the parent process.
-        inherit,
-        /// Pass an already open file from the parent to the child.
-        ///
-        /// Nonblocking mode will be kept in the child process if present. This is
-        /// likely not supported by the child process. For example:
-        /// - Zig's std.Io.File.stdout() assumes blocking mode
-        /// - Rust explicity documents that nonblocking stdio may cause panics
-        /// - C++ standard streams do not support nonblocking file descriptors
-        file: File,
-        /// Pass a null stream to the child process by opening "/dev/null" on POSIX
-        /// and "NUL" on Windows.
-        ignore,
-        /// Create a new pipe for the stream.
-        ///
-        /// The corresponding field (`stdout`, `stderr`, or `stdin`) will be
-        /// assigned a `File` object that can be used to read from or write to the
-        /// pipe.
-        pipe,
-        /// Spawn the child process with the corresponding stream missing. This
-        /// will likely result in the child encountering EBADF if it tries to use
-        /// stdin, stdout, or stderr, or if only one stream is closed, it will
-        /// result in them getting mixed up. Generally, this option is for advanced
-        /// use cases only.
-        close,
-    };
-};
-
-/// Creates a child process.
-///
-/// `argv[0]` is the name of the program to execute. If it is not already a
-/// file path (i.e. it contains '/'), it is resolved into a file path based on
-/// PATH from the parent environment.
-pub fn spawn(io: Io, options: SpawnOptions) SpawnError!Child {
-    return io.vtable.processSpawn(io.userdata, options);
-}
-
-/// Creates a child process.
-///
-/// `argv[0]` is the file path of the program to execute, relative to `dir`. It
-/// is *always* treated as a file path, even if it does not contain '/'.
-pub fn spawnPath(io: Io, dir: Io.Dir, options: SpawnOptions) SpawnError!Child {
-    return io.vtable.processSpawnPath(io.userdata, dir, options);
-}
-
-pub const RunError = error{
-    StreamTooLong,
-} || SpawnError || Io.File.MultiReader.UnendingError || Io.Timeout.Error;
-
-pub const RunOptions = struct {
-    argv: []const []const u8,
-    stderr_limit: Io.Limit = .unlimited,
-    stdout_limit: Io.Limit = .unlimited,
-    /// How many bytes to initially allocate for stderr and stdout.
-    reserve_amount: usize = 64,
-
-    /// Set to change the current working directory when spawning the child process.
-    cwd: Child.Cwd = .inherit,
-    /// Replaces the child environment when provided. The PATH value from here
-    /// is not used to resolve `argv[0]`; that resolution always uses parent
-    /// environment.
-    environ_map: ?*const Environ.Map = null,
-    expand_arg0: ArgExpansion = .no_expand,
-    /// When populated, a pipe will be created for the child process to
-    /// communicate progress back to the parent. The file descriptor of the
-    /// write end of the pipe will be specified in the `ZIG_PROGRESS`
-    /// environment variable inside the child process. The progress reported by
-    /// the child will be attached to this progress node in the parent process.
-    ///
-    /// The child's progress tree will be grafted into the parent's progress tree,
-    /// by substituting this node with the child's root node.
-    progress_node: std.Progress.Node = std.Progress.Node.none,
-    /// Windows-only. Sets the CREATE_NO_WINDOW flag in CreateProcess.
-    create_no_window: bool = true,
-    /// Darwin-only. Disable ASLR for the child process.
-    disable_aslr: bool = false,
-    timeout: Io.Timeout = .none,
-};
-
-pub const RunResult = struct {
-    term: Child.Term,
-    stdout: []u8,
-    stderr: []u8,
-};
-
-/// Spawns a child process, waits for it, collecting stdout and stderr, and then returns.
-/// If it succeeds, the caller owns result.stdout and result.stderr memory.
-pub fn run(gpa: Allocator, io: Io, options: RunOptions) RunError!RunResult {
-    var child = try spawn(io, .{
-        .argv = options.argv,
-        .cwd = options.cwd,
-        .environ_map = options.environ_map,
-        .expand_arg0 = options.expand_arg0,
-        .progress_node = options.progress_node,
-        .create_no_window = options.create_no_window,
-        .disable_aslr = options.disable_aslr,
-
-        .stdin = .ignore,
-        .stdout = .pipe,
-        .stderr = .pipe,
-    });
-    defer child.kill(io);
-
-    var multi_reader_buffer: Io.File.MultiReader.Buffer(2) = undefined;
-    var multi_reader: Io.File.MultiReader = undefined;
-    multi_reader.init(gpa, io, multi_reader_buffer.toStreams(), &amp;.{ child.stdout.?, child.stderr.? });
-    defer multi_reader.deinit();
-
-    const stdout_reader = multi_reader.reader(0);
-    const stderr_reader = multi_reader.reader(1);
-
-    while (multi_reader.fill(options.reserve_amount, options.timeout)) |_| {
-        if (options.stdout_limit.toInt()) |limit| {
-            if (stdout_reader.buffered().len &gt; limit)
-                return error.StreamTooLong;
-        }
-        if (options.stderr_limit.toInt()) |limit| {
-            if (stderr_reader.buffered().len &gt; limit)
-                return error.StreamTooLong;
-        }
-    } else |err| switch (err) {
-        error.EndOfStream =&gt; {},
-        else =&gt; |e| return e,
-    }
-
-    try multi_reader.checkAnyError();
-
-    const term = try child.wait(io);
-
-    const stdout_slice = try multi_reader.toOwnedSlice(0);
-    errdefer gpa.free(stdout_slice);
-
-    const stderr_slice = try multi_reader.toOwnedSlice(1);
-    errdefer gpa.free(stderr_slice);
-
-    return .{
-        .stdout = stdout_slice,
-        .stderr = stderr_slice,
-        .term = term,
-    };
-}
-
-pub const TotalSystemMemoryError = error{
-    UnknownTotalSystemMemory,
-};
-
-/// Returns the total system memory, in bytes as a u64.
-/// We return a u64 instead of usize due to PAE on ARM
-/// and Linux's /proc/meminfo reporting more memory when
-/// using QEMU user mode emulation.
-pub fn totalSystemMemory() TotalSystemMemoryError!u64 {
-    switch (native_os) {
-        .linux =&gt; {
-            var info: std.os.linux.Sysinfo = undefined;
-            const result: usize = std.os.linux.sysinfo(&amp;info);
-            if (std.os.linux.errno(result) != .SUCCESS) {
-                return error.UnknownTotalSystemMemory;
-            }
-            // Promote to u64 to avoid overflow on systems where info.totalram is a 32-bit usize
-            return @as(u64, info.totalram) * info.mem_unit;
-        },
-        .dragonfly, .freebsd, .netbsd =&gt; {
-            const name = if (native_os == .netbsd) "hw.physmem64" else "hw.physmem";
-            var physmem: c_ulong = undefined;
-            var len: usize = @sizeOf(c_ulong);
-            switch (posix.errno(posix.system.sysctlbyname(name, &amp;physmem, &amp;len, null, 0))) {
-                .SUCCESS =&gt; return @intCast(physmem),
-                .FAULT =&gt; unreachable,
-                .PERM =&gt; unreachable, // only when setting values
-                .NOMEM =&gt; unreachable, // memory already on the stack
-                .NOENT =&gt; unreachable,
-                else =&gt; return error.UnknownTotalSystemMemory,
-            }
-        },
-        // whole Darwin family
-        .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos =&gt; {
-            // "hw.memsize" returns uint64_t
-            var physmem: u64 = undefined;
-            var len: usize = @sizeOf(u64);
-            switch (posix.errno(posix.system.sysctlbyname("hw.memsize", &amp;physmem, &amp;len, null, 0))) {
-                .SUCCESS =&gt; return physmem,
-                .FAULT =&gt; unreachable,
-                .PERM =&gt; unreachable, // only when setting values
-                .NOMEM =&gt; unreachable, // memory already on the stack
-                .NOENT =&gt; unreachable, // constant, known good value
-                else =&gt; return error.UnknownTotalSystemMemory,
-            }
-        },
-        .openbsd =&gt; {
-            const mib: [2]c_int = [_]c_int{
-                posix.CTL.HW,
-                posix.HW.PHYSMEM64,
-            };
-            var physmem: i64 = undefined;
-            var len: usize = @sizeOf(@TypeOf(physmem));
-            posix.sysctl(&amp;mib, &amp;physmem, &amp;len, null, 0) catch |err| switch (err) {
-                error.NameTooLong =&gt; unreachable, // constant, known good value
-                error.PermissionDenied =&gt; unreachable, // only when setting values,
-                error.SystemResources =&gt; unreachable, // memory already on the stack
-                error.UnknownName =&gt; unreachable, // constant, known good value
-                else =&gt; return error.UnknownTotalSystemMemory,
-            };
-            assert(physmem &gt;= 0);
-            return @as(u64, @bitCast(physmem));
-        },
-        .windows =&gt; {
-            var sbi: windows.SYSTEM.BASIC_INFORMATION = undefined;
-            const rc = windows.ntdll.NtQuerySystemInformation(
-                .Basic,
-                &amp;sbi,
-                @sizeOf(windows.SYSTEM.BASIC_INFORMATION),
-                null,
-            );
-            if (rc != .SUCCESS) {
-                return error.UnknownTotalSystemMemory;
-            }
-            return @as(u64, sbi.NumberOfPhysicalPages) * sbi.PageSize;
-        },
-        else =&gt; return error.UnknownTotalSystemMemory,
-    }
-}
-
-/// Indicate intent to terminate with a successful exit code.
-///
-/// In debug builds, this is a no-op, so that the calling code's cleanup
-/// mechanisms are tested and so that external tools checking for resource
-/// leaks can be accurate. In release builds, this calls `exit` with code zero,
-/// and does not return.
-pub fn cleanExit(io: Io) void {
-    if (builtin.mode == .Debug) return;
-    _ = io.lockStderr(&amp;.{}, .no_color) catch {};
-    exit(0);
-}
-
-/// Request ability to have more open file descriptors simultaneously.
-///
-/// On some systems, this raises the limit before seeing ProcessFdQuotaExceeded
-/// errors. On other systems, this does nothing.
-pub fn raiseFileDescriptorLimit() void {
-    const have_rlimit = posix.rlimit_resource != void;
-    if (!have_rlimit) return;
-
-    var lim = posix.getrlimit(.NOFILE) catch return; // Oh well; we tried.
-    if (native_os.isDarwin()) {
-        // On Darwin, `NOFILE` is bounded by a hardcoded value `OPEN_MAX`.
-        // According to the man pages for setrlimit():
-        //   setrlimit() now returns with errno set to EINVAL in places that historically succeeded.
-        //   It no longer accepts "rlim_cur = RLIM.INFINITY" for RLIM.NOFILE.
-        //   Use "rlim_cur = min(OPEN_MAX, rlim_max)".
-        lim.max = @min(std.c.OPEN_MAX, lim.max);
-    }
-    if (lim.cur == lim.max) return;
-
-    // Do a binary search for the limit.
-    var min: posix.rlim_t = lim.cur;
-    var max: posix.rlim_t = 1 &lt;&lt; 20;
-    // But if there's a defined upper bound, don't search, just set it.
-    if (lim.max != posix.RLIM.INFINITY) {
-        min = lim.max;
-        max = lim.max;
-    }
-
-    while (true) {
-        lim.cur = min + @divTrunc(max - min, 2); // on freebsd rlim_t is signed
-        if (posix.setrlimit(.NOFILE, lim)) |_| {
-            min = lim.cur;
-        } else |_| {
-            max = lim.cur;
-        }
-        if (min + 1 &gt;= max) break;
-    }
-}
-
-test raiseFileDescriptorLimit {
-    raiseFileDescriptorLimit();
-}
-
-/// Logs an error and then terminates the process with exit code 1.
-pub fn fatal(comptime format: []const u8, format_arguments: anytype) noreturn {
-    std.log.err(format, format_arguments);
-    exit(1);
-}
-
-pub const ExecutablePathBaseError = error{
-    FileNotFound,
-    AccessDenied,
-    /// The operating system does not support an executable learning its own
-    /// path.
-    OperationUnsupported,
-    NotDir,
-    SymLinkLoop,
-    InputOutput,
-    FileTooBig,
-    IsDir,
-    ProcessFdQuotaExceeded,
-    SystemFdQuotaExceeded,
-    NoDevice,
-    SystemResources,
-    NoSpaceLeft,
-    FileSystem,
-    BadPathName,
-    DeviceBusy,
-    PipeBusy,
-    NotLink,
-    PathAlreadyExists,
-    /// On Windows, `\\server` or `\\server\share` was not found.
-    NetworkNotFound,
-    ProcessNotFound,
-    /// On Windows, antivirus software is enabled by default. It can be
-    /// disabled, but Windows Update sometimes ignores the user's preference
-    /// and re-enables it. When enabled, antivirus software on Windows
-    /// intercepts file system operations and makes them significantly slower
-    /// in addition to possibly failing with this error code.
-    AntivirusInterference,
-    /// On Windows, the volume does not contain a recognized file system. File
-    /// system drivers might not be loaded, or the volume may be corrupt.
-    UnrecognizedVolume,
-    PermissionDenied,
-} || Io.Cancelable || Io.UnexpectedError;
-
-pub const ExecutablePathAllocError = ExecutablePathBaseError || Allocator.Error;
-
-pub fn executablePathAlloc(io: Io, allocator: Allocator) ExecutablePathAllocError![:0]u8 {
-    var buffer: [max_path_bytes]u8 = undefined;
-    const n = executablePath(io, &amp;buffer) catch |err| switch (err) {
-        error.NameTooLong =&gt; unreachable,
-        else =&gt; |e| return e,
-    };
-    return allocator.dupeZ(u8, buffer[0..n]);
-}
-
-pub const ExecutablePathError = ExecutablePathBaseError || error{NameTooLong};
-
-/// Get the path to the current executable, following symlinks.
-///
-/// This function may return an error if the current executable
-/// was deleted after spawning.
-///
-/// Returned value is a slice of out_buffer.
-///
-/// On Windows, the result is encoded as [WTF-8](https://wtf-8.codeberg.page/).
-/// On other platforms, the result is an opaque sequence of bytes with no particular encoding.
-///
-/// On Linux, depends on procfs being mounted. If the currently executing binary has
-/// been deleted, the file path looks something like "/a/b/c/exe (deleted)".
-///
-/// See also:
-/// * `executableDirPath` - to obtain only the directory
-/// * `openExecutable` - to obtain only an open file handle
-pub fn executablePath(io: Io, out_buffer: []u8) ExecutablePathError!usize {
-    return io.vtable.processExecutablePath(io.userdata, out_buffer);
-}
-
-/// Get the directory path that contains the current executable.
-///
-/// Returns index into `out_buffer`.
-///
-/// On Windows, the result is encoded as [WTF-8](https://wtf-8.codeberg.page/).
-/// On other platforms, the result is an opaque sequence of bytes with no particular encoding.
-pub fn executableDirPath(io: Io, out_buffer: []u8) ExecutablePathError!usize {
-    const n = try executablePath(io, out_buffer);
-    // Assert that the OS APIs return absolute paths, and therefore dirname
-    // will not return null.
-    return std.fs.path.dirname(out_buffer[0..n]).?.len;
-}
-
-/// Same as `executableDirPath` except allocates the result.
-pub fn executableDirPathAlloc(io: Io, allocator: Allocator) ExecutablePathAllocError![]u8 {
-    var buffer: [max_path_bytes]u8 = undefined;
-    const dir_path_len = executableDirPath(io, &amp;buffer) catch |err| switch (err) {
-        error.NameTooLong =&gt; unreachable,
-        else =&gt; |e| return e,
-    };
-    return allocator.dupe(u8, buffer[0..dir_path_len]);
-}
-
-pub const OpenExecutableError = File.OpenError || ExecutablePathError || File.LockError;
-
-pub fn openExecutable(io: Io, flags: File.OpenFlags) OpenExecutableError!File {
-    return io.vtable.processExecutableOpen(io.userdata, flags);
-}
-
-/// Causes abnormal process termination.
-///
-/// If linking against libc, this calls `std.c.abort`. Otherwise it raises
-/// SIGABRT followed by SIGKILL.
-///
-/// Invokes the current signal handler for SIGABRT, if any.
-pub fn abort() noreturn {
-    @branchHint(.cold);
-    // MSVCRT abort() sometimes opens a popup window which is undesirable, so
-    // even when linking libc on Windows we use our own abort implementation.
-    // See https://github.com/ziglang/zig/issues/2071 for more details.
-    if (native_os == .windows) {
-        if (builtin.mode == .Debug and windows.peb().BeingDebugged.toBool()) {
-            @breakpoint();
-        }
-        windows.ntdll.RtlExitUserProcess(3);
-    }
-    if (!builtin.link_libc and native_os == .linux) {
-        // The Linux man page says that the libc abort() function
-        // "first unblocks the SIGABRT signal", but this is a footgun
-        // for user-defined signal handlers that want to restore some state in
-        // some program sections and crash in others.
-        // So, the user-installed SIGABRT handler is run, if present.
-        posix.raise(.ABRT) catch {};
-
-        // Disable all signal handlers.
-        const filledset = std.os.linux.sigfillset();
-        posix.sigprocmask(posix.SIG.BLOCK, &amp;filledset, null);
-
-        // Only one thread may proceed to the rest of abort().
-        if (!builtin.single_threaded) {
-            const global = struct {
-                var abort_entered: bool = false;
-            };
-            while (@cmpxchgWeak(bool, &amp;global.abort_entered, false, true, .seq_cst, .seq_cst)) |_| {}
-        }
-
-        // Install default handler so that the tkill below will terminate.
-        const sigact: posix.Sigaction = .{
-            .handler = .{ .handler = posix.SIG.DFL },
-            .mask = posix.sigemptyset(),
-            .flags = 0,
-        };
-        posix.sigaction(.ABRT, &amp;sigact, null);
-
-        _ = std.os.linux.tkill(std.os.linux.gettid(), .ABRT);
-
-        var sigabrtmask = posix.sigemptyset();
-        posix.sigaddset(&amp;sigabrtmask, .ABRT);
-        posix.sigprocmask(posix.SIG.UNBLOCK, &amp;sigabrtmask, null);
-
-        // Beyond this point should be unreachable.
-        @as(*allowzero volatile u8, @ptrFromInt(0)).* = 0;
-        posix.raise(.KILL) catch {};
-        exit(127); // Pid 1 might not be signalled in some containers.
-    }
-    switch (native_os) {
-        .uefi, .wasi, .emscripten, .cuda, .amdhsa =&gt; @trap(),
-        else =&gt; posix.system.abort(),
-    }
-}
-
-/// Exits all threads of the program with the specified status code.
-pub fn exit(status: u8) noreturn {
-    if (builtin.link_libc) {
-        std.c.exit(status);
-    } else switch (native_os) {
-        .windows =&gt; windows.ntdll.RtlExitUserProcess(status),
-        .wasi =&gt; std.os.wasi.proc_exit(status),
-        .linux =&gt; {
-            if (!builtin.single_threaded) std.os.linux.exit_group(status);
-            posix.system.exit(status);
-        },
-        .uefi =&gt; {
-            const uefi = std.os.uefi;
-            // exit() is only available if exitBootServices() has not been called yet.
-            // This call to exit should not fail, so we catch-ignore errors.
-            if (uefi.system_table.boot_services) |bs| {
-                bs.exit(uefi.handle, @enumFromInt(status), null) catch {};
-            }
-            // If we can't exit, reboot the system instead.
-            uefi.system_table.runtime_services.resetSystem(.cold, @enumFromInt(status), null);
-        },
-        else =&gt; posix.system.exit(status),
-    }
-}
-
-pub const SetCurrentDirError = error{
-    AccessDenied,
-    BadPathName,
-    FileNotFound,
-    FileSystem,
-    NameTooLong,
-    NoDevice,
-    NotDir,
-    OperationUnsupported,
-    UnrecognizedVolume,
-} || Io.Cancelable || Io.UnexpectedError;
-
-/// Changes the current working directory to the open directory handle.
-/// Corresponds to "fchdir" in libc.
-///
-/// This modifies global process state and can have surprising effects in
-/// multithreaded applications. Most applications and especially libraries
-/// should not call this function as a general rule, however it can have use
-/// cases in, for example, implementing a shell, or child process execution.
-///
-/// Calling this function makes code less portable and less reusable.
-pub fn setCurrentDir(io: Io, dir: Io.Dir) !void {
-    return io.vtable.processSetCurrentDir(io.userdata, dir);
-}
-
-pub const SetCurrentPathError = error{
-    AccessDenied,
-    SymLinkLoop,
-    SystemResources,
-    BadPathName,
-    FileNotFound,
-    FileSystem,
-    NoDevice,
-    NotDir,
-    NameTooLong,
-    OperationUnsupported,
-    /// Windows-only. The path is invalid WTF-8.
-    /// https://wtf-8.codeberg.page/
-    InvalidWtf8,
-} || Io.Cancelable || Io.UnexpectedError;
-
-/// Changes the current working directory to the given path.
-/// Corresponds to "chdir" in libc.
-///
-/// This modifies global process state and can have surprising effects in
-/// multithreaded applications. Most applications and especially libraries
-/// should not call this function as a general rule, however it can have use
-/// cases in, for example, implementing a shell, or child process execution.
-///
-/// Calling this function makes code less portable and less reusable.
-pub fn setCurrentPath(io: Io, path: []const u8) !void {
-    return io.vtable.processSetCurrentPath(io.userdata, path);
-}
-
-pub const LockMemoryError = error{
-    UnsupportedOperation,
-    PermissionDenied,
-    LockedMemoryLimitExceeded,
-    SystemResources,
-} || Io.UnexpectedError;
-
-pub const LockMemoryOptions = struct {
-    /// Lock pages that are currently resident and mark the entire range so
-    /// that the remaining nonresident pages are locked when they are populated
-    /// by a page fault.
-    on_fault: bool = false,
-};
-
-/// Request part of the calling process's virtual address space to be in RAM,
-/// preventing that memory from being paged to the swap area.
-///
-/// Corresponds to "mlock" or "mlock2" in libc.
-///
-/// See also:
-/// * unlockMemory
-pub fn lockMemory(memory: []align(std.heap.page_size_min) const u8, options: LockMemoryOptions) LockMemoryError!void {
-    if (native_os == .windows) {
-        // TODO call VirtualLock
-    }
-    if (!options.on_fault and @TypeOf(posix.system.mlock) != void) {
-        switch (posix.errno(posix.system.mlock(memory.ptr, memory.len))) {
-            .SUCCESS =&gt; return,
-            .INVAL =&gt; |err| return std.Io.Threaded.errnoBug(err), // unaligned, negative, runs off end of addrspace
-            .PERM =&gt; return error.PermissionDenied,
-            .NOMEM =&gt; return error.LockedMemoryLimitExceeded,
-            .AGAIN =&gt; return error.SystemResources,
-            else =&gt; |err| return posix.unexpectedErrno(err),
-        }
-    }
-    if (@TypeOf(posix.system.mlock2) != void) {
-        const flags: posix.MLOCK = .{ .ONFAULT = options.on_fault };
-        switch (posix.errno(posix.system.mlock2(memory.ptr, memory.len, flags))) {
-            .SUCCESS =&gt; return,
-            .INVAL =&gt; |err| return std.Io.Threaded.errnoBug(err), // unaligned, negative, runs off end of addrspace
-            .PERM =&gt; return error.PermissionDenied,
-            .NOMEM =&gt; return error.LockedMemoryLimitExceeded,
-            .AGAIN =&gt; return error.SystemResources,
-            else =&gt; |err| return posix.unexpectedErrno(err),
-        }
-    }
-    return error.UnsupportedOperation;
-}
-
-pub const UnlockMemoryError = error{
-    PermissionDenied,
-    OutOfMemory,
-    SystemResources,
-} || Io.UnexpectedError;
-
-/// Withdraw request for process's virtual address space to be in RAM.
-///
-/// Corresponds to "munlock" in libc.
-///
-/// See also:
-/// * `lockMemory`
-pub fn unlockMemory(memory: []align(std.heap.page_size_min) const u8) UnlockMemoryError!void {
-    if (@TypeOf(posix.system.munlock) == void) return;
-    switch (posix.errno(posix.system.munlock(memory.ptr, memory.len))) {
-        .SUCCESS =&gt; return,
-        .INVAL =&gt; |err| return std.Io.Threaded.errnoBug(err), // unaligned or runs off end of addr space
-        .PERM =&gt; return error.PermissionDenied,
-        .NOMEM =&gt; return error.OutOfMemory,
-        .AGAIN =&gt; return error.SystemResources,
-        else =&gt; |err| return posix.unexpectedErrno(err),
-    }
-}
-
-pub const LockMemoryAllOptions = struct {
-    current: bool = false,
-    future: bool = false,
-    /// Asserted to be used together with `current` or `future`, or both.
-    on_fault: bool = false,
-};
-
-pub fn lockMemoryAll(options: LockMemoryAllOptions) LockMemoryError!void {
-    if (@TypeOf(posix.system.mlockall) == void) return error.UnsupportedOperation;
-    var flags: posix.MCL = .{
-        .CURRENT = options.current,
-        .FUTURE = options.future,
-    };
-    if (options.on_fault) {
-        assert(options.current or options.future);
-        if (@hasField(posix.MCL, "ONFAULT")) {
-            flags.ONFAULT = true;
-        } else {
-            return error.UnsupportedOperation;
-        }
-    }
-    switch (posix.errno(posix.system.mlockall(flags))) {
-        .SUCCESS =&gt; return,
-        .INVAL =&gt; |err| return std.Io.Threaded.errnoBug(err),
-        .PERM =&gt; return error.PermissionDenied,
-        .NOMEM =&gt; return error.LockedMemoryLimitExceeded,
-        .AGAIN =&gt; return error.SystemResources,
-        else =&gt; |err| return posix.unexpectedErrno(err),
-    }
-}
-
-pub fn unlockMemoryAll() UnlockMemoryError!void {
-    if (@TypeOf(posix.system.munlockall) == void) return;
-    switch (posix.errno(posix.system.munlockall())) {
-        .SUCCESS =&gt; return,
-        .PERM =&gt; return error.PermissionDenied,
-        .NOMEM =&gt; return error.OutOfMemory,
-        .AGAIN =&gt; return error.SystemResources,
-        else =&gt; |err| return posix.unexpectedErrno(err),
-    }
-}
-
-pub const ProtectMemoryError = error{
-    UnsupportedOperation,
-    /// OpenBSD will refuse to change memory protection if the specified region
-    /// contains any pages that have previously been marked immutable using the
-    /// `mimmutable` function.
-    PermissionDenied,
-    /// The memory cannot be given the specified access. This can happen, for
-    /// example, if you memory map a file to which you have read-only access,
-    /// then use `protectMemory` to mark it writable.
-    AccessDenied,
-    /// Changing the protection of a memory region would result in the total
-    /// number of mappings with distinct attributes exceeding the allowed
-    /// maximum.
-    OutOfMemory,
-} || Io.UnexpectedError;
-
-pub const MemoryProtection = packed struct(u3) {
-    read: bool = false,
-    write: bool = false,
-    execute: bool = false,
-};
-
-pub fn protectMemory(memory: []align(std.heap.page_size_min) u8, protection: MemoryProtection) ProtectMemoryError!void {
-    if (native_os == .windows) {
-        var addr = memory.ptr; // ntdll takes an extra level of indirection here
-        var size = memory.len; // ntdll takes an extra level of indirection here
-        var old: windows.PAGE = undefined;
-        const current_process: windows.HANDLE = @ptrFromInt(@as(usize, @bitCast(@as(isize, -1))));
-        const new = windows.PAGE.fromProtection(protection) orelse return error.AccessDenied;
-        switch (windows.ntdll.NtProtectVirtualMemory(current_process, @ptrCast(&amp;addr), &amp;size, new, &amp;old)) {
-            .SUCCESS =&gt; return,
-            .INVALID_ADDRESS =&gt; return error.AccessDenied,
-            else =&gt; |st| return windows.unexpectedStatus(st),
-        }
-    } else if (posix.PROT != void) {
-        const flags: posix.PROT = .{
-            .READ = protection.read,
-            .WRITE = protection.write,
-            .EXEC = protection.execute,
-        };
-        switch (posix.errno(posix.system.mprotect(memory.ptr, memory.len, flags))) {
-            .SUCCESS =&gt; return,
-            .PERM =&gt; return error.PermissionDenied,
-            .INVAL =&gt; |err| return std.Io.Threaded.errnoBug(err),
-            .ACCES =&gt; return error.AccessDenied,
-            .NOMEM =&gt; return error.OutOfMemory,
-            else =&gt; |err| return posix.unexpectedErrno(err),
-        }
-    }
-    return error.UnsupportedOperation;
-}
-
-var test_page: [std.heap.page_size_max]u8 align(std.heap.page_size_max) = undefined;
-
-test lockMemory {
-    lockMemory(&amp;test_page, .{}) catch return error.SkipZigTest;
-    unlockMemory(&amp;test_page) catch return error.SkipZigTest;
-}
-
-test lockMemoryAll {
-    lockMemoryAll(.{ .current = true }) catch return error.SkipZigTest;
-    unlockMemoryAll() catch return error.SkipZigTest;
-}
-
-test protectMemory {
-    protectMemory(&amp;test_page, .{}) catch return error.SkipZigTest;
-    protectMemory(&amp;test_page, .{ .read = true, .write = true }) catch return error.SkipZigTest;
-}</pre>
+    <pre><a id="L1"></a>const builtin = @import("builtin");
+<a id="L2"></a>const native_os = builtin.os.tag;
+<a id="L3"></a>
+<a id="L4"></a>const std = @import("std.zig");
+<a id="L5"></a>const Io = std.Io;
+<a id="L6"></a>const File = std.Io.File;
+<a id="L7"></a>const fs = std.fs;
+<a id="L8"></a>const mem = std.mem;
+<a id="L9"></a>const math = std.math;
+<a id="L10"></a>const Allocator = std.mem.Allocator;
+<a id="L11"></a>const assert = std.debug.assert;
+<a id="L12"></a>const testing = std.testing;
+<a id="L13"></a>const posix = std.posix;
+<a id="L14"></a>const windows = std.os.windows;
+<a id="L15"></a>const unicode = std.unicode;
+<a id="L16"></a>const max_path_bytes = std.fs.max_path_bytes;
+<a id="L17"></a>
+<a id="L18"></a>pub const Child = @import("process/Child.zig");
+<a id="L19"></a>pub const Args = @import("process/Args.zig");
+<a id="L20"></a>pub const Environ = @import("process/Environ.zig");
+<a id="L21"></a>pub const Preopens = @import("process/Preopens.zig");
+<a id="L22"></a>
+<a id="L23"></a>/// A standard set of pre-initialized useful APIs for programs to take
+<a id="L24"></a>/// advantage of. This is the type of the first parameter of the main function.
+<a id="L25"></a>/// Applications wanting more flexibility can accept `Init.Minimal` instead.
+<a id="L26"></a>///
+<a id="L27"></a>/// Completion of https://github.com/ziglang/zig/issues/24510 will also allow
+<a id="L28"></a>/// the second parameter of the main function to be a custom struct that
+<a id="L29"></a>/// contain auto-parsed CLI arguments.
+<a id="L30"></a>pub const Init = struct {
+<a id="L31"></a>    /// `Init` is a superset of `Minimal`; the latter is included here.
+<a id="L32"></a>    minimal: Minimal,
+<a id="L33"></a>    /// Permanent storage for the entire process, cleaned automatically on
+<a id="L34"></a>    /// exit. Threadsafe.
+<a id="L35"></a>    arena: *std.heap.ArenaAllocator,
+<a id="L36"></a>    /// A default-selected general purpose allocator for temporary heap
+<a id="L37"></a>    /// allocations. Debug mode will set up leak checking if possible.
+<a id="L38"></a>    /// Threadsafe.
+<a id="L39"></a>    gpa: Allocator,
+<a id="L40"></a>    /// An appropriate default Io implementation based on the target
+<a id="L41"></a>    /// configuration. Debug mode will set up leak checking if possible.
+<a id="L42"></a>    io: Io,
+<a id="L43"></a>    /// Environment variables, initialized with `gpa`. Not threadsafe.
+<a id="L44"></a>    environ_map: *Environ.Map,
+<a id="L45"></a>    /// Named files that have been provided by the parent process. This is
+<a id="L46"></a>    /// mainly useful on WASI, but can be used on other systems to mimic the
+<a id="L47"></a>    /// behavior with respect to stdio.
+<a id="L48"></a>    preopens: Preopens,
+<a id="L49"></a>
+<a id="L50"></a>    /// Alternative to `Init` as the first parameter of the main function.
+<a id="L51"></a>    pub const Minimal = struct {
+<a id="L52"></a>        /// Environment variables.
+<a id="L53"></a>        environ: Environ,
+<a id="L54"></a>        /// Command line arguments.
+<a id="L55"></a>        args: Args,
+<a id="L56"></a>    };
+<a id="L57"></a>};
+<a id="L58"></a>
+<a id="L59"></a>pub const CurrentPathError = error{
+<a id="L60"></a>    NameTooLong,
+<a id="L61"></a>    /// Not possible on Windows. Always returned on WASI.
+<a id="L62"></a>    CurrentDirUnlinked,
+<a id="L63"></a>} || Io.Cancelable || Io.UnexpectedError;
+<a id="L64"></a>
+<a id="L65"></a>/// On Windows, the result is encoded as [WTF-8](https://wtf-8.codeberg.page/).
+<a id="L66"></a>/// On other platforms, the result is an opaque sequence of bytes with no
+<a id="L67"></a>/// particular encoding.
+<a id="L68"></a>pub fn currentPath(io: Io, buffer: []u8) CurrentPathError!usize {
+<a id="L69"></a>    return io.vtable.processCurrentPath(io.userdata, buffer);
+<a id="L70"></a>}
+<a id="L71"></a>
+<a id="L72"></a>pub const CurrentPathAllocError = Allocator.Error || error{
+<a id="L73"></a>    /// Not possible on Windows. Always returned on WASI.
+<a id="L74"></a>    CurrentDirUnlinked,
+<a id="L75"></a>} || Io.Cancelable || Io.UnexpectedError;
+<a id="L76"></a>
+<a id="L77"></a>/// On Windows, the result is encoded as [WTF-8](https://wtf-8.codeberg.page/).
+<a id="L78"></a>/// On other platforms, the result is an opaque sequence of bytes with no
+<a id="L79"></a>/// particular encoding.
+<a id="L80"></a>///
+<a id="L81"></a>/// Caller owns returned memory.
+<a id="L82"></a>pub fn currentPathAlloc(io: Io, allocator: Allocator) CurrentPathAllocError![:0]u8 {
+<a id="L83"></a>    var buffer: [max_path_bytes]u8 = undefined;
+<a id="L84"></a>    const n = currentPath(io, &amp;buffer) catch |err| switch (err) {
+<a id="L85"></a>        error.NameTooLong =&gt; unreachable,
+<a id="L86"></a>        else =&gt; |e| return e,
+<a id="L87"></a>    };
+<a id="L88"></a>    return allocator.dupeZ(u8, buffer[0..n]);
+<a id="L89"></a>}
+<a id="L90"></a>
+<a id="L91"></a>test currentPathAlloc {
+<a id="L92"></a>    const cwd = try currentPathAlloc(testing.io, testing.allocator);
+<a id="L93"></a>    testing.allocator.free(cwd);
+<a id="L94"></a>}
+<a id="L95"></a>
+<a id="L96"></a>pub const UserInfo = struct {
+<a id="L97"></a>    uid: posix.uid_t,
+<a id="L98"></a>    gid: posix.gid_t,
+<a id="L99"></a>};
+<a id="L100"></a>
+<a id="L101"></a>/// POSIX function which gets a uid from username.
+<a id="L102"></a>pub fn getUserInfo(name: []const u8) !UserInfo {
+<a id="L103"></a>    return switch (native_os) {
+<a id="L104"></a>        .linux,
+<a id="L105"></a>        .driverkit,
+<a id="L106"></a>        .ios,
+<a id="L107"></a>        .maccatalyst,
+<a id="L108"></a>        .macos,
+<a id="L109"></a>        .tvos,
+<a id="L110"></a>        .visionos,
+<a id="L111"></a>        .watchos,
+<a id="L112"></a>        .freebsd,
+<a id="L113"></a>        .netbsd,
+<a id="L114"></a>        .openbsd,
+<a id="L115"></a>        .haiku,
+<a id="L116"></a>        .illumos,
+<a id="L117"></a>        .serenity,
+<a id="L118"></a>        =&gt; posixGetUserInfo(name),
+<a id="L119"></a>        else =&gt; @compileError("Unsupported OS"),
+<a id="L120"></a>    };
+<a id="L121"></a>}
+<a id="L122"></a>
+<a id="L123"></a>/// TODO this reads /etc/passwd. But sometimes the user/id mapping is in something else
+<a id="L124"></a>/// like NIS, AD, etc. See `man nss` or look at an strace for `id myuser`.
+<a id="L125"></a>pub fn posixGetUserInfo(io: Io, name: []const u8) !UserInfo {
+<a id="L126"></a>    const file = try Io.Dir.openFileAbsolute(io, "/etc/passwd", .{});
+<a id="L127"></a>    defer file.close(io);
+<a id="L128"></a>    var buffer: [4096]u8 = undefined;
+<a id="L129"></a>    var file_reader = file.reader(&amp;buffer);
+<a id="L130"></a>    return posixGetUserInfoPasswdStream(name, &amp;file_reader.interface) catch |err| switch (err) {
+<a id="L131"></a>        error.ReadFailed =&gt; return file_reader.err.?,
+<a id="L132"></a>        error.EndOfStream =&gt; return error.UserNotFound,
+<a id="L133"></a>        error.CorruptPasswordFile =&gt; return error.CorruptPasswordFile,
+<a id="L134"></a>    };
+<a id="L135"></a>}
+<a id="L136"></a>
+<a id="L137"></a>fn posixGetUserInfoPasswdStream(name: []const u8, reader: *std.Io.Reader) !UserInfo {
+<a id="L138"></a>    const State = enum {
+<a id="L139"></a>        start,
+<a id="L140"></a>        wait_for_next_line,
+<a id="L141"></a>        skip_password,
+<a id="L142"></a>        read_user_id,
+<a id="L143"></a>        read_group_id,
+<a id="L144"></a>    };
+<a id="L145"></a>
+<a id="L146"></a>    var name_index: usize = 0;
+<a id="L147"></a>    var uid: posix.uid_t = 0;
+<a id="L148"></a>    var gid: posix.gid_t = 0;
+<a id="L149"></a>
+<a id="L150"></a>    sw: switch (State.start) {
+<a id="L151"></a>        .start =&gt; switch (try reader.takeByte()) {
+<a id="L152"></a>            ':' =&gt; {
+<a id="L153"></a>                if (name_index == name.len) {
+<a id="L154"></a>                    continue :sw .skip_password;
+<a id="L155"></a>                } else {
+<a id="L156"></a>                    continue :sw .wait_for_next_line;
+<a id="L157"></a>                }
+<a id="L158"></a>            },
+<a id="L159"></a>            '\n' =&gt; return error.CorruptPasswordFile,
+<a id="L160"></a>            else =&gt; |byte| {
+<a id="L161"></a>                if (name_index == name.len or name[name_index] != byte) {
+<a id="L162"></a>                    continue :sw .wait_for_next_line;
+<a id="L163"></a>                }
+<a id="L164"></a>                name_index += 1;
+<a id="L165"></a>                continue :sw .start;
+<a id="L166"></a>            },
+<a id="L167"></a>        },
+<a id="L168"></a>        .wait_for_next_line =&gt; switch (try reader.takeByte()) {
+<a id="L169"></a>            '\n' =&gt; {
+<a id="L170"></a>                name_index = 0;
+<a id="L171"></a>                continue :sw .start;
+<a id="L172"></a>            },
+<a id="L173"></a>            else =&gt; continue :sw .wait_for_next_line,
+<a id="L174"></a>        },
+<a id="L175"></a>        .skip_password =&gt; switch (try reader.takeByte()) {
+<a id="L176"></a>            '\n' =&gt; return error.CorruptPasswordFile,
+<a id="L177"></a>            ':' =&gt; {
+<a id="L178"></a>                continue :sw .read_user_id;
+<a id="L179"></a>            },
+<a id="L180"></a>            else =&gt; continue :sw .skip_password,
+<a id="L181"></a>        },
+<a id="L182"></a>        .read_user_id =&gt; switch (try reader.takeByte()) {
+<a id="L183"></a>            ':' =&gt; {
+<a id="L184"></a>                continue :sw .read_group_id;
+<a id="L185"></a>            },
+<a id="L186"></a>            '\n' =&gt; return error.CorruptPasswordFile,
+<a id="L187"></a>            else =&gt; |byte| {
+<a id="L188"></a>                const digit = switch (byte) {
+<a id="L189"></a>                    '0'...'9' =&gt; byte - '0',
+<a id="L190"></a>                    else =&gt; return error.CorruptPasswordFile,
+<a id="L191"></a>                };
+<a id="L192"></a>                {
+<a id="L193"></a>                    const ov = @mulWithOverflow(uid, 10);
+<a id="L194"></a>                    if (ov[1] != 0) return error.CorruptPasswordFile;
+<a id="L195"></a>                    uid = ov[0];
+<a id="L196"></a>                }
+<a id="L197"></a>                {
+<a id="L198"></a>                    const ov = @addWithOverflow(uid, digit);
+<a id="L199"></a>                    if (ov[1] != 0) return error.CorruptPasswordFile;
+<a id="L200"></a>                    uid = ov[0];
+<a id="L201"></a>                }
+<a id="L202"></a>                continue :sw .read_user_id;
+<a id="L203"></a>            },
+<a id="L204"></a>        },
+<a id="L205"></a>        .read_group_id =&gt; switch (try reader.takeByte()) {
+<a id="L206"></a>            '\n', ':' =&gt; return .{
+<a id="L207"></a>                .uid = uid,
+<a id="L208"></a>                .gid = gid,
+<a id="L209"></a>            },
+<a id="L210"></a>            else =&gt; |byte| {
+<a id="L211"></a>                const digit = switch (byte) {
+<a id="L212"></a>                    '0'...'9' =&gt; byte - '0',
+<a id="L213"></a>                    else =&gt; return error.CorruptPasswordFile,
+<a id="L214"></a>                };
+<a id="L215"></a>                {
+<a id="L216"></a>                    const ov = @mulWithOverflow(gid, 10);
+<a id="L217"></a>                    if (ov[1] != 0) return error.CorruptPasswordFile;
+<a id="L218"></a>                    gid = ov[0];
+<a id="L219"></a>                }
+<a id="L220"></a>                {
+<a id="L221"></a>                    const ov = @addWithOverflow(gid, digit);
+<a id="L222"></a>                    if (ov[1] != 0) return error.CorruptPasswordFile;
+<a id="L223"></a>                    gid = ov[0];
+<a id="L224"></a>                }
+<a id="L225"></a>                continue :sw .read_group_id;
+<a id="L226"></a>            },
+<a id="L227"></a>        },
+<a id="L228"></a>    }
+<a id="L229"></a>    comptime unreachable;
+<a id="L230"></a>}
+<a id="L231"></a>
+<a id="L232"></a>pub fn getBaseAddress() usize {
+<a id="L233"></a>    switch (native_os) {
+<a id="L234"></a>        .linux =&gt; {
+<a id="L235"></a>            const phdrs = std.posix.getSelfPhdrs();
+<a id="L236"></a>            var base: usize = 0;
+<a id="L237"></a>            for (phdrs) |phdr| switch (phdr.type) {
+<a id="L238"></a>                .LOAD =&gt; return base + phdr.vaddr,
+<a id="L239"></a>                .PHDR =&gt; base = @intFromPtr(phdrs.ptr) - phdr.vaddr,
+<a id="L240"></a>                else =&gt; {},
+<a id="L241"></a>            } else unreachable;
+<a id="L242"></a>        },
+<a id="L243"></a>        .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos =&gt; {
+<a id="L244"></a>            return @intFromPtr(&amp;std.c._mh_execute_header);
+<a id="L245"></a>        },
+<a id="L246"></a>        .windows =&gt; return @intFromPtr(windows.peb().ImageBaseAddress),
+<a id="L247"></a>        else =&gt; @compileError("Unsupported OS"),
+<a id="L248"></a>    }
+<a id="L249"></a>}
+<a id="L250"></a>
+<a id="L251"></a>/// Tells whether the target operating system supports replacing the current
+<a id="L252"></a>/// process image. If this is `false` then calling `replace` or `replaceFile`
+<a id="L253"></a>/// functions will return `error.OperationUnsupported`.
+<a id="L254"></a>pub const can_replace = switch (native_os) {
+<a id="L255"></a>    .windows, .haiku, .wasi =&gt; false,
+<a id="L256"></a>    else =&gt; true,
+<a id="L257"></a>};
+<a id="L258"></a>
+<a id="L259"></a>/// Tells whether spawning child processes is supported.
+<a id="L260"></a>pub const can_spawn = switch (native_os) {
+<a id="L261"></a>    .wasi, .ios, .tvos, .visionos, .watchos =&gt; false,
+<a id="L262"></a>    else =&gt; true,
+<a id="L263"></a>};
+<a id="L264"></a>
+<a id="L265"></a>pub const ReplaceError = error{
+<a id="L266"></a>    /// The target operating system cannot replace the process image with a new
+<a id="L267"></a>    /// one.
+<a id="L268"></a>    OperationUnsupported,
+<a id="L269"></a>    SystemResources,
+<a id="L270"></a>    AccessDenied,
+<a id="L271"></a>    PermissionDenied,
+<a id="L272"></a>    InvalidExe,
+<a id="L273"></a>    FileSystem,
+<a id="L274"></a>    IsDir,
+<a id="L275"></a>    FileNotFound,
+<a id="L276"></a>    NotDir,
+<a id="L277"></a>    FileBusy,
+<a id="L278"></a>    ProcessFdQuotaExceeded,
+<a id="L279"></a>    SystemFdQuotaExceeded,
+<a id="L280"></a>} || Allocator.Error || Io.Dir.PathNameError || Io.Cancelable || Io.UnexpectedError;
+<a id="L281"></a>
+<a id="L282"></a>pub const ReplaceOptions = struct {
+<a id="L283"></a>    argv: []const []const u8,
+<a id="L284"></a>    expand_arg0: ArgExpansion = .no_expand,
+<a id="L285"></a>    /// Replaces the environment when provided. The PATH value from here is
+<a id="L286"></a>    /// never used to resolve `argv[0]`.
+<a id="L287"></a>    environ_map: ?*const Environ.Map = null,
+<a id="L288"></a>};
+<a id="L289"></a>
+<a id="L290"></a>/// Replaces the current process image with the executed process. If this
+<a id="L291"></a>/// function succeeds, it does not return.
+<a id="L292"></a>///
+<a id="L293"></a>/// `argv[0]` is the name of the process to replace the current one with. If it
+<a id="L294"></a>/// is not already a file path (i.e. it contains '/'), it is resolved into a
+<a id="L295"></a>/// file path based on PATH from the parent environment.
+<a id="L296"></a>///
+<a id="L297"></a>/// It is illegal to call this function in a fork() child.
+<a id="L298"></a>pub fn replace(io: Io, options: ReplaceOptions) ReplaceError {
+<a id="L299"></a>    return io.vtable.processReplace(io.userdata, options);
+<a id="L300"></a>}
+<a id="L301"></a>
+<a id="L302"></a>/// Replaces the current process image with the executed process. If this
+<a id="L303"></a>/// function succeeds, it does not return.
+<a id="L304"></a>///
+<a id="L305"></a>/// `argv[0]` is the file path of the process to replace the current one with,
+<a id="L306"></a>/// relative to `dir`. It is *always* treated as a file path, even if it does
+<a id="L307"></a>/// not contain '/'.
+<a id="L308"></a>///
+<a id="L309"></a>/// It is illegal to call this function in a fork() child.
+<a id="L310"></a>pub fn replacePath(io: Io, dir: Io.Dir, options: ReplaceOptions) ReplaceError {
+<a id="L311"></a>    return io.vtable.processReplacePath(io.userdata, dir, options);
+<a id="L312"></a>}
+<a id="L313"></a>
+<a id="L314"></a>pub const ArgExpansion = enum { expand, no_expand };
+<a id="L315"></a>
+<a id="L316"></a>/// File name extensions supported natively by `CreateProcess()` on Windows.
+<a id="L317"></a>pub const WindowsExtension = enum { bat, cmd, com, exe };
+<a id="L318"></a>
+<a id="L319"></a>pub const SpawnError = error{
+<a id="L320"></a>    /// The operating system does not support creating child processes.
+<a id="L321"></a>    OperationUnsupported,
+<a id="L322"></a>    OutOfMemory,
+<a id="L323"></a>    /// POSIX-only. `StdIo.ignore` was selected and opening `/dev/null` returned ENODEV.
+<a id="L324"></a>    NoDevice,
+<a id="L325"></a>    /// Windows-only. `cwd` or `argv` was provided and it was invalid WTF-8.
+<a id="L326"></a>    /// https://wtf-8.codeberg.page/
+<a id="L327"></a>    InvalidWtf8,
+<a id="L328"></a>    /// Windows-only. NUL (U+0000), LF (U+000A), CR (U+000D) are not allowed
+<a id="L329"></a>    /// within arguments when executing a `.bat`/`.cmd` script.
+<a id="L330"></a>    /// - NUL/LF signifiies end of arguments, so anything afterwards
+<a id="L331"></a>    ///   would be lost after execution.
+<a id="L332"></a>    /// - CR is stripped by `cmd.exe`, so any CR codepoints
+<a id="L333"></a>    ///   would be lost after execution.
+<a id="L334"></a>    InvalidBatchScriptArg,
+<a id="L335"></a>    SystemResources,
+<a id="L336"></a>    AccessDenied,
+<a id="L337"></a>    PermissionDenied,
+<a id="L338"></a>    InvalidExe,
+<a id="L339"></a>    FileSystem,
+<a id="L340"></a>    IsDir,
+<a id="L341"></a>    FileNotFound,
+<a id="L342"></a>    NotDir,
+<a id="L343"></a>    FileBusy,
+<a id="L344"></a>    ProcessFdQuotaExceeded,
+<a id="L345"></a>    SystemFdQuotaExceeded,
+<a id="L346"></a>    ResourceLimitReached,
+<a id="L347"></a>    InvalidUserId,
+<a id="L348"></a>    InvalidProcessGroupId,
+<a id="L349"></a>    SymLinkLoop,
+<a id="L350"></a>    InvalidName,
+<a id="L351"></a>    /// An attempt was made to change the process group ID of one of the
+<a id="L352"></a>    /// children of the calling process and the child had already performed an
+<a id="L353"></a>    /// image replacement.
+<a id="L354"></a>    ProcessAlreadyExec,
+<a id="L355"></a>    /// On Windows, the volume does not contain a recognized file system. File
+<a id="L356"></a>    /// system drivers might not be loaded, or the volume may be corrupt.
+<a id="L357"></a>    UnrecognizedVolume,
+<a id="L358"></a>} || Io.File.OpenError || Io.Dir.PathNameError || Io.Cancelable || Io.UnexpectedError;
+<a id="L359"></a>
+<a id="L360"></a>pub const SpawnOptions = struct {
+<a id="L361"></a>    argv: []const []const u8,
+<a id="L362"></a>
+<a id="L363"></a>    /// Set to change the current working directory when spawning the child process.
+<a id="L364"></a>    cwd: Child.Cwd = .inherit,
+<a id="L365"></a>    /// Replaces the child environment when provided. The PATH value from here
+<a id="L366"></a>    /// is not used to resolve `argv[0]`; that resolution always uses parent
+<a id="L367"></a>    /// environment.
+<a id="L368"></a>    environ_map: ?*const Environ.Map = null,
+<a id="L369"></a>    expand_arg0: ArgExpansion = .no_expand,
+<a id="L370"></a>    /// When populated, a pipe will be created for the child process to
+<a id="L371"></a>    /// communicate progress back to the parent. The file descriptor of the
+<a id="L372"></a>    /// write end of the pipe will be specified in the `ZIG_PROGRESS`
+<a id="L373"></a>    /// environment variable inside the child process. The progress reported by
+<a id="L374"></a>    /// the child will be attached to this progress node in the parent process.
+<a id="L375"></a>    ///
+<a id="L376"></a>    /// The child's progress tree will be grafted into the parent's progress tree,
+<a id="L377"></a>    /// by substituting this node with the child's root node.
+<a id="L378"></a>    progress_node: std.Progress.Node = std.Progress.Node.none,
+<a id="L379"></a>
+<a id="L380"></a>    stdin: StdIo = .inherit,
+<a id="L381"></a>    stdout: StdIo = .inherit,
+<a id="L382"></a>    stderr: StdIo = .inherit,
+<a id="L383"></a>
+<a id="L384"></a>    /// Set to true to obtain rusage information for the child process.
+<a id="L385"></a>    /// Depending on the target platform and implementation status, the
+<a id="L386"></a>    /// requested statistics may or may not be available. If they are
+<a id="L387"></a>    /// available, then the `resource_usage_statistics` field will be populated
+<a id="L388"></a>    /// after calling `wait`.
+<a id="L389"></a>    /// On Linux and Darwin, this obtains rusage statistics from wait4().
+<a id="L390"></a>    request_resource_usage_statistics: bool = false,
+<a id="L391"></a>
+<a id="L392"></a>    /// Set to change the user id when spawning the child process.
+<a id="L393"></a>    uid: ?posix.uid_t = null,
+<a id="L394"></a>    /// Set to change the group id when spawning the child process.
+<a id="L395"></a>    gid: ?posix.gid_t = null,
+<a id="L396"></a>    /// Set to change the process group id when spawning the child process.
+<a id="L397"></a>    pgid: ?posix.pid_t = null,
+<a id="L398"></a>
+<a id="L399"></a>    /// Start child process in suspended state.
+<a id="L400"></a>    /// For Posix systems it's started as if SIGSTOP was sent.
+<a id="L401"></a>    start_suspended: bool = false,
+<a id="L402"></a>    /// Windows-only. Sets the CREATE_NO_WINDOW flag in CreateProcess.
+<a id="L403"></a>    create_no_window: bool = false,
+<a id="L404"></a>    /// Darwin-only. Disable ASLR for the child process.
+<a id="L405"></a>    disable_aslr: bool = false,
+<a id="L406"></a>
+<a id="L407"></a>    /// Behavior of the child process's standard input, output, and error streams.
+<a id="L408"></a>    pub const StdIo = union(enum) {
+<a id="L409"></a>        /// Inherit the corresponding stream from the parent process.
+<a id="L410"></a>        inherit,
+<a id="L411"></a>        /// Pass an already open file from the parent to the child.
+<a id="L412"></a>        ///
+<a id="L413"></a>        /// Nonblocking mode will be kept in the child process if present. This is
+<a id="L414"></a>        /// likely not supported by the child process. For example:
+<a id="L415"></a>        /// - Zig's std.Io.File.stdout() assumes blocking mode
+<a id="L416"></a>        /// - Rust explicity documents that nonblocking stdio may cause panics
+<a id="L417"></a>        /// - C++ standard streams do not support nonblocking file descriptors
+<a id="L418"></a>        file: File,
+<a id="L419"></a>        /// Pass a null stream to the child process by opening "/dev/null" on POSIX
+<a id="L420"></a>        /// and "NUL" on Windows.
+<a id="L421"></a>        ignore,
+<a id="L422"></a>        /// Create a new pipe for the stream.
+<a id="L423"></a>        ///
+<a id="L424"></a>        /// The corresponding field (`stdout`, `stderr`, or `stdin`) will be
+<a id="L425"></a>        /// assigned a `File` object that can be used to read from or write to the
+<a id="L426"></a>        /// pipe.
+<a id="L427"></a>        pipe,
+<a id="L428"></a>        /// Spawn the child process with the corresponding stream missing. This
+<a id="L429"></a>        /// will likely result in the child encountering EBADF if it tries to use
+<a id="L430"></a>        /// stdin, stdout, or stderr, or if only one stream is closed, it will
+<a id="L431"></a>        /// result in them getting mixed up. Generally, this option is for advanced
+<a id="L432"></a>        /// use cases only.
+<a id="L433"></a>        close,
+<a id="L434"></a>    };
+<a id="L435"></a>};
+<a id="L436"></a>
+<a id="L437"></a>/// Creates a child process.
+<a id="L438"></a>///
+<a id="L439"></a>/// `argv[0]` is the name of the program to execute. If it is not already a
+<a id="L440"></a>/// file path (i.e. it contains '/'), it is resolved into a file path based on
+<a id="L441"></a>/// PATH from the parent environment.
+<a id="L442"></a>pub fn spawn(io: Io, options: SpawnOptions) SpawnError!Child {
+<a id="L443"></a>    return io.vtable.processSpawn(io.userdata, options);
+<a id="L444"></a>}
+<a id="L445"></a>
+<a id="L446"></a>/// Creates a child process.
+<a id="L447"></a>///
+<a id="L448"></a>/// `argv[0]` is the file path of the program to execute, relative to `dir`. It
+<a id="L449"></a>/// is *always* treated as a file path, even if it does not contain '/'.
+<a id="L450"></a>pub fn spawnPath(io: Io, dir: Io.Dir, options: SpawnOptions) SpawnError!Child {
+<a id="L451"></a>    return io.vtable.processSpawnPath(io.userdata, dir, options);
+<a id="L452"></a>}
+<a id="L453"></a>
+<a id="L454"></a>pub const RunError = error{
+<a id="L455"></a>    StreamTooLong,
+<a id="L456"></a>} || SpawnError || Io.File.MultiReader.UnendingError || Io.Timeout.Error;
+<a id="L457"></a>
+<a id="L458"></a>pub const RunOptions = struct {
+<a id="L459"></a>    argv: []const []const u8,
+<a id="L460"></a>    stderr_limit: Io.Limit = .unlimited,
+<a id="L461"></a>    stdout_limit: Io.Limit = .unlimited,
+<a id="L462"></a>    /// How many bytes to initially allocate for stderr and stdout.
+<a id="L463"></a>    reserve_amount: usize = 64,
+<a id="L464"></a>
+<a id="L465"></a>    /// Set to change the current working directory when spawning the child process.
+<a id="L466"></a>    cwd: Child.Cwd = .inherit,
+<a id="L467"></a>    /// Replaces the child environment when provided. The PATH value from here
+<a id="L468"></a>    /// is not used to resolve `argv[0]`; that resolution always uses parent
+<a id="L469"></a>    /// environment.
+<a id="L470"></a>    environ_map: ?*const Environ.Map = null,
+<a id="L471"></a>    expand_arg0: ArgExpansion = .no_expand,
+<a id="L472"></a>    /// When populated, a pipe will be created for the child process to
+<a id="L473"></a>    /// communicate progress back to the parent. The file descriptor of the
+<a id="L474"></a>    /// write end of the pipe will be specified in the `ZIG_PROGRESS`
+<a id="L475"></a>    /// environment variable inside the child process. The progress reported by
+<a id="L476"></a>    /// the child will be attached to this progress node in the parent process.
+<a id="L477"></a>    ///
+<a id="L478"></a>    /// The child's progress tree will be grafted into the parent's progress tree,
+<a id="L479"></a>    /// by substituting this node with the child's root node.
+<a id="L480"></a>    progress_node: std.Progress.Node = std.Progress.Node.none,
+<a id="L481"></a>    /// Windows-only. Sets the CREATE_NO_WINDOW flag in CreateProcess.
+<a id="L482"></a>    create_no_window: bool = true,
+<a id="L483"></a>    /// Darwin-only. Disable ASLR for the child process.
+<a id="L484"></a>    disable_aslr: bool = false,
+<a id="L485"></a>    timeout: Io.Timeout = .none,
+<a id="L486"></a>};
+<a id="L487"></a>
+<a id="L488"></a>pub const RunResult = struct {
+<a id="L489"></a>    term: Child.Term,
+<a id="L490"></a>    stdout: []u8,
+<a id="L491"></a>    stderr: []u8,
+<a id="L492"></a>};
+<a id="L493"></a>
+<a id="L494"></a>/// Spawns a child process, waits for it, collecting stdout and stderr, and then returns.
+<a id="L495"></a>/// If it succeeds, the caller owns result.stdout and result.stderr memory.
+<a id="L496"></a>pub fn run(gpa: Allocator, io: Io, options: RunOptions) RunError!RunResult {
+<a id="L497"></a>    var child = try spawn(io, .{
+<a id="L498"></a>        .argv = options.argv,
+<a id="L499"></a>        .cwd = options.cwd,
+<a id="L500"></a>        .environ_map = options.environ_map,
+<a id="L501"></a>        .expand_arg0 = options.expand_arg0,
+<a id="L502"></a>        .progress_node = options.progress_node,
+<a id="L503"></a>        .create_no_window = options.create_no_window,
+<a id="L504"></a>        .disable_aslr = options.disable_aslr,
+<a id="L505"></a>
+<a id="L506"></a>        .stdin = .ignore,
+<a id="L507"></a>        .stdout = .pipe,
+<a id="L508"></a>        .stderr = .pipe,
+<a id="L509"></a>    });
+<a id="L510"></a>    defer child.kill(io);
+<a id="L511"></a>
+<a id="L512"></a>    var multi_reader_buffer: Io.File.MultiReader.Buffer(2) = undefined;
+<a id="L513"></a>    var multi_reader: Io.File.MultiReader = undefined;
+<a id="L514"></a>    multi_reader.init(gpa, io, multi_reader_buffer.toStreams(), &amp;.{ child.stdout.?, child.stderr.? });
+<a id="L515"></a>    defer multi_reader.deinit();
+<a id="L516"></a>
+<a id="L517"></a>    const stdout_reader = multi_reader.reader(0);
+<a id="L518"></a>    const stderr_reader = multi_reader.reader(1);
+<a id="L519"></a>
+<a id="L520"></a>    while (multi_reader.fill(options.reserve_amount, options.timeout)) |_| {
+<a id="L521"></a>        if (options.stdout_limit.toInt()) |limit| {
+<a id="L522"></a>            if (stdout_reader.buffered().len &gt; limit)
+<a id="L523"></a>                return error.StreamTooLong;
+<a id="L524"></a>        }
+<a id="L525"></a>        if (options.stderr_limit.toInt()) |limit| {
+<a id="L526"></a>            if (stderr_reader.buffered().len &gt; limit)
+<a id="L527"></a>                return error.StreamTooLong;
+<a id="L528"></a>        }
+<a id="L529"></a>    } else |err| switch (err) {
+<a id="L530"></a>        error.EndOfStream =&gt; {},
+<a id="L531"></a>        else =&gt; |e| return e,
+<a id="L532"></a>    }
+<a id="L533"></a>
+<a id="L534"></a>    try multi_reader.checkAnyError();
+<a id="L535"></a>
+<a id="L536"></a>    const term = try child.wait(io);
+<a id="L537"></a>
+<a id="L538"></a>    const stdout_slice = try multi_reader.toOwnedSlice(0);
+<a id="L539"></a>    errdefer gpa.free(stdout_slice);
+<a id="L540"></a>
+<a id="L541"></a>    const stderr_slice = try multi_reader.toOwnedSlice(1);
+<a id="L542"></a>    errdefer gpa.free(stderr_slice);
+<a id="L543"></a>
+<a id="L544"></a>    return .{
+<a id="L545"></a>        .stdout = stdout_slice,
+<a id="L546"></a>        .stderr = stderr_slice,
+<a id="L547"></a>        .term = term,
+<a id="L548"></a>    };
+<a id="L549"></a>}
+<a id="L550"></a>
+<a id="L551"></a>pub const TotalSystemMemoryError = error{
+<a id="L552"></a>    UnknownTotalSystemMemory,
+<a id="L553"></a>};
+<a id="L554"></a>
+<a id="L555"></a>/// Returns the total system memory, in bytes as a u64.
+<a id="L556"></a>/// We return a u64 instead of usize due to PAE on ARM
+<a id="L557"></a>/// and Linux's /proc/meminfo reporting more memory when
+<a id="L558"></a>/// using QEMU user mode emulation.
+<a id="L559"></a>pub fn totalSystemMemory() TotalSystemMemoryError!u64 {
+<a id="L560"></a>    switch (native_os) {
+<a id="L561"></a>        .linux =&gt; {
+<a id="L562"></a>            var info: std.os.linux.Sysinfo = undefined;
+<a id="L563"></a>            const result: usize = std.os.linux.sysinfo(&amp;info);
+<a id="L564"></a>            if (std.os.linux.errno(result) != .SUCCESS) {
+<a id="L565"></a>                return error.UnknownTotalSystemMemory;
+<a id="L566"></a>            }
+<a id="L567"></a>            // Promote to u64 to avoid overflow on systems where info.totalram is a 32-bit usize
+<a id="L568"></a>            return @as(u64, info.totalram) * info.mem_unit;
+<a id="L569"></a>        },
+<a id="L570"></a>        .dragonfly, .freebsd, .netbsd =&gt; {
+<a id="L571"></a>            const name = if (native_os == .netbsd) "hw.physmem64" else "hw.physmem";
+<a id="L572"></a>            var physmem: c_ulong = undefined;
+<a id="L573"></a>            var len: usize = @sizeOf(c_ulong);
+<a id="L574"></a>            switch (posix.errno(posix.system.sysctlbyname(name, &amp;physmem, &amp;len, null, 0))) {
+<a id="L575"></a>                .SUCCESS =&gt; return @intCast(physmem),
+<a id="L576"></a>                .FAULT =&gt; unreachable,
+<a id="L577"></a>                .PERM =&gt; unreachable, // only when setting values
+<a id="L578"></a>                .NOMEM =&gt; unreachable, // memory already on the stack
+<a id="L579"></a>                .NOENT =&gt; unreachable,
+<a id="L580"></a>                else =&gt; return error.UnknownTotalSystemMemory,
+<a id="L581"></a>            }
+<a id="L582"></a>        },
+<a id="L583"></a>        // whole Darwin family
+<a id="L584"></a>        .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos =&gt; {
+<a id="L585"></a>            // "hw.memsize" returns uint64_t
+<a id="L586"></a>            var physmem: u64 = undefined;
+<a id="L587"></a>            var len: usize = @sizeOf(u64);
+<a id="L588"></a>            switch (posix.errno(posix.system.sysctlbyname("hw.memsize", &amp;physmem, &amp;len, null, 0))) {
+<a id="L589"></a>                .SUCCESS =&gt; return physmem,
+<a id="L590"></a>                .FAULT =&gt; unreachable,
+<a id="L591"></a>                .PERM =&gt; unreachable, // only when setting values
+<a id="L592"></a>                .NOMEM =&gt; unreachable, // memory already on the stack
+<a id="L593"></a>                .NOENT =&gt; unreachable, // constant, known good value
+<a id="L594"></a>                else =&gt; return error.UnknownTotalSystemMemory,
+<a id="L595"></a>            }
+<a id="L596"></a>        },
+<a id="L597"></a>        .openbsd =&gt; {
+<a id="L598"></a>            const mib: [2]c_int = [_]c_int{
+<a id="L599"></a>                posix.CTL.HW,
+<a id="L600"></a>                posix.HW.PHYSMEM64,
+<a id="L601"></a>            };
+<a id="L602"></a>            var physmem: i64 = undefined;
+<a id="L603"></a>            var len: usize = @sizeOf(@TypeOf(physmem));
+<a id="L604"></a>            posix.sysctl(&amp;mib, &amp;physmem, &amp;len, null, 0) catch |err| switch (err) {
+<a id="L605"></a>                error.NameTooLong =&gt; unreachable, // constant, known good value
+<a id="L606"></a>                error.PermissionDenied =&gt; unreachable, // only when setting values,
+<a id="L607"></a>                error.SystemResources =&gt; unreachable, // memory already on the stack
+<a id="L608"></a>                error.UnknownName =&gt; unreachable, // constant, known good value
+<a id="L609"></a>                else =&gt; return error.UnknownTotalSystemMemory,
+<a id="L610"></a>            };
+<a id="L611"></a>            assert(physmem &gt;= 0);
+<a id="L612"></a>            return @as(u64, @bitCast(physmem));
+<a id="L613"></a>        },
+<a id="L614"></a>        .windows =&gt; {
+<a id="L615"></a>            var sbi: windows.SYSTEM.BASIC_INFORMATION = undefined;
+<a id="L616"></a>            const rc = windows.ntdll.NtQuerySystemInformation(
+<a id="L617"></a>                .Basic,
+<a id="L618"></a>                &amp;sbi,
+<a id="L619"></a>                @sizeOf(windows.SYSTEM.BASIC_INFORMATION),
+<a id="L620"></a>                null,
+<a id="L621"></a>            );
+<a id="L622"></a>            if (rc != .SUCCESS) {
+<a id="L623"></a>                return error.UnknownTotalSystemMemory;
+<a id="L624"></a>            }
+<a id="L625"></a>            return @as(u64, sbi.NumberOfPhysicalPages) * sbi.PageSize;
+<a id="L626"></a>        },
+<a id="L627"></a>        else =&gt; return error.UnknownTotalSystemMemory,
+<a id="L628"></a>    }
+<a id="L629"></a>}
+<a id="L630"></a>
+<a id="L631"></a>/// Indicate intent to terminate with a successful exit code.
+<a id="L632"></a>///
+<a id="L633"></a>/// In debug builds, this is a no-op, so that the calling code's cleanup
+<a id="L634"></a>/// mechanisms are tested and so that external tools checking for resource
+<a id="L635"></a>/// leaks can be accurate. In release builds, this calls `exit` with code zero,
+<a id="L636"></a>/// and does not return.
+<a id="L637"></a>pub fn cleanExit(io: Io) void {
+<a id="L638"></a>    if (builtin.mode == .Debug) return;
+<a id="L639"></a>    _ = io.lockStderr(&amp;.{}, .no_color) catch {};
+<a id="L640"></a>    exit(0);
+<a id="L641"></a>}
+<a id="L642"></a>
+<a id="L643"></a>/// Request ability to have more open file descriptors simultaneously.
+<a id="L644"></a>///
+<a id="L645"></a>/// On some systems, this raises the limit before seeing ProcessFdQuotaExceeded
+<a id="L646"></a>/// errors. On other systems, this does nothing.
+<a id="L647"></a>pub fn raiseFileDescriptorLimit() void {
+<a id="L648"></a>    const have_rlimit = posix.rlimit_resource != void;
+<a id="L649"></a>    if (!have_rlimit) return;
+<a id="L650"></a>
+<a id="L651"></a>    var lim = posix.getrlimit(.NOFILE) catch return; // Oh well; we tried.
+<a id="L652"></a>    if (native_os.isDarwin()) {
+<a id="L653"></a>        // On Darwin, `NOFILE` is bounded by a hardcoded value `OPEN_MAX`.
+<a id="L654"></a>        // According to the man pages for setrlimit():
+<a id="L655"></a>        //   setrlimit() now returns with errno set to EINVAL in places that historically succeeded.
+<a id="L656"></a>        //   It no longer accepts "rlim_cur = RLIM.INFINITY" for RLIM.NOFILE.
+<a id="L657"></a>        //   Use "rlim_cur = min(OPEN_MAX, rlim_max)".
+<a id="L658"></a>        lim.max = @min(std.c.OPEN_MAX, lim.max);
+<a id="L659"></a>    }
+<a id="L660"></a>    if (lim.cur == lim.max) return;
+<a id="L661"></a>
+<a id="L662"></a>    // Do a binary search for the limit.
+<a id="L663"></a>    var min: posix.rlim_t = lim.cur;
+<a id="L664"></a>    var max: posix.rlim_t = 1 &lt;&lt; 20;
+<a id="L665"></a>    // But if there's a defined upper bound, don't search, just set it.
+<a id="L666"></a>    if (lim.max != posix.RLIM.INFINITY) {
+<a id="L667"></a>        min = lim.max;
+<a id="L668"></a>        max = lim.max;
+<a id="L669"></a>    }
+<a id="L670"></a>
+<a id="L671"></a>    while (true) {
+<a id="L672"></a>        lim.cur = min + @divTrunc(max - min, 2); // on freebsd rlim_t is signed
+<a id="L673"></a>        if (posix.setrlimit(.NOFILE, lim)) |_| {
+<a id="L674"></a>            min = lim.cur;
+<a id="L675"></a>        } else |_| {
+<a id="L676"></a>            max = lim.cur;
+<a id="L677"></a>        }
+<a id="L678"></a>        if (min + 1 &gt;= max) break;
+<a id="L679"></a>    }
+<a id="L680"></a>}
+<a id="L681"></a>
+<a id="L682"></a>test raiseFileDescriptorLimit {
+<a id="L683"></a>    raiseFileDescriptorLimit();
+<a id="L684"></a>}
+<a id="L685"></a>
+<a id="L686"></a>/// Logs an error and then terminates the process with exit code 1.
+<a id="L687"></a>pub fn fatal(comptime format: []const u8, format_arguments: anytype) noreturn {
+<a id="L688"></a>    std.log.err(format, format_arguments);
+<a id="L689"></a>    exit(1);
+<a id="L690"></a>}
+<a id="L691"></a>
+<a id="L692"></a>pub const ExecutablePathBaseError = error{
+<a id="L693"></a>    FileNotFound,
+<a id="L694"></a>    AccessDenied,
+<a id="L695"></a>    /// The operating system does not support an executable learning its own
+<a id="L696"></a>    /// path.
+<a id="L697"></a>    OperationUnsupported,
+<a id="L698"></a>    NotDir,
+<a id="L699"></a>    SymLinkLoop,
+<a id="L700"></a>    InputOutput,
+<a id="L701"></a>    FileTooBig,
+<a id="L702"></a>    IsDir,
+<a id="L703"></a>    ProcessFdQuotaExceeded,
+<a id="L704"></a>    SystemFdQuotaExceeded,
+<a id="L705"></a>    NoDevice,
+<a id="L706"></a>    SystemResources,
+<a id="L707"></a>    NoSpaceLeft,
+<a id="L708"></a>    FileSystem,
+<a id="L709"></a>    BadPathName,
+<a id="L710"></a>    DeviceBusy,
+<a id="L711"></a>    PipeBusy,
+<a id="L712"></a>    NotLink,
+<a id="L713"></a>    PathAlreadyExists,
+<a id="L714"></a>    /// On Windows, `\\server` or `\\server\share` was not found.
+<a id="L715"></a>    NetworkNotFound,
+<a id="L716"></a>    ProcessNotFound,
+<a id="L717"></a>    /// On Windows, antivirus software is enabled by default. It can be
+<a id="L718"></a>    /// disabled, but Windows Update sometimes ignores the user's preference
+<a id="L719"></a>    /// and re-enables it. When enabled, antivirus software on Windows
+<a id="L720"></a>    /// intercepts file system operations and makes them significantly slower
+<a id="L721"></a>    /// in addition to possibly failing with this error code.
+<a id="L722"></a>    AntivirusInterference,
+<a id="L723"></a>    /// On Windows, the volume does not contain a recognized file system. File
+<a id="L724"></a>    /// system drivers might not be loaded, or the volume may be corrupt.
+<a id="L725"></a>    UnrecognizedVolume,
+<a id="L726"></a>    PermissionDenied,
+<a id="L727"></a>} || Io.Cancelable || Io.UnexpectedError;
+<a id="L728"></a>
+<a id="L729"></a>pub const ExecutablePathAllocError = ExecutablePathBaseError || Allocator.Error;
+<a id="L730"></a>
+<a id="L731"></a>pub fn executablePathAlloc(io: Io, allocator: Allocator) ExecutablePathAllocError![:0]u8 {
+<a id="L732"></a>    var buffer: [max_path_bytes]u8 = undefined;
+<a id="L733"></a>    const n = executablePath(io, &amp;buffer) catch |err| switch (err) {
+<a id="L734"></a>        error.NameTooLong =&gt; unreachable,
+<a id="L735"></a>        else =&gt; |e| return e,
+<a id="L736"></a>    };
+<a id="L737"></a>    return allocator.dupeZ(u8, buffer[0..n]);
+<a id="L738"></a>}
+<a id="L739"></a>
+<a id="L740"></a>pub const ExecutablePathError = ExecutablePathBaseError || error{NameTooLong};
+<a id="L741"></a>
+<a id="L742"></a>/// Get the path to the current executable, following symlinks.
+<a id="L743"></a>///
+<a id="L744"></a>/// This function may return an error if the current executable
+<a id="L745"></a>/// was deleted after spawning.
+<a id="L746"></a>///
+<a id="L747"></a>/// Returned value is a slice of out_buffer.
+<a id="L748"></a>///
+<a id="L749"></a>/// On Windows, the result is encoded as [WTF-8](https://wtf-8.codeberg.page/).
+<a id="L750"></a>/// On other platforms, the result is an opaque sequence of bytes with no particular encoding.
+<a id="L751"></a>///
+<a id="L752"></a>/// On Linux, depends on procfs being mounted. If the currently executing binary has
+<a id="L753"></a>/// been deleted, the file path looks something like "/a/b/c/exe (deleted)".
+<a id="L754"></a>///
+<a id="L755"></a>/// See also:
+<a id="L756"></a>/// * `executableDirPath` - to obtain only the directory
+<a id="L757"></a>/// * `openExecutable` - to obtain only an open file handle
+<a id="L758"></a>pub fn executablePath(io: Io, out_buffer: []u8) ExecutablePathError!usize {
+<a id="L759"></a>    return io.vtable.processExecutablePath(io.userdata, out_buffer);
+<a id="L760"></a>}
+<a id="L761"></a>
+<a id="L762"></a>/// Get the directory path that contains the current executable.
+<a id="L763"></a>///
+<a id="L764"></a>/// Returns index into `out_buffer`.
+<a id="L765"></a>///
+<a id="L766"></a>/// On Windows, the result is encoded as [WTF-8](https://wtf-8.codeberg.page/).
+<a id="L767"></a>/// On other platforms, the result is an opaque sequence of bytes with no particular encoding.
+<a id="L768"></a>pub fn executableDirPath(io: Io, out_buffer: []u8) ExecutablePathError!usize {
+<a id="L769"></a>    const n = try executablePath(io, out_buffer);
+<a id="L770"></a>    // Assert that the OS APIs return absolute paths, and therefore dirname
+<a id="L771"></a>    // will not return null.
+<a id="L772"></a>    return std.fs.path.dirname(out_buffer[0..n]).?.len;
+<a id="L773"></a>}
+<a id="L774"></a>
+<a id="L775"></a>/// Same as `executableDirPath` except allocates the result.
+<a id="L776"></a>pub fn executableDirPathAlloc(io: Io, allocator: Allocator) ExecutablePathAllocError![]u8 {
+<a id="L777"></a>    var buffer: [max_path_bytes]u8 = undefined;
+<a id="L778"></a>    const dir_path_len = executableDirPath(io, &amp;buffer) catch |err| switch (err) {
+<a id="L779"></a>        error.NameTooLong =&gt; unreachable,
+<a id="L780"></a>        else =&gt; |e| return e,
+<a id="L781"></a>    };
+<a id="L782"></a>    return allocator.dupe(u8, buffer[0..dir_path_len]);
+<a id="L783"></a>}
+<a id="L784"></a>
+<a id="L785"></a>pub const OpenExecutableError = File.OpenError || ExecutablePathError || File.LockError;
+<a id="L786"></a>
+<a id="L787"></a>pub fn openExecutable(io: Io, flags: File.OpenFlags) OpenExecutableError!File {
+<a id="L788"></a>    return io.vtable.processExecutableOpen(io.userdata, flags);
+<a id="L789"></a>}
+<a id="L790"></a>
+<a id="L791"></a>/// Causes abnormal process termination.
+<a id="L792"></a>///
+<a id="L793"></a>/// If linking against libc, this calls `std.c.abort`. Otherwise it raises
+<a id="L794"></a>/// SIGABRT followed by SIGKILL.
+<a id="L795"></a>///
+<a id="L796"></a>/// Invokes the current signal handler for SIGABRT, if any.
+<a id="L797"></a>pub fn abort() noreturn {
+<a id="L798"></a>    @branchHint(.cold);
+<a id="L799"></a>    // MSVCRT abort() sometimes opens a popup window which is undesirable, so
+<a id="L800"></a>    // even when linking libc on Windows we use our own abort implementation.
+<a id="L801"></a>    // See https://github.com/ziglang/zig/issues/2071 for more details.
+<a id="L802"></a>    if (native_os == .windows) {
+<a id="L803"></a>        if (builtin.mode == .Debug and windows.peb().BeingDebugged.toBool()) {
+<a id="L804"></a>            @breakpoint();
+<a id="L805"></a>        }
+<a id="L806"></a>        windows.ntdll.RtlExitUserProcess(3);
+<a id="L807"></a>    }
+<a id="L808"></a>    if (!builtin.link_libc and native_os == .linux) {
+<a id="L809"></a>        // The Linux man page says that the libc abort() function
+<a id="L810"></a>        // "first unblocks the SIGABRT signal", but this is a footgun
+<a id="L811"></a>        // for user-defined signal handlers that want to restore some state in
+<a id="L812"></a>        // some program sections and crash in others.
+<a id="L813"></a>        // So, the user-installed SIGABRT handler is run, if present.
+<a id="L814"></a>        posix.raise(.ABRT) catch {};
+<a id="L815"></a>
+<a id="L816"></a>        // Disable all signal handlers.
+<a id="L817"></a>        const filledset = std.os.linux.sigfillset();
+<a id="L818"></a>        posix.sigprocmask(posix.SIG.BLOCK, &amp;filledset, null);
+<a id="L819"></a>
+<a id="L820"></a>        // Only one thread may proceed to the rest of abort().
+<a id="L821"></a>        if (!builtin.single_threaded) {
+<a id="L822"></a>            const global = struct {
+<a id="L823"></a>                var abort_entered: bool = false;
+<a id="L824"></a>            };
+<a id="L825"></a>            while (@cmpxchgWeak(bool, &amp;global.abort_entered, false, true, .seq_cst, .seq_cst)) |_| {}
+<a id="L826"></a>        }
+<a id="L827"></a>
+<a id="L828"></a>        // Install default handler so that the tkill below will terminate.
+<a id="L829"></a>        const sigact: posix.Sigaction = .{
+<a id="L830"></a>            .handler = .{ .handler = posix.SIG.DFL },
+<a id="L831"></a>            .mask = posix.sigemptyset(),
+<a id="L832"></a>            .flags = 0,
+<a id="L833"></a>        };
+<a id="L834"></a>        posix.sigaction(.ABRT, &amp;sigact, null);
+<a id="L835"></a>
+<a id="L836"></a>        _ = std.os.linux.tkill(std.os.linux.gettid(), .ABRT);
+<a id="L837"></a>
+<a id="L838"></a>        var sigabrtmask = posix.sigemptyset();
+<a id="L839"></a>        posix.sigaddset(&amp;sigabrtmask, .ABRT);
+<a id="L840"></a>        posix.sigprocmask(posix.SIG.UNBLOCK, &amp;sigabrtmask, null);
+<a id="L841"></a>
+<a id="L842"></a>        // Beyond this point should be unreachable.
+<a id="L843"></a>        @as(*allowzero volatile u8, @ptrFromInt(0)).* = 0;
+<a id="L844"></a>        posix.raise(.KILL) catch {};
+<a id="L845"></a>        exit(127); // Pid 1 might not be signalled in some containers.
+<a id="L846"></a>    }
+<a id="L847"></a>    switch (native_os) {
+<a id="L848"></a>        .uefi, .wasi, .emscripten, .cuda, .amdhsa =&gt; @trap(),
+<a id="L849"></a>        else =&gt; posix.system.abort(),
+<a id="L850"></a>    }
+<a id="L851"></a>}
+<a id="L852"></a>
+<a id="L853"></a>/// Exits all threads of the program with the specified status code.
+<a id="L854"></a>pub fn exit(status: u8) noreturn {
+<a id="L855"></a>    if (builtin.link_libc) {
+<a id="L856"></a>        std.c.exit(status);
+<a id="L857"></a>    } else switch (native_os) {
+<a id="L858"></a>        .windows =&gt; windows.ntdll.RtlExitUserProcess(status),
+<a id="L859"></a>        .wasi =&gt; std.os.wasi.proc_exit(status),
+<a id="L860"></a>        .linux =&gt; {
+<a id="L861"></a>            if (!builtin.single_threaded) std.os.linux.exit_group(status);
+<a id="L862"></a>            posix.system.exit(status);
+<a id="L863"></a>        },
+<a id="L864"></a>        .uefi =&gt; {
+<a id="L865"></a>            const uefi = std.os.uefi;
+<a id="L866"></a>            // exit() is only available if exitBootServices() has not been called yet.
+<a id="L867"></a>            // This call to exit should not fail, so we catch-ignore errors.
+<a id="L868"></a>            if (uefi.system_table.boot_services) |bs| {
+<a id="L869"></a>                bs.exit(uefi.handle, @enumFromInt(status), null) catch {};
+<a id="L870"></a>            }
+<a id="L871"></a>            // If we can't exit, reboot the system instead.
+<a id="L872"></a>            uefi.system_table.runtime_services.resetSystem(.cold, @enumFromInt(status), null);
+<a id="L873"></a>        },
+<a id="L874"></a>        else =&gt; posix.system.exit(status),
+<a id="L875"></a>    }
+<a id="L876"></a>}
+<a id="L877"></a>
+<a id="L878"></a>pub const SetCurrentDirError = error{
+<a id="L879"></a>    AccessDenied,
+<a id="L880"></a>    BadPathName,
+<a id="L881"></a>    FileNotFound,
+<a id="L882"></a>    FileSystem,
+<a id="L883"></a>    NameTooLong,
+<a id="L884"></a>    NoDevice,
+<a id="L885"></a>    NotDir,
+<a id="L886"></a>    OperationUnsupported,
+<a id="L887"></a>    UnrecognizedVolume,
+<a id="L888"></a>} || Io.Cancelable || Io.UnexpectedError;
+<a id="L889"></a>
+<a id="L890"></a>/// Changes the current working directory to the open directory handle.
+<a id="L891"></a>/// Corresponds to "fchdir" in libc.
+<a id="L892"></a>///
+<a id="L893"></a>/// This modifies global process state and can have surprising effects in
+<a id="L894"></a>/// multithreaded applications. Most applications and especially libraries
+<a id="L895"></a>/// should not call this function as a general rule, however it can have use
+<a id="L896"></a>/// cases in, for example, implementing a shell, or child process execution.
+<a id="L897"></a>///
+<a id="L898"></a>/// Calling this function makes code less portable and less reusable.
+<a id="L899"></a>pub fn setCurrentDir(io: Io, dir: Io.Dir) !void {
+<a id="L900"></a>    return io.vtable.processSetCurrentDir(io.userdata, dir);
+<a id="L901"></a>}
+<a id="L902"></a>
+<a id="L903"></a>pub const SetCurrentPathError = error{
+<a id="L904"></a>    AccessDenied,
+<a id="L905"></a>    SymLinkLoop,
+<a id="L906"></a>    SystemResources,
+<a id="L907"></a>    BadPathName,
+<a id="L908"></a>    FileNotFound,
+<a id="L909"></a>    FileSystem,
+<a id="L910"></a>    NoDevice,
+<a id="L911"></a>    NotDir,
+<a id="L912"></a>    NameTooLong,
+<a id="L913"></a>    OperationUnsupported,
+<a id="L914"></a>    /// Windows-only. The path is invalid WTF-8.
+<a id="L915"></a>    /// https://wtf-8.codeberg.page/
+<a id="L916"></a>    InvalidWtf8,
+<a id="L917"></a>} || Io.Cancelable || Io.UnexpectedError;
+<a id="L918"></a>
+<a id="L919"></a>/// Changes the current working directory to the given path.
+<a id="L920"></a>/// Corresponds to "chdir" in libc.
+<a id="L921"></a>///
+<a id="L922"></a>/// This modifies global process state and can have surprising effects in
+<a id="L923"></a>/// multithreaded applications. Most applications and especially libraries
+<a id="L924"></a>/// should not call this function as a general rule, however it can have use
+<a id="L925"></a>/// cases in, for example, implementing a shell, or child process execution.
+<a id="L926"></a>///
+<a id="L927"></a>/// Calling this function makes code less portable and less reusable.
+<a id="L928"></a>pub fn setCurrentPath(io: Io, path: []const u8) !void {
+<a id="L929"></a>    return io.vtable.processSetCurrentPath(io.userdata, path);
+<a id="L930"></a>}
+<a id="L931"></a>
+<a id="L932"></a>pub const LockMemoryError = error{
+<a id="L933"></a>    UnsupportedOperation,
+<a id="L934"></a>    PermissionDenied,
+<a id="L935"></a>    LockedMemoryLimitExceeded,
+<a id="L936"></a>    SystemResources,
+<a id="L937"></a>} || Io.UnexpectedError;
+<a id="L938"></a>
+<a id="L939"></a>pub const LockMemoryOptions = struct {
+<a id="L940"></a>    /// Lock pages that are currently resident and mark the entire range so
+<a id="L941"></a>    /// that the remaining nonresident pages are locked when they are populated
+<a id="L942"></a>    /// by a page fault.
+<a id="L943"></a>    on_fault: bool = false,
+<a id="L944"></a>};
+<a id="L945"></a>
+<a id="L946"></a>/// Request part of the calling process's virtual address space to be in RAM,
+<a id="L947"></a>/// preventing that memory from being paged to the swap area.
+<a id="L948"></a>///
+<a id="L949"></a>/// Corresponds to "mlock" or "mlock2" in libc.
+<a id="L950"></a>///
+<a id="L951"></a>/// See also:
+<a id="L952"></a>/// * unlockMemory
+<a id="L953"></a>pub fn lockMemory(memory: []align(std.heap.page_size_min) const u8, options: LockMemoryOptions) LockMemoryError!void {
+<a id="L954"></a>    if (native_os == .windows) {
+<a id="L955"></a>        // TODO call VirtualLock
+<a id="L956"></a>    }
+<a id="L957"></a>    if (!options.on_fault and @TypeOf(posix.system.mlock) != void) {
+<a id="L958"></a>        switch (posix.errno(posix.system.mlock(memory.ptr, memory.len))) {
+<a id="L959"></a>            .SUCCESS =&gt; return,
+<a id="L960"></a>            .INVAL =&gt; |err| return std.Io.Threaded.errnoBug(err), // unaligned, negative, runs off end of addrspace
+<a id="L961"></a>            .PERM =&gt; return error.PermissionDenied,
+<a id="L962"></a>            .NOMEM =&gt; return error.LockedMemoryLimitExceeded,
+<a id="L963"></a>            .AGAIN =&gt; return error.SystemResources,
+<a id="L964"></a>            else =&gt; |err| return posix.unexpectedErrno(err),
+<a id="L965"></a>        }
+<a id="L966"></a>    }
+<a id="L967"></a>    if (@TypeOf(posix.system.mlock2) != void) {
+<a id="L968"></a>        const flags: posix.MLOCK = .{ .ONFAULT = options.on_fault };
+<a id="L969"></a>        switch (posix.errno(posix.system.mlock2(memory.ptr, memory.len, flags))) {
+<a id="L970"></a>            .SUCCESS =&gt; return,
+<a id="L971"></a>            .INVAL =&gt; |err| return std.Io.Threaded.errnoBug(err), // unaligned, negative, runs off end of addrspace
+<a id="L972"></a>            .PERM =&gt; return error.PermissionDenied,
+<a id="L973"></a>            .NOMEM =&gt; return error.LockedMemoryLimitExceeded,
+<a id="L974"></a>            .AGAIN =&gt; return error.SystemResources,
+<a id="L975"></a>            else =&gt; |err| return posix.unexpectedErrno(err),
+<a id="L976"></a>        }
+<a id="L977"></a>    }
+<a id="L978"></a>    return error.UnsupportedOperation;
+<a id="L979"></a>}
+<a id="L980"></a>
+<a id="L981"></a>pub const UnlockMemoryError = error{
+<a id="L982"></a>    PermissionDenied,
+<a id="L983"></a>    OutOfMemory,
+<a id="L984"></a>    SystemResources,
+<a id="L985"></a>} || Io.UnexpectedError;
+<a id="L986"></a>
+<a id="L987"></a>/// Withdraw request for process's virtual address space to be in RAM.
+<a id="L988"></a>///
+<a id="L989"></a>/// Corresponds to "munlock" in libc.
+<a id="L990"></a>///
+<a id="L991"></a>/// See also:
+<a id="L992"></a>/// * `lockMemory`
+<a id="L993"></a>pub fn unlockMemory(memory: []align(std.heap.page_size_min) const u8) UnlockMemoryError!void {
+<a id="L994"></a>    if (@TypeOf(posix.system.munlock) == void) return;
+<a id="L995"></a>    switch (posix.errno(posix.system.munlock(memory.ptr, memory.len))) {
+<a id="L996"></a>        .SUCCESS =&gt; return,
+<a id="L997"></a>        .INVAL =&gt; |err| return std.Io.Threaded.errnoBug(err), // unaligned or runs off end of addr space
+<a id="L998"></a>        .PERM =&gt; return error.PermissionDenied,
+<a id="L999"></a>        .NOMEM =&gt; return error.OutOfMemory,
+<a id="L1000"></a>        .AGAIN =&gt; return error.SystemResources,
+<a id="L1001"></a>        else =&gt; |err| return posix.unexpectedErrno(err),
+<a id="L1002"></a>    }
+<a id="L1003"></a>}
+<a id="L1004"></a>
+<a id="L1005"></a>pub const LockMemoryAllOptions = struct {
+<a id="L1006"></a>    current: bool = false,
+<a id="L1007"></a>    future: bool = false,
+<a id="L1008"></a>    /// Asserted to be used together with `current` or `future`, or both.
+<a id="L1009"></a>    on_fault: bool = false,
+<a id="L1010"></a>};
+<a id="L1011"></a>
+<a id="L1012"></a>pub fn lockMemoryAll(options: LockMemoryAllOptions) LockMemoryError!void {
+<a id="L1013"></a>    if (@TypeOf(posix.system.mlockall) == void) return error.UnsupportedOperation;
+<a id="L1014"></a>    var flags: posix.MCL = .{
+<a id="L1015"></a>        .CURRENT = options.current,
+<a id="L1016"></a>        .FUTURE = options.future,
+<a id="L1017"></a>    };
+<a id="L1018"></a>    if (options.on_fault) {
+<a id="L1019"></a>        assert(options.current or options.future);
+<a id="L1020"></a>        if (@hasField(posix.MCL, "ONFAULT")) {
+<a id="L1021"></a>            flags.ONFAULT = true;
+<a id="L1022"></a>        } else {
+<a id="L1023"></a>            return error.UnsupportedOperation;
+<a id="L1024"></a>        }
+<a id="L1025"></a>    }
+<a id="L1026"></a>    switch (posix.errno(posix.system.mlockall(flags))) {
+<a id="L1027"></a>        .SUCCESS =&gt; return,
+<a id="L1028"></a>        .INVAL =&gt; |err| return std.Io.Threaded.errnoBug(err),
+<a id="L1029"></a>        .PERM =&gt; return error.PermissionDenied,
+<a id="L1030"></a>        .NOMEM =&gt; return error.LockedMemoryLimitExceeded,
+<a id="L1031"></a>        .AGAIN =&gt; return error.SystemResources,
+<a id="L1032"></a>        else =&gt; |err| return posix.unexpectedErrno(err),
+<a id="L1033"></a>    }
+<a id="L1034"></a>}
+<a id="L1035"></a>
+<a id="L1036"></a>pub fn unlockMemoryAll() UnlockMemoryError!void {
+<a id="L1037"></a>    if (@TypeOf(posix.system.munlockall) == void) return;
+<a id="L1038"></a>    switch (posix.errno(posix.system.munlockall())) {
+<a id="L1039"></a>        .SUCCESS =&gt; return,
+<a id="L1040"></a>        .PERM =&gt; return error.PermissionDenied,
+<a id="L1041"></a>        .NOMEM =&gt; return error.OutOfMemory,
+<a id="L1042"></a>        .AGAIN =&gt; return error.SystemResources,
+<a id="L1043"></a>        else =&gt; |err| return posix.unexpectedErrno(err),
+<a id="L1044"></a>    }
+<a id="L1045"></a>}
+<a id="L1046"></a>
+<a id="L1047"></a>pub const ProtectMemoryError = error{
+<a id="L1048"></a>    UnsupportedOperation,
+<a id="L1049"></a>    /// OpenBSD will refuse to change memory protection if the specified region
+<a id="L1050"></a>    /// contains any pages that have previously been marked immutable using the
+<a id="L1051"></a>    /// `mimmutable` function.
+<a id="L1052"></a>    PermissionDenied,
+<a id="L1053"></a>    /// The memory cannot be given the specified access. This can happen, for
+<a id="L1054"></a>    /// example, if you memory map a file to which you have read-only access,
+<a id="L1055"></a>    /// then use `protectMemory` to mark it writable.
+<a id="L1056"></a>    AccessDenied,
+<a id="L1057"></a>    /// Changing the protection of a memory region would result in the total
+<a id="L1058"></a>    /// number of mappings with distinct attributes exceeding the allowed
+<a id="L1059"></a>    /// maximum.
+<a id="L1060"></a>    OutOfMemory,
+<a id="L1061"></a>} || Io.UnexpectedError;
+<a id="L1062"></a>
+<a id="L1063"></a>pub const MemoryProtection = packed struct(u3) {
+<a id="L1064"></a>    read: bool = false,
+<a id="L1065"></a>    write: bool = false,
+<a id="L1066"></a>    execute: bool = false,
+<a id="L1067"></a>};
+<a id="L1068"></a>
+<a id="L1069"></a>pub fn protectMemory(memory: []align(std.heap.page_size_min) u8, protection: MemoryProtection) ProtectMemoryError!void {
+<a id="L1070"></a>    if (native_os == .windows) {
+<a id="L1071"></a>        var addr = memory.ptr; // ntdll takes an extra level of indirection here
+<a id="L1072"></a>        var size = memory.len; // ntdll takes an extra level of indirection here
+<a id="L1073"></a>        var old: windows.PAGE = undefined;
+<a id="L1074"></a>        const current_process: windows.HANDLE = @ptrFromInt(@as(usize, @bitCast(@as(isize, -1))));
+<a id="L1075"></a>        const new = windows.PAGE.fromProtection(protection) orelse return error.AccessDenied;
+<a id="L1076"></a>        switch (windows.ntdll.NtProtectVirtualMemory(current_process, @ptrCast(&amp;addr), &amp;size, new, &amp;old)) {
+<a id="L1077"></a>            .SUCCESS =&gt; return,
+<a id="L1078"></a>            .INVALID_ADDRESS =&gt; return error.AccessDenied,
+<a id="L1079"></a>            else =&gt; |st| return windows.unexpectedStatus(st),
+<a id="L1080"></a>        }
+<a id="L1081"></a>    } else if (posix.PROT != void) {
+<a id="L1082"></a>        const flags: posix.PROT = .{
+<a id="L1083"></a>            .READ = protection.read,
+<a id="L1084"></a>            .WRITE = protection.write,
+<a id="L1085"></a>            .EXEC = protection.execute,
+<a id="L1086"></a>        };
+<a id="L1087"></a>        switch (posix.errno(posix.system.mprotect(memory.ptr, memory.len, flags))) {
+<a id="L1088"></a>            .SUCCESS =&gt; return,
+<a id="L1089"></a>            .PERM =&gt; return error.PermissionDenied,
+<a id="L1090"></a>            .INVAL =&gt; |err| return std.Io.Threaded.errnoBug(err),
+<a id="L1091"></a>            .ACCES =&gt; return error.AccessDenied,
+<a id="L1092"></a>            .NOMEM =&gt; return error.OutOfMemory,
+<a id="L1093"></a>            else =&gt; |err| return posix.unexpectedErrno(err),
+<a id="L1094"></a>        }
+<a id="L1095"></a>    }
+<a id="L1096"></a>    return error.UnsupportedOperation;
+<a id="L1097"></a>}
+<a id="L1098"></a>
+<a id="L1099"></a>var test_page: [std.heap.page_size_max]u8 align(std.heap.page_size_max) = undefined;
+<a id="L1100"></a>
+<a id="L1101"></a>test lockMemory {
+<a id="L1102"></a>    lockMemory(&amp;test_page, .{}) catch return error.SkipZigTest;
+<a id="L1103"></a>    unlockMemory(&amp;test_page) catch return error.SkipZigTest;
+<a id="L1104"></a>}
+<a id="L1105"></a>
+<a id="L1106"></a>test lockMemoryAll {
+<a id="L1107"></a>    lockMemoryAll(.{ .current = true }) catch return error.SkipZigTest;
+<a id="L1108"></a>    unlockMemoryAll() catch return error.SkipZigTest;
+<a id="L1109"></a>}
+<a id="L1110"></a>
+<a id="L1111"></a>test protectMemory {
+<a id="L1112"></a>    protectMemory(&amp;test_page, .{}) catch return error.SkipZigTest;
+<a id="L1113"></a>    protectMemory(&amp;test_page, .{ .read = true, .write = true }) catch return error.SkipZigTest;
+<a id="L1114"></a>}
+</pre>
 </body>
 </html>

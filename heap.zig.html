@@ -2,1038 +2,1041 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Source: zig-0.16.0-std/heap.zig</title>
+    <title>Source: heap.zig</title>
     <style>
         body { background: #1e1e1e; color: #d4d4d4; font-family: monospace; padding: 20px; }
         pre { white-space: pre-wrap; word-wrap: break-word; }
         .header { border-bottom: 1px solid #444; padding-bottom: 10px; margin-bottom: 20px; }
         a { color: #569cd6; }
+        a[id] { color: inherit; text-decoration: none; }
+        :target { background: #3a3a00; }
     </style>
 </head>
 <body>
     <div class="header">
-        <a href="/">Index</a> | <strong>File: zig-0.16.0-std/heap.zig</strong>
+        <a href="/">Index</a> | <strong>File: heap.zig</strong>
     </div>
-    <pre>const std = @import("std.zig");
-const builtin = @import("builtin");
-const root = @import("root");
-const assert = std.debug.assert;
-const testing = std.testing;
-const mem = std.mem;
-const c = std.c;
-const Allocator = std.mem.Allocator;
-const windows = std.os.windows;
-const Alignment = std.mem.Alignment;
-
-pub const ArenaAllocator = @import("heap/ArenaAllocator.zig");
-pub const SmpAllocator = @import("heap/SmpAllocator.zig");
-pub const FixedBufferAllocator = @import("heap/FixedBufferAllocator.zig");
-pub const PageAllocator = @import("heap/PageAllocator.zig");
-pub const WasmAllocator = if (builtin.single_threaded) BrkAllocator else @compileError("unimplemented");
-pub const BrkAllocator = @import("heap/BrkAllocator.zig");
-
-pub const DebugAllocatorConfig = @import("heap/debug_allocator.zig").Config;
-pub const DebugAllocator = @import("heap/debug_allocator.zig").DebugAllocator;
-pub const Check = enum { ok, leak };
-
-/// A memory pool that can allocate objects of a single type very quickly.
-/// Use this when you need to allocate a lot of objects of the same type,
-/// because it outperforms general purpose allocators.
-/// Functions that potentially allocate memory accept an `Allocator` parameter.
-pub fn MemoryPool(comptime Item: type) type {
-    return memory_pool.Extra(Item, .{ .alignment = null });
-}
-pub const memory_pool = @import("heap/memory_pool.zig");
-
-/// Deprecated; use `memory_pool.Aligned`.
-pub const MemoryPoolAligned = memory_pool.Aligned;
-/// Deprecated; use `memory_pool.Extra`.
-pub const MemoryPoolExtra = memory_pool.Extra;
-/// Deprecated; use `memory_pool.Options`.
-pub const MemoryPoolOptions = memory_pool.Options;
-
-/// comptime-known minimum page size of the target.
-///
-/// All pointers from `mmap` or `NtAllocateVirtualMemory` are aligned to at least
-/// `page_size_min`, but their actual alignment may be bigger.
-///
-/// This value can be overridden via `std.options.page_size_min`.
-///
-/// On many systems, the actual page size can only be determined at runtime
-/// with `pageSize`.
-pub const page_size_min: usize = std.options.page_size_min orelse (page_size_min_default orelse @compileError(@tagName(builtin.cpu.arch) ++ "-" ++ @tagName(builtin.os.tag) ++ " has unknown page_size_min; populate std.options.page_size_min"));
-/// comptime-known maximum page size of the target.
-///
-/// Targeting a system with a larger page size may require overriding
-/// `std.options.page_size_max`, as well as providing a corresponding linker
-/// option.
-///
-/// The actual page size can only be determined at runtime with `pageSize`.
-pub const page_size_max: usize = std.options.page_size_max orelse (page_size_max_default orelse if (builtin.os.tag == .freestanding or builtin.os.tag == .other)
-    @compileError("freestanding/other page_size_max must provided with std.options.page_size_max")
-else
-    @compileError(@tagName(builtin.cpu.arch) ++ "-" ++ @tagName(builtin.os.tag) ++ " has unknown page_size_max; populate std.options.page_size_max"));
-
-/// If the page size is comptime-known, return value is comptime.
-/// Otherwise, calls `std.options.queryPageSize` which by default queries the
-/// host operating system at runtime.
-pub inline fn pageSize() usize {
-    if (page_size_min == page_size_max) return page_size_min;
-    return std.options.queryPageSize();
-}
-
-test pageSize {
-    assert(std.math.isPowerOfTwo(pageSize()));
-}
-
-/// The default implementation of `std.options.queryPageSize`.
-/// Asserts that the page size is within `page_size_min` and `page_size_max`
-pub fn defaultQueryPageSize() usize {
-    const global = struct {
-        var cached_result: std.atomic.Value(usize) = .init(0);
-    };
-    var size = global.cached_result.load(.unordered);
-    if (size &gt; 0) return size;
-    size = size: switch (builtin.os.tag) {
-        .linux =&gt; if (builtin.link_libc)
-            @max(std.c.sysconf(@intFromEnum(std.c._SC.PAGESIZE)), 0)
-        else
-            std.os.linux.getauxval(std.elf.AT_PAGESZ),
-        .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos =&gt; {
-            const task_port = std.c.mach_task_self();
-            // mach_task_self may fail "if there are any resource failures or other errors".
-            if (task_port == std.c.TASK.NULL) break :size 0;
-            var info_count = std.c.TASK.VM.INFO_COUNT;
-            var vm_info: std.c.task_vm_info_data_t = undefined;
-            vm_info.page_size = 0;
-            _ = std.c.task_info(
-                task_port,
-                std.c.TASK.VM.INFO,
-                @as(std.c.task_info_t, @ptrCast(&amp;vm_info)),
-                &amp;info_count,
-            );
-            break :size @intCast(vm_info.page_size);
-        },
-        .windows =&gt; {
-            var sbi: windows.SYSTEM.BASIC_INFORMATION = undefined;
-            switch (windows.ntdll.NtQuerySystemInformation(
-                .Basic,
-                &amp;sbi,
-                @sizeOf(windows.SYSTEM.BASIC_INFORMATION),
-                null,
-            )) {
-                .SUCCESS =&gt; break :size sbi.PageSize,
-                else =&gt; break :size 0,
-            }
-        },
-        else =&gt; if (builtin.link_libc)
-            @max(std.c.sysconf(@intFromEnum(std.c._SC.PAGESIZE)), 0)
-        else if (builtin.os.tag == .freestanding or builtin.os.tag == .other)
-            @compileError("unsupported target: freestanding/other")
-        else
-            @compileError("pageSize on " ++ @tagName(builtin.cpu.arch) ++ "-" ++ @tagName(builtin.os.tag) ++ " is not supported without linking libc, using the default implementation"),
-    };
-    if (size == 0) size = page_size_max;
-
-    assert(size &gt;= page_size_min);
-    assert(size &lt;= page_size_max);
-    global.cached_result.store(size, .unordered);
-
-    return size;
-}
-
-test defaultQueryPageSize {
-    if (builtin.cpu.arch.isWasm()) return error.SkipZigTest;
-    assert(std.math.isPowerOfTwo(defaultQueryPageSize()));
-}
-
-/// A wrapper around the C memory allocation API which supports the full `Allocator`
-/// interface, including arbitrary alignment. Simple `malloc` calls are used when
-/// possible, but large requested alignments may require larger buffers in order to
-/// satisfy the request. As well as `malloc`, `realloc`, and `free`, the extension
-/// functions `malloc_usable_size` and `posix_memalign` are used when available.
-pub const c_allocator: Allocator = .{
-    .ptr = undefined,
-    .vtable = &amp;c_allocator_impl.vtable,
-};
-const c_allocator_impl = struct {
-    comptime {
-        if (!builtin.link_libc) {
-            @compileError("C allocator is only available when linking against libc");
-        }
-    }
-
-    const vtable: Allocator.VTable = .{
-        .alloc = alloc,
-        .resize = resize,
-        .remap = remap,
-        .free = free,
-    };
-
-    const have_posix_memalign = switch (builtin.os.tag) {
-        .dragonfly,
-        .netbsd,
-        .freebsd,
-        .illumos,
-        .openbsd,
-        .linux,
-        .driverkit,
-        .ios,
-        .maccatalyst,
-        .macos,
-        .tvos,
-        .visionos,
-        .watchos,
-        .serenity,
-        =&gt; true,
-        else =&gt; false,
-    };
-
-    fn allocStrat(need_align: Alignment) union(enum) {
-        raw,
-        posix_memalign: if (have_posix_memalign) void else noreturn,
-        manual_align: if (have_posix_memalign) noreturn else void,
-    } {
-        // If `malloc` guarantees `need_align`, always prefer a raw allocation.
-        if (Alignment.compare(need_align, .lte, .of(c.max_align_t))) {
-            return .raw;
-        }
-        // Use `posix_memalign` if available. Otherwise, we must manually align the allocation.
-        return if (have_posix_memalign) .posix_memalign else .manual_align;
-    }
-
-    /// If `allocStrat(a) == .manual_align`, an allocation looks like this:
-    ///
-    /// unaligned_ptr   hdr_ptr  aligned_ptr
-    /// v               v        v
-    /// +---------------+--------+--------------+
-    /// |    padding    | header | usable bytes |
-    /// +---------------+--------+--------------+
-    ///
-    /// * `unaligned_ptr` is the raw return value of `malloc`.
-    /// * `aligned_ptr` is computed by aligning `unaligned_ptr` forward; it is what `alloc` returns.
-    /// * `hdr_ptr` points to a pointer-sized header directly before the usable space. This header
-    ///   contains the value `unaligned_ptr`, so that we can pass it to `free` later. This is
-    ///   necessary because the width of the padding is unknown.
-    ///
-    /// This function accepts `aligned_ptr` and offsets it backwards to return `hdr_ptr`.
-    fn manualAlignHeader(aligned_ptr: [*]u8) *[*]u8 {
-        return @ptrCast(@alignCast(aligned_ptr - @sizeOf(usize)));
-    }
-
-    fn alloc(
-        _: *anyopaque,
-        len: usize,
-        alignment: Alignment,
-        return_address: usize,
-    ) ?[*]u8 {
-        _ = return_address;
-        assert(len &gt; 0);
-        switch (allocStrat(alignment)) {
-            .raw =&gt; {
-                // `std.c.max_align_t` isn't the whole story, because if `len` is smaller than
-                // every C type with alignment `max_align_t`, the allocation can be less-aligned.
-                // The implementation need only guarantee that any type of length `len` would be
-                // suitably aligned.
-                //
-                // For instance, if `len == 8` and `alignment == .@"16"`, then `malloc` may not
-                // fulfil this request, because there is necessarily no C type with 8-byte size
-                // but 16-byte alignment.
-                //
-                // In theory, the resulting rule here would be target-specific, but in practice,
-                // the smallest type with an alignment of `max_align_t` has the same size (it's
-                // usually `c_longdouble`), so we can just extend the allocation size up to the
-                // alignment of `max_align_t` if necessary.
-                const actual_len = @max(len, @alignOf(std.c.max_align_t));
-                const ptr = c.malloc(actual_len) orelse return null;
-                assert(alignment.check(@intFromPtr(ptr)));
-                return @ptrCast(ptr);
-            },
-            .posix_memalign =&gt; {
-                // The posix_memalign only accepts alignment values that are a
-                // multiple of the pointer size
-                const effective_alignment = @max(alignment.toByteUnits(), @sizeOf(usize));
-                var aligned_ptr: ?*anyopaque = undefined;
-                if (c.posix_memalign(&amp;aligned_ptr, effective_alignment, len) != 0) {
-                    return null;
-                }
-                assert(alignment.check(@intFromPtr(aligned_ptr)));
-                return @ptrCast(aligned_ptr);
-            },
-            .manual_align =&gt; {
-                // Overallocate to account for alignment padding and store the original pointer
-                // returned by `malloc` before the aligned address.
-                const padded_len = len + @sizeOf(usize) + alignment.toByteUnits() - 1;
-                const unaligned_ptr: [*]u8 = @ptrCast(c.malloc(padded_len) orelse return null);
-                const unaligned_addr = @intFromPtr(unaligned_ptr);
-                const aligned_addr = alignment.forward(unaligned_addr + @sizeOf(usize));
-                const aligned_ptr = unaligned_ptr + (aligned_addr - unaligned_addr);
-                manualAlignHeader(aligned_ptr).* = unaligned_ptr;
-                return aligned_ptr;
-            },
-        }
-    }
-
-    fn resize(
-        _: *anyopaque,
-        memory: []u8,
-        alignment: Alignment,
-        new_len: usize,
-        return_address: usize,
-    ) bool {
-        _ = return_address;
-        assert(new_len &gt; 0);
-        if (new_len &lt;= memory.len) {
-            return true; // in-place shrink always works
-        }
-        const mallocSize = func: {
-            if (@TypeOf(c.malloc_size) != void) break :func c.malloc_size;
-            if (@TypeOf(c.malloc_usable_size) != void) break :func c.malloc_usable_size;
-            if (@TypeOf(c._msize) != void) break :func c._msize;
-            return false; // we don't know how much space is actually available
-        };
-        const usable_len: usize = switch (allocStrat(alignment)) {
-            .raw, .posix_memalign =&gt; mallocSize(memory.ptr),
-            .manual_align =&gt; usable_len: {
-                const unaligned_ptr = manualAlignHeader(memory.ptr).*;
-                const full_len = mallocSize(unaligned_ptr);
-                const padding = @intFromPtr(memory.ptr) - @intFromPtr(unaligned_ptr);
-                break :usable_len full_len - padding;
-            },
-        };
-        return new_len &lt;= usable_len;
-    }
-
-    fn remap(
-        ctx: *anyopaque,
-        memory: []u8,
-        alignment: Alignment,
-        new_len: usize,
-        return_address: usize,
-    ) ?[*]u8 {
-        assert(new_len &gt; 0);
-        // Prefer resizing in-place if possible, since `realloc` could be expensive even if legal.
-        if (resize(ctx, memory, alignment, new_len, return_address)) {
-            return memory.ptr;
-        }
-        switch (allocStrat(alignment)) {
-            .raw =&gt; {
-                // `malloc` and friends guarantee the required alignment, so we can try `realloc`.
-                // C only needs to respect `max_align_t` up to the allocation size due to object
-                // alignment rules. If necessary, extend the allocation size.
-                const actual_len = @max(new_len, @alignOf(std.c.max_align_t));
-                const new_ptr = c.realloc(memory.ptr, actual_len) orelse return null;
-                assert(alignment.check(@intFromPtr(new_ptr)));
-                return @ptrCast(new_ptr);
-            },
-            .posix_memalign, .manual_align =&gt; {
-                // `realloc` would potentially return a new allocation which does not respect
-                // the original alignment, so we can't do anything more.
-                return null;
-            },
-        }
-    }
-
-    fn free(
-        _: *anyopaque,
-        memory: []u8,
-        alignment: Alignment,
-        return_address: usize,
-    ) void {
-        _ = return_address;
-        switch (allocStrat(alignment)) {
-            .raw, .posix_memalign =&gt; c.free(memory.ptr),
-            .manual_align =&gt; c.free(manualAlignHeader(memory.ptr).*),
-        }
-    }
-};
-
-/// On operating systems that support memory mapping, this allocator makes a
-/// syscall directly for every allocation and free.
-///
-/// Otherwise, it falls back to the preferred singleton for the target.
-///
-/// Thread-safe.
-pub const page_allocator: Allocator = if (@hasDecl(root, "os") and
-    @hasDecl(root.os, "heap") and
-    @hasDecl(root.os.heap, "page_allocator"))
-    root.os.heap.page_allocator
-else if (builtin.target.cpu.arch.isWasm()) .{
-    .ptr = undefined,
-    .vtable = &amp;WasmAllocator.vtable,
-} else .{
-    .ptr = undefined,
-    .vtable = &amp;PageAllocator.vtable,
-};
-
-pub const smp_allocator: Allocator = .{
-    .ptr = undefined,
-    .vtable = &amp;SmpAllocator.vtable,
-};
-
-/// This allocator is fast, small, and specific to WebAssembly.
-pub const wasm_allocator: Allocator = .{
-    .ptr = undefined,
-    .vtable = &amp;WasmAllocator.vtable,
-};
-
-/// Supports single-threaded WebAssembly and Linux.
-pub const brk_allocator: Allocator = .{
-    .ptr = undefined,
-    .vtable = &amp;BrkAllocator.vtable,
-};
-
-/// Returns a `StackFallbackAllocator` allocating using either a
-/// `FixedBufferAllocator` on an array of size `size` and falling back to
-/// `fallback_allocator` if that fails.
-pub fn stackFallback(comptime size: usize, fallback_allocator: Allocator) StackFallbackAllocator(size) {
-    return StackFallbackAllocator(size){
-        .buffer = undefined,
-        .fallback_allocator = fallback_allocator,
-        .fixed_buffer_allocator = undefined,
-    };
-}
-
-/// An allocator that attempts to allocate using a
-/// `FixedBufferAllocator` using an array of size `size`. If the
-/// allocation fails, it will fall back to using
-/// `fallback_allocator`. Easily created with `stackFallback`.
-pub fn StackFallbackAllocator(comptime size: usize) type {
-    return struct {
-        const Self = @This();
-
-        buffer: [size]u8,
-        fallback_allocator: Allocator,
-        fixed_buffer_allocator: FixedBufferAllocator,
-        get_called: if (std.debug.runtime_safety) bool else void =
-            if (std.debug.runtime_safety) false else {},
-
-        /// This function both fetches a `Allocator` interface to this
-        /// allocator *and* resets the internal buffer allocator.
-        pub fn get(self: *Self) Allocator {
-            if (std.debug.runtime_safety) {
-                assert(!self.get_called); // `get` called multiple times; instead use `const allocator = stackFallback(N).get();`
-                self.get_called = true;
-            }
-            self.fixed_buffer_allocator = FixedBufferAllocator.init(self.buffer[0..]);
-            return .{
-                .ptr = self,
-                .vtable = &amp;.{
-                    .alloc = alloc,
-                    .resize = resize,
-                    .remap = remap,
-                    .free = free,
-                },
-            };
-        }
-
-        /// Unlike most std allocators `StackFallbackAllocator` modifies
-        /// its internal state before returning an implementation of
-        /// the`Allocator` interface and therefore also doesn't use
-        /// the usual `.allocator()` method.
-        pub const allocator = @compileError("use 'const allocator = stackFallback(N).get();' instead");
-
-        fn alloc(
-            ctx: *anyopaque,
-            len: usize,
-            alignment: Alignment,
-            ra: usize,
-        ) ?[*]u8 {
-            const self: *Self = @ptrCast(@alignCast(ctx));
-            return FixedBufferAllocator.alloc(&amp;self.fixed_buffer_allocator, len, alignment, ra) orelse
-                return self.fallback_allocator.rawAlloc(len, alignment, ra);
-        }
-
-        fn resize(
-            ctx: *anyopaque,
-            buf: []u8,
-            alignment: Alignment,
-            new_len: usize,
-            ra: usize,
-        ) bool {
-            const self: *Self = @ptrCast(@alignCast(ctx));
-            if (self.fixed_buffer_allocator.ownsPtr(buf.ptr)) {
-                return FixedBufferAllocator.resize(&amp;self.fixed_buffer_allocator, buf, alignment, new_len, ra);
-            } else {
-                return self.fallback_allocator.rawResize(buf, alignment, new_len, ra);
-            }
-        }
-
-        fn remap(
-            context: *anyopaque,
-            memory: []u8,
-            alignment: Alignment,
-            new_len: usize,
-            return_address: usize,
-        ) ?[*]u8 {
-            const self: *Self = @ptrCast(@alignCast(context));
-            if (self.fixed_buffer_allocator.ownsPtr(memory.ptr)) {
-                return FixedBufferAllocator.remap(&amp;self.fixed_buffer_allocator, memory, alignment, new_len, return_address);
-            } else {
-                return self.fallback_allocator.rawRemap(memory, alignment, new_len, return_address);
-            }
-        }
-
-        fn free(
-            ctx: *anyopaque,
-            buf: []u8,
-            alignment: Alignment,
-            ra: usize,
-        ) void {
-            const self: *Self = @ptrCast(@alignCast(ctx));
-            if (self.fixed_buffer_allocator.ownsPtr(buf.ptr)) {
-                return FixedBufferAllocator.free(&amp;self.fixed_buffer_allocator, buf, alignment, ra);
-            } else {
-                return self.fallback_allocator.rawFree(buf, alignment, ra);
-            }
-        }
-    };
-}
-
-test c_allocator {
-    if (builtin.link_libc) {
-        try testAllocator(c_allocator);
-        try testAllocatorAligned(c_allocator);
-        try testAllocatorLargeAlignment(c_allocator);
-        try testAllocatorAlignedShrink(c_allocator);
-    }
-}
-
-test smp_allocator {
-    if (builtin.single_threaded) return;
-    try testAllocator(smp_allocator);
-    try testAllocatorAligned(smp_allocator);
-    try testAllocatorLargeAlignment(smp_allocator);
-    try testAllocatorAlignedShrink(smp_allocator);
-}
-
-test PageAllocator {
-    const allocator = page_allocator;
-    try testAllocator(allocator);
-    try testAllocatorAligned(allocator);
-    if (!builtin.target.cpu.arch.isWasm()) {
-        try testAllocatorLargeAlignment(allocator);
-        try testAllocatorAlignedShrink(allocator);
-    }
-
-    if (builtin.os.tag == .windows) {
-        const slice = try allocator.alignedAlloc(u8, .fromByteUnits(page_size_min), 128);
-        slice[0] = 0x12;
-        slice[127] = 0x34;
-        allocator.free(slice);
-    }
-    {
-        var buf = try allocator.alloc(u8, pageSize() + 1);
-        defer allocator.free(buf);
-        buf = try allocator.realloc(buf, 1); // shrink past the page boundary
-    }
-}
-
-test ArenaAllocator {
-    var arena_allocator = ArenaAllocator.init(page_allocator);
-    defer arena_allocator.deinit();
-    const allocator = arena_allocator.allocator();
-
-    try testAllocator(allocator);
-    try testAllocatorAligned(allocator);
-    try testAllocatorLargeAlignment(allocator);
-    try testAllocatorAlignedShrink(allocator);
-}
-
-test "StackFallbackAllocator" {
-    {
-        var stack_allocator = stackFallback(4096, std.testing.allocator);
-        try testAllocator(stack_allocator.get());
-    }
-    {
-        var stack_allocator = stackFallback(4096, std.testing.allocator);
-        try testAllocatorAligned(stack_allocator.get());
-    }
-    {
-        var stack_allocator = stackFallback(4096, std.testing.allocator);
-        try testAllocatorLargeAlignment(stack_allocator.get());
-    }
-    {
-        var stack_allocator = stackFallback(4096, std.testing.allocator);
-        try testAllocatorAlignedShrink(stack_allocator.get());
-    }
-}
-
-/// This one should not try alignments that exceed what C malloc can handle.
-pub fn testAllocator(base_allocator: mem.Allocator) !void {
-    var validationAllocator = mem.validationWrap(base_allocator);
-    const allocator = validationAllocator.allocator();
-
-    var slice = try allocator.alloc(*i32, 100);
-    try testing.expect(slice.len == 100);
-    for (slice, 0..) |*item, i| {
-        item.* = try allocator.create(i32);
-        item.*.* = @as(i32, @intCast(i));
-    }
-
-    slice = try allocator.realloc(slice, 20000);
-    try testing.expect(slice.len == 20000);
-
-    for (slice[0..100], 0..) |item, i| {
-        try testing.expect(item.* == @as(i32, @intCast(i)));
-        allocator.destroy(item);
-    }
-
-    if (allocator.resize(slice, 50)) {
-        slice = slice[0..50];
-        if (allocator.resize(slice, 25)) {
-            slice = slice[0..25];
-            try testing.expect(allocator.resize(slice, 0));
-            slice = slice[0..0];
-            slice = try allocator.realloc(slice, 10);
-            try testing.expect(slice.len == 10);
-        }
-    }
-    allocator.free(slice);
-
-    // Zero-length allocation
-    const empty = try allocator.alloc(u8, 0);
-    allocator.free(empty);
-    // Allocation with zero-sized types
-    const zero_bit_ptr = try allocator.create(u0);
-    zero_bit_ptr.* = 0;
-    allocator.destroy(zero_bit_ptr);
-    const zero_len_array = try allocator.create([0]u64);
-    allocator.destroy(zero_len_array);
-
-    const oversize = try allocator.alignedAlloc(u32, null, 5);
-    try testing.expect(oversize.len &gt;= 5);
-    for (oversize) |*item| {
-        item.* = 0xDEADBEEF;
-    }
-    allocator.free(oversize);
-}
-
-pub fn testAllocatorAligned(base_allocator: mem.Allocator) !void {
-    var validationAllocator = mem.validationWrap(base_allocator);
-    const allocator = validationAllocator.allocator();
-
-    // Test a few alignment values, smaller and bigger than the type's one
-    inline for ([_]Alignment{ .@"1", .@"2", .@"4", .@"8", .@"16", .@"32", .@"64" }) |alignment| {
-        // initial
-        var slice = try allocator.alignedAlloc(u8, alignment, 10);
-        try testing.expect(slice.len == 10);
-        // grow
-        slice = try allocator.realloc(slice, 100);
-        try testing.expect(slice.len == 100);
-        if (allocator.resize(slice, 10)) {
-            slice = slice[0..10];
-        }
-        try testing.expect(allocator.resize(slice, 0));
-        slice = slice[0..0];
-        // realloc from zero
-        slice = try allocator.realloc(slice, 100);
-        try testing.expect(slice.len == 100);
-        if (allocator.resize(slice, 10)) {
-            slice = slice[0..10];
-        }
-        try testing.expect(allocator.resize(slice, 0));
-    }
-}
-
-pub fn testAllocatorLargeAlignment(base_allocator: mem.Allocator) !void {
-    var validationAllocator = mem.validationWrap(base_allocator);
-    const allocator = validationAllocator.allocator();
-
-    const large_align: usize = page_size_min / 2;
-
-    var align_mask: usize = undefined;
-    align_mask = @shlWithOverflow(~@as(usize, 0), @as(Allocator.Log2Align, @ctz(large_align)))[0];
-
-    var slice = try allocator.alignedAlloc(u8, .fromByteUnits(large_align), 500);
-    try testing.expect(@intFromPtr(slice.ptr) &amp; align_mask == @intFromPtr(slice.ptr));
-
-    if (allocator.resize(slice, 100)) {
-        slice = slice[0..100];
-    }
-
-    slice = try allocator.realloc(slice, 5000);
-    try testing.expect(@intFromPtr(slice.ptr) &amp; align_mask == @intFromPtr(slice.ptr));
-
-    if (allocator.resize(slice, 10)) {
-        slice = slice[0..10];
-    }
-
-    slice = try allocator.realloc(slice, 20000);
-    try testing.expect(@intFromPtr(slice.ptr) &amp; align_mask == @intFromPtr(slice.ptr));
-
-    allocator.free(slice);
-}
-
-pub fn testAllocatorAlignedShrink(base_allocator: mem.Allocator) !void {
-    var validationAllocator = mem.validationWrap(base_allocator);
-    const allocator = validationAllocator.allocator();
-
-    var debug_buffer: [1000]u8 = undefined;
-    var fib = FixedBufferAllocator.init(&amp;debug_buffer);
-    const debug_allocator = fib.allocator();
-
-    const alloc_size = pageSize() * 2 + 50;
-    var slice = try allocator.alignedAlloc(u8, .@"16", alloc_size);
-    defer allocator.free(slice);
-
-    var stuff_to_free = std.array_list.Managed([]align(16) u8).init(debug_allocator);
-    // On Windows, VirtualAlloc returns addresses aligned to a 64K boundary,
-    // which is 16 pages, hence the 32. This test may require to increase
-    // the size of the allocations feeding the `allocator` parameter if they
-    // fail, because of this high over-alignment we want to have.
-    while (@intFromPtr(slice.ptr) == mem.alignForward(usize, @intFromPtr(slice.ptr), pageSize() * 32)) {
-        try stuff_to_free.append(slice);
-        slice = try allocator.alignedAlloc(u8, .@"16", alloc_size);
-    }
-    while (stuff_to_free.pop()) |item| {
-        allocator.free(item);
-    }
-    slice[0] = 0x12;
-    slice[60] = 0x34;
-
-    slice = try allocator.reallocAdvanced(slice, alloc_size / 2, 0);
-    try testing.expect(slice[0] == 0x12);
-    try testing.expect(slice[60] == 0x34);
-}
-
-const page_size_min_default: ?usize = switch (builtin.os.tag) {
-    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos =&gt; switch (builtin.cpu.arch) {
-        .x86_64 =&gt; 4 &lt;&lt; 10,
-        .aarch64 =&gt; 16 &lt;&lt; 10,
-        else =&gt; null,
-    },
-    .windows =&gt; switch (builtin.cpu.arch) {
-        // -- &lt;https://devblogs.microsoft.com/oldnewthing/20210510-00/?p=105200&gt;
-        .x86, .x86_64 =&gt; 4 &lt;&lt; 10,
-        // SuperH =&gt; 4 &lt;&lt; 10,
-        .mips, .mipsel, .mips64, .mips64el =&gt; 4 &lt;&lt; 10,
-        .powerpc, .powerpcle, .powerpc64, .powerpc64le =&gt; 4 &lt;&lt; 10,
-        // DEC Alpha =&gt; 8 &lt;&lt; 10,
-        // Itanium =&gt; 8 &lt;&lt; 10,
-        .thumb, .thumbeb, .arm, .armeb, .aarch64, .aarch64_be =&gt; 4 &lt;&lt; 10,
-        else =&gt; null,
-    },
-    .wasi =&gt; switch (builtin.cpu.arch) {
-        .wasm32, .wasm64 =&gt; 64 &lt;&lt; 10,
-        else =&gt; null,
-    },
-    // https://github.com/tianocore/edk2/blob/b158dad150bf02879668f72ce306445250838201/MdePkg/Include/Uefi/UefiBaseType.h#L180-L187
-    .uefi =&gt; 4 &lt;&lt; 10,
-    .freebsd =&gt; switch (builtin.cpu.arch) {
-        // FreeBSD/sys/*
-        .x86, .x86_64 =&gt; 4 &lt;&lt; 10,
-        .thumb, .thumbeb, .arm, .armeb =&gt; 4 &lt;&lt; 10,
-        .aarch64, .aarch64_be =&gt; 4 &lt;&lt; 10,
-        .powerpc, .powerpc64, .powerpc64le, .powerpcle =&gt; 4 &lt;&lt; 10,
-        .riscv32, .riscv64 =&gt; 4 &lt;&lt; 10,
-        else =&gt; null,
-    },
-    .netbsd =&gt; switch (builtin.cpu.arch) {
-        // NetBSD/sys/arch/*
-        .alpha =&gt; 8 &lt;&lt; 10,
-        .x86, .x86_64 =&gt; 4 &lt;&lt; 10,
-        .thumb, .thumbeb, .arm, .armeb =&gt; 4 &lt;&lt; 10,
-        .aarch64, .aarch64_be =&gt; 4 &lt;&lt; 10,
-        .hppa =&gt; 4 &lt;&lt; 10,
-        .mips, .mipsel, .mips64, .mips64el =&gt; 4 &lt;&lt; 10,
-        .powerpc, .powerpc64, .powerpc64le, .powerpcle =&gt; 4 &lt;&lt; 10,
-        .sh, .sheb =&gt; 4 &lt;&lt; 10,
-        .sparc =&gt; 4 &lt;&lt; 10,
-        .sparc64 =&gt; 8 &lt;&lt; 10,
-        .riscv32, .riscv64 =&gt; 4 &lt;&lt; 10,
-        // Sun-2
-        .m68k =&gt; 2 &lt;&lt; 10,
-        else =&gt; null,
-    },
-    .dragonfly =&gt; switch (builtin.cpu.arch) {
-        .x86, .x86_64 =&gt; 4 &lt;&lt; 10,
-        else =&gt; null,
-    },
-    .openbsd =&gt; switch (builtin.cpu.arch) {
-        // OpenBSD/sys/arch/*
-        .alpha =&gt; 8 &lt;&lt; 10,
-        .hppa =&gt; 4 &lt;&lt; 10,
-        .x86, .x86_64 =&gt; 4 &lt;&lt; 10,
-        .thumb, .thumbeb, .arm, .armeb, .aarch64, .aarch64_be =&gt; 4 &lt;&lt; 10,
-        .mips64, .mips64el =&gt; 4 &lt;&lt; 10,
-        .powerpc, .powerpc64, .powerpc64le, .powerpcle =&gt; 4 &lt;&lt; 10,
-        .riscv64 =&gt; 4 &lt;&lt; 10,
-        .sh, .sheb =&gt; 4 &lt;&lt; 10,
-        .sparc64 =&gt; 8 &lt;&lt; 10,
-        else =&gt; null,
-    },
-    .illumos =&gt; switch (builtin.cpu.arch) {
-        // src/uts/*/sys/machparam.h
-        .x86, .x86_64 =&gt; 4 &lt;&lt; 10,
-        .sparc, .sparc64 =&gt; 8 &lt;&lt; 10,
-        else =&gt; null,
-    },
-    .fuchsia =&gt; switch (builtin.cpu.arch) {
-        // fuchsia/kernel/arch/*/include/arch/defines.h
-        .x86_64 =&gt; 4 &lt;&lt; 10,
-        .aarch64, .aarch64_be =&gt; 4 &lt;&lt; 10,
-        .riscv64 =&gt; 4 &lt;&lt; 10,
-        else =&gt; null,
-    },
-    // https://github.com/SerenityOS/serenity/blob/62b938b798dc009605b5df8a71145942fc53808b/Kernel/API/POSIX/sys/limits.h#L11-L13
-    .serenity =&gt; 4 &lt;&lt; 10,
-    .haiku =&gt; switch (builtin.cpu.arch) {
-        // haiku/headers/posix/arch/*/limits.h
-        .thumb, .thumbeb, .arm, .armeb =&gt; 4 &lt;&lt; 10,
-        .aarch64, .aarch64_be =&gt; 4 &lt;&lt; 10,
-        .m68k =&gt; 4 &lt;&lt; 10,
-        .mips, .mipsel, .mips64, .mips64el =&gt; 4 &lt;&lt; 10,
-        .powerpc, .powerpc64, .powerpc64le, .powerpcle =&gt; 4 &lt;&lt; 10,
-        .riscv64 =&gt; 4 &lt;&lt; 10,
-        .sparc64 =&gt; 8 &lt;&lt; 10,
-        .x86, .x86_64 =&gt; 4 &lt;&lt; 10,
-        else =&gt; null,
-    },
-    .hurd =&gt; switch (builtin.cpu.arch) {
-        // gnumach/*/include/mach/*/vm_param.h
-        .x86, .x86_64 =&gt; 4 &lt;&lt; 10,
-        .aarch64 =&gt; null,
-        else =&gt; null,
-    },
-    .plan9 =&gt; switch (builtin.cpu.arch) {
-        // 9front/sys/src/9/*/mem.h
-        .x86, .x86_64 =&gt; 4 &lt;&lt; 10,
-        .thumb, .thumbeb, .arm, .armeb =&gt; 4 &lt;&lt; 10,
-        .aarch64, .aarch64_be =&gt; 4 &lt;&lt; 10,
-        .mips, .mipsel, .mips64, .mips64el =&gt; 4 &lt;&lt; 10,
-        .powerpc, .powerpcle, .powerpc64, .powerpc64le =&gt; 4 &lt;&lt; 10,
-        .sparc =&gt; 4 &lt;&lt; 10,
-        else =&gt; null,
-    },
-    .ps3 =&gt; switch (builtin.cpu.arch) {
-        // cell/SDK_doc/en/html/C_and_C++_standard_libraries/stdlib.html
-        .powerpc64 =&gt; 1 &lt;&lt; 20, // 1 MiB
-        else =&gt; null,
-    },
-    .ps4 =&gt; switch (builtin.cpu.arch) {
-        // https://github.com/ps4dev/ps4sdk/blob/4df9d001b66ae4ec07d9a51b62d1e4c5e270eecc/include/machine/param.h#L95
-        .x86, .x86_64 =&gt; 4 &lt;&lt; 10,
-        else =&gt; null,
-    },
-    .ps5 =&gt; switch (builtin.cpu.arch) {
-        // https://github.com/PS5Dev/PS5SDK/blob/a2e03a2a0231a3a3397fa6cd087a01ca6d04f273/include/machine/param.h#L95
-        .x86, .x86_64 =&gt; 16 &lt;&lt; 10,
-        else =&gt; null,
-    },
-    .psp =&gt; switch (builtin.cpu.arch) {
-        // minimum block allocation by testing sceKernel
-        .mips, .mipsel =&gt; 1 &lt;&lt; 8, // 256
-        else =&gt; null,
-    },
-    // system/lib/libc/musl/arch/emscripten/bits/limits.h
-    .emscripten =&gt; 64 &lt;&lt; 10,
-    .linux =&gt; switch (builtin.cpu.arch) {
-        // Linux/arch/*/Kconfig
-        .alpha =&gt; 8 &lt;&lt; 10,
-        .arc, .arceb =&gt; 4 &lt;&lt; 10,
-        .thumb, .thumbeb, .arm, .armeb =&gt; 4 &lt;&lt; 10,
-        .aarch64, .aarch64_be =&gt; 4 &lt;&lt; 10,
-        .csky =&gt; 4 &lt;&lt; 10,
-        .hexagon =&gt; 4 &lt;&lt; 10,
-        .hppa =&gt; 4 &lt;&lt; 10,
-        .loongarch32, .loongarch64 =&gt; 4 &lt;&lt; 10,
-        .m68k =&gt; 4 &lt;&lt; 10,
-        .microblaze, .microblazeel =&gt; 4 &lt;&lt; 10,
-        .mips, .mipsel, .mips64, .mips64el =&gt; 4 &lt;&lt; 10,
-        .or1k =&gt; 8 &lt;&lt; 10,
-        .powerpc, .powerpc64, .powerpc64le, .powerpcle =&gt; 4 &lt;&lt; 10,
-        .riscv32, .riscv64 =&gt; 4 &lt;&lt; 10,
-        .s390x =&gt; 4 &lt;&lt; 10,
-        .sh, .sheb =&gt; 4 &lt;&lt; 10,
-        .sparc =&gt; 4 &lt;&lt; 10,
-        .sparc64 =&gt; 8 &lt;&lt; 10,
-        .x86, .x86_64 =&gt; 4 &lt;&lt; 10,
-        .xtensa, .xtensaeb =&gt; 4 &lt;&lt; 10,
-        else =&gt; null,
-    },
-    .freestanding, .other =&gt; switch (builtin.cpu.arch) {
-        .wasm32, .wasm64 =&gt; 64 &lt;&lt; 10,
-        .x86, .x86_64 =&gt; 4 &lt;&lt; 10,
-        .aarch64, .aarch64_be =&gt; 4 &lt;&lt; 10,
-        else =&gt; null,
-    },
-    else =&gt; null,
-};
-
-const page_size_max_default: ?usize = switch (builtin.os.tag) {
-    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos =&gt; switch (builtin.cpu.arch) {
-        .x86_64 =&gt; 4 &lt;&lt; 10,
-        .aarch64 =&gt; 16 &lt;&lt; 10,
-        else =&gt; null,
-    },
-    .windows =&gt; switch (builtin.cpu.arch) {
-        // -- &lt;https://devblogs.microsoft.com/oldnewthing/20210510-00/?p=105200&gt;
-        .x86, .x86_64 =&gt; 4 &lt;&lt; 10,
-        // SuperH =&gt; 4 &lt;&lt; 10,
-        .mips, .mipsel, .mips64, .mips64el =&gt; 4 &lt;&lt; 10,
-        .powerpc, .powerpcle, .powerpc64, .powerpc64le =&gt; 4 &lt;&lt; 10,
-        // DEC Alpha =&gt; 8 &lt;&lt; 10,
-        // Itanium =&gt; 8 &lt;&lt; 10,
-        .thumb, .thumbeb, .arm, .armeb, .aarch64, .aarch64_be =&gt; 4 &lt;&lt; 10,
-        else =&gt; null,
-    },
-    .wasi =&gt; switch (builtin.cpu.arch) {
-        .wasm32, .wasm64 =&gt; 64 &lt;&lt; 10,
-        else =&gt; null,
-    },
-    // https://github.com/tianocore/edk2/blob/b158dad150bf02879668f72ce306445250838201/MdePkg/Include/Uefi/UefiBaseType.h#L180-L187
-    .uefi =&gt; 4 &lt;&lt; 10,
-    .freebsd =&gt; switch (builtin.cpu.arch) {
-        // FreeBSD/sys/*
-        .x86, .x86_64 =&gt; 4 &lt;&lt; 10,
-        .thumb, .thumbeb, .arm, .armeb =&gt; 4 &lt;&lt; 10,
-        .aarch64, .aarch64_be =&gt; 4 &lt;&lt; 10,
-        .powerpc, .powerpc64, .powerpc64le, .powerpcle =&gt; 4 &lt;&lt; 10,
-        .riscv32, .riscv64 =&gt; 4 &lt;&lt; 10,
-        else =&gt; null,
-    },
-    .netbsd =&gt; switch (builtin.cpu.arch) {
-        // NetBSD/sys/arch/*
-        .alpha =&gt; 8 &lt;&lt; 10,
-        .x86, .x86_64 =&gt; 4 &lt;&lt; 10,
-        .thumb, .thumbeb, .arm, .armeb =&gt; 4 &lt;&lt; 10,
-        .aarch64, .aarch64_be =&gt; 64 &lt;&lt; 10,
-        .hppa =&gt; 4 &lt;&lt; 10,
-        .mips, .mipsel, .mips64, .mips64el =&gt; 16 &lt;&lt; 10,
-        .powerpc, .powerpc64, .powerpc64le, .powerpcle =&gt; 16 &lt;&lt; 10,
-        .sh, .sheb =&gt; 4 &lt;&lt; 10,
-        .sparc =&gt; 8 &lt;&lt; 10,
-        .sparc64 =&gt; 8 &lt;&lt; 10,
-        .riscv32, .riscv64 =&gt; 4 &lt;&lt; 10,
-        .m68k =&gt; 8 &lt;&lt; 10,
-        else =&gt; null,
-    },
-    .dragonfly =&gt; switch (builtin.cpu.arch) {
-        .x86, .x86_64 =&gt; 4 &lt;&lt; 10,
-        else =&gt; null,
-    },
-    .openbsd =&gt; switch (builtin.cpu.arch) {
-        // OpenBSD/sys/arch/*
-        .alpha =&gt; 8 &lt;&lt; 10,
-        .hppa =&gt; 4 &lt;&lt; 10,
-        .x86, .x86_64 =&gt; 4 &lt;&lt; 10,
-        .thumb, .thumbeb, .arm, .armeb, .aarch64, .aarch64_be =&gt; 4 &lt;&lt; 10,
-        .mips64, .mips64el =&gt; 16 &lt;&lt; 10,
-        .powerpc, .powerpc64, .powerpc64le, .powerpcle =&gt; 4 &lt;&lt; 10,
-        .riscv64 =&gt; 4 &lt;&lt; 10,
-        .sh, .sheb =&gt; 4 &lt;&lt; 10,
-        .sparc64 =&gt; 8 &lt;&lt; 10,
-        else =&gt; null,
-    },
-    .illumos =&gt; switch (builtin.cpu.arch) {
-        // src/uts/*/sys/machparam.h
-        .x86, .x86_64 =&gt; 4 &lt;&lt; 10,
-        .sparc, .sparc64 =&gt; 8 &lt;&lt; 10,
-        else =&gt; null,
-    },
-    .fuchsia =&gt; switch (builtin.cpu.arch) {
-        // fuchsia/kernel/arch/*/include/arch/defines.h
-        .x86_64 =&gt; 4 &lt;&lt; 10,
-        .aarch64, .aarch64_be =&gt; 4 &lt;&lt; 10,
-        .riscv64 =&gt; 4 &lt;&lt; 10,
-        else =&gt; null,
-    },
-    // https://github.com/SerenityOS/serenity/blob/62b938b798dc009605b5df8a71145942fc53808b/Kernel/API/POSIX/sys/limits.h#L11-L13
-    .serenity =&gt; 4 &lt;&lt; 10,
-    .haiku =&gt; switch (builtin.cpu.arch) {
-        // haiku/headers/posix/arch/*/limits.h
-        .thumb, .thumbeb, .arm, .armeb =&gt; 4 &lt;&lt; 10,
-        .aarch64, .aarch64_be =&gt; 4 &lt;&lt; 10,
-        .m68k =&gt; 4 &lt;&lt; 10,
-        .mips, .mipsel, .mips64, .mips64el =&gt; 4 &lt;&lt; 10,
-        .powerpc, .powerpc64, .powerpc64le, .powerpcle =&gt; 4 &lt;&lt; 10,
-        .riscv64 =&gt; 4 &lt;&lt; 10,
-        .sparc64 =&gt; 8 &lt;&lt; 10,
-        .x86, .x86_64 =&gt; 4 &lt;&lt; 10,
-        else =&gt; null,
-    },
-    .hurd =&gt; switch (builtin.cpu.arch) {
-        // gnumach/*/include/mach/*/vm_param.h
-        .x86, .x86_64 =&gt; 4 &lt;&lt; 10,
-        .aarch64 =&gt; null,
-        else =&gt; null,
-    },
-    .plan9 =&gt; switch (builtin.cpu.arch) {
-        // 9front/sys/src/9/*/mem.h
-        .x86, .x86_64 =&gt; 4 &lt;&lt; 10,
-        .thumb, .thumbeb, .arm, .armeb =&gt; 4 &lt;&lt; 10,
-        .aarch64, .aarch64_be =&gt; 64 &lt;&lt; 10,
-        .mips, .mipsel, .mips64, .mips64el =&gt; 16 &lt;&lt; 10,
-        .powerpc, .powerpcle, .powerpc64, .powerpc64le =&gt; 4 &lt;&lt; 10,
-        .sparc =&gt; 4 &lt;&lt; 10,
-        else =&gt; null,
-    },
-    .ps3 =&gt; switch (builtin.cpu.arch) {
-        // cell/SDK_doc/en/html/C_and_C++_standard_libraries/stdlib.html
-        .powerpc64 =&gt; 1 &lt;&lt; 20, // 1 MiB
-        else =&gt; null,
-    },
-    .ps4 =&gt; switch (builtin.cpu.arch) {
-        // https://github.com/ps4dev/ps4sdk/blob/4df9d001b66ae4ec07d9a51b62d1e4c5e270eecc/include/machine/param.h#L95
-        .x86, .x86_64 =&gt; 4 &lt;&lt; 10,
-        else =&gt; null,
-    },
-    .ps5 =&gt; switch (builtin.cpu.arch) {
-        // https://github.com/PS5Dev/PS5SDK/blob/a2e03a2a0231a3a3397fa6cd087a01ca6d04f273/include/machine/param.h#L95
-        .x86, .x86_64 =&gt; 16 &lt;&lt; 10,
-        else =&gt; null,
-    },
-    .psp =&gt; switch (builtin.cpu.arch) {
-        // minimum block allocation by testing sceKernel
-        .mips, .mipsel =&gt; 1 &lt;&lt; 8, // 256
-        else =&gt; null,
-    },
-    // system/lib/libc/musl/arch/emscripten/bits/limits.h
-    .emscripten =&gt; 64 &lt;&lt; 10,
-    .linux =&gt; switch (builtin.cpu.arch) {
-        // Linux/arch/*/Kconfig
-        .alpha =&gt; 8 &lt;&lt; 10,
-        .arc, .arceb =&gt; 16 &lt;&lt; 10,
-        .thumb, .thumbeb, .arm, .armeb =&gt; 4 &lt;&lt; 10,
-        .aarch64, .aarch64_be =&gt; 64 &lt;&lt; 10,
-        .csky =&gt; 4 &lt;&lt; 10,
-        .hexagon =&gt; 256 &lt;&lt; 10,
-        .hppa =&gt; 64 &lt;&lt; 10,
-        .loongarch32, .loongarch64 =&gt; 64 &lt;&lt; 10,
-        .m68k =&gt; 8 &lt;&lt; 10,
-        .microblaze, .microblazeel =&gt; 4 &lt;&lt; 10,
-        .mips, .mipsel, .mips64, .mips64el =&gt; 64 &lt;&lt; 10,
-        .or1k =&gt; 8 &lt;&lt; 10,
-        .powerpc, .powerpc64, .powerpc64le, .powerpcle =&gt; 256 &lt;&lt; 10,
-        .riscv32, .riscv64 =&gt; 4 &lt;&lt; 10,
-        .s390x =&gt; 4 &lt;&lt; 10,
-        .sh, .sheb =&gt; 64 &lt;&lt; 10,
-        .sparc =&gt; 4 &lt;&lt; 10,
-        .sparc64 =&gt; 8 &lt;&lt; 10,
-        .x86, .x86_64 =&gt; 4 &lt;&lt; 10,
-        .xtensa, .xtensaeb =&gt; 4 &lt;&lt; 10,
-        else =&gt; null,
-    },
-    .freestanding =&gt; switch (builtin.cpu.arch) {
-        .wasm32, .wasm64 =&gt; 64 &lt;&lt; 10,
-        else =&gt; null,
-    },
-    else =&gt; null,
-};
-
-test {
-    _ = @import("heap/memory_pool.zig");
-    _ = ArenaAllocator;
-    _ = DebugAllocator(.{});
-    _ = FixedBufferAllocator;
-    if (builtin.single_threaded) {
-        if (builtin.cpu.arch.isWasm() or (builtin.os.tag == .linux and !builtin.link_libc)) {
-            _ = brk_allocator;
-        }
-    } else {
-        _ = smp_allocator;
-    }
-}</pre>
+    <pre><a id="L1"></a>const std = @import("std.zig");
+<a id="L2"></a>const builtin = @import("builtin");
+<a id="L3"></a>const root = @import("root");
+<a id="L4"></a>const assert = std.debug.assert;
+<a id="L5"></a>const testing = std.testing;
+<a id="L6"></a>const mem = std.mem;
+<a id="L7"></a>const c = std.c;
+<a id="L8"></a>const Allocator = std.mem.Allocator;
+<a id="L9"></a>const windows = std.os.windows;
+<a id="L10"></a>const Alignment = std.mem.Alignment;
+<a id="L11"></a>
+<a id="L12"></a>pub const ArenaAllocator = @import("heap/ArenaAllocator.zig");
+<a id="L13"></a>pub const SmpAllocator = @import("heap/SmpAllocator.zig");
+<a id="L14"></a>pub const FixedBufferAllocator = @import("heap/FixedBufferAllocator.zig");
+<a id="L15"></a>pub const PageAllocator = @import("heap/PageAllocator.zig");
+<a id="L16"></a>pub const WasmAllocator = if (builtin.single_threaded) BrkAllocator else @compileError("unimplemented");
+<a id="L17"></a>pub const BrkAllocator = @import("heap/BrkAllocator.zig");
+<a id="L18"></a>
+<a id="L19"></a>pub const DebugAllocatorConfig = @import("heap/debug_allocator.zig").Config;
+<a id="L20"></a>pub const DebugAllocator = @import("heap/debug_allocator.zig").DebugAllocator;
+<a id="L21"></a>pub const Check = enum { ok, leak };
+<a id="L22"></a>
+<a id="L23"></a>/// A memory pool that can allocate objects of a single type very quickly.
+<a id="L24"></a>/// Use this when you need to allocate a lot of objects of the same type,
+<a id="L25"></a>/// because it outperforms general purpose allocators.
+<a id="L26"></a>/// Functions that potentially allocate memory accept an `Allocator` parameter.
+<a id="L27"></a>pub fn MemoryPool(comptime Item: type) type {
+<a id="L28"></a>    return memory_pool.Extra(Item, .{ .alignment = null });
+<a id="L29"></a>}
+<a id="L30"></a>pub const memory_pool = @import("heap/memory_pool.zig");
+<a id="L31"></a>
+<a id="L32"></a>/// Deprecated; use `memory_pool.Aligned`.
+<a id="L33"></a>pub const MemoryPoolAligned = memory_pool.Aligned;
+<a id="L34"></a>/// Deprecated; use `memory_pool.Extra`.
+<a id="L35"></a>pub const MemoryPoolExtra = memory_pool.Extra;
+<a id="L36"></a>/// Deprecated; use `memory_pool.Options`.
+<a id="L37"></a>pub const MemoryPoolOptions = memory_pool.Options;
+<a id="L38"></a>
+<a id="L39"></a>/// comptime-known minimum page size of the target.
+<a id="L40"></a>///
+<a id="L41"></a>/// All pointers from `mmap` or `NtAllocateVirtualMemory` are aligned to at least
+<a id="L42"></a>/// `page_size_min`, but their actual alignment may be bigger.
+<a id="L43"></a>///
+<a id="L44"></a>/// This value can be overridden via `std.options.page_size_min`.
+<a id="L45"></a>///
+<a id="L46"></a>/// On many systems, the actual page size can only be determined at runtime
+<a id="L47"></a>/// with `pageSize`.
+<a id="L48"></a>pub const page_size_min: usize = std.options.page_size_min orelse (page_size_min_default orelse @compileError(@tagName(builtin.cpu.arch) ++ "-" ++ @tagName(builtin.os.tag) ++ " has unknown page_size_min; populate std.options.page_size_min"));
+<a id="L49"></a>/// comptime-known maximum page size of the target.
+<a id="L50"></a>///
+<a id="L51"></a>/// Targeting a system with a larger page size may require overriding
+<a id="L52"></a>/// `std.options.page_size_max`, as well as providing a corresponding linker
+<a id="L53"></a>/// option.
+<a id="L54"></a>///
+<a id="L55"></a>/// The actual page size can only be determined at runtime with `pageSize`.
+<a id="L56"></a>pub const page_size_max: usize = std.options.page_size_max orelse (page_size_max_default orelse if (builtin.os.tag == .freestanding or builtin.os.tag == .other)
+<a id="L57"></a>    @compileError("freestanding/other page_size_max must provided with std.options.page_size_max")
+<a id="L58"></a>else
+<a id="L59"></a>    @compileError(@tagName(builtin.cpu.arch) ++ "-" ++ @tagName(builtin.os.tag) ++ " has unknown page_size_max; populate std.options.page_size_max"));
+<a id="L60"></a>
+<a id="L61"></a>/// If the page size is comptime-known, return value is comptime.
+<a id="L62"></a>/// Otherwise, calls `std.options.queryPageSize` which by default queries the
+<a id="L63"></a>/// host operating system at runtime.
+<a id="L64"></a>pub inline fn pageSize() usize {
+<a id="L65"></a>    if (page_size_min == page_size_max) return page_size_min;
+<a id="L66"></a>    return std.options.queryPageSize();
+<a id="L67"></a>}
+<a id="L68"></a>
+<a id="L69"></a>test pageSize {
+<a id="L70"></a>    assert(std.math.isPowerOfTwo(pageSize()));
+<a id="L71"></a>}
+<a id="L72"></a>
+<a id="L73"></a>/// The default implementation of `std.options.queryPageSize`.
+<a id="L74"></a>/// Asserts that the page size is within `page_size_min` and `page_size_max`
+<a id="L75"></a>pub fn defaultQueryPageSize() usize {
+<a id="L76"></a>    const global = struct {
+<a id="L77"></a>        var cached_result: std.atomic.Value(usize) = .init(0);
+<a id="L78"></a>    };
+<a id="L79"></a>    var size = global.cached_result.load(.unordered);
+<a id="L80"></a>    if (size &gt; 0) return size;
+<a id="L81"></a>    size = size: switch (builtin.os.tag) {
+<a id="L82"></a>        .linux =&gt; if (builtin.link_libc)
+<a id="L83"></a>            @max(std.c.sysconf(@intFromEnum(std.c._SC.PAGESIZE)), 0)
+<a id="L84"></a>        else
+<a id="L85"></a>            std.os.linux.getauxval(std.elf.AT_PAGESZ),
+<a id="L86"></a>        .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos =&gt; {
+<a id="L87"></a>            const task_port = std.c.mach_task_self();
+<a id="L88"></a>            // mach_task_self may fail "if there are any resource failures or other errors".
+<a id="L89"></a>            if (task_port == std.c.TASK.NULL) break :size 0;
+<a id="L90"></a>            var info_count = std.c.TASK.VM.INFO_COUNT;
+<a id="L91"></a>            var vm_info: std.c.task_vm_info_data_t = undefined;
+<a id="L92"></a>            vm_info.page_size = 0;
+<a id="L93"></a>            _ = std.c.task_info(
+<a id="L94"></a>                task_port,
+<a id="L95"></a>                std.c.TASK.VM.INFO,
+<a id="L96"></a>                @as(std.c.task_info_t, @ptrCast(&amp;vm_info)),
+<a id="L97"></a>                &amp;info_count,
+<a id="L98"></a>            );
+<a id="L99"></a>            break :size @intCast(vm_info.page_size);
+<a id="L100"></a>        },
+<a id="L101"></a>        .windows =&gt; {
+<a id="L102"></a>            var sbi: windows.SYSTEM.BASIC_INFORMATION = undefined;
+<a id="L103"></a>            switch (windows.ntdll.NtQuerySystemInformation(
+<a id="L104"></a>                .Basic,
+<a id="L105"></a>                &amp;sbi,
+<a id="L106"></a>                @sizeOf(windows.SYSTEM.BASIC_INFORMATION),
+<a id="L107"></a>                null,
+<a id="L108"></a>            )) {
+<a id="L109"></a>                .SUCCESS =&gt; break :size sbi.PageSize,
+<a id="L110"></a>                else =&gt; break :size 0,
+<a id="L111"></a>            }
+<a id="L112"></a>        },
+<a id="L113"></a>        else =&gt; if (builtin.link_libc)
+<a id="L114"></a>            @max(std.c.sysconf(@intFromEnum(std.c._SC.PAGESIZE)), 0)
+<a id="L115"></a>        else if (builtin.os.tag == .freestanding or builtin.os.tag == .other)
+<a id="L116"></a>            @compileError("unsupported target: freestanding/other")
+<a id="L117"></a>        else
+<a id="L118"></a>            @compileError("pageSize on " ++ @tagName(builtin.cpu.arch) ++ "-" ++ @tagName(builtin.os.tag) ++ " is not supported without linking libc, using the default implementation"),
+<a id="L119"></a>    };
+<a id="L120"></a>    if (size == 0) size = page_size_max;
+<a id="L121"></a>
+<a id="L122"></a>    assert(size &gt;= page_size_min);
+<a id="L123"></a>    assert(size &lt;= page_size_max);
+<a id="L124"></a>    global.cached_result.store(size, .unordered);
+<a id="L125"></a>
+<a id="L126"></a>    return size;
+<a id="L127"></a>}
+<a id="L128"></a>
+<a id="L129"></a>test defaultQueryPageSize {
+<a id="L130"></a>    if (builtin.cpu.arch.isWasm()) return error.SkipZigTest;
+<a id="L131"></a>    assert(std.math.isPowerOfTwo(defaultQueryPageSize()));
+<a id="L132"></a>}
+<a id="L133"></a>
+<a id="L134"></a>/// A wrapper around the C memory allocation API which supports the full `Allocator`
+<a id="L135"></a>/// interface, including arbitrary alignment. Simple `malloc` calls are used when
+<a id="L136"></a>/// possible, but large requested alignments may require larger buffers in order to
+<a id="L137"></a>/// satisfy the request. As well as `malloc`, `realloc`, and `free`, the extension
+<a id="L138"></a>/// functions `malloc_usable_size` and `posix_memalign` are used when available.
+<a id="L139"></a>pub const c_allocator: Allocator = .{
+<a id="L140"></a>    .ptr = undefined,
+<a id="L141"></a>    .vtable = &amp;c_allocator_impl.vtable,
+<a id="L142"></a>};
+<a id="L143"></a>const c_allocator_impl = struct {
+<a id="L144"></a>    comptime {
+<a id="L145"></a>        if (!builtin.link_libc) {
+<a id="L146"></a>            @compileError("C allocator is only available when linking against libc");
+<a id="L147"></a>        }
+<a id="L148"></a>    }
+<a id="L149"></a>
+<a id="L150"></a>    const vtable: Allocator.VTable = .{
+<a id="L151"></a>        .alloc = alloc,
+<a id="L152"></a>        .resize = resize,
+<a id="L153"></a>        .remap = remap,
+<a id="L154"></a>        .free = free,
+<a id="L155"></a>    };
+<a id="L156"></a>
+<a id="L157"></a>    const have_posix_memalign = switch (builtin.os.tag) {
+<a id="L158"></a>        .dragonfly,
+<a id="L159"></a>        .netbsd,
+<a id="L160"></a>        .freebsd,
+<a id="L161"></a>        .illumos,
+<a id="L162"></a>        .openbsd,
+<a id="L163"></a>        .linux,
+<a id="L164"></a>        .driverkit,
+<a id="L165"></a>        .ios,
+<a id="L166"></a>        .maccatalyst,
+<a id="L167"></a>        .macos,
+<a id="L168"></a>        .tvos,
+<a id="L169"></a>        .visionos,
+<a id="L170"></a>        .watchos,
+<a id="L171"></a>        .serenity,
+<a id="L172"></a>        =&gt; true,
+<a id="L173"></a>        else =&gt; false,
+<a id="L174"></a>    };
+<a id="L175"></a>
+<a id="L176"></a>    fn allocStrat(need_align: Alignment) union(enum) {
+<a id="L177"></a>        raw,
+<a id="L178"></a>        posix_memalign: if (have_posix_memalign) void else noreturn,
+<a id="L179"></a>        manual_align: if (have_posix_memalign) noreturn else void,
+<a id="L180"></a>    } {
+<a id="L181"></a>        // If `malloc` guarantees `need_align`, always prefer a raw allocation.
+<a id="L182"></a>        if (Alignment.compare(need_align, .lte, .of(c.max_align_t))) {
+<a id="L183"></a>            return .raw;
+<a id="L184"></a>        }
+<a id="L185"></a>        // Use `posix_memalign` if available. Otherwise, we must manually align the allocation.
+<a id="L186"></a>        return if (have_posix_memalign) .posix_memalign else .manual_align;
+<a id="L187"></a>    }
+<a id="L188"></a>
+<a id="L189"></a>    /// If `allocStrat(a) == .manual_align`, an allocation looks like this:
+<a id="L190"></a>    ///
+<a id="L191"></a>    /// unaligned_ptr   hdr_ptr  aligned_ptr
+<a id="L192"></a>    /// v               v        v
+<a id="L193"></a>    /// +---------------+--------+--------------+
+<a id="L194"></a>    /// |    padding    | header | usable bytes |
+<a id="L195"></a>    /// +---------------+--------+--------------+
+<a id="L196"></a>    ///
+<a id="L197"></a>    /// * `unaligned_ptr` is the raw return value of `malloc`.
+<a id="L198"></a>    /// * `aligned_ptr` is computed by aligning `unaligned_ptr` forward; it is what `alloc` returns.
+<a id="L199"></a>    /// * `hdr_ptr` points to a pointer-sized header directly before the usable space. This header
+<a id="L200"></a>    ///   contains the value `unaligned_ptr`, so that we can pass it to `free` later. This is
+<a id="L201"></a>    ///   necessary because the width of the padding is unknown.
+<a id="L202"></a>    ///
+<a id="L203"></a>    /// This function accepts `aligned_ptr` and offsets it backwards to return `hdr_ptr`.
+<a id="L204"></a>    fn manualAlignHeader(aligned_ptr: [*]u8) *[*]u8 {
+<a id="L205"></a>        return @ptrCast(@alignCast(aligned_ptr - @sizeOf(usize)));
+<a id="L206"></a>    }
+<a id="L207"></a>
+<a id="L208"></a>    fn alloc(
+<a id="L209"></a>        _: *anyopaque,
+<a id="L210"></a>        len: usize,
+<a id="L211"></a>        alignment: Alignment,
+<a id="L212"></a>        return_address: usize,
+<a id="L213"></a>    ) ?[*]u8 {
+<a id="L214"></a>        _ = return_address;
+<a id="L215"></a>        assert(len &gt; 0);
+<a id="L216"></a>        switch (allocStrat(alignment)) {
+<a id="L217"></a>            .raw =&gt; {
+<a id="L218"></a>                // `std.c.max_align_t` isn't the whole story, because if `len` is smaller than
+<a id="L219"></a>                // every C type with alignment `max_align_t`, the allocation can be less-aligned.
+<a id="L220"></a>                // The implementation need only guarantee that any type of length `len` would be
+<a id="L221"></a>                // suitably aligned.
+<a id="L222"></a>                //
+<a id="L223"></a>                // For instance, if `len == 8` and `alignment == .@"16"`, then `malloc` may not
+<a id="L224"></a>                // fulfil this request, because there is necessarily no C type with 8-byte size
+<a id="L225"></a>                // but 16-byte alignment.
+<a id="L226"></a>                //
+<a id="L227"></a>                // In theory, the resulting rule here would be target-specific, but in practice,
+<a id="L228"></a>                // the smallest type with an alignment of `max_align_t` has the same size (it's
+<a id="L229"></a>                // usually `c_longdouble`), so we can just extend the allocation size up to the
+<a id="L230"></a>                // alignment of `max_align_t` if necessary.
+<a id="L231"></a>                const actual_len = @max(len, @alignOf(std.c.max_align_t));
+<a id="L232"></a>                const ptr = c.malloc(actual_len) orelse return null;
+<a id="L233"></a>                assert(alignment.check(@intFromPtr(ptr)));
+<a id="L234"></a>                return @ptrCast(ptr);
+<a id="L235"></a>            },
+<a id="L236"></a>            .posix_memalign =&gt; {
+<a id="L237"></a>                // The posix_memalign only accepts alignment values that are a
+<a id="L238"></a>                // multiple of the pointer size
+<a id="L239"></a>                const effective_alignment = @max(alignment.toByteUnits(), @sizeOf(usize));
+<a id="L240"></a>                var aligned_ptr: ?*anyopaque = undefined;
+<a id="L241"></a>                if (c.posix_memalign(&amp;aligned_ptr, effective_alignment, len) != 0) {
+<a id="L242"></a>                    return null;
+<a id="L243"></a>                }
+<a id="L244"></a>                assert(alignment.check(@intFromPtr(aligned_ptr)));
+<a id="L245"></a>                return @ptrCast(aligned_ptr);
+<a id="L246"></a>            },
+<a id="L247"></a>            .manual_align =&gt; {
+<a id="L248"></a>                // Overallocate to account for alignment padding and store the original pointer
+<a id="L249"></a>                // returned by `malloc` before the aligned address.
+<a id="L250"></a>                const padded_len = len + @sizeOf(usize) + alignment.toByteUnits() - 1;
+<a id="L251"></a>                const unaligned_ptr: [*]u8 = @ptrCast(c.malloc(padded_len) orelse return null);
+<a id="L252"></a>                const unaligned_addr = @intFromPtr(unaligned_ptr);
+<a id="L253"></a>                const aligned_addr = alignment.forward(unaligned_addr + @sizeOf(usize));
+<a id="L254"></a>                const aligned_ptr = unaligned_ptr + (aligned_addr - unaligned_addr);
+<a id="L255"></a>                manualAlignHeader(aligned_ptr).* = unaligned_ptr;
+<a id="L256"></a>                return aligned_ptr;
+<a id="L257"></a>            },
+<a id="L258"></a>        }
+<a id="L259"></a>    }
+<a id="L260"></a>
+<a id="L261"></a>    fn resize(
+<a id="L262"></a>        _: *anyopaque,
+<a id="L263"></a>        memory: []u8,
+<a id="L264"></a>        alignment: Alignment,
+<a id="L265"></a>        new_len: usize,
+<a id="L266"></a>        return_address: usize,
+<a id="L267"></a>    ) bool {
+<a id="L268"></a>        _ = return_address;
+<a id="L269"></a>        assert(new_len &gt; 0);
+<a id="L270"></a>        if (new_len &lt;= memory.len) {
+<a id="L271"></a>            return true; // in-place shrink always works
+<a id="L272"></a>        }
+<a id="L273"></a>        const mallocSize = func: {
+<a id="L274"></a>            if (@TypeOf(c.malloc_size) != void) break :func c.malloc_size;
+<a id="L275"></a>            if (@TypeOf(c.malloc_usable_size) != void) break :func c.malloc_usable_size;
+<a id="L276"></a>            if (@TypeOf(c._msize) != void) break :func c._msize;
+<a id="L277"></a>            return false; // we don't know how much space is actually available
+<a id="L278"></a>        };
+<a id="L279"></a>        const usable_len: usize = switch (allocStrat(alignment)) {
+<a id="L280"></a>            .raw, .posix_memalign =&gt; mallocSize(memory.ptr),
+<a id="L281"></a>            .manual_align =&gt; usable_len: {
+<a id="L282"></a>                const unaligned_ptr = manualAlignHeader(memory.ptr).*;
+<a id="L283"></a>                const full_len = mallocSize(unaligned_ptr);
+<a id="L284"></a>                const padding = @intFromPtr(memory.ptr) - @intFromPtr(unaligned_ptr);
+<a id="L285"></a>                break :usable_len full_len - padding;
+<a id="L286"></a>            },
+<a id="L287"></a>        };
+<a id="L288"></a>        return new_len &lt;= usable_len;
+<a id="L289"></a>    }
+<a id="L290"></a>
+<a id="L291"></a>    fn remap(
+<a id="L292"></a>        ctx: *anyopaque,
+<a id="L293"></a>        memory: []u8,
+<a id="L294"></a>        alignment: Alignment,
+<a id="L295"></a>        new_len: usize,
+<a id="L296"></a>        return_address: usize,
+<a id="L297"></a>    ) ?[*]u8 {
+<a id="L298"></a>        assert(new_len &gt; 0);
+<a id="L299"></a>        // Prefer resizing in-place if possible, since `realloc` could be expensive even if legal.
+<a id="L300"></a>        if (resize(ctx, memory, alignment, new_len, return_address)) {
+<a id="L301"></a>            return memory.ptr;
+<a id="L302"></a>        }
+<a id="L303"></a>        switch (allocStrat(alignment)) {
+<a id="L304"></a>            .raw =&gt; {
+<a id="L305"></a>                // `malloc` and friends guarantee the required alignment, so we can try `realloc`.
+<a id="L306"></a>                // C only needs to respect `max_align_t` up to the allocation size due to object
+<a id="L307"></a>                // alignment rules. If necessary, extend the allocation size.
+<a id="L308"></a>                const actual_len = @max(new_len, @alignOf(std.c.max_align_t));
+<a id="L309"></a>                const new_ptr = c.realloc(memory.ptr, actual_len) orelse return null;
+<a id="L310"></a>                assert(alignment.check(@intFromPtr(new_ptr)));
+<a id="L311"></a>                return @ptrCast(new_ptr);
+<a id="L312"></a>            },
+<a id="L313"></a>            .posix_memalign, .manual_align =&gt; {
+<a id="L314"></a>                // `realloc` would potentially return a new allocation which does not respect
+<a id="L315"></a>                // the original alignment, so we can't do anything more.
+<a id="L316"></a>                return null;
+<a id="L317"></a>            },
+<a id="L318"></a>        }
+<a id="L319"></a>    }
+<a id="L320"></a>
+<a id="L321"></a>    fn free(
+<a id="L322"></a>        _: *anyopaque,
+<a id="L323"></a>        memory: []u8,
+<a id="L324"></a>        alignment: Alignment,
+<a id="L325"></a>        return_address: usize,
+<a id="L326"></a>    ) void {
+<a id="L327"></a>        _ = return_address;
+<a id="L328"></a>        switch (allocStrat(alignment)) {
+<a id="L329"></a>            .raw, .posix_memalign =&gt; c.free(memory.ptr),
+<a id="L330"></a>            .manual_align =&gt; c.free(manualAlignHeader(memory.ptr).*),
+<a id="L331"></a>        }
+<a id="L332"></a>    }
+<a id="L333"></a>};
+<a id="L334"></a>
+<a id="L335"></a>/// On operating systems that support memory mapping, this allocator makes a
+<a id="L336"></a>/// syscall directly for every allocation and free.
+<a id="L337"></a>///
+<a id="L338"></a>/// Otherwise, it falls back to the preferred singleton for the target.
+<a id="L339"></a>///
+<a id="L340"></a>/// Thread-safe.
+<a id="L341"></a>pub const page_allocator: Allocator = if (@hasDecl(root, "os") and
+<a id="L342"></a>    @hasDecl(root.os, "heap") and
+<a id="L343"></a>    @hasDecl(root.os.heap, "page_allocator"))
+<a id="L344"></a>    root.os.heap.page_allocator
+<a id="L345"></a>else if (builtin.target.cpu.arch.isWasm()) .{
+<a id="L346"></a>    .ptr = undefined,
+<a id="L347"></a>    .vtable = &amp;WasmAllocator.vtable,
+<a id="L348"></a>} else .{
+<a id="L349"></a>    .ptr = undefined,
+<a id="L350"></a>    .vtable = &amp;PageAllocator.vtable,
+<a id="L351"></a>};
+<a id="L352"></a>
+<a id="L353"></a>pub const smp_allocator: Allocator = .{
+<a id="L354"></a>    .ptr = undefined,
+<a id="L355"></a>    .vtable = &amp;SmpAllocator.vtable,
+<a id="L356"></a>};
+<a id="L357"></a>
+<a id="L358"></a>/// This allocator is fast, small, and specific to WebAssembly.
+<a id="L359"></a>pub const wasm_allocator: Allocator = .{
+<a id="L360"></a>    .ptr = undefined,
+<a id="L361"></a>    .vtable = &amp;WasmAllocator.vtable,
+<a id="L362"></a>};
+<a id="L363"></a>
+<a id="L364"></a>/// Supports single-threaded WebAssembly and Linux.
+<a id="L365"></a>pub const brk_allocator: Allocator = .{
+<a id="L366"></a>    .ptr = undefined,
+<a id="L367"></a>    .vtable = &amp;BrkAllocator.vtable,
+<a id="L368"></a>};
+<a id="L369"></a>
+<a id="L370"></a>/// Returns a `StackFallbackAllocator` allocating using either a
+<a id="L371"></a>/// `FixedBufferAllocator` on an array of size `size` and falling back to
+<a id="L372"></a>/// `fallback_allocator` if that fails.
+<a id="L373"></a>pub fn stackFallback(comptime size: usize, fallback_allocator: Allocator) StackFallbackAllocator(size) {
+<a id="L374"></a>    return StackFallbackAllocator(size){
+<a id="L375"></a>        .buffer = undefined,
+<a id="L376"></a>        .fallback_allocator = fallback_allocator,
+<a id="L377"></a>        .fixed_buffer_allocator = undefined,
+<a id="L378"></a>    };
+<a id="L379"></a>}
+<a id="L380"></a>
+<a id="L381"></a>/// An allocator that attempts to allocate using a
+<a id="L382"></a>/// `FixedBufferAllocator` using an array of size `size`. If the
+<a id="L383"></a>/// allocation fails, it will fall back to using
+<a id="L384"></a>/// `fallback_allocator`. Easily created with `stackFallback`.
+<a id="L385"></a>pub fn StackFallbackAllocator(comptime size: usize) type {
+<a id="L386"></a>    return struct {
+<a id="L387"></a>        const Self = @This();
+<a id="L388"></a>
+<a id="L389"></a>        buffer: [size]u8,
+<a id="L390"></a>        fallback_allocator: Allocator,
+<a id="L391"></a>        fixed_buffer_allocator: FixedBufferAllocator,
+<a id="L392"></a>        get_called: if (std.debug.runtime_safety) bool else void =
+<a id="L393"></a>            if (std.debug.runtime_safety) false else {},
+<a id="L394"></a>
+<a id="L395"></a>        /// This function both fetches a `Allocator` interface to this
+<a id="L396"></a>        /// allocator *and* resets the internal buffer allocator.
+<a id="L397"></a>        pub fn get(self: *Self) Allocator {
+<a id="L398"></a>            if (std.debug.runtime_safety) {
+<a id="L399"></a>                assert(!self.get_called); // `get` called multiple times; instead use `const allocator = stackFallback(N).get();`
+<a id="L400"></a>                self.get_called = true;
+<a id="L401"></a>            }
+<a id="L402"></a>            self.fixed_buffer_allocator = FixedBufferAllocator.init(self.buffer[0..]);
+<a id="L403"></a>            return .{
+<a id="L404"></a>                .ptr = self,
+<a id="L405"></a>                .vtable = &amp;.{
+<a id="L406"></a>                    .alloc = alloc,
+<a id="L407"></a>                    .resize = resize,
+<a id="L408"></a>                    .remap = remap,
+<a id="L409"></a>                    .free = free,
+<a id="L410"></a>                },
+<a id="L411"></a>            };
+<a id="L412"></a>        }
+<a id="L413"></a>
+<a id="L414"></a>        /// Unlike most std allocators `StackFallbackAllocator` modifies
+<a id="L415"></a>        /// its internal state before returning an implementation of
+<a id="L416"></a>        /// the`Allocator` interface and therefore also doesn't use
+<a id="L417"></a>        /// the usual `.allocator()` method.
+<a id="L418"></a>        pub const allocator = @compileError("use 'const allocator = stackFallback(N).get();' instead");
+<a id="L419"></a>
+<a id="L420"></a>        fn alloc(
+<a id="L421"></a>            ctx: *anyopaque,
+<a id="L422"></a>            len: usize,
+<a id="L423"></a>            alignment: Alignment,
+<a id="L424"></a>            ra: usize,
+<a id="L425"></a>        ) ?[*]u8 {
+<a id="L426"></a>            const self: *Self = @ptrCast(@alignCast(ctx));
+<a id="L427"></a>            return FixedBufferAllocator.alloc(&amp;self.fixed_buffer_allocator, len, alignment, ra) orelse
+<a id="L428"></a>                return self.fallback_allocator.rawAlloc(len, alignment, ra);
+<a id="L429"></a>        }
+<a id="L430"></a>
+<a id="L431"></a>        fn resize(
+<a id="L432"></a>            ctx: *anyopaque,
+<a id="L433"></a>            buf: []u8,
+<a id="L434"></a>            alignment: Alignment,
+<a id="L435"></a>            new_len: usize,
+<a id="L436"></a>            ra: usize,
+<a id="L437"></a>        ) bool {
+<a id="L438"></a>            const self: *Self = @ptrCast(@alignCast(ctx));
+<a id="L439"></a>            if (self.fixed_buffer_allocator.ownsPtr(buf.ptr)) {
+<a id="L440"></a>                return FixedBufferAllocator.resize(&amp;self.fixed_buffer_allocator, buf, alignment, new_len, ra);
+<a id="L441"></a>            } else {
+<a id="L442"></a>                return self.fallback_allocator.rawResize(buf, alignment, new_len, ra);
+<a id="L443"></a>            }
+<a id="L444"></a>        }
+<a id="L445"></a>
+<a id="L446"></a>        fn remap(
+<a id="L447"></a>            context: *anyopaque,
+<a id="L448"></a>            memory: []u8,
+<a id="L449"></a>            alignment: Alignment,
+<a id="L450"></a>            new_len: usize,
+<a id="L451"></a>            return_address: usize,
+<a id="L452"></a>        ) ?[*]u8 {
+<a id="L453"></a>            const self: *Self = @ptrCast(@alignCast(context));
+<a id="L454"></a>            if (self.fixed_buffer_allocator.ownsPtr(memory.ptr)) {
+<a id="L455"></a>                return FixedBufferAllocator.remap(&amp;self.fixed_buffer_allocator, memory, alignment, new_len, return_address);
+<a id="L456"></a>            } else {
+<a id="L457"></a>                return self.fallback_allocator.rawRemap(memory, alignment, new_len, return_address);
+<a id="L458"></a>            }
+<a id="L459"></a>        }
+<a id="L460"></a>
+<a id="L461"></a>        fn free(
+<a id="L462"></a>            ctx: *anyopaque,
+<a id="L463"></a>            buf: []u8,
+<a id="L464"></a>            alignment: Alignment,
+<a id="L465"></a>            ra: usize,
+<a id="L466"></a>        ) void {
+<a id="L467"></a>            const self: *Self = @ptrCast(@alignCast(ctx));
+<a id="L468"></a>            if (self.fixed_buffer_allocator.ownsPtr(buf.ptr)) {
+<a id="L469"></a>                return FixedBufferAllocator.free(&amp;self.fixed_buffer_allocator, buf, alignment, ra);
+<a id="L470"></a>            } else {
+<a id="L471"></a>                return self.fallback_allocator.rawFree(buf, alignment, ra);
+<a id="L472"></a>            }
+<a id="L473"></a>        }
+<a id="L474"></a>    };
+<a id="L475"></a>}
+<a id="L476"></a>
+<a id="L477"></a>test c_allocator {
+<a id="L478"></a>    if (builtin.link_libc) {
+<a id="L479"></a>        try testAllocator(c_allocator);
+<a id="L480"></a>        try testAllocatorAligned(c_allocator);
+<a id="L481"></a>        try testAllocatorLargeAlignment(c_allocator);
+<a id="L482"></a>        try testAllocatorAlignedShrink(c_allocator);
+<a id="L483"></a>    }
+<a id="L484"></a>}
+<a id="L485"></a>
+<a id="L486"></a>test smp_allocator {
+<a id="L487"></a>    if (builtin.single_threaded) return;
+<a id="L488"></a>    try testAllocator(smp_allocator);
+<a id="L489"></a>    try testAllocatorAligned(smp_allocator);
+<a id="L490"></a>    try testAllocatorLargeAlignment(smp_allocator);
+<a id="L491"></a>    try testAllocatorAlignedShrink(smp_allocator);
+<a id="L492"></a>}
+<a id="L493"></a>
+<a id="L494"></a>test PageAllocator {
+<a id="L495"></a>    const allocator = page_allocator;
+<a id="L496"></a>    try testAllocator(allocator);
+<a id="L497"></a>    try testAllocatorAligned(allocator);
+<a id="L498"></a>    if (!builtin.target.cpu.arch.isWasm()) {
+<a id="L499"></a>        try testAllocatorLargeAlignment(allocator);
+<a id="L500"></a>        try testAllocatorAlignedShrink(allocator);
+<a id="L501"></a>    }
+<a id="L502"></a>
+<a id="L503"></a>    if (builtin.os.tag == .windows) {
+<a id="L504"></a>        const slice = try allocator.alignedAlloc(u8, .fromByteUnits(page_size_min), 128);
+<a id="L505"></a>        slice[0] = 0x12;
+<a id="L506"></a>        slice[127] = 0x34;
+<a id="L507"></a>        allocator.free(slice);
+<a id="L508"></a>    }
+<a id="L509"></a>    {
+<a id="L510"></a>        var buf = try allocator.alloc(u8, pageSize() + 1);
+<a id="L511"></a>        defer allocator.free(buf);
+<a id="L512"></a>        buf = try allocator.realloc(buf, 1); // shrink past the page boundary
+<a id="L513"></a>    }
+<a id="L514"></a>}
+<a id="L515"></a>
+<a id="L516"></a>test ArenaAllocator {
+<a id="L517"></a>    var arena_allocator = ArenaAllocator.init(page_allocator);
+<a id="L518"></a>    defer arena_allocator.deinit();
+<a id="L519"></a>    const allocator = arena_allocator.allocator();
+<a id="L520"></a>
+<a id="L521"></a>    try testAllocator(allocator);
+<a id="L522"></a>    try testAllocatorAligned(allocator);
+<a id="L523"></a>    try testAllocatorLargeAlignment(allocator);
+<a id="L524"></a>    try testAllocatorAlignedShrink(allocator);
+<a id="L525"></a>}
+<a id="L526"></a>
+<a id="L527"></a>test "StackFallbackAllocator" {
+<a id="L528"></a>    {
+<a id="L529"></a>        var stack_allocator = stackFallback(4096, std.testing.allocator);
+<a id="L530"></a>        try testAllocator(stack_allocator.get());
+<a id="L531"></a>    }
+<a id="L532"></a>    {
+<a id="L533"></a>        var stack_allocator = stackFallback(4096, std.testing.allocator);
+<a id="L534"></a>        try testAllocatorAligned(stack_allocator.get());
+<a id="L535"></a>    }
+<a id="L536"></a>    {
+<a id="L537"></a>        var stack_allocator = stackFallback(4096, std.testing.allocator);
+<a id="L538"></a>        try testAllocatorLargeAlignment(stack_allocator.get());
+<a id="L539"></a>    }
+<a id="L540"></a>    {
+<a id="L541"></a>        var stack_allocator = stackFallback(4096, std.testing.allocator);
+<a id="L542"></a>        try testAllocatorAlignedShrink(stack_allocator.get());
+<a id="L543"></a>    }
+<a id="L544"></a>}
+<a id="L545"></a>
+<a id="L546"></a>/// This one should not try alignments that exceed what C malloc can handle.
+<a id="L547"></a>pub fn testAllocator(base_allocator: mem.Allocator) !void {
+<a id="L548"></a>    var validationAllocator = mem.validationWrap(base_allocator);
+<a id="L549"></a>    const allocator = validationAllocator.allocator();
+<a id="L550"></a>
+<a id="L551"></a>    var slice = try allocator.alloc(*i32, 100);
+<a id="L552"></a>    try testing.expect(slice.len == 100);
+<a id="L553"></a>    for (slice, 0..) |*item, i| {
+<a id="L554"></a>        item.* = try allocator.create(i32);
+<a id="L555"></a>        item.*.* = @as(i32, @intCast(i));
+<a id="L556"></a>    }
+<a id="L557"></a>
+<a id="L558"></a>    slice = try allocator.realloc(slice, 20000);
+<a id="L559"></a>    try testing.expect(slice.len == 20000);
+<a id="L560"></a>
+<a id="L561"></a>    for (slice[0..100], 0..) |item, i| {
+<a id="L562"></a>        try testing.expect(item.* == @as(i32, @intCast(i)));
+<a id="L563"></a>        allocator.destroy(item);
+<a id="L564"></a>    }
+<a id="L565"></a>
+<a id="L566"></a>    if (allocator.resize(slice, 50)) {
+<a id="L567"></a>        slice = slice[0..50];
+<a id="L568"></a>        if (allocator.resize(slice, 25)) {
+<a id="L569"></a>            slice = slice[0..25];
+<a id="L570"></a>            try testing.expect(allocator.resize(slice, 0));
+<a id="L571"></a>            slice = slice[0..0];
+<a id="L572"></a>            slice = try allocator.realloc(slice, 10);
+<a id="L573"></a>            try testing.expect(slice.len == 10);
+<a id="L574"></a>        }
+<a id="L575"></a>    }
+<a id="L576"></a>    allocator.free(slice);
+<a id="L577"></a>
+<a id="L578"></a>    // Zero-length allocation
+<a id="L579"></a>    const empty = try allocator.alloc(u8, 0);
+<a id="L580"></a>    allocator.free(empty);
+<a id="L581"></a>    // Allocation with zero-sized types
+<a id="L582"></a>    const zero_bit_ptr = try allocator.create(u0);
+<a id="L583"></a>    zero_bit_ptr.* = 0;
+<a id="L584"></a>    allocator.destroy(zero_bit_ptr);
+<a id="L585"></a>    const zero_len_array = try allocator.create([0]u64);
+<a id="L586"></a>    allocator.destroy(zero_len_array);
+<a id="L587"></a>
+<a id="L588"></a>    const oversize = try allocator.alignedAlloc(u32, null, 5);
+<a id="L589"></a>    try testing.expect(oversize.len &gt;= 5);
+<a id="L590"></a>    for (oversize) |*item| {
+<a id="L591"></a>        item.* = 0xDEADBEEF;
+<a id="L592"></a>    }
+<a id="L593"></a>    allocator.free(oversize);
+<a id="L594"></a>}
+<a id="L595"></a>
+<a id="L596"></a>pub fn testAllocatorAligned(base_allocator: mem.Allocator) !void {
+<a id="L597"></a>    var validationAllocator = mem.validationWrap(base_allocator);
+<a id="L598"></a>    const allocator = validationAllocator.allocator();
+<a id="L599"></a>
+<a id="L600"></a>    // Test a few alignment values, smaller and bigger than the type's one
+<a id="L601"></a>    inline for ([_]Alignment{ .@"1", .@"2", .@"4", .@"8", .@"16", .@"32", .@"64" }) |alignment| {
+<a id="L602"></a>        // initial
+<a id="L603"></a>        var slice = try allocator.alignedAlloc(u8, alignment, 10);
+<a id="L604"></a>        try testing.expect(slice.len == 10);
+<a id="L605"></a>        // grow
+<a id="L606"></a>        slice = try allocator.realloc(slice, 100);
+<a id="L607"></a>        try testing.expect(slice.len == 100);
+<a id="L608"></a>        if (allocator.resize(slice, 10)) {
+<a id="L609"></a>            slice = slice[0..10];
+<a id="L610"></a>        }
+<a id="L611"></a>        try testing.expect(allocator.resize(slice, 0));
+<a id="L612"></a>        slice = slice[0..0];
+<a id="L613"></a>        // realloc from zero
+<a id="L614"></a>        slice = try allocator.realloc(slice, 100);
+<a id="L615"></a>        try testing.expect(slice.len == 100);
+<a id="L616"></a>        if (allocator.resize(slice, 10)) {
+<a id="L617"></a>            slice = slice[0..10];
+<a id="L618"></a>        }
+<a id="L619"></a>        try testing.expect(allocator.resize(slice, 0));
+<a id="L620"></a>    }
+<a id="L621"></a>}
+<a id="L622"></a>
+<a id="L623"></a>pub fn testAllocatorLargeAlignment(base_allocator: mem.Allocator) !void {
+<a id="L624"></a>    var validationAllocator = mem.validationWrap(base_allocator);
+<a id="L625"></a>    const allocator = validationAllocator.allocator();
+<a id="L626"></a>
+<a id="L627"></a>    const large_align: usize = page_size_min / 2;
+<a id="L628"></a>
+<a id="L629"></a>    var align_mask: usize = undefined;
+<a id="L630"></a>    align_mask = @shlWithOverflow(~@as(usize, 0), @as(Allocator.Log2Align, @ctz(large_align)))[0];
+<a id="L631"></a>
+<a id="L632"></a>    var slice = try allocator.alignedAlloc(u8, .fromByteUnits(large_align), 500);
+<a id="L633"></a>    try testing.expect(@intFromPtr(slice.ptr) &amp; align_mask == @intFromPtr(slice.ptr));
+<a id="L634"></a>
+<a id="L635"></a>    if (allocator.resize(slice, 100)) {
+<a id="L636"></a>        slice = slice[0..100];
+<a id="L637"></a>    }
+<a id="L638"></a>
+<a id="L639"></a>    slice = try allocator.realloc(slice, 5000);
+<a id="L640"></a>    try testing.expect(@intFromPtr(slice.ptr) &amp; align_mask == @intFromPtr(slice.ptr));
+<a id="L641"></a>
+<a id="L642"></a>    if (allocator.resize(slice, 10)) {
+<a id="L643"></a>        slice = slice[0..10];
+<a id="L644"></a>    }
+<a id="L645"></a>
+<a id="L646"></a>    slice = try allocator.realloc(slice, 20000);
+<a id="L647"></a>    try testing.expect(@intFromPtr(slice.ptr) &amp; align_mask == @intFromPtr(slice.ptr));
+<a id="L648"></a>
+<a id="L649"></a>    allocator.free(slice);
+<a id="L650"></a>}
+<a id="L651"></a>
+<a id="L652"></a>pub fn testAllocatorAlignedShrink(base_allocator: mem.Allocator) !void {
+<a id="L653"></a>    var validationAllocator = mem.validationWrap(base_allocator);
+<a id="L654"></a>    const allocator = validationAllocator.allocator();
+<a id="L655"></a>
+<a id="L656"></a>    var debug_buffer: [1000]u8 = undefined;
+<a id="L657"></a>    var fib = FixedBufferAllocator.init(&amp;debug_buffer);
+<a id="L658"></a>    const debug_allocator = fib.allocator();
+<a id="L659"></a>
+<a id="L660"></a>    const alloc_size = pageSize() * 2 + 50;
+<a id="L661"></a>    var slice = try allocator.alignedAlloc(u8, .@"16", alloc_size);
+<a id="L662"></a>    defer allocator.free(slice);
+<a id="L663"></a>
+<a id="L664"></a>    var stuff_to_free = std.array_list.Managed([]align(16) u8).init(debug_allocator);
+<a id="L665"></a>    // On Windows, VirtualAlloc returns addresses aligned to a 64K boundary,
+<a id="L666"></a>    // which is 16 pages, hence the 32. This test may require to increase
+<a id="L667"></a>    // the size of the allocations feeding the `allocator` parameter if they
+<a id="L668"></a>    // fail, because of this high over-alignment we want to have.
+<a id="L669"></a>    while (@intFromPtr(slice.ptr) == mem.alignForward(usize, @intFromPtr(slice.ptr), pageSize() * 32)) {
+<a id="L670"></a>        try stuff_to_free.append(slice);
+<a id="L671"></a>        slice = try allocator.alignedAlloc(u8, .@"16", alloc_size);
+<a id="L672"></a>    }
+<a id="L673"></a>    while (stuff_to_free.pop()) |item| {
+<a id="L674"></a>        allocator.free(item);
+<a id="L675"></a>    }
+<a id="L676"></a>    slice[0] = 0x12;
+<a id="L677"></a>    slice[60] = 0x34;
+<a id="L678"></a>
+<a id="L679"></a>    slice = try allocator.reallocAdvanced(slice, alloc_size / 2, 0);
+<a id="L680"></a>    try testing.expect(slice[0] == 0x12);
+<a id="L681"></a>    try testing.expect(slice[60] == 0x34);
+<a id="L682"></a>}
+<a id="L683"></a>
+<a id="L684"></a>const page_size_min_default: ?usize = switch (builtin.os.tag) {
+<a id="L685"></a>    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos =&gt; switch (builtin.cpu.arch) {
+<a id="L686"></a>        .x86_64 =&gt; 4 &lt;&lt; 10,
+<a id="L687"></a>        .aarch64 =&gt; 16 &lt;&lt; 10,
+<a id="L688"></a>        else =&gt; null,
+<a id="L689"></a>    },
+<a id="L690"></a>    .windows =&gt; switch (builtin.cpu.arch) {
+<a id="L691"></a>        // -- &lt;https://devblogs.microsoft.com/oldnewthing/20210510-00/?p=105200&gt;
+<a id="L692"></a>        .x86, .x86_64 =&gt; 4 &lt;&lt; 10,
+<a id="L693"></a>        // SuperH =&gt; 4 &lt;&lt; 10,
+<a id="L694"></a>        .mips, .mipsel, .mips64, .mips64el =&gt; 4 &lt;&lt; 10,
+<a id="L695"></a>        .powerpc, .powerpcle, .powerpc64, .powerpc64le =&gt; 4 &lt;&lt; 10,
+<a id="L696"></a>        // DEC Alpha =&gt; 8 &lt;&lt; 10,
+<a id="L697"></a>        // Itanium =&gt; 8 &lt;&lt; 10,
+<a id="L698"></a>        .thumb, .thumbeb, .arm, .armeb, .aarch64, .aarch64_be =&gt; 4 &lt;&lt; 10,
+<a id="L699"></a>        else =&gt; null,
+<a id="L700"></a>    },
+<a id="L701"></a>    .wasi =&gt; switch (builtin.cpu.arch) {
+<a id="L702"></a>        .wasm32, .wasm64 =&gt; 64 &lt;&lt; 10,
+<a id="L703"></a>        else =&gt; null,
+<a id="L704"></a>    },
+<a id="L705"></a>    // https://github.com/tianocore/edk2/blob/b158dad150bf02879668f72ce306445250838201/MdePkg/Include/Uefi/UefiBaseType.h#L180-L187
+<a id="L706"></a>    .uefi =&gt; 4 &lt;&lt; 10,
+<a id="L707"></a>    .freebsd =&gt; switch (builtin.cpu.arch) {
+<a id="L708"></a>        // FreeBSD/sys/*
+<a id="L709"></a>        .x86, .x86_64 =&gt; 4 &lt;&lt; 10,
+<a id="L710"></a>        .thumb, .thumbeb, .arm, .armeb =&gt; 4 &lt;&lt; 10,
+<a id="L711"></a>        .aarch64, .aarch64_be =&gt; 4 &lt;&lt; 10,
+<a id="L712"></a>        .powerpc, .powerpc64, .powerpc64le, .powerpcle =&gt; 4 &lt;&lt; 10,
+<a id="L713"></a>        .riscv32, .riscv64 =&gt; 4 &lt;&lt; 10,
+<a id="L714"></a>        else =&gt; null,
+<a id="L715"></a>    },
+<a id="L716"></a>    .netbsd =&gt; switch (builtin.cpu.arch) {
+<a id="L717"></a>        // NetBSD/sys/arch/*
+<a id="L718"></a>        .alpha =&gt; 8 &lt;&lt; 10,
+<a id="L719"></a>        .x86, .x86_64 =&gt; 4 &lt;&lt; 10,
+<a id="L720"></a>        .thumb, .thumbeb, .arm, .armeb =&gt; 4 &lt;&lt; 10,
+<a id="L721"></a>        .aarch64, .aarch64_be =&gt; 4 &lt;&lt; 10,
+<a id="L722"></a>        .hppa =&gt; 4 &lt;&lt; 10,
+<a id="L723"></a>        .mips, .mipsel, .mips64, .mips64el =&gt; 4 &lt;&lt; 10,
+<a id="L724"></a>        .powerpc, .powerpc64, .powerpc64le, .powerpcle =&gt; 4 &lt;&lt; 10,
+<a id="L725"></a>        .sh, .sheb =&gt; 4 &lt;&lt; 10,
+<a id="L726"></a>        .sparc =&gt; 4 &lt;&lt; 10,
+<a id="L727"></a>        .sparc64 =&gt; 8 &lt;&lt; 10,
+<a id="L728"></a>        .riscv32, .riscv64 =&gt; 4 &lt;&lt; 10,
+<a id="L729"></a>        // Sun-2
+<a id="L730"></a>        .m68k =&gt; 2 &lt;&lt; 10,
+<a id="L731"></a>        else =&gt; null,
+<a id="L732"></a>    },
+<a id="L733"></a>    .dragonfly =&gt; switch (builtin.cpu.arch) {
+<a id="L734"></a>        .x86, .x86_64 =&gt; 4 &lt;&lt; 10,
+<a id="L735"></a>        else =&gt; null,
+<a id="L736"></a>    },
+<a id="L737"></a>    .openbsd =&gt; switch (builtin.cpu.arch) {
+<a id="L738"></a>        // OpenBSD/sys/arch/*
+<a id="L739"></a>        .alpha =&gt; 8 &lt;&lt; 10,
+<a id="L740"></a>        .hppa =&gt; 4 &lt;&lt; 10,
+<a id="L741"></a>        .x86, .x86_64 =&gt; 4 &lt;&lt; 10,
+<a id="L742"></a>        .thumb, .thumbeb, .arm, .armeb, .aarch64, .aarch64_be =&gt; 4 &lt;&lt; 10,
+<a id="L743"></a>        .mips64, .mips64el =&gt; 4 &lt;&lt; 10,
+<a id="L744"></a>        .powerpc, .powerpc64, .powerpc64le, .powerpcle =&gt; 4 &lt;&lt; 10,
+<a id="L745"></a>        .riscv64 =&gt; 4 &lt;&lt; 10,
+<a id="L746"></a>        .sh, .sheb =&gt; 4 &lt;&lt; 10,
+<a id="L747"></a>        .sparc64 =&gt; 8 &lt;&lt; 10,
+<a id="L748"></a>        else =&gt; null,
+<a id="L749"></a>    },
+<a id="L750"></a>    .illumos =&gt; switch (builtin.cpu.arch) {
+<a id="L751"></a>        // src/uts/*/sys/machparam.h
+<a id="L752"></a>        .x86, .x86_64 =&gt; 4 &lt;&lt; 10,
+<a id="L753"></a>        .sparc, .sparc64 =&gt; 8 &lt;&lt; 10,
+<a id="L754"></a>        else =&gt; null,
+<a id="L755"></a>    },
+<a id="L756"></a>    .fuchsia =&gt; switch (builtin.cpu.arch) {
+<a id="L757"></a>        // fuchsia/kernel/arch/*/include/arch/defines.h
+<a id="L758"></a>        .x86_64 =&gt; 4 &lt;&lt; 10,
+<a id="L759"></a>        .aarch64, .aarch64_be =&gt; 4 &lt;&lt; 10,
+<a id="L760"></a>        .riscv64 =&gt; 4 &lt;&lt; 10,
+<a id="L761"></a>        else =&gt; null,
+<a id="L762"></a>    },
+<a id="L763"></a>    // https://github.com/SerenityOS/serenity/blob/62b938b798dc009605b5df8a71145942fc53808b/Kernel/API/POSIX/sys/limits.h#L11-L13
+<a id="L764"></a>    .serenity =&gt; 4 &lt;&lt; 10,
+<a id="L765"></a>    .haiku =&gt; switch (builtin.cpu.arch) {
+<a id="L766"></a>        // haiku/headers/posix/arch/*/limits.h
+<a id="L767"></a>        .thumb, .thumbeb, .arm, .armeb =&gt; 4 &lt;&lt; 10,
+<a id="L768"></a>        .aarch64, .aarch64_be =&gt; 4 &lt;&lt; 10,
+<a id="L769"></a>        .m68k =&gt; 4 &lt;&lt; 10,
+<a id="L770"></a>        .mips, .mipsel, .mips64, .mips64el =&gt; 4 &lt;&lt; 10,
+<a id="L771"></a>        .powerpc, .powerpc64, .powerpc64le, .powerpcle =&gt; 4 &lt;&lt; 10,
+<a id="L772"></a>        .riscv64 =&gt; 4 &lt;&lt; 10,
+<a id="L773"></a>        .sparc64 =&gt; 8 &lt;&lt; 10,
+<a id="L774"></a>        .x86, .x86_64 =&gt; 4 &lt;&lt; 10,
+<a id="L775"></a>        else =&gt; null,
+<a id="L776"></a>    },
+<a id="L777"></a>    .hurd =&gt; switch (builtin.cpu.arch) {
+<a id="L778"></a>        // gnumach/*/include/mach/*/vm_param.h
+<a id="L779"></a>        .x86, .x86_64 =&gt; 4 &lt;&lt; 10,
+<a id="L780"></a>        .aarch64 =&gt; null,
+<a id="L781"></a>        else =&gt; null,
+<a id="L782"></a>    },
+<a id="L783"></a>    .plan9 =&gt; switch (builtin.cpu.arch) {
+<a id="L784"></a>        // 9front/sys/src/9/*/mem.h
+<a id="L785"></a>        .x86, .x86_64 =&gt; 4 &lt;&lt; 10,
+<a id="L786"></a>        .thumb, .thumbeb, .arm, .armeb =&gt; 4 &lt;&lt; 10,
+<a id="L787"></a>        .aarch64, .aarch64_be =&gt; 4 &lt;&lt; 10,
+<a id="L788"></a>        .mips, .mipsel, .mips64, .mips64el =&gt; 4 &lt;&lt; 10,
+<a id="L789"></a>        .powerpc, .powerpcle, .powerpc64, .powerpc64le =&gt; 4 &lt;&lt; 10,
+<a id="L790"></a>        .sparc =&gt; 4 &lt;&lt; 10,
+<a id="L791"></a>        else =&gt; null,
+<a id="L792"></a>    },
+<a id="L793"></a>    .ps3 =&gt; switch (builtin.cpu.arch) {
+<a id="L794"></a>        // cell/SDK_doc/en/html/C_and_C++_standard_libraries/stdlib.html
+<a id="L795"></a>        .powerpc64 =&gt; 1 &lt;&lt; 20, // 1 MiB
+<a id="L796"></a>        else =&gt; null,
+<a id="L797"></a>    },
+<a id="L798"></a>    .ps4 =&gt; switch (builtin.cpu.arch) {
+<a id="L799"></a>        // https://github.com/ps4dev/ps4sdk/blob/4df9d001b66ae4ec07d9a51b62d1e4c5e270eecc/include/machine/param.h#L95
+<a id="L800"></a>        .x86, .x86_64 =&gt; 4 &lt;&lt; 10,
+<a id="L801"></a>        else =&gt; null,
+<a id="L802"></a>    },
+<a id="L803"></a>    .ps5 =&gt; switch (builtin.cpu.arch) {
+<a id="L804"></a>        // https://github.com/PS5Dev/PS5SDK/blob/a2e03a2a0231a3a3397fa6cd087a01ca6d04f273/include/machine/param.h#L95
+<a id="L805"></a>        .x86, .x86_64 =&gt; 16 &lt;&lt; 10,
+<a id="L806"></a>        else =&gt; null,
+<a id="L807"></a>    },
+<a id="L808"></a>    .psp =&gt; switch (builtin.cpu.arch) {
+<a id="L809"></a>        // minimum block allocation by testing sceKernel
+<a id="L810"></a>        .mips, .mipsel =&gt; 1 &lt;&lt; 8, // 256
+<a id="L811"></a>        else =&gt; null,
+<a id="L812"></a>    },
+<a id="L813"></a>    // system/lib/libc/musl/arch/emscripten/bits/limits.h
+<a id="L814"></a>    .emscripten =&gt; 64 &lt;&lt; 10,
+<a id="L815"></a>    .linux =&gt; switch (builtin.cpu.arch) {
+<a id="L816"></a>        // Linux/arch/*/Kconfig
+<a id="L817"></a>        .alpha =&gt; 8 &lt;&lt; 10,
+<a id="L818"></a>        .arc, .arceb =&gt; 4 &lt;&lt; 10,
+<a id="L819"></a>        .thumb, .thumbeb, .arm, .armeb =&gt; 4 &lt;&lt; 10,
+<a id="L820"></a>        .aarch64, .aarch64_be =&gt; 4 &lt;&lt; 10,
+<a id="L821"></a>        .csky =&gt; 4 &lt;&lt; 10,
+<a id="L822"></a>        .hexagon =&gt; 4 &lt;&lt; 10,
+<a id="L823"></a>        .hppa =&gt; 4 &lt;&lt; 10,
+<a id="L824"></a>        .loongarch32, .loongarch64 =&gt; 4 &lt;&lt; 10,
+<a id="L825"></a>        .m68k =&gt; 4 &lt;&lt; 10,
+<a id="L826"></a>        .microblaze, .microblazeel =&gt; 4 &lt;&lt; 10,
+<a id="L827"></a>        .mips, .mipsel, .mips64, .mips64el =&gt; 4 &lt;&lt; 10,
+<a id="L828"></a>        .or1k =&gt; 8 &lt;&lt; 10,
+<a id="L829"></a>        .powerpc, .powerpc64, .powerpc64le, .powerpcle =&gt; 4 &lt;&lt; 10,
+<a id="L830"></a>        .riscv32, .riscv64 =&gt; 4 &lt;&lt; 10,
+<a id="L831"></a>        .s390x =&gt; 4 &lt;&lt; 10,
+<a id="L832"></a>        .sh, .sheb =&gt; 4 &lt;&lt; 10,
+<a id="L833"></a>        .sparc =&gt; 4 &lt;&lt; 10,
+<a id="L834"></a>        .sparc64 =&gt; 8 &lt;&lt; 10,
+<a id="L835"></a>        .x86, .x86_64 =&gt; 4 &lt;&lt; 10,
+<a id="L836"></a>        .xtensa, .xtensaeb =&gt; 4 &lt;&lt; 10,
+<a id="L837"></a>        else =&gt; null,
+<a id="L838"></a>    },
+<a id="L839"></a>    .freestanding, .other =&gt; switch (builtin.cpu.arch) {
+<a id="L840"></a>        .wasm32, .wasm64 =&gt; 64 &lt;&lt; 10,
+<a id="L841"></a>        .x86, .x86_64 =&gt; 4 &lt;&lt; 10,
+<a id="L842"></a>        .aarch64, .aarch64_be =&gt; 4 &lt;&lt; 10,
+<a id="L843"></a>        else =&gt; null,
+<a id="L844"></a>    },
+<a id="L845"></a>    else =&gt; null,
+<a id="L846"></a>};
+<a id="L847"></a>
+<a id="L848"></a>const page_size_max_default: ?usize = switch (builtin.os.tag) {
+<a id="L849"></a>    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos =&gt; switch (builtin.cpu.arch) {
+<a id="L850"></a>        .x86_64 =&gt; 4 &lt;&lt; 10,
+<a id="L851"></a>        .aarch64 =&gt; 16 &lt;&lt; 10,
+<a id="L852"></a>        else =&gt; null,
+<a id="L853"></a>    },
+<a id="L854"></a>    .windows =&gt; switch (builtin.cpu.arch) {
+<a id="L855"></a>        // -- &lt;https://devblogs.microsoft.com/oldnewthing/20210510-00/?p=105200&gt;
+<a id="L856"></a>        .x86, .x86_64 =&gt; 4 &lt;&lt; 10,
+<a id="L857"></a>        // SuperH =&gt; 4 &lt;&lt; 10,
+<a id="L858"></a>        .mips, .mipsel, .mips64, .mips64el =&gt; 4 &lt;&lt; 10,
+<a id="L859"></a>        .powerpc, .powerpcle, .powerpc64, .powerpc64le =&gt; 4 &lt;&lt; 10,
+<a id="L860"></a>        // DEC Alpha =&gt; 8 &lt;&lt; 10,
+<a id="L861"></a>        // Itanium =&gt; 8 &lt;&lt; 10,
+<a id="L862"></a>        .thumb, .thumbeb, .arm, .armeb, .aarch64, .aarch64_be =&gt; 4 &lt;&lt; 10,
+<a id="L863"></a>        else =&gt; null,
+<a id="L864"></a>    },
+<a id="L865"></a>    .wasi =&gt; switch (builtin.cpu.arch) {
+<a id="L866"></a>        .wasm32, .wasm64 =&gt; 64 &lt;&lt; 10,
+<a id="L867"></a>        else =&gt; null,
+<a id="L868"></a>    },
+<a id="L869"></a>    // https://github.com/tianocore/edk2/blob/b158dad150bf02879668f72ce306445250838201/MdePkg/Include/Uefi/UefiBaseType.h#L180-L187
+<a id="L870"></a>    .uefi =&gt; 4 &lt;&lt; 10,
+<a id="L871"></a>    .freebsd =&gt; switch (builtin.cpu.arch) {
+<a id="L872"></a>        // FreeBSD/sys/*
+<a id="L873"></a>        .x86, .x86_64 =&gt; 4 &lt;&lt; 10,
+<a id="L874"></a>        .thumb, .thumbeb, .arm, .armeb =&gt; 4 &lt;&lt; 10,
+<a id="L875"></a>        .aarch64, .aarch64_be =&gt; 4 &lt;&lt; 10,
+<a id="L876"></a>        .powerpc, .powerpc64, .powerpc64le, .powerpcle =&gt; 4 &lt;&lt; 10,
+<a id="L877"></a>        .riscv32, .riscv64 =&gt; 4 &lt;&lt; 10,
+<a id="L878"></a>        else =&gt; null,
+<a id="L879"></a>    },
+<a id="L880"></a>    .netbsd =&gt; switch (builtin.cpu.arch) {
+<a id="L881"></a>        // NetBSD/sys/arch/*
+<a id="L882"></a>        .alpha =&gt; 8 &lt;&lt; 10,
+<a id="L883"></a>        .x86, .x86_64 =&gt; 4 &lt;&lt; 10,
+<a id="L884"></a>        .thumb, .thumbeb, .arm, .armeb =&gt; 4 &lt;&lt; 10,
+<a id="L885"></a>        .aarch64, .aarch64_be =&gt; 64 &lt;&lt; 10,
+<a id="L886"></a>        .hppa =&gt; 4 &lt;&lt; 10,
+<a id="L887"></a>        .mips, .mipsel, .mips64, .mips64el =&gt; 16 &lt;&lt; 10,
+<a id="L888"></a>        .powerpc, .powerpc64, .powerpc64le, .powerpcle =&gt; 16 &lt;&lt; 10,
+<a id="L889"></a>        .sh, .sheb =&gt; 4 &lt;&lt; 10,
+<a id="L890"></a>        .sparc =&gt; 8 &lt;&lt; 10,
+<a id="L891"></a>        .sparc64 =&gt; 8 &lt;&lt; 10,
+<a id="L892"></a>        .riscv32, .riscv64 =&gt; 4 &lt;&lt; 10,
+<a id="L893"></a>        .m68k =&gt; 8 &lt;&lt; 10,
+<a id="L894"></a>        else =&gt; null,
+<a id="L895"></a>    },
+<a id="L896"></a>    .dragonfly =&gt; switch (builtin.cpu.arch) {
+<a id="L897"></a>        .x86, .x86_64 =&gt; 4 &lt;&lt; 10,
+<a id="L898"></a>        else =&gt; null,
+<a id="L899"></a>    },
+<a id="L900"></a>    .openbsd =&gt; switch (builtin.cpu.arch) {
+<a id="L901"></a>        // OpenBSD/sys/arch/*
+<a id="L902"></a>        .alpha =&gt; 8 &lt;&lt; 10,
+<a id="L903"></a>        .hppa =&gt; 4 &lt;&lt; 10,
+<a id="L904"></a>        .x86, .x86_64 =&gt; 4 &lt;&lt; 10,
+<a id="L905"></a>        .thumb, .thumbeb, .arm, .armeb, .aarch64, .aarch64_be =&gt; 4 &lt;&lt; 10,
+<a id="L906"></a>        .mips64, .mips64el =&gt; 16 &lt;&lt; 10,
+<a id="L907"></a>        .powerpc, .powerpc64, .powerpc64le, .powerpcle =&gt; 4 &lt;&lt; 10,
+<a id="L908"></a>        .riscv64 =&gt; 4 &lt;&lt; 10,
+<a id="L909"></a>        .sh, .sheb =&gt; 4 &lt;&lt; 10,
+<a id="L910"></a>        .sparc64 =&gt; 8 &lt;&lt; 10,
+<a id="L911"></a>        else =&gt; null,
+<a id="L912"></a>    },
+<a id="L913"></a>    .illumos =&gt; switch (builtin.cpu.arch) {
+<a id="L914"></a>        // src/uts/*/sys/machparam.h
+<a id="L915"></a>        .x86, .x86_64 =&gt; 4 &lt;&lt; 10,
+<a id="L916"></a>        .sparc, .sparc64 =&gt; 8 &lt;&lt; 10,
+<a id="L917"></a>        else =&gt; null,
+<a id="L918"></a>    },
+<a id="L919"></a>    .fuchsia =&gt; switch (builtin.cpu.arch) {
+<a id="L920"></a>        // fuchsia/kernel/arch/*/include/arch/defines.h
+<a id="L921"></a>        .x86_64 =&gt; 4 &lt;&lt; 10,
+<a id="L922"></a>        .aarch64, .aarch64_be =&gt; 4 &lt;&lt; 10,
+<a id="L923"></a>        .riscv64 =&gt; 4 &lt;&lt; 10,
+<a id="L924"></a>        else =&gt; null,
+<a id="L925"></a>    },
+<a id="L926"></a>    // https://github.com/SerenityOS/serenity/blob/62b938b798dc009605b5df8a71145942fc53808b/Kernel/API/POSIX/sys/limits.h#L11-L13
+<a id="L927"></a>    .serenity =&gt; 4 &lt;&lt; 10,
+<a id="L928"></a>    .haiku =&gt; switch (builtin.cpu.arch) {
+<a id="L929"></a>        // haiku/headers/posix/arch/*/limits.h
+<a id="L930"></a>        .thumb, .thumbeb, .arm, .armeb =&gt; 4 &lt;&lt; 10,
+<a id="L931"></a>        .aarch64, .aarch64_be =&gt; 4 &lt;&lt; 10,
+<a id="L932"></a>        .m68k =&gt; 4 &lt;&lt; 10,
+<a id="L933"></a>        .mips, .mipsel, .mips64, .mips64el =&gt; 4 &lt;&lt; 10,
+<a id="L934"></a>        .powerpc, .powerpc64, .powerpc64le, .powerpcle =&gt; 4 &lt;&lt; 10,
+<a id="L935"></a>        .riscv64 =&gt; 4 &lt;&lt; 10,
+<a id="L936"></a>        .sparc64 =&gt; 8 &lt;&lt; 10,
+<a id="L937"></a>        .x86, .x86_64 =&gt; 4 &lt;&lt; 10,
+<a id="L938"></a>        else =&gt; null,
+<a id="L939"></a>    },
+<a id="L940"></a>    .hurd =&gt; switch (builtin.cpu.arch) {
+<a id="L941"></a>        // gnumach/*/include/mach/*/vm_param.h
+<a id="L942"></a>        .x86, .x86_64 =&gt; 4 &lt;&lt; 10,
+<a id="L943"></a>        .aarch64 =&gt; null,
+<a id="L944"></a>        else =&gt; null,
+<a id="L945"></a>    },
+<a id="L946"></a>    .plan9 =&gt; switch (builtin.cpu.arch) {
+<a id="L947"></a>        // 9front/sys/src/9/*/mem.h
+<a id="L948"></a>        .x86, .x86_64 =&gt; 4 &lt;&lt; 10,
+<a id="L949"></a>        .thumb, .thumbeb, .arm, .armeb =&gt; 4 &lt;&lt; 10,
+<a id="L950"></a>        .aarch64, .aarch64_be =&gt; 64 &lt;&lt; 10,
+<a id="L951"></a>        .mips, .mipsel, .mips64, .mips64el =&gt; 16 &lt;&lt; 10,
+<a id="L952"></a>        .powerpc, .powerpcle, .powerpc64, .powerpc64le =&gt; 4 &lt;&lt; 10,
+<a id="L953"></a>        .sparc =&gt; 4 &lt;&lt; 10,
+<a id="L954"></a>        else =&gt; null,
+<a id="L955"></a>    },
+<a id="L956"></a>    .ps3 =&gt; switch (builtin.cpu.arch) {
+<a id="L957"></a>        // cell/SDK_doc/en/html/C_and_C++_standard_libraries/stdlib.html
+<a id="L958"></a>        .powerpc64 =&gt; 1 &lt;&lt; 20, // 1 MiB
+<a id="L959"></a>        else =&gt; null,
+<a id="L960"></a>    },
+<a id="L961"></a>    .ps4 =&gt; switch (builtin.cpu.arch) {
+<a id="L962"></a>        // https://github.com/ps4dev/ps4sdk/blob/4df9d001b66ae4ec07d9a51b62d1e4c5e270eecc/include/machine/param.h#L95
+<a id="L963"></a>        .x86, .x86_64 =&gt; 4 &lt;&lt; 10,
+<a id="L964"></a>        else =&gt; null,
+<a id="L965"></a>    },
+<a id="L966"></a>    .ps5 =&gt; switch (builtin.cpu.arch) {
+<a id="L967"></a>        // https://github.com/PS5Dev/PS5SDK/blob/a2e03a2a0231a3a3397fa6cd087a01ca6d04f273/include/machine/param.h#L95
+<a id="L968"></a>        .x86, .x86_64 =&gt; 16 &lt;&lt; 10,
+<a id="L969"></a>        else =&gt; null,
+<a id="L970"></a>    },
+<a id="L971"></a>    .psp =&gt; switch (builtin.cpu.arch) {
+<a id="L972"></a>        // minimum block allocation by testing sceKernel
+<a id="L973"></a>        .mips, .mipsel =&gt; 1 &lt;&lt; 8, // 256
+<a id="L974"></a>        else =&gt; null,
+<a id="L975"></a>    },
+<a id="L976"></a>    // system/lib/libc/musl/arch/emscripten/bits/limits.h
+<a id="L977"></a>    .emscripten =&gt; 64 &lt;&lt; 10,
+<a id="L978"></a>    .linux =&gt; switch (builtin.cpu.arch) {
+<a id="L979"></a>        // Linux/arch/*/Kconfig
+<a id="L980"></a>        .alpha =&gt; 8 &lt;&lt; 10,
+<a id="L981"></a>        .arc, .arceb =&gt; 16 &lt;&lt; 10,
+<a id="L982"></a>        .thumb, .thumbeb, .arm, .armeb =&gt; 4 &lt;&lt; 10,
+<a id="L983"></a>        .aarch64, .aarch64_be =&gt; 64 &lt;&lt; 10,
+<a id="L984"></a>        .csky =&gt; 4 &lt;&lt; 10,
+<a id="L985"></a>        .hexagon =&gt; 256 &lt;&lt; 10,
+<a id="L986"></a>        .hppa =&gt; 64 &lt;&lt; 10,
+<a id="L987"></a>        .loongarch32, .loongarch64 =&gt; 64 &lt;&lt; 10,
+<a id="L988"></a>        .m68k =&gt; 8 &lt;&lt; 10,
+<a id="L989"></a>        .microblaze, .microblazeel =&gt; 4 &lt;&lt; 10,
+<a id="L990"></a>        .mips, .mipsel, .mips64, .mips64el =&gt; 64 &lt;&lt; 10,
+<a id="L991"></a>        .or1k =&gt; 8 &lt;&lt; 10,
+<a id="L992"></a>        .powerpc, .powerpc64, .powerpc64le, .powerpcle =&gt; 256 &lt;&lt; 10,
+<a id="L993"></a>        .riscv32, .riscv64 =&gt; 4 &lt;&lt; 10,
+<a id="L994"></a>        .s390x =&gt; 4 &lt;&lt; 10,
+<a id="L995"></a>        .sh, .sheb =&gt; 64 &lt;&lt; 10,
+<a id="L996"></a>        .sparc =&gt; 4 &lt;&lt; 10,
+<a id="L997"></a>        .sparc64 =&gt; 8 &lt;&lt; 10,
+<a id="L998"></a>        .x86, .x86_64 =&gt; 4 &lt;&lt; 10,
+<a id="L999"></a>        .xtensa, .xtensaeb =&gt; 4 &lt;&lt; 10,
+<a id="L1000"></a>        else =&gt; null,
+<a id="L1001"></a>    },
+<a id="L1002"></a>    .freestanding =&gt; switch (builtin.cpu.arch) {
+<a id="L1003"></a>        .wasm32, .wasm64 =&gt; 64 &lt;&lt; 10,
+<a id="L1004"></a>        else =&gt; null,
+<a id="L1005"></a>    },
+<a id="L1006"></a>    else =&gt; null,
+<a id="L1007"></a>};
+<a id="L1008"></a>
+<a id="L1009"></a>test {
+<a id="L1010"></a>    _ = @import("heap/memory_pool.zig");
+<a id="L1011"></a>    _ = ArenaAllocator;
+<a id="L1012"></a>    _ = DebugAllocator(.{});
+<a id="L1013"></a>    _ = FixedBufferAllocator;
+<a id="L1014"></a>    if (builtin.single_threaded) {
+<a id="L1015"></a>        if (builtin.cpu.arch.isWasm() or (builtin.os.tag == .linux and !builtin.link_libc)) {
+<a id="L1016"></a>            _ = brk_allocator;
+<a id="L1017"></a>        }
+<a id="L1018"></a>    } else {
+<a id="L1019"></a>        _ = smp_allocator;
+<a id="L1020"></a>    }
+<a id="L1021"></a>}
+</pre>
 </body>
 </html>

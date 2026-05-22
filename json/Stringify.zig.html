@@ -2,1016 +2,1019 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Source: zig-0.16.0-std/json/Stringify.zig</title>
+    <title>Source: json/Stringify.zig</title>
     <style>
         body { background: #1e1e1e; color: #d4d4d4; font-family: monospace; padding: 20px; }
         pre { white-space: pre-wrap; word-wrap: break-word; }
         .header { border-bottom: 1px solid #444; padding-bottom: 10px; margin-bottom: 20px; }
         a { color: #569cd6; }
+        a[id] { color: inherit; text-decoration: none; }
+        :target { background: #3a3a00; }
     </style>
 </head>
 <body>
     <div class="header">
-        <a href="/">Index</a> | <strong>File: zig-0.16.0-std/json/Stringify.zig</strong>
+        <a href="/">Index</a> | <strong>File: json/Stringify.zig</strong>
     </div>
-    <pre>//! Writes JSON ([RFC8259](https://tools.ietf.org/html/rfc8259)) formatted data
-//! to a stream.
-//!
-//! The sequence of method calls to write JSON content must follow this grammar:
-//! ```
-//!  &lt;once&gt; = &lt;value&gt;
-//!  &lt;value&gt; =
-//!    | &lt;object&gt;
-//!    | &lt;array&gt;
-//!    | write
-//!    | print
-//!    | &lt;writeRawStream&gt;
-//!  &lt;object&gt; = beginObject ( &lt;field&gt; &lt;value&gt; )* endObject
-//!  &lt;field&gt; = objectField | objectFieldRaw | &lt;objectFieldRawStream&gt;
-//!  &lt;array&gt; = beginArray ( &lt;value&gt; )* endArray
-//!  &lt;writeRawStream&gt; = beginWriteRaw ( stream.writeAll )* endWriteRaw
-//!  &lt;objectFieldRawStream&gt; = beginObjectFieldRaw ( stream.writeAll )* endObjectFieldRaw
-//! ```
-
-const std = @import("../std.zig");
-const assert = std.debug.assert;
-const Allocator = std.mem.Allocator;
-const ArrayList = std.ArrayList;
-const BitStack = std.BitStack;
-const Stringify = @This();
-const Writer = std.Io.Writer;
-
-const IndentationMode = enum(u1) {
-    object = 0,
-    array = 1,
-};
-
-writer: *Writer,
-options: Options = .{},
-indent_level: usize = 0,
-next_punctuation: enum {
-    the_beginning,
-    none,
-    comma,
-    colon,
-} = .the_beginning,
-
-nesting_stack: switch (safety_checks) {
-    .checked_to_fixed_depth =&gt; |fixed_buffer_size| [(fixed_buffer_size + 7) &gt;&gt; 3]u8,
-    .assumed_correct =&gt; void,
-} = switch (safety_checks) {
-    .checked_to_fixed_depth =&gt; @splat(0),
-    .assumed_correct =&gt; {},
-},
-
-raw_streaming_mode: if (build_mode_has_safety)
-    enum { none, value, objectField }
-else
-    void = if (build_mode_has_safety) .none else {},
-
-const build_mode_has_safety = switch (@import("builtin").mode) {
-    .Debug, .ReleaseSafe =&gt; true,
-    .ReleaseFast, .ReleaseSmall =&gt; false,
-};
-
-/// The `safety_checks_hint` parameter determines how much memory is used to enable assertions that the above grammar is being followed,
-/// e.g. tripping an assertion rather than allowing `endObject` to emit the final `}` in `[[[]]}`.
-/// "Depth" in this context means the depth of nested `[]` or `{}` expressions
-/// (or equivalently the amount of recursion on the `&lt;value&gt;` grammar expression above).
-/// For example, emitting the JSON `[[[]]]` requires a depth of 3.
-/// If `.checked_to_fixed_depth` is used, there is additionally an assertion that the nesting depth never exceeds the given limit.
-/// `.checked_to_fixed_depth` embeds the storage required in the `Stringify` struct.
-/// `.assumed_correct` requires no space and performs none of these assertions.
-/// In `ReleaseFast` and `ReleaseSmall` mode, the given `safety_checks_hint` is ignored and is always treated as `.assumed_correct`.
-const safety_checks_hint: union(enum) {
-    /// Rounded up to the nearest multiple of 8.
-    checked_to_fixed_depth: usize,
-    assumed_correct,
-} = .{ .checked_to_fixed_depth = 256 };
-
-const safety_checks: @TypeOf(safety_checks_hint) = if (build_mode_has_safety)
-    safety_checks_hint
-else
-    .assumed_correct;
-
-pub const Error = Writer.Error;
-
-pub fn beginArray(self: *Stringify) Error!void {
-    if (build_mode_has_safety) assert(self.raw_streaming_mode == .none);
-    try self.valueStart();
-    try self.writer.writeByte('[');
-    try self.pushIndentation(.array);
-    self.next_punctuation = .none;
-}
-
-pub fn beginObject(self: *Stringify) Error!void {
-    if (build_mode_has_safety) assert(self.raw_streaming_mode == .none);
-    try self.valueStart();
-    try self.writer.writeByte('{');
-    try self.pushIndentation(.object);
-    self.next_punctuation = .none;
-}
-
-pub fn endArray(self: *Stringify) Error!void {
-    if (build_mode_has_safety) assert(self.raw_streaming_mode == .none);
-    self.popIndentation(.array);
-    switch (self.next_punctuation) {
-        .none =&gt; {},
-        .comma =&gt; {
-            try self.indent();
-        },
-        .the_beginning, .colon =&gt; unreachable,
-    }
-    try self.writer.writeByte(']');
-    self.valueDone();
-}
-
-pub fn endObject(self: *Stringify) Error!void {
-    if (build_mode_has_safety) assert(self.raw_streaming_mode == .none);
-    self.popIndentation(.object);
-    switch (self.next_punctuation) {
-        .none =&gt; {},
-        .comma =&gt; {
-            try self.indent();
-        },
-        .the_beginning, .colon =&gt; unreachable,
-    }
-    try self.writer.writeByte('}');
-    self.valueDone();
-}
-
-fn pushIndentation(self: *Stringify, mode: IndentationMode) !void {
-    switch (safety_checks) {
-        .checked_to_fixed_depth =&gt; {
-            BitStack.pushWithStateAssumeCapacity(&amp;self.nesting_stack, &amp;self.indent_level, @intFromEnum(mode));
-        },
-        .assumed_correct =&gt; {
-            self.indent_level += 1;
-        },
-    }
-}
-fn popIndentation(self: *Stringify, expected_mode: IndentationMode) void {
-    switch (safety_checks) {
-        .checked_to_fixed_depth =&gt; {
-            assert(BitStack.popWithState(&amp;self.nesting_stack, &amp;self.indent_level) == @intFromEnum(expected_mode));
-        },
-        .assumed_correct =&gt; {
-            self.indent_level -= 1;
-        },
-    }
-}
-
-fn indent(self: *Stringify) !void {
-    var char: u8 = ' ';
-    const n_chars = switch (self.options.whitespace) {
-        .minified =&gt; return,
-        .indent_1 =&gt; 1 * self.indent_level,
-        .indent_2 =&gt; 2 * self.indent_level,
-        .indent_3 =&gt; 3 * self.indent_level,
-        .indent_4 =&gt; 4 * self.indent_level,
-        .indent_8 =&gt; 8 * self.indent_level,
-        .indent_tab =&gt; blk: {
-            char = '\t';
-            break :blk self.indent_level;
-        },
-    };
-    try self.writer.writeByte('\n');
-    try self.writer.splatByteAll(char, n_chars);
-}
-
-fn valueStart(self: *Stringify) !void {
-    if (self.isObjectKeyExpected()) |is_it| assert(!is_it); // Call objectField*(), not write(), for object keys.
-    return self.valueStartAssumeTypeOk();
-}
-fn objectFieldStart(self: *Stringify) !void {
-    if (self.isObjectKeyExpected()) |is_it| assert(is_it); // Expected write(), not objectField*().
-    return self.valueStartAssumeTypeOk();
-}
-fn valueStartAssumeTypeOk(self: *Stringify) !void {
-    assert(!self.isComplete()); // JSON document already complete.
-    switch (self.next_punctuation) {
-        .the_beginning =&gt; {
-            // No indentation for the very beginning.
-        },
-        .none =&gt; {
-            // First item in a container.
-            try self.indent();
-        },
-        .comma =&gt; {
-            // Subsequent item in a container.
-            try self.writer.writeByte(',');
-            try self.indent();
-        },
-        .colon =&gt; {
-            try self.writer.writeByte(':');
-            if (self.options.whitespace != .minified) {
-                try self.writer.writeByte(' ');
-            }
-        },
-    }
-}
-fn valueDone(self: *Stringify) void {
-    self.next_punctuation = .comma;
-}
-
-// Only when safety is enabled:
-fn isObjectKeyExpected(self: *const Stringify) ?bool {
-    switch (safety_checks) {
-        .checked_to_fixed_depth =&gt; return self.indent_level &gt; 0 and
-            BitStack.peekWithState(&amp;self.nesting_stack, self.indent_level) == @intFromEnum(IndentationMode.object) and
-            self.next_punctuation != .colon,
-        .assumed_correct =&gt; return null,
-    }
-}
-fn isComplete(self: *const Stringify) bool {
-    return self.indent_level == 0 and self.next_punctuation == .comma;
-}
-
-/// An alternative to calling `write` that formats a value with `std.fmt`.
-/// This function does the usual punctuation and indentation formatting
-/// assuming the resulting formatted string represents a single complete value;
-/// e.g. `"1"`, `"[]"`, `"[1,2]"`, not `"1,2"`.
-/// This function may be useful for doing your own number formatting.
-pub fn print(self: *Stringify, comptime fmt: []const u8, args: anytype) Error!void {
-    if (build_mode_has_safety) assert(self.raw_streaming_mode == .none);
-    try self.valueStart();
-    try self.writer.print(fmt, args);
-    self.valueDone();
-}
-
-test print {
-    var out_buf: [1024]u8 = undefined;
-    var out: Writer = .fixed(&amp;out_buf);
-
-    var w: Stringify = .{ .writer = &amp;out, .options = .{ .whitespace = .indent_2 } };
-
-    try w.beginObject();
-    try w.objectField("a");
-    try w.print("[  ]", .{});
-    try w.objectField("b");
-    try w.beginArray();
-    try w.print("[{s}] ", .{"[]"});
-    try w.print("  {}", .{12345});
-    try w.endArray();
-    try w.endObject();
-
-    const expected =
-        \\{
-        \\  "a": [  ],
-        \\  "b": [
-        \\    [[]] ,
-        \\      12345
-        \\  ]
-        \\}
-    ;
-    try std.testing.expectEqualStrings(expected, out.buffered());
-}
-
-/// An alternative to calling `write` that allows you to write directly to the `.writer` field, e.g. with `.writer.writeAll()`.
-/// Call `beginWriteRaw()`, then write a complete value (including any quotes if necessary) directly to the `.writer` field,
-/// then call `endWriteRaw()`.
-/// This can be useful for streaming very long strings into the output without needing it all buffered in memory.
-pub fn beginWriteRaw(self: *Stringify) !void {
-    if (build_mode_has_safety) {
-        assert(self.raw_streaming_mode == .none);
-        self.raw_streaming_mode = .value;
-    }
-    try self.valueStart();
-}
-
-/// See `beginWriteRaw`.
-pub fn endWriteRaw(self: *Stringify) void {
-    if (build_mode_has_safety) {
-        assert(self.raw_streaming_mode == .value);
-        self.raw_streaming_mode = .none;
-    }
-    self.valueDone();
-}
-
-/// See `Stringify` for when to call this method.
-/// `key` is the string content of the property name.
-/// Surrounding quotes will be added and any special characters will be escaped.
-/// See also `objectFieldRaw`.
-pub fn objectField(self: *Stringify, key: []const u8) Error!void {
-    if (build_mode_has_safety) assert(self.raw_streaming_mode == .none);
-    try self.objectFieldStart();
-    try encodeJsonString(key, self.options, self.writer);
-    self.next_punctuation = .colon;
-}
-/// See `Stringify` for when to call this method.
-/// `quoted_key` is the complete bytes of the key including quotes and any necessary escape sequences.
-/// A few assertions are performed on the given value to ensure that the caller of this function understands the API contract.
-/// See also `objectField`.
-pub fn objectFieldRaw(self: *Stringify, quoted_key: []const u8) Error!void {
-    if (build_mode_has_safety) assert(self.raw_streaming_mode == .none);
-    assert(quoted_key.len &gt;= 2 and quoted_key[0] == '"' and quoted_key[quoted_key.len - 1] == '"'); // quoted_key should be "quoted".
-    try self.objectFieldStart();
-    try self.writer.writeAll(quoted_key);
-    self.next_punctuation = .colon;
-}
-
-/// In the rare case that you need to write very long object field names,
-/// this is an alternative to `objectField` and `objectFieldRaw` that allows you to write directly to the `.writer` field
-/// similar to `beginWriteRaw`.
-/// Call `endObjectFieldRaw()` when you're done.
-pub fn beginObjectFieldRaw(self: *Stringify) !void {
-    if (build_mode_has_safety) {
-        assert(self.raw_streaming_mode == .none);
-        self.raw_streaming_mode = .objectField;
-    }
-    try self.objectFieldStart();
-}
-
-/// See `beginObjectFieldRaw`.
-pub fn endObjectFieldRaw(self: *Stringify) void {
-    if (build_mode_has_safety) {
-        assert(self.raw_streaming_mode == .objectField);
-        self.raw_streaming_mode = .none;
-    }
-    self.next_punctuation = .colon;
-}
-
-/// Renders the given Zig value as JSON.
-///
-/// Supported types:
-///  * Zig `bool` -&gt; JSON `true` or `false`.
-///  * Zig `?T` -&gt; `null` or the rendering of `T`.
-///  * Zig `i32`, `u64`, etc. -&gt; JSON number or string.
-///      * When option `emit_nonportable_numbers_as_strings` is true, if the value is outside the range `+-1&lt;&lt;53` (the precise integer range of f64), it is rendered as a JSON string in base 10. Otherwise, it is rendered as JSON number.
-///  * Zig floats -&gt; JSON number or string.
-///      * If the value cannot be precisely represented by an f64, it is rendered as a JSON string. Otherwise, it is rendered as JSON number.
-///      * TODO: Float rendering will likely change in the future, e.g. to remove the unnecessary "e+00".
-///  * Zig `[]const u8`, `[]u8`, `*[N]u8`, `@Vector(N, u8)`, and similar -&gt; JSON string.
-///      * See `Options.emit_strings_as_arrays`.
-///      * If the content is not valid UTF-8, rendered as an array of numbers instead.
-///  * Zig `[]T`, `[N]T`, `*[N]T`, `@Vector(N, T)`, and similar -&gt; JSON array of the rendering of each item.
-///  * Zig tuple -&gt; JSON array of the rendering of each item.
-///  * Zig `struct` -&gt; JSON object with each field in declaration order.
-///      * If the struct declares a method `pub fn jsonStringify(self: *@This(), jw: anytype) !void`, it is called to do the serialization instead of the default behavior. The given `jw` is a pointer to this `Stringify`. See `std.json.Value` for an example.
-///      * See `Options.emit_null_optional_fields`.
-///  * Zig `union(enum)` -&gt; JSON object with one field named for the active tag and a value representing the payload.
-///      * If the payload is `void`, then the emitted value is `{}`.
-///      * If the union declares a method `pub fn jsonStringify(self: *@This(), jw: anytype) !void`, it is called to do the serialization instead of the default behavior. The given `jw` is a pointer to this `Stringify`.
-///  * Zig `enum` -&gt; JSON string naming the active tag.
-///      * If the enum declares a method `pub fn jsonStringify(self: *@This(), jw: anytype) !void`, it is called to do the serialization instead of the default behavior. The given `jw` is a pointer to this `Stringify`.
-///      * If the enum is non-exhaustive, unnamed values are rendered as integers.
-///  * Zig untyped enum literal -&gt; JSON string naming the active tag.
-///  * Zig error -&gt; JSON string naming the error.
-///  * Zig `*T` -&gt; the rendering of `T`. Note there is no guard against circular-reference infinite recursion.
-///
-/// See also alternative functions `print` and `beginWriteRaw`.
-/// For writing object field names, use `objectField` instead.
-pub fn write(self: *Stringify, v: anytype) Error!void {
-    if (build_mode_has_safety) assert(self.raw_streaming_mode == .none);
-    const T = @TypeOf(v);
-    switch (@typeInfo(T)) {
-        .int =&gt; {
-            try self.valueStart();
-            if (self.options.emit_nonportable_numbers_as_strings and
-                (v &lt;= -(1 &lt;&lt; 53) or v &gt;= (1 &lt;&lt; 53)))
-            {
-                try self.writer.print("\"{}\"", .{v});
-            } else {
-                try self.writer.print("{}", .{v});
-            }
-            self.valueDone();
-            return;
-        },
-        .comptime_int =&gt; {
-            return self.write(@as(std.math.IntFittingRange(v, v), v));
-        },
-        .float, .comptime_float =&gt; {
-            if (@as(f64, @floatCast(v)) == v) {
-                try self.valueStart();
-                try self.writer.print("{}", .{@as(f64, @floatCast(v))});
-                self.valueDone();
-                return;
-            }
-            try self.valueStart();
-            try self.writer.print("\"{}\"", .{v});
-            self.valueDone();
-            return;
-        },
-
-        .bool =&gt; {
-            try self.valueStart();
-            try self.writer.writeAll(if (v) "true" else "false");
-            self.valueDone();
-            return;
-        },
-        .null =&gt; {
-            try self.valueStart();
-            try self.writer.writeAll("null");
-            self.valueDone();
-            return;
-        },
-        .optional =&gt; {
-            if (v) |payload| {
-                return try self.write(payload);
-            } else {
-                return try self.write(null);
-            }
-        },
-        .@"enum" =&gt; |enum_info| {
-            if (std.meta.hasFn(T, "jsonStringify")) {
-                return v.jsonStringify(self);
-            }
-
-            if (!enum_info.is_exhaustive) {
-                inline for (enum_info.fields) |field| {
-                    if (v == @field(T, field.name)) {
-                        break;
-                    }
-                } else {
-                    return self.write(@intFromEnum(v));
-                }
-            }
-
-            return self.stringValue(@tagName(v));
-        },
-        .enum_literal =&gt; {
-            return self.stringValue(@tagName(v));
-        },
-        .@"union" =&gt; {
-            if (std.meta.hasFn(T, "jsonStringify")) {
-                return v.jsonStringify(self);
-            }
-
-            const info = @typeInfo(T).@"union";
-            if (info.tag_type) |UnionTagType| {
-                try self.beginObject();
-                inline for (info.fields) |u_field| {
-                    if (v == @field(UnionTagType, u_field.name)) {
-                        try self.objectField(u_field.name);
-                        if (u_field.type == void) {
-                            // void v is {}
-                            try self.beginObject();
-                            try self.endObject();
-                        } else {
-                            try self.write(@field(v, u_field.name));
-                        }
-                        break;
-                    }
-                } else {
-                    unreachable; // No active tag?
-                }
-                try self.endObject();
-                return;
-            } else {
-                @compileError("Unable to stringify untagged union '" ++ @typeName(T) ++ "'");
-            }
-        },
-        .@"struct" =&gt; |S| {
-            if (std.meta.hasFn(T, "jsonStringify")) {
-                return v.jsonStringify(self);
-            }
-
-            if (S.is_tuple) {
-                try self.beginArray();
-            } else {
-                try self.beginObject();
-            }
-            inline for (S.fields) |Field| {
-                // don't include void fields
-                if (Field.type == void) continue;
-
-                var emit_field = true;
-
-                // don't include optional fields that are null when emit_null_optional_fields is set to false
-                if (@typeInfo(Field.type) == .optional) {
-                    if (self.options.emit_null_optional_fields == false) {
-                        if (@field(v, Field.name) == null) {
-                            emit_field = false;
-                        }
-                    }
-                }
-
-                if (emit_field) {
-                    if (!S.is_tuple) {
-                        try self.objectField(Field.name);
-                    }
-                    try self.write(@field(v, Field.name));
-                }
-            }
-            if (S.is_tuple) {
-                try self.endArray();
-            } else {
-                try self.endObject();
-            }
-            return;
-        },
-        .error_set =&gt; return self.stringValue(@errorName(v)),
-        .pointer =&gt; |ptr_info| switch (ptr_info.size) {
-            .one =&gt; switch (@typeInfo(ptr_info.child)) {
-                .array =&gt; {
-                    // Coerce `*[N]T` to `[]const T`.
-                    const Slice = []const std.meta.Elem(ptr_info.child);
-                    return self.write(@as(Slice, v));
-                },
-                else =&gt; {
-                    return self.write(v.*);
-                },
-            },
-            .many, .slice =&gt; {
-                if (ptr_info.size == .many and ptr_info.sentinel() == null)
-                    @compileError("unable to stringify type '" ++ @typeName(T) ++ "' without sentinel");
-                const slice = if (ptr_info.size == .many) std.mem.span(v) else v;
-
-                if (ptr_info.child == u8) {
-                    // This is a []const u8, or some similar Zig string.
-                    if (!self.options.emit_strings_as_arrays and std.unicode.utf8ValidateSlice(slice)) {
-                        return self.stringValue(slice);
-                    }
-                }
-
-                try self.beginArray();
-                for (slice) |x| {
-                    try self.write(x);
-                }
-                try self.endArray();
-                return;
-            },
-            else =&gt; @compileError("Unable to stringify type '" ++ @typeName(T) ++ "'"),
-        },
-        .array =&gt; {
-            // Coerce `[N]T` to `*const [N]T` (and then to `[]const T`).
-            return self.write(&amp;v);
-        },
-        .vector =&gt; |info| {
-            const array: [info.len]info.child = v;
-            return self.write(&amp;array);
-        },
-        else =&gt; @compileError("Unable to stringify type '" ++ @typeName(T) ++ "'"),
-    }
-    unreachable;
-}
-
-fn stringValue(self: *Stringify, s: []const u8) !void {
-    try self.valueStart();
-    try encodeJsonString(s, self.options, self.writer);
-    self.valueDone();
-}
-
-pub const Options = struct {
-    /// Controls the whitespace emitted.
-    /// The default `.minified` is a compact encoding with no whitespace between tokens.
-    /// Any setting other than `.minified` will use newlines, indentation, and a space after each ':'.
-    /// `.indent_1` means 1 space for each indentation level, `.indent_2` means 2 spaces, etc.
-    /// `.indent_tab` uses a tab for each indentation level.
-    whitespace: enum {
-        minified,
-        indent_1,
-        indent_2,
-        indent_3,
-        indent_4,
-        indent_8,
-        indent_tab,
-    } = .minified,
-
-    /// Should optional fields with null value be written?
-    emit_null_optional_fields: bool = true,
-
-    /// Arrays/slices of u8 are typically encoded as JSON strings.
-    /// This option emits them as arrays of numbers instead.
-    /// Does not affect calls to `objectField*()`.
-    emit_strings_as_arrays: bool = false,
-
-    /// Should unicode characters be escaped in strings?
-    escape_unicode: bool = false,
-
-    /// When true, renders numbers outside the range `+-1&lt;&lt;53` (the precise integer range of f64) as JSON strings in base 10.
-    emit_nonportable_numbers_as_strings: bool = false,
-};
-
-/// Writes the given value to the `Writer` writer.
-/// See `Stringify` for how the given value is serialized into JSON.
-/// The maximum nesting depth of the output JSON document is 256.
-pub fn value(v: anytype, options: Options, writer: *Writer) Error!void {
-    var s: Stringify = .{ .writer = writer, .options = options };
-    try s.write(v);
-}
-
-test value {
-    var out: Writer.Allocating = .init(std.testing.allocator);
-    const writer = &amp;out.writer;
-    defer out.deinit();
-
-    const T = struct { a: i32, b: []const u8 };
-    try value(T{ .a = 123, .b = "xy" }, .{}, writer);
-    try std.testing.expectEqualSlices(u8, "{\"a\":123,\"b\":\"xy\"}", out.written());
-
-    try testStringify("9999999999999999", 9999999999999999, .{});
-    try testStringify("\"9999999999999999\"", 9999999999999999, .{ .emit_nonportable_numbers_as_strings = true });
-
-    try testStringify("[1,1]", @as(@Vector(2, u32), @splat(1)), .{});
-    try testStringify("\"AA\"", @as(@Vector(2, u8), @splat('A')), .{});
-    try testStringify("[65,65]", @as(@Vector(2, u8), @splat('A')), .{ .emit_strings_as_arrays = true });
-
-    // void field
-    try testStringify("{\"foo\":42}", struct {
-        foo: u32,
-        bar: void = {},
-    }{ .foo = 42 }, .{});
-
-    const Tuple = struct { []const u8, usize };
-    try testStringify("[\"foo\",42]", Tuple{ "foo", 42 }, .{});
-
-    comptime {
-        testStringify("false", false, .{}) catch unreachable;
-        const MyStruct = struct { foo: u32 };
-        testStringify("[{\"foo\":42},{\"foo\":100},{\"foo\":1000}]", [_]MyStruct{
-            MyStruct{ .foo = 42 },
-            MyStruct{ .foo = 100 },
-            MyStruct{ .foo = 1000 },
-        }, .{}) catch unreachable;
-    }
-}
-
-/// Calls `value` and stores the result in dynamically allocated memory instead
-/// of taking a writer.
-///
-/// Caller owns returned memory.
-pub fn valueAlloc(gpa: Allocator, v: anytype, options: Options) error{OutOfMemory}![]u8 {
-    var aw: Writer.Allocating = .init(gpa);
-    defer aw.deinit();
-    value(v, options, &amp;aw.writer) catch return error.OutOfMemory;
-    return aw.toOwnedSlice();
-}
-
-test valueAlloc {
-    const allocator = std.testing.allocator;
-    const expected =
-        \\{"foo":"bar","answer":42,"my_friend":"sammy"}
-    ;
-    const actual = try valueAlloc(allocator, .{ .foo = "bar", .answer = 42, .my_friend = "sammy" }, .{});
-    defer allocator.free(actual);
-
-    try std.testing.expectEqualStrings(expected, actual);
-}
-
-fn outputUnicodeEscape(codepoint: u21, w: *Writer) Error!void {
-    if (codepoint &lt;= 0xFFFF) {
-        // If the character is in the Basic Multilingual Plane (U+0000 through U+FFFF),
-        // then it may be represented as a six-character sequence: a reverse solidus, followed
-        // by the lowercase letter u, followed by four hexadecimal digits that encode the character's code point.
-        try w.writeAll("\\u");
-        try w.printInt(codepoint, 16, .lower, .{ .width = 4, .fill = '0' });
-    } else {
-        assert(codepoint &lt;= 0x10FFFF);
-        // To escape an extended character that is not in the Basic Multilingual Plane,
-        // the character is represented as a 12-character sequence, encoding the UTF-16 surrogate pair.
-        const high = @as(u16, @intCast((codepoint - 0x10000) &gt;&gt; 10)) + 0xD800;
-        const low = @as(u16, @intCast(codepoint &amp; 0x3FF)) + 0xDC00;
-        try w.writeAll("\\u");
-        try w.printInt(high, 16, .lower, .{ .width = 4, .fill = '0' });
-        try w.writeAll("\\u");
-        try w.printInt(low, 16, .lower, .{ .width = 4, .fill = '0' });
-    }
-}
-
-fn outputSpecialEscape(c: u8, writer: *Writer) Error!void {
-    switch (c) {
-        '\\' =&gt; try writer.writeAll("\\\\"),
-        '\"' =&gt; try writer.writeAll("\\\""),
-        0x08 =&gt; try writer.writeAll("\\b"),
-        0x0C =&gt; try writer.writeAll("\\f"),
-        '\n' =&gt; try writer.writeAll("\\n"),
-        '\r' =&gt; try writer.writeAll("\\r"),
-        '\t' =&gt; try writer.writeAll("\\t"),
-        else =&gt; try outputUnicodeEscape(c, writer),
-    }
-}
-
-/// Write `string` to `writer` as a JSON encoded string.
-pub fn encodeJsonString(string: []const u8, options: Options, writer: *Writer) Error!void {
-    try writer.writeByte('\"');
-    try encodeJsonStringChars(string, options, writer);
-    try writer.writeByte('\"');
-}
-
-/// Write `chars` to `writer` as JSON encoded string characters.
-pub fn encodeJsonStringChars(chars: []const u8, options: Options, writer: *Writer) Error!void {
-    var write_cursor: usize = 0;
-    var i: usize = 0;
-    if (options.escape_unicode) {
-        while (i &lt; chars.len) : (i += 1) {
-            switch (chars[i]) {
-                // normal ascii character
-                0x20...0x21, 0x23...0x5B, 0x5D...0x7E =&gt; {},
-                0x00...0x1F, '\\', '\"' =&gt; {
-                    // Always must escape these.
-                    try writer.writeAll(chars[write_cursor..i]);
-                    try outputSpecialEscape(chars[i], writer);
-                    write_cursor = i + 1;
-                },
-                0x7F...0xFF =&gt; {
-                    try writer.writeAll(chars[write_cursor..i]);
-                    const ulen = std.unicode.utf8ByteSequenceLength(chars[i]) catch unreachable;
-                    const codepoint = std.unicode.utf8Decode(chars[i..][0..ulen]) catch unreachable;
-                    try outputUnicodeEscape(codepoint, writer);
-                    i += ulen - 1;
-                    write_cursor = i + 1;
-                },
-            }
-        }
-    } else {
-        while (i &lt; chars.len) : (i += 1) {
-            switch (chars[i]) {
-                // normal bytes
-                0x20...0x21, 0x23...0x5B, 0x5D...0xFF =&gt; {},
-                0x00...0x1F, '\\', '\"' =&gt; {
-                    // Always must escape these.
-                    try writer.writeAll(chars[write_cursor..i]);
-                    try outputSpecialEscape(chars[i], writer);
-                    write_cursor = i + 1;
-                },
-            }
-        }
-    }
-    try writer.writeAll(chars[write_cursor..chars.len]);
-}
-
-test "json write stream" {
-    var out_buf: [1024]u8 = undefined;
-    var out: Writer = .fixed(&amp;out_buf);
-    var w: Stringify = .{ .writer = &amp;out, .options = .{ .whitespace = .indent_2 } };
-    try testBasicWriteStream(&amp;w);
-}
-
-fn testBasicWriteStream(w: *Stringify) !void {
-    w.writer.end = 0;
-
-    try w.beginObject();
-
-    try w.objectField("object");
-    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_allocator.deinit();
-    try w.write(try getJsonObject(arena_allocator.allocator()));
-
-    try w.objectFieldRaw("\"string\"");
-    try w.write("This is a string");
-
-    try w.objectField("array");
-    try w.beginArray();
-    try w.write("Another string");
-    try w.write(@as(i32, 1));
-    try w.write(@as(f32, 3.5));
-    try w.endArray();
-
-    try w.objectField("int");
-    try w.write(@as(i32, 10));
-
-    try w.objectField("float");
-    try w.write(@as(f32, 3.5));
-
-    try w.endObject();
-
-    const expected =
-        \\{
-        \\  "object": {
-        \\    "one": 1,
-        \\    "two": 2
-        \\  },
-        \\  "string": "This is a string",
-        \\  "array": [
-        \\    "Another string",
-        \\    1,
-        \\    3.5
-        \\  ],
-        \\  "int": 10,
-        \\  "float": 3.5
-        \\}
-    ;
-    try std.testing.expectEqualStrings(expected, w.writer.buffered());
-}
-
-fn getJsonObject(allocator: std.mem.Allocator) !std.json.Value {
-    var v: std.json.Value = .{ .object = .empty };
-    try v.object.put(allocator, "one", std.json.Value{ .integer = @as(i64, @intCast(1)) });
-    try v.object.put(allocator, "two", std.json.Value{ .float = 2.0 });
-    return v;
-}
-
-test "stringify null optional fields" {
-    const MyStruct = struct {
-        optional: ?[]const u8 = null,
-        required: []const u8 = "something",
-        another_optional: ?[]const u8 = null,
-        another_required: []const u8 = "something else",
-    };
-    try testStringify(
-        \\{"optional":null,"required":"something","another_optional":null,"another_required":"something else"}
-    ,
-        MyStruct{},
-        .{},
-    );
-    try testStringify(
-        \\{"required":"something","another_required":"something else"}
-    ,
-        MyStruct{},
-        .{ .emit_null_optional_fields = false },
-    );
-}
-
-test "stringify basic types" {
-    try testStringify("false", false, .{});
-    try testStringify("true", true, .{});
-    try testStringify("null", @as(?u8, null), .{});
-    try testStringify("null", @as(?*u32, null), .{});
-    try testStringify("42", 42, .{});
-    try testStringify("42", 42.0, .{});
-    try testStringify("42", @as(u8, 42), .{});
-    try testStringify("42", @as(u128, 42), .{});
-    try testStringify("9999999999999999", 9999999999999999, .{});
-    try testStringify("42", @as(f32, 42), .{});
-    try testStringify("42", @as(f64, 42), .{});
-    try testStringify("\"ItBroke\"", @as(anyerror, error.ItBroke), .{});
-    try testStringify("\"ItBroke\"", error.ItBroke, .{});
-}
-
-test "stringify string" {
-    try testStringify("\"hello\"", "hello", .{});
-    try testStringify("\"with\\nescapes\\r\"", "with\nescapes\r", .{});
-    try testStringify("\"with\\nescapes\\r\"", "with\nescapes\r", .{ .escape_unicode = true });
-    try testStringify("\"with unicode\\u0001\"", "with unicode\u{1}", .{});
-    try testStringify("\"with unicode\\u0001\"", "with unicode\u{1}", .{ .escape_unicode = true });
-    try testStringify("\"with unicode\u{80}\"", "with unicode\u{80}", .{});
-    try testStringify("\"with unicode\\u0080\"", "with unicode\u{80}", .{ .escape_unicode = true });
-    try testStringify("\"with unicode\u{FF}\"", "with unicode\u{FF}", .{});
-    try testStringify("\"with unicode\\u00ff\"", "with unicode\u{FF}", .{ .escape_unicode = true });
-    try testStringify("\"with unicode\u{100}\"", "with unicode\u{100}", .{});
-    try testStringify("\"with unicode\\u0100\"", "with unicode\u{100}", .{ .escape_unicode = true });
-    try testStringify("\"with unicode\u{800}\"", "with unicode\u{800}", .{});
-    try testStringify("\"with unicode\\u0800\"", "with unicode\u{800}", .{ .escape_unicode = true });
-    try testStringify("\"with unicode\u{8000}\"", "with unicode\u{8000}", .{});
-    try testStringify("\"with unicode\\u8000\"", "with unicode\u{8000}", .{ .escape_unicode = true });
-    try testStringify("\"with unicode\u{D799}\"", "with unicode\u{D799}", .{});
-    try testStringify("\"with unicode\\ud799\"", "with unicode\u{D799}", .{ .escape_unicode = true });
-    try testStringify("\"with unicode\u{10000}\"", "with unicode\u{10000}", .{});
-    try testStringify("\"with unicode\\ud800\\udc00\"", "with unicode\u{10000}", .{ .escape_unicode = true });
-    try testStringify("\"with unicode\u{10FFFF}\"", "with unicode\u{10FFFF}", .{});
-    try testStringify("\"with unicode\\udbff\\udfff\"", "with unicode\u{10FFFF}", .{ .escape_unicode = true });
-}
-
-test "stringify many-item sentinel-terminated string" {
-    try testStringify("\"hello\"", @as([*:0]const u8, "hello"), .{});
-    try testStringify("\"with\\nescapes\\r\"", @as([*:0]const u8, "with\nescapes\r"), .{ .escape_unicode = true });
-    try testStringify("\"with unicode\\u0001\"", @as([*:0]const u8, "with unicode\u{1}"), .{ .escape_unicode = true });
-}
-
-test "stringify enums" {
-    const E = enum {
-        foo,
-        bar,
-    };
-    try testStringify("\"foo\"", E.foo, .{});
-    try testStringify("\"bar\"", E.bar, .{});
-}
-
-test "stringify non-exhaustive enum" {
-    const E = enum(u8) {
-        foo = 0,
-        _,
-    };
-    try testStringify("\"foo\"", E.foo, .{});
-    try testStringify("1", @as(E, @enumFromInt(1)), .{});
-}
-
-test "stringify enum literals" {
-    try testStringify("\"foo\"", .foo, .{});
-    try testStringify("\"bar\"", .bar, .{});
-}
-
-test "stringify tagged unions" {
-    const T = union(enum) {
-        nothing,
-        foo: u32,
-        bar: bool,
-    };
-    try testStringify("{\"nothing\":{}}", T{ .nothing = {} }, .{});
-    try testStringify("{\"foo\":42}", T{ .foo = 42 }, .{});
-    try testStringify("{\"bar\":true}", T{ .bar = true }, .{});
-}
-
-test "stringify struct" {
-    try testStringify("{\"foo\":42}", struct {
-        foo: u32,
-    }{ .foo = 42 }, .{});
-}
-
-test "emit_strings_as_arrays" {
-    // Should only affect string values, not object keys.
-    try testStringify("{\"foo\":\"bar\"}", .{ .foo = "bar" }, .{});
-    try testStringify("{\"foo\":[98,97,114]}", .{ .foo = "bar" }, .{ .emit_strings_as_arrays = true });
-    // Should *not* affect these types:
-    try testStringify("\"foo\"", @as(enum { foo, bar }, .foo), .{ .emit_strings_as_arrays = true });
-    try testStringify("\"ItBroke\"", error.ItBroke, .{ .emit_strings_as_arrays = true });
-    // Should work on these:
-    try testStringify("\"bar\"", @Vector(3, u8){ 'b', 'a', 'r' }, .{});
-    try testStringify("[98,97,114]", @Vector(3, u8){ 'b', 'a', 'r' }, .{ .emit_strings_as_arrays = true });
-    try testStringify("\"bar\"", [3]u8{ 'b', 'a', 'r' }, .{});
-    try testStringify("[98,97,114]", [3]u8{ 'b', 'a', 'r' }, .{ .emit_strings_as_arrays = true });
-}
-
-test "stringify struct with indentation" {
-    try testStringify(
-        \\{
-        \\    "foo": 42,
-        \\    "bar": [
-        \\        1,
-        \\        2,
-        \\        3
-        \\    ]
-        \\}
-    ,
-        struct {
-            foo: u32,
-            bar: [3]u32,
-        }{
-            .foo = 42,
-            .bar = .{ 1, 2, 3 },
-        },
-        .{ .whitespace = .indent_4 },
-    );
-    try testStringify(
-        "{\n\t\"foo\": 42,\n\t\"bar\": [\n\t\t1,\n\t\t2,\n\t\t3\n\t]\n}",
-        struct {
-            foo: u32,
-            bar: [3]u32,
-        }{
-            .foo = 42,
-            .bar = .{ 1, 2, 3 },
-        },
-        .{ .whitespace = .indent_tab },
-    );
-    try testStringify(
-        \\{"foo":42,"bar":[1,2,3]}
-    ,
-        struct {
-            foo: u32,
-            bar: [3]u32,
-        }{
-            .foo = 42,
-            .bar = .{ 1, 2, 3 },
-        },
-        .{ .whitespace = .minified },
-    );
-}
-
-test "stringify array of structs" {
-    const MyStruct = struct {
-        foo: u32,
-    };
-    try testStringify("[{\"foo\":42},{\"foo\":100},{\"foo\":1000}]", [_]MyStruct{
-        MyStruct{ .foo = 42 },
-        MyStruct{ .foo = 100 },
-        MyStruct{ .foo = 1000 },
-    }, .{});
-}
-
-test "stringify struct with custom stringifier" {
-    try testStringify("[\"something special\",42]", struct {
-        foo: u32,
-        const Self = @This();
-        pub fn jsonStringify(v: @This(), jws: anytype) !void {
-            _ = v;
-            try jws.beginArray();
-            try jws.write("something special");
-            try jws.write(42);
-            try jws.endArray();
-        }
-    }{ .foo = 42 }, .{});
-}
-
-fn testStringify(expected: []const u8, v: anytype, options: Options) !void {
-    var buffer: [4096]u8 = undefined;
-    var w: Writer = .fixed(&amp;buffer);
-    try value(v, options, &amp;w);
-    try std.testing.expectEqualStrings(expected, w.buffered());
-}
-
-test "raw streaming" {
-    var out_buf: [1024]u8 = undefined;
-    var out: Writer = .fixed(&amp;out_buf);
-
-    var w: Stringify = .{ .writer = &amp;out, .options = .{ .whitespace = .indent_2 } };
-    try w.beginObject();
-    try w.beginObjectFieldRaw();
-    try w.writer.writeAll("\"long");
-    try w.writer.writeAll(" key\"");
-    w.endObjectFieldRaw();
-    try w.beginWriteRaw();
-    try w.writer.writeAll("\"long");
-    try w.writer.writeAll(" value\"");
-    w.endWriteRaw();
-    try w.endObject();
-
-    const expected =
-        \\{
-        \\  "long key": "long value"
-        \\}
-    ;
-    try std.testing.expectEqualStrings(expected, w.writer.buffered());
-}</pre>
+    <pre><a id="L1"></a>//! Writes JSON ([RFC8259](https://tools.ietf.org/html/rfc8259)) formatted data
+<a id="L2"></a>//! to a stream.
+<a id="L3"></a>//!
+<a id="L4"></a>//! The sequence of method calls to write JSON content must follow this grammar:
+<a id="L5"></a>//! ```
+<a id="L6"></a>//!  &lt;once&gt; = &lt;value&gt;
+<a id="L7"></a>//!  &lt;value&gt; =
+<a id="L8"></a>//!    | &lt;object&gt;
+<a id="L9"></a>//!    | &lt;array&gt;
+<a id="L10"></a>//!    | write
+<a id="L11"></a>//!    | print
+<a id="L12"></a>//!    | &lt;writeRawStream&gt;
+<a id="L13"></a>//!  &lt;object&gt; = beginObject ( &lt;field&gt; &lt;value&gt; )* endObject
+<a id="L14"></a>//!  &lt;field&gt; = objectField | objectFieldRaw | &lt;objectFieldRawStream&gt;
+<a id="L15"></a>//!  &lt;array&gt; = beginArray ( &lt;value&gt; )* endArray
+<a id="L16"></a>//!  &lt;writeRawStream&gt; = beginWriteRaw ( stream.writeAll )* endWriteRaw
+<a id="L17"></a>//!  &lt;objectFieldRawStream&gt; = beginObjectFieldRaw ( stream.writeAll )* endObjectFieldRaw
+<a id="L18"></a>//! ```
+<a id="L19"></a>
+<a id="L20"></a>const std = @import("../std.zig");
+<a id="L21"></a>const assert = std.debug.assert;
+<a id="L22"></a>const Allocator = std.mem.Allocator;
+<a id="L23"></a>const ArrayList = std.ArrayList;
+<a id="L24"></a>const BitStack = std.BitStack;
+<a id="L25"></a>const Stringify = @This();
+<a id="L26"></a>const Writer = std.Io.Writer;
+<a id="L27"></a>
+<a id="L28"></a>const IndentationMode = enum(u1) {
+<a id="L29"></a>    object = 0,
+<a id="L30"></a>    array = 1,
+<a id="L31"></a>};
+<a id="L32"></a>
+<a id="L33"></a>writer: *Writer,
+<a id="L34"></a>options: Options = .{},
+<a id="L35"></a>indent_level: usize = 0,
+<a id="L36"></a>next_punctuation: enum {
+<a id="L37"></a>    the_beginning,
+<a id="L38"></a>    none,
+<a id="L39"></a>    comma,
+<a id="L40"></a>    colon,
+<a id="L41"></a>} = .the_beginning,
+<a id="L42"></a>
+<a id="L43"></a>nesting_stack: switch (safety_checks) {
+<a id="L44"></a>    .checked_to_fixed_depth =&gt; |fixed_buffer_size| [(fixed_buffer_size + 7) &gt;&gt; 3]u8,
+<a id="L45"></a>    .assumed_correct =&gt; void,
+<a id="L46"></a>} = switch (safety_checks) {
+<a id="L47"></a>    .checked_to_fixed_depth =&gt; @splat(0),
+<a id="L48"></a>    .assumed_correct =&gt; {},
+<a id="L49"></a>},
+<a id="L50"></a>
+<a id="L51"></a>raw_streaming_mode: if (build_mode_has_safety)
+<a id="L52"></a>    enum { none, value, objectField }
+<a id="L53"></a>else
+<a id="L54"></a>    void = if (build_mode_has_safety) .none else {},
+<a id="L55"></a>
+<a id="L56"></a>const build_mode_has_safety = switch (@import("builtin").mode) {
+<a id="L57"></a>    .Debug, .ReleaseSafe =&gt; true,
+<a id="L58"></a>    .ReleaseFast, .ReleaseSmall =&gt; false,
+<a id="L59"></a>};
+<a id="L60"></a>
+<a id="L61"></a>/// The `safety_checks_hint` parameter determines how much memory is used to enable assertions that the above grammar is being followed,
+<a id="L62"></a>/// e.g. tripping an assertion rather than allowing `endObject` to emit the final `}` in `[[[]]}`.
+<a id="L63"></a>/// "Depth" in this context means the depth of nested `[]` or `{}` expressions
+<a id="L64"></a>/// (or equivalently the amount of recursion on the `&lt;value&gt;` grammar expression above).
+<a id="L65"></a>/// For example, emitting the JSON `[[[]]]` requires a depth of 3.
+<a id="L66"></a>/// If `.checked_to_fixed_depth` is used, there is additionally an assertion that the nesting depth never exceeds the given limit.
+<a id="L67"></a>/// `.checked_to_fixed_depth` embeds the storage required in the `Stringify` struct.
+<a id="L68"></a>/// `.assumed_correct` requires no space and performs none of these assertions.
+<a id="L69"></a>/// In `ReleaseFast` and `ReleaseSmall` mode, the given `safety_checks_hint` is ignored and is always treated as `.assumed_correct`.
+<a id="L70"></a>const safety_checks_hint: union(enum) {
+<a id="L71"></a>    /// Rounded up to the nearest multiple of 8.
+<a id="L72"></a>    checked_to_fixed_depth: usize,
+<a id="L73"></a>    assumed_correct,
+<a id="L74"></a>} = .{ .checked_to_fixed_depth = 256 };
+<a id="L75"></a>
+<a id="L76"></a>const safety_checks: @TypeOf(safety_checks_hint) = if (build_mode_has_safety)
+<a id="L77"></a>    safety_checks_hint
+<a id="L78"></a>else
+<a id="L79"></a>    .assumed_correct;
+<a id="L80"></a>
+<a id="L81"></a>pub const Error = Writer.Error;
+<a id="L82"></a>
+<a id="L83"></a>pub fn beginArray(self: *Stringify) Error!void {
+<a id="L84"></a>    if (build_mode_has_safety) assert(self.raw_streaming_mode == .none);
+<a id="L85"></a>    try self.valueStart();
+<a id="L86"></a>    try self.writer.writeByte('[');
+<a id="L87"></a>    try self.pushIndentation(.array);
+<a id="L88"></a>    self.next_punctuation = .none;
+<a id="L89"></a>}
+<a id="L90"></a>
+<a id="L91"></a>pub fn beginObject(self: *Stringify) Error!void {
+<a id="L92"></a>    if (build_mode_has_safety) assert(self.raw_streaming_mode == .none);
+<a id="L93"></a>    try self.valueStart();
+<a id="L94"></a>    try self.writer.writeByte('{');
+<a id="L95"></a>    try self.pushIndentation(.object);
+<a id="L96"></a>    self.next_punctuation = .none;
+<a id="L97"></a>}
+<a id="L98"></a>
+<a id="L99"></a>pub fn endArray(self: *Stringify) Error!void {
+<a id="L100"></a>    if (build_mode_has_safety) assert(self.raw_streaming_mode == .none);
+<a id="L101"></a>    self.popIndentation(.array);
+<a id="L102"></a>    switch (self.next_punctuation) {
+<a id="L103"></a>        .none =&gt; {},
+<a id="L104"></a>        .comma =&gt; {
+<a id="L105"></a>            try self.indent();
+<a id="L106"></a>        },
+<a id="L107"></a>        .the_beginning, .colon =&gt; unreachable,
+<a id="L108"></a>    }
+<a id="L109"></a>    try self.writer.writeByte(']');
+<a id="L110"></a>    self.valueDone();
+<a id="L111"></a>}
+<a id="L112"></a>
+<a id="L113"></a>pub fn endObject(self: *Stringify) Error!void {
+<a id="L114"></a>    if (build_mode_has_safety) assert(self.raw_streaming_mode == .none);
+<a id="L115"></a>    self.popIndentation(.object);
+<a id="L116"></a>    switch (self.next_punctuation) {
+<a id="L117"></a>        .none =&gt; {},
+<a id="L118"></a>        .comma =&gt; {
+<a id="L119"></a>            try self.indent();
+<a id="L120"></a>        },
+<a id="L121"></a>        .the_beginning, .colon =&gt; unreachable,
+<a id="L122"></a>    }
+<a id="L123"></a>    try self.writer.writeByte('}');
+<a id="L124"></a>    self.valueDone();
+<a id="L125"></a>}
+<a id="L126"></a>
+<a id="L127"></a>fn pushIndentation(self: *Stringify, mode: IndentationMode) !void {
+<a id="L128"></a>    switch (safety_checks) {
+<a id="L129"></a>        .checked_to_fixed_depth =&gt; {
+<a id="L130"></a>            BitStack.pushWithStateAssumeCapacity(&amp;self.nesting_stack, &amp;self.indent_level, @intFromEnum(mode));
+<a id="L131"></a>        },
+<a id="L132"></a>        .assumed_correct =&gt; {
+<a id="L133"></a>            self.indent_level += 1;
+<a id="L134"></a>        },
+<a id="L135"></a>    }
+<a id="L136"></a>}
+<a id="L137"></a>fn popIndentation(self: *Stringify, expected_mode: IndentationMode) void {
+<a id="L138"></a>    switch (safety_checks) {
+<a id="L139"></a>        .checked_to_fixed_depth =&gt; {
+<a id="L140"></a>            assert(BitStack.popWithState(&amp;self.nesting_stack, &amp;self.indent_level) == @intFromEnum(expected_mode));
+<a id="L141"></a>        },
+<a id="L142"></a>        .assumed_correct =&gt; {
+<a id="L143"></a>            self.indent_level -= 1;
+<a id="L144"></a>        },
+<a id="L145"></a>    }
+<a id="L146"></a>}
+<a id="L147"></a>
+<a id="L148"></a>fn indent(self: *Stringify) !void {
+<a id="L149"></a>    var char: u8 = ' ';
+<a id="L150"></a>    const n_chars = switch (self.options.whitespace) {
+<a id="L151"></a>        .minified =&gt; return,
+<a id="L152"></a>        .indent_1 =&gt; 1 * self.indent_level,
+<a id="L153"></a>        .indent_2 =&gt; 2 * self.indent_level,
+<a id="L154"></a>        .indent_3 =&gt; 3 * self.indent_level,
+<a id="L155"></a>        .indent_4 =&gt; 4 * self.indent_level,
+<a id="L156"></a>        .indent_8 =&gt; 8 * self.indent_level,
+<a id="L157"></a>        .indent_tab =&gt; blk: {
+<a id="L158"></a>            char = '\t';
+<a id="L159"></a>            break :blk self.indent_level;
+<a id="L160"></a>        },
+<a id="L161"></a>    };
+<a id="L162"></a>    try self.writer.writeByte('\n');
+<a id="L163"></a>    try self.writer.splatByteAll(char, n_chars);
+<a id="L164"></a>}
+<a id="L165"></a>
+<a id="L166"></a>fn valueStart(self: *Stringify) !void {
+<a id="L167"></a>    if (self.isObjectKeyExpected()) |is_it| assert(!is_it); // Call objectField*(), not write(), for object keys.
+<a id="L168"></a>    return self.valueStartAssumeTypeOk();
+<a id="L169"></a>}
+<a id="L170"></a>fn objectFieldStart(self: *Stringify) !void {
+<a id="L171"></a>    if (self.isObjectKeyExpected()) |is_it| assert(is_it); // Expected write(), not objectField*().
+<a id="L172"></a>    return self.valueStartAssumeTypeOk();
+<a id="L173"></a>}
+<a id="L174"></a>fn valueStartAssumeTypeOk(self: *Stringify) !void {
+<a id="L175"></a>    assert(!self.isComplete()); // JSON document already complete.
+<a id="L176"></a>    switch (self.next_punctuation) {
+<a id="L177"></a>        .the_beginning =&gt; {
+<a id="L178"></a>            // No indentation for the very beginning.
+<a id="L179"></a>        },
+<a id="L180"></a>        .none =&gt; {
+<a id="L181"></a>            // First item in a container.
+<a id="L182"></a>            try self.indent();
+<a id="L183"></a>        },
+<a id="L184"></a>        .comma =&gt; {
+<a id="L185"></a>            // Subsequent item in a container.
+<a id="L186"></a>            try self.writer.writeByte(',');
+<a id="L187"></a>            try self.indent();
+<a id="L188"></a>        },
+<a id="L189"></a>        .colon =&gt; {
+<a id="L190"></a>            try self.writer.writeByte(':');
+<a id="L191"></a>            if (self.options.whitespace != .minified) {
+<a id="L192"></a>                try self.writer.writeByte(' ');
+<a id="L193"></a>            }
+<a id="L194"></a>        },
+<a id="L195"></a>    }
+<a id="L196"></a>}
+<a id="L197"></a>fn valueDone(self: *Stringify) void {
+<a id="L198"></a>    self.next_punctuation = .comma;
+<a id="L199"></a>}
+<a id="L200"></a>
+<a id="L201"></a>// Only when safety is enabled:
+<a id="L202"></a>fn isObjectKeyExpected(self: *const Stringify) ?bool {
+<a id="L203"></a>    switch (safety_checks) {
+<a id="L204"></a>        .checked_to_fixed_depth =&gt; return self.indent_level &gt; 0 and
+<a id="L205"></a>            BitStack.peekWithState(&amp;self.nesting_stack, self.indent_level) == @intFromEnum(IndentationMode.object) and
+<a id="L206"></a>            self.next_punctuation != .colon,
+<a id="L207"></a>        .assumed_correct =&gt; return null,
+<a id="L208"></a>    }
+<a id="L209"></a>}
+<a id="L210"></a>fn isComplete(self: *const Stringify) bool {
+<a id="L211"></a>    return self.indent_level == 0 and self.next_punctuation == .comma;
+<a id="L212"></a>}
+<a id="L213"></a>
+<a id="L214"></a>/// An alternative to calling `write` that formats a value with `std.fmt`.
+<a id="L215"></a>/// This function does the usual punctuation and indentation formatting
+<a id="L216"></a>/// assuming the resulting formatted string represents a single complete value;
+<a id="L217"></a>/// e.g. `"1"`, `"[]"`, `"[1,2]"`, not `"1,2"`.
+<a id="L218"></a>/// This function may be useful for doing your own number formatting.
+<a id="L219"></a>pub fn print(self: *Stringify, comptime fmt: []const u8, args: anytype) Error!void {
+<a id="L220"></a>    if (build_mode_has_safety) assert(self.raw_streaming_mode == .none);
+<a id="L221"></a>    try self.valueStart();
+<a id="L222"></a>    try self.writer.print(fmt, args);
+<a id="L223"></a>    self.valueDone();
+<a id="L224"></a>}
+<a id="L225"></a>
+<a id="L226"></a>test print {
+<a id="L227"></a>    var out_buf: [1024]u8 = undefined;
+<a id="L228"></a>    var out: Writer = .fixed(&amp;out_buf);
+<a id="L229"></a>
+<a id="L230"></a>    var w: Stringify = .{ .writer = &amp;out, .options = .{ .whitespace = .indent_2 } };
+<a id="L231"></a>
+<a id="L232"></a>    try w.beginObject();
+<a id="L233"></a>    try w.objectField("a");
+<a id="L234"></a>    try w.print("[  ]", .{});
+<a id="L235"></a>    try w.objectField("b");
+<a id="L236"></a>    try w.beginArray();
+<a id="L237"></a>    try w.print("[{s}] ", .{"[]"});
+<a id="L238"></a>    try w.print("  {}", .{12345});
+<a id="L239"></a>    try w.endArray();
+<a id="L240"></a>    try w.endObject();
+<a id="L241"></a>
+<a id="L242"></a>    const expected =
+<a id="L243"></a>        \\{
+<a id="L244"></a>        \\  "a": [  ],
+<a id="L245"></a>        \\  "b": [
+<a id="L246"></a>        \\    [[]] ,
+<a id="L247"></a>        \\      12345
+<a id="L248"></a>        \\  ]
+<a id="L249"></a>        \\}
+<a id="L250"></a>    ;
+<a id="L251"></a>    try std.testing.expectEqualStrings(expected, out.buffered());
+<a id="L252"></a>}
+<a id="L253"></a>
+<a id="L254"></a>/// An alternative to calling `write` that allows you to write directly to the `.writer` field, e.g. with `.writer.writeAll()`.
+<a id="L255"></a>/// Call `beginWriteRaw()`, then write a complete value (including any quotes if necessary) directly to the `.writer` field,
+<a id="L256"></a>/// then call `endWriteRaw()`.
+<a id="L257"></a>/// This can be useful for streaming very long strings into the output without needing it all buffered in memory.
+<a id="L258"></a>pub fn beginWriteRaw(self: *Stringify) !void {
+<a id="L259"></a>    if (build_mode_has_safety) {
+<a id="L260"></a>        assert(self.raw_streaming_mode == .none);
+<a id="L261"></a>        self.raw_streaming_mode = .value;
+<a id="L262"></a>    }
+<a id="L263"></a>    try self.valueStart();
+<a id="L264"></a>}
+<a id="L265"></a>
+<a id="L266"></a>/// See `beginWriteRaw`.
+<a id="L267"></a>pub fn endWriteRaw(self: *Stringify) void {
+<a id="L268"></a>    if (build_mode_has_safety) {
+<a id="L269"></a>        assert(self.raw_streaming_mode == .value);
+<a id="L270"></a>        self.raw_streaming_mode = .none;
+<a id="L271"></a>    }
+<a id="L272"></a>    self.valueDone();
+<a id="L273"></a>}
+<a id="L274"></a>
+<a id="L275"></a>/// See `Stringify` for when to call this method.
+<a id="L276"></a>/// `key` is the string content of the property name.
+<a id="L277"></a>/// Surrounding quotes will be added and any special characters will be escaped.
+<a id="L278"></a>/// See also `objectFieldRaw`.
+<a id="L279"></a>pub fn objectField(self: *Stringify, key: []const u8) Error!void {
+<a id="L280"></a>    if (build_mode_has_safety) assert(self.raw_streaming_mode == .none);
+<a id="L281"></a>    try self.objectFieldStart();
+<a id="L282"></a>    try encodeJsonString(key, self.options, self.writer);
+<a id="L283"></a>    self.next_punctuation = .colon;
+<a id="L284"></a>}
+<a id="L285"></a>/// See `Stringify` for when to call this method.
+<a id="L286"></a>/// `quoted_key` is the complete bytes of the key including quotes and any necessary escape sequences.
+<a id="L287"></a>/// A few assertions are performed on the given value to ensure that the caller of this function understands the API contract.
+<a id="L288"></a>/// See also `objectField`.
+<a id="L289"></a>pub fn objectFieldRaw(self: *Stringify, quoted_key: []const u8) Error!void {
+<a id="L290"></a>    if (build_mode_has_safety) assert(self.raw_streaming_mode == .none);
+<a id="L291"></a>    assert(quoted_key.len &gt;= 2 and quoted_key[0] == '"' and quoted_key[quoted_key.len - 1] == '"'); // quoted_key should be "quoted".
+<a id="L292"></a>    try self.objectFieldStart();
+<a id="L293"></a>    try self.writer.writeAll(quoted_key);
+<a id="L294"></a>    self.next_punctuation = .colon;
+<a id="L295"></a>}
+<a id="L296"></a>
+<a id="L297"></a>/// In the rare case that you need to write very long object field names,
+<a id="L298"></a>/// this is an alternative to `objectField` and `objectFieldRaw` that allows you to write directly to the `.writer` field
+<a id="L299"></a>/// similar to `beginWriteRaw`.
+<a id="L300"></a>/// Call `endObjectFieldRaw()` when you're done.
+<a id="L301"></a>pub fn beginObjectFieldRaw(self: *Stringify) !void {
+<a id="L302"></a>    if (build_mode_has_safety) {
+<a id="L303"></a>        assert(self.raw_streaming_mode == .none);
+<a id="L304"></a>        self.raw_streaming_mode = .objectField;
+<a id="L305"></a>    }
+<a id="L306"></a>    try self.objectFieldStart();
+<a id="L307"></a>}
+<a id="L308"></a>
+<a id="L309"></a>/// See `beginObjectFieldRaw`.
+<a id="L310"></a>pub fn endObjectFieldRaw(self: *Stringify) void {
+<a id="L311"></a>    if (build_mode_has_safety) {
+<a id="L312"></a>        assert(self.raw_streaming_mode == .objectField);
+<a id="L313"></a>        self.raw_streaming_mode = .none;
+<a id="L314"></a>    }
+<a id="L315"></a>    self.next_punctuation = .colon;
+<a id="L316"></a>}
+<a id="L317"></a>
+<a id="L318"></a>/// Renders the given Zig value as JSON.
+<a id="L319"></a>///
+<a id="L320"></a>/// Supported types:
+<a id="L321"></a>///  * Zig `bool` -&gt; JSON `true` or `false`.
+<a id="L322"></a>///  * Zig `?T` -&gt; `null` or the rendering of `T`.
+<a id="L323"></a>///  * Zig `i32`, `u64`, etc. -&gt; JSON number or string.
+<a id="L324"></a>///      * When option `emit_nonportable_numbers_as_strings` is true, if the value is outside the range `+-1&lt;&lt;53` (the precise integer range of f64), it is rendered as a JSON string in base 10. Otherwise, it is rendered as JSON number.
+<a id="L325"></a>///  * Zig floats -&gt; JSON number or string.
+<a id="L326"></a>///      * If the value cannot be precisely represented by an f64, it is rendered as a JSON string. Otherwise, it is rendered as JSON number.
+<a id="L327"></a>///      * TODO: Float rendering will likely change in the future, e.g. to remove the unnecessary "e+00".
+<a id="L328"></a>///  * Zig `[]const u8`, `[]u8`, `*[N]u8`, `@Vector(N, u8)`, and similar -&gt; JSON string.
+<a id="L329"></a>///      * See `Options.emit_strings_as_arrays`.
+<a id="L330"></a>///      * If the content is not valid UTF-8, rendered as an array of numbers instead.
+<a id="L331"></a>///  * Zig `[]T`, `[N]T`, `*[N]T`, `@Vector(N, T)`, and similar -&gt; JSON array of the rendering of each item.
+<a id="L332"></a>///  * Zig tuple -&gt; JSON array of the rendering of each item.
+<a id="L333"></a>///  * Zig `struct` -&gt; JSON object with each field in declaration order.
+<a id="L334"></a>///      * If the struct declares a method `pub fn jsonStringify(self: *@This(), jw: anytype) !void`, it is called to do the serialization instead of the default behavior. The given `jw` is a pointer to this `Stringify`. See `std.json.Value` for an example.
+<a id="L335"></a>///      * See `Options.emit_null_optional_fields`.
+<a id="L336"></a>///  * Zig `union(enum)` -&gt; JSON object with one field named for the active tag and a value representing the payload.
+<a id="L337"></a>///      * If the payload is `void`, then the emitted value is `{}`.
+<a id="L338"></a>///      * If the union declares a method `pub fn jsonStringify(self: *@This(), jw: anytype) !void`, it is called to do the serialization instead of the default behavior. The given `jw` is a pointer to this `Stringify`.
+<a id="L339"></a>///  * Zig `enum` -&gt; JSON string naming the active tag.
+<a id="L340"></a>///      * If the enum declares a method `pub fn jsonStringify(self: *@This(), jw: anytype) !void`, it is called to do the serialization instead of the default behavior. The given `jw` is a pointer to this `Stringify`.
+<a id="L341"></a>///      * If the enum is non-exhaustive, unnamed values are rendered as integers.
+<a id="L342"></a>///  * Zig untyped enum literal -&gt; JSON string naming the active tag.
+<a id="L343"></a>///  * Zig error -&gt; JSON string naming the error.
+<a id="L344"></a>///  * Zig `*T` -&gt; the rendering of `T`. Note there is no guard against circular-reference infinite recursion.
+<a id="L345"></a>///
+<a id="L346"></a>/// See also alternative functions `print` and `beginWriteRaw`.
+<a id="L347"></a>/// For writing object field names, use `objectField` instead.
+<a id="L348"></a>pub fn write(self: *Stringify, v: anytype) Error!void {
+<a id="L349"></a>    if (build_mode_has_safety) assert(self.raw_streaming_mode == .none);
+<a id="L350"></a>    const T = @TypeOf(v);
+<a id="L351"></a>    switch (@typeInfo(T)) {
+<a id="L352"></a>        .int =&gt; {
+<a id="L353"></a>            try self.valueStart();
+<a id="L354"></a>            if (self.options.emit_nonportable_numbers_as_strings and
+<a id="L355"></a>                (v &lt;= -(1 &lt;&lt; 53) or v &gt;= (1 &lt;&lt; 53)))
+<a id="L356"></a>            {
+<a id="L357"></a>                try self.writer.print("\"{}\"", .{v});
+<a id="L358"></a>            } else {
+<a id="L359"></a>                try self.writer.print("{}", .{v});
+<a id="L360"></a>            }
+<a id="L361"></a>            self.valueDone();
+<a id="L362"></a>            return;
+<a id="L363"></a>        },
+<a id="L364"></a>        .comptime_int =&gt; {
+<a id="L365"></a>            return self.write(@as(std.math.IntFittingRange(v, v), v));
+<a id="L366"></a>        },
+<a id="L367"></a>        .float, .comptime_float =&gt; {
+<a id="L368"></a>            if (@as(f64, @floatCast(v)) == v) {
+<a id="L369"></a>                try self.valueStart();
+<a id="L370"></a>                try self.writer.print("{}", .{@as(f64, @floatCast(v))});
+<a id="L371"></a>                self.valueDone();
+<a id="L372"></a>                return;
+<a id="L373"></a>            }
+<a id="L374"></a>            try self.valueStart();
+<a id="L375"></a>            try self.writer.print("\"{}\"", .{v});
+<a id="L376"></a>            self.valueDone();
+<a id="L377"></a>            return;
+<a id="L378"></a>        },
+<a id="L379"></a>
+<a id="L380"></a>        .bool =&gt; {
+<a id="L381"></a>            try self.valueStart();
+<a id="L382"></a>            try self.writer.writeAll(if (v) "true" else "false");
+<a id="L383"></a>            self.valueDone();
+<a id="L384"></a>            return;
+<a id="L385"></a>        },
+<a id="L386"></a>        .null =&gt; {
+<a id="L387"></a>            try self.valueStart();
+<a id="L388"></a>            try self.writer.writeAll("null");
+<a id="L389"></a>            self.valueDone();
+<a id="L390"></a>            return;
+<a id="L391"></a>        },
+<a id="L392"></a>        .optional =&gt; {
+<a id="L393"></a>            if (v) |payload| {
+<a id="L394"></a>                return try self.write(payload);
+<a id="L395"></a>            } else {
+<a id="L396"></a>                return try self.write(null);
+<a id="L397"></a>            }
+<a id="L398"></a>        },
+<a id="L399"></a>        .@"enum" =&gt; |enum_info| {
+<a id="L400"></a>            if (std.meta.hasFn(T, "jsonStringify")) {
+<a id="L401"></a>                return v.jsonStringify(self);
+<a id="L402"></a>            }
+<a id="L403"></a>
+<a id="L404"></a>            if (!enum_info.is_exhaustive) {
+<a id="L405"></a>                inline for (enum_info.fields) |field| {
+<a id="L406"></a>                    if (v == @field(T, field.name)) {
+<a id="L407"></a>                        break;
+<a id="L408"></a>                    }
+<a id="L409"></a>                } else {
+<a id="L410"></a>                    return self.write(@intFromEnum(v));
+<a id="L411"></a>                }
+<a id="L412"></a>            }
+<a id="L413"></a>
+<a id="L414"></a>            return self.stringValue(@tagName(v));
+<a id="L415"></a>        },
+<a id="L416"></a>        .enum_literal =&gt; {
+<a id="L417"></a>            return self.stringValue(@tagName(v));
+<a id="L418"></a>        },
+<a id="L419"></a>        .@"union" =&gt; {
+<a id="L420"></a>            if (std.meta.hasFn(T, "jsonStringify")) {
+<a id="L421"></a>                return v.jsonStringify(self);
+<a id="L422"></a>            }
+<a id="L423"></a>
+<a id="L424"></a>            const info = @typeInfo(T).@"union";
+<a id="L425"></a>            if (info.tag_type) |UnionTagType| {
+<a id="L426"></a>                try self.beginObject();
+<a id="L427"></a>                inline for (info.fields) |u_field| {
+<a id="L428"></a>                    if (v == @field(UnionTagType, u_field.name)) {
+<a id="L429"></a>                        try self.objectField(u_field.name);
+<a id="L430"></a>                        if (u_field.type == void) {
+<a id="L431"></a>                            // void v is {}
+<a id="L432"></a>                            try self.beginObject();
+<a id="L433"></a>                            try self.endObject();
+<a id="L434"></a>                        } else {
+<a id="L435"></a>                            try self.write(@field(v, u_field.name));
+<a id="L436"></a>                        }
+<a id="L437"></a>                        break;
+<a id="L438"></a>                    }
+<a id="L439"></a>                } else {
+<a id="L440"></a>                    unreachable; // No active tag?
+<a id="L441"></a>                }
+<a id="L442"></a>                try self.endObject();
+<a id="L443"></a>                return;
+<a id="L444"></a>            } else {
+<a id="L445"></a>                @compileError("Unable to stringify untagged union '" ++ @typeName(T) ++ "'");
+<a id="L446"></a>            }
+<a id="L447"></a>        },
+<a id="L448"></a>        .@"struct" =&gt; |S| {
+<a id="L449"></a>            if (std.meta.hasFn(T, "jsonStringify")) {
+<a id="L450"></a>                return v.jsonStringify(self);
+<a id="L451"></a>            }
+<a id="L452"></a>
+<a id="L453"></a>            if (S.is_tuple) {
+<a id="L454"></a>                try self.beginArray();
+<a id="L455"></a>            } else {
+<a id="L456"></a>                try self.beginObject();
+<a id="L457"></a>            }
+<a id="L458"></a>            inline for (S.fields) |Field| {
+<a id="L459"></a>                // don't include void fields
+<a id="L460"></a>                if (Field.type == void) continue;
+<a id="L461"></a>
+<a id="L462"></a>                var emit_field = true;
+<a id="L463"></a>
+<a id="L464"></a>                // don't include optional fields that are null when emit_null_optional_fields is set to false
+<a id="L465"></a>                if (@typeInfo(Field.type) == .optional) {
+<a id="L466"></a>                    if (self.options.emit_null_optional_fields == false) {
+<a id="L467"></a>                        if (@field(v, Field.name) == null) {
+<a id="L468"></a>                            emit_field = false;
+<a id="L469"></a>                        }
+<a id="L470"></a>                    }
+<a id="L471"></a>                }
+<a id="L472"></a>
+<a id="L473"></a>                if (emit_field) {
+<a id="L474"></a>                    if (!S.is_tuple) {
+<a id="L475"></a>                        try self.objectField(Field.name);
+<a id="L476"></a>                    }
+<a id="L477"></a>                    try self.write(@field(v, Field.name));
+<a id="L478"></a>                }
+<a id="L479"></a>            }
+<a id="L480"></a>            if (S.is_tuple) {
+<a id="L481"></a>                try self.endArray();
+<a id="L482"></a>            } else {
+<a id="L483"></a>                try self.endObject();
+<a id="L484"></a>            }
+<a id="L485"></a>            return;
+<a id="L486"></a>        },
+<a id="L487"></a>        .error_set =&gt; return self.stringValue(@errorName(v)),
+<a id="L488"></a>        .pointer =&gt; |ptr_info| switch (ptr_info.size) {
+<a id="L489"></a>            .one =&gt; switch (@typeInfo(ptr_info.child)) {
+<a id="L490"></a>                .array =&gt; {
+<a id="L491"></a>                    // Coerce `*[N]T` to `[]const T`.
+<a id="L492"></a>                    const Slice = []const std.meta.Elem(ptr_info.child);
+<a id="L493"></a>                    return self.write(@as(Slice, v));
+<a id="L494"></a>                },
+<a id="L495"></a>                else =&gt; {
+<a id="L496"></a>                    return self.write(v.*);
+<a id="L497"></a>                },
+<a id="L498"></a>            },
+<a id="L499"></a>            .many, .slice =&gt; {
+<a id="L500"></a>                if (ptr_info.size == .many and ptr_info.sentinel() == null)
+<a id="L501"></a>                    @compileError("unable to stringify type '" ++ @typeName(T) ++ "' without sentinel");
+<a id="L502"></a>                const slice = if (ptr_info.size == .many) std.mem.span(v) else v;
+<a id="L503"></a>
+<a id="L504"></a>                if (ptr_info.child == u8) {
+<a id="L505"></a>                    // This is a []const u8, or some similar Zig string.
+<a id="L506"></a>                    if (!self.options.emit_strings_as_arrays and std.unicode.utf8ValidateSlice(slice)) {
+<a id="L507"></a>                        return self.stringValue(slice);
+<a id="L508"></a>                    }
+<a id="L509"></a>                }
+<a id="L510"></a>
+<a id="L511"></a>                try self.beginArray();
+<a id="L512"></a>                for (slice) |x| {
+<a id="L513"></a>                    try self.write(x);
+<a id="L514"></a>                }
+<a id="L515"></a>                try self.endArray();
+<a id="L516"></a>                return;
+<a id="L517"></a>            },
+<a id="L518"></a>            else =&gt; @compileError("Unable to stringify type '" ++ @typeName(T) ++ "'"),
+<a id="L519"></a>        },
+<a id="L520"></a>        .array =&gt; {
+<a id="L521"></a>            // Coerce `[N]T` to `*const [N]T` (and then to `[]const T`).
+<a id="L522"></a>            return self.write(&amp;v);
+<a id="L523"></a>        },
+<a id="L524"></a>        .vector =&gt; |info| {
+<a id="L525"></a>            const array: [info.len]info.child = v;
+<a id="L526"></a>            return self.write(&amp;array);
+<a id="L527"></a>        },
+<a id="L528"></a>        else =&gt; @compileError("Unable to stringify type '" ++ @typeName(T) ++ "'"),
+<a id="L529"></a>    }
+<a id="L530"></a>    unreachable;
+<a id="L531"></a>}
+<a id="L532"></a>
+<a id="L533"></a>fn stringValue(self: *Stringify, s: []const u8) !void {
+<a id="L534"></a>    try self.valueStart();
+<a id="L535"></a>    try encodeJsonString(s, self.options, self.writer);
+<a id="L536"></a>    self.valueDone();
+<a id="L537"></a>}
+<a id="L538"></a>
+<a id="L539"></a>pub const Options = struct {
+<a id="L540"></a>    /// Controls the whitespace emitted.
+<a id="L541"></a>    /// The default `.minified` is a compact encoding with no whitespace between tokens.
+<a id="L542"></a>    /// Any setting other than `.minified` will use newlines, indentation, and a space after each ':'.
+<a id="L543"></a>    /// `.indent_1` means 1 space for each indentation level, `.indent_2` means 2 spaces, etc.
+<a id="L544"></a>    /// `.indent_tab` uses a tab for each indentation level.
+<a id="L545"></a>    whitespace: enum {
+<a id="L546"></a>        minified,
+<a id="L547"></a>        indent_1,
+<a id="L548"></a>        indent_2,
+<a id="L549"></a>        indent_3,
+<a id="L550"></a>        indent_4,
+<a id="L551"></a>        indent_8,
+<a id="L552"></a>        indent_tab,
+<a id="L553"></a>    } = .minified,
+<a id="L554"></a>
+<a id="L555"></a>    /// Should optional fields with null value be written?
+<a id="L556"></a>    emit_null_optional_fields: bool = true,
+<a id="L557"></a>
+<a id="L558"></a>    /// Arrays/slices of u8 are typically encoded as JSON strings.
+<a id="L559"></a>    /// This option emits them as arrays of numbers instead.
+<a id="L560"></a>    /// Does not affect calls to `objectField*()`.
+<a id="L561"></a>    emit_strings_as_arrays: bool = false,
+<a id="L562"></a>
+<a id="L563"></a>    /// Should unicode characters be escaped in strings?
+<a id="L564"></a>    escape_unicode: bool = false,
+<a id="L565"></a>
+<a id="L566"></a>    /// When true, renders numbers outside the range `+-1&lt;&lt;53` (the precise integer range of f64) as JSON strings in base 10.
+<a id="L567"></a>    emit_nonportable_numbers_as_strings: bool = false,
+<a id="L568"></a>};
+<a id="L569"></a>
+<a id="L570"></a>/// Writes the given value to the `Writer` writer.
+<a id="L571"></a>/// See `Stringify` for how the given value is serialized into JSON.
+<a id="L572"></a>/// The maximum nesting depth of the output JSON document is 256.
+<a id="L573"></a>pub fn value(v: anytype, options: Options, writer: *Writer) Error!void {
+<a id="L574"></a>    var s: Stringify = .{ .writer = writer, .options = options };
+<a id="L575"></a>    try s.write(v);
+<a id="L576"></a>}
+<a id="L577"></a>
+<a id="L578"></a>test value {
+<a id="L579"></a>    var out: Writer.Allocating = .init(std.testing.allocator);
+<a id="L580"></a>    const writer = &amp;out.writer;
+<a id="L581"></a>    defer out.deinit();
+<a id="L582"></a>
+<a id="L583"></a>    const T = struct { a: i32, b: []const u8 };
+<a id="L584"></a>    try value(T{ .a = 123, .b = "xy" }, .{}, writer);
+<a id="L585"></a>    try std.testing.expectEqualSlices(u8, "{\"a\":123,\"b\":\"xy\"}", out.written());
+<a id="L586"></a>
+<a id="L587"></a>    try testStringify("9999999999999999", 9999999999999999, .{});
+<a id="L588"></a>    try testStringify("\"9999999999999999\"", 9999999999999999, .{ .emit_nonportable_numbers_as_strings = true });
+<a id="L589"></a>
+<a id="L590"></a>    try testStringify("[1,1]", @as(@Vector(2, u32), @splat(1)), .{});
+<a id="L591"></a>    try testStringify("\"AA\"", @as(@Vector(2, u8), @splat('A')), .{});
+<a id="L592"></a>    try testStringify("[65,65]", @as(@Vector(2, u8), @splat('A')), .{ .emit_strings_as_arrays = true });
+<a id="L593"></a>
+<a id="L594"></a>    // void field
+<a id="L595"></a>    try testStringify("{\"foo\":42}", struct {
+<a id="L596"></a>        foo: u32,
+<a id="L597"></a>        bar: void = {},
+<a id="L598"></a>    }{ .foo = 42 }, .{});
+<a id="L599"></a>
+<a id="L600"></a>    const Tuple = struct { []const u8, usize };
+<a id="L601"></a>    try testStringify("[\"foo\",42]", Tuple{ "foo", 42 }, .{});
+<a id="L602"></a>
+<a id="L603"></a>    comptime {
+<a id="L604"></a>        testStringify("false", false, .{}) catch unreachable;
+<a id="L605"></a>        const MyStruct = struct { foo: u32 };
+<a id="L606"></a>        testStringify("[{\"foo\":42},{\"foo\":100},{\"foo\":1000}]", [_]MyStruct{
+<a id="L607"></a>            MyStruct{ .foo = 42 },
+<a id="L608"></a>            MyStruct{ .foo = 100 },
+<a id="L609"></a>            MyStruct{ .foo = 1000 },
+<a id="L610"></a>        }, .{}) catch unreachable;
+<a id="L611"></a>    }
+<a id="L612"></a>}
+<a id="L613"></a>
+<a id="L614"></a>/// Calls `value` and stores the result in dynamically allocated memory instead
+<a id="L615"></a>/// of taking a writer.
+<a id="L616"></a>///
+<a id="L617"></a>/// Caller owns returned memory.
+<a id="L618"></a>pub fn valueAlloc(gpa: Allocator, v: anytype, options: Options) error{OutOfMemory}![]u8 {
+<a id="L619"></a>    var aw: Writer.Allocating = .init(gpa);
+<a id="L620"></a>    defer aw.deinit();
+<a id="L621"></a>    value(v, options, &amp;aw.writer) catch return error.OutOfMemory;
+<a id="L622"></a>    return aw.toOwnedSlice();
+<a id="L623"></a>}
+<a id="L624"></a>
+<a id="L625"></a>test valueAlloc {
+<a id="L626"></a>    const allocator = std.testing.allocator;
+<a id="L627"></a>    const expected =
+<a id="L628"></a>        \\{"foo":"bar","answer":42,"my_friend":"sammy"}
+<a id="L629"></a>    ;
+<a id="L630"></a>    const actual = try valueAlloc(allocator, .{ .foo = "bar", .answer = 42, .my_friend = "sammy" }, .{});
+<a id="L631"></a>    defer allocator.free(actual);
+<a id="L632"></a>
+<a id="L633"></a>    try std.testing.expectEqualStrings(expected, actual);
+<a id="L634"></a>}
+<a id="L635"></a>
+<a id="L636"></a>fn outputUnicodeEscape(codepoint: u21, w: *Writer) Error!void {
+<a id="L637"></a>    if (codepoint &lt;= 0xFFFF) {
+<a id="L638"></a>        // If the character is in the Basic Multilingual Plane (U+0000 through U+FFFF),
+<a id="L639"></a>        // then it may be represented as a six-character sequence: a reverse solidus, followed
+<a id="L640"></a>        // by the lowercase letter u, followed by four hexadecimal digits that encode the character's code point.
+<a id="L641"></a>        try w.writeAll("\\u");
+<a id="L642"></a>        try w.printInt(codepoint, 16, .lower, .{ .width = 4, .fill = '0' });
+<a id="L643"></a>    } else {
+<a id="L644"></a>        assert(codepoint &lt;= 0x10FFFF);
+<a id="L645"></a>        // To escape an extended character that is not in the Basic Multilingual Plane,
+<a id="L646"></a>        // the character is represented as a 12-character sequence, encoding the UTF-16 surrogate pair.
+<a id="L647"></a>        const high = @as(u16, @intCast((codepoint - 0x10000) &gt;&gt; 10)) + 0xD800;
+<a id="L648"></a>        const low = @as(u16, @intCast(codepoint &amp; 0x3FF)) + 0xDC00;
+<a id="L649"></a>        try w.writeAll("\\u");
+<a id="L650"></a>        try w.printInt(high, 16, .lower, .{ .width = 4, .fill = '0' });
+<a id="L651"></a>        try w.writeAll("\\u");
+<a id="L652"></a>        try w.printInt(low, 16, .lower, .{ .width = 4, .fill = '0' });
+<a id="L653"></a>    }
+<a id="L654"></a>}
+<a id="L655"></a>
+<a id="L656"></a>fn outputSpecialEscape(c: u8, writer: *Writer) Error!void {
+<a id="L657"></a>    switch (c) {
+<a id="L658"></a>        '\\' =&gt; try writer.writeAll("\\\\"),
+<a id="L659"></a>        '\"' =&gt; try writer.writeAll("\\\""),
+<a id="L660"></a>        0x08 =&gt; try writer.writeAll("\\b"),
+<a id="L661"></a>        0x0C =&gt; try writer.writeAll("\\f"),
+<a id="L662"></a>        '\n' =&gt; try writer.writeAll("\\n"),
+<a id="L663"></a>        '\r' =&gt; try writer.writeAll("\\r"),
+<a id="L664"></a>        '\t' =&gt; try writer.writeAll("\\t"),
+<a id="L665"></a>        else =&gt; try outputUnicodeEscape(c, writer),
+<a id="L666"></a>    }
+<a id="L667"></a>}
+<a id="L668"></a>
+<a id="L669"></a>/// Write `string` to `writer` as a JSON encoded string.
+<a id="L670"></a>pub fn encodeJsonString(string: []const u8, options: Options, writer: *Writer) Error!void {
+<a id="L671"></a>    try writer.writeByte('\"');
+<a id="L672"></a>    try encodeJsonStringChars(string, options, writer);
+<a id="L673"></a>    try writer.writeByte('\"');
+<a id="L674"></a>}
+<a id="L675"></a>
+<a id="L676"></a>/// Write `chars` to `writer` as JSON encoded string characters.
+<a id="L677"></a>pub fn encodeJsonStringChars(chars: []const u8, options: Options, writer: *Writer) Error!void {
+<a id="L678"></a>    var write_cursor: usize = 0;
+<a id="L679"></a>    var i: usize = 0;
+<a id="L680"></a>    if (options.escape_unicode) {
+<a id="L681"></a>        while (i &lt; chars.len) : (i += 1) {
+<a id="L682"></a>            switch (chars[i]) {
+<a id="L683"></a>                // normal ascii character
+<a id="L684"></a>                0x20...0x21, 0x23...0x5B, 0x5D...0x7E =&gt; {},
+<a id="L685"></a>                0x00...0x1F, '\\', '\"' =&gt; {
+<a id="L686"></a>                    // Always must escape these.
+<a id="L687"></a>                    try writer.writeAll(chars[write_cursor..i]);
+<a id="L688"></a>                    try outputSpecialEscape(chars[i], writer);
+<a id="L689"></a>                    write_cursor = i + 1;
+<a id="L690"></a>                },
+<a id="L691"></a>                0x7F...0xFF =&gt; {
+<a id="L692"></a>                    try writer.writeAll(chars[write_cursor..i]);
+<a id="L693"></a>                    const ulen = std.unicode.utf8ByteSequenceLength(chars[i]) catch unreachable;
+<a id="L694"></a>                    const codepoint = std.unicode.utf8Decode(chars[i..][0..ulen]) catch unreachable;
+<a id="L695"></a>                    try outputUnicodeEscape(codepoint, writer);
+<a id="L696"></a>                    i += ulen - 1;
+<a id="L697"></a>                    write_cursor = i + 1;
+<a id="L698"></a>                },
+<a id="L699"></a>            }
+<a id="L700"></a>        }
+<a id="L701"></a>    } else {
+<a id="L702"></a>        while (i &lt; chars.len) : (i += 1) {
+<a id="L703"></a>            switch (chars[i]) {
+<a id="L704"></a>                // normal bytes
+<a id="L705"></a>                0x20...0x21, 0x23...0x5B, 0x5D...0xFF =&gt; {},
+<a id="L706"></a>                0x00...0x1F, '\\', '\"' =&gt; {
+<a id="L707"></a>                    // Always must escape these.
+<a id="L708"></a>                    try writer.writeAll(chars[write_cursor..i]);
+<a id="L709"></a>                    try outputSpecialEscape(chars[i], writer);
+<a id="L710"></a>                    write_cursor = i + 1;
+<a id="L711"></a>                },
+<a id="L712"></a>            }
+<a id="L713"></a>        }
+<a id="L714"></a>    }
+<a id="L715"></a>    try writer.writeAll(chars[write_cursor..chars.len]);
+<a id="L716"></a>}
+<a id="L717"></a>
+<a id="L718"></a>test "json write stream" {
+<a id="L719"></a>    var out_buf: [1024]u8 = undefined;
+<a id="L720"></a>    var out: Writer = .fixed(&amp;out_buf);
+<a id="L721"></a>    var w: Stringify = .{ .writer = &amp;out, .options = .{ .whitespace = .indent_2 } };
+<a id="L722"></a>    try testBasicWriteStream(&amp;w);
+<a id="L723"></a>}
+<a id="L724"></a>
+<a id="L725"></a>fn testBasicWriteStream(w: *Stringify) !void {
+<a id="L726"></a>    w.writer.end = 0;
+<a id="L727"></a>
+<a id="L728"></a>    try w.beginObject();
+<a id="L729"></a>
+<a id="L730"></a>    try w.objectField("object");
+<a id="L731"></a>    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+<a id="L732"></a>    defer arena_allocator.deinit();
+<a id="L733"></a>    try w.write(try getJsonObject(arena_allocator.allocator()));
+<a id="L734"></a>
+<a id="L735"></a>    try w.objectFieldRaw("\"string\"");
+<a id="L736"></a>    try w.write("This is a string");
+<a id="L737"></a>
+<a id="L738"></a>    try w.objectField("array");
+<a id="L739"></a>    try w.beginArray();
+<a id="L740"></a>    try w.write("Another string");
+<a id="L741"></a>    try w.write(@as(i32, 1));
+<a id="L742"></a>    try w.write(@as(f32, 3.5));
+<a id="L743"></a>    try w.endArray();
+<a id="L744"></a>
+<a id="L745"></a>    try w.objectField("int");
+<a id="L746"></a>    try w.write(@as(i32, 10));
+<a id="L747"></a>
+<a id="L748"></a>    try w.objectField("float");
+<a id="L749"></a>    try w.write(@as(f32, 3.5));
+<a id="L750"></a>
+<a id="L751"></a>    try w.endObject();
+<a id="L752"></a>
+<a id="L753"></a>    const expected =
+<a id="L754"></a>        \\{
+<a id="L755"></a>        \\  "object": {
+<a id="L756"></a>        \\    "one": 1,
+<a id="L757"></a>        \\    "two": 2
+<a id="L758"></a>        \\  },
+<a id="L759"></a>        \\  "string": "This is a string",
+<a id="L760"></a>        \\  "array": [
+<a id="L761"></a>        \\    "Another string",
+<a id="L762"></a>        \\    1,
+<a id="L763"></a>        \\    3.5
+<a id="L764"></a>        \\  ],
+<a id="L765"></a>        \\  "int": 10,
+<a id="L766"></a>        \\  "float": 3.5
+<a id="L767"></a>        \\}
+<a id="L768"></a>    ;
+<a id="L769"></a>    try std.testing.expectEqualStrings(expected, w.writer.buffered());
+<a id="L770"></a>}
+<a id="L771"></a>
+<a id="L772"></a>fn getJsonObject(allocator: std.mem.Allocator) !std.json.Value {
+<a id="L773"></a>    var v: std.json.Value = .{ .object = .empty };
+<a id="L774"></a>    try v.object.put(allocator, "one", std.json.Value{ .integer = @as(i64, @intCast(1)) });
+<a id="L775"></a>    try v.object.put(allocator, "two", std.json.Value{ .float = 2.0 });
+<a id="L776"></a>    return v;
+<a id="L777"></a>}
+<a id="L778"></a>
+<a id="L779"></a>test "stringify null optional fields" {
+<a id="L780"></a>    const MyStruct = struct {
+<a id="L781"></a>        optional: ?[]const u8 = null,
+<a id="L782"></a>        required: []const u8 = "something",
+<a id="L783"></a>        another_optional: ?[]const u8 = null,
+<a id="L784"></a>        another_required: []const u8 = "something else",
+<a id="L785"></a>    };
+<a id="L786"></a>    try testStringify(
+<a id="L787"></a>        \\{"optional":null,"required":"something","another_optional":null,"another_required":"something else"}
+<a id="L788"></a>    ,
+<a id="L789"></a>        MyStruct{},
+<a id="L790"></a>        .{},
+<a id="L791"></a>    );
+<a id="L792"></a>    try testStringify(
+<a id="L793"></a>        \\{"required":"something","another_required":"something else"}
+<a id="L794"></a>    ,
+<a id="L795"></a>        MyStruct{},
+<a id="L796"></a>        .{ .emit_null_optional_fields = false },
+<a id="L797"></a>    );
+<a id="L798"></a>}
+<a id="L799"></a>
+<a id="L800"></a>test "stringify basic types" {
+<a id="L801"></a>    try testStringify("false", false, .{});
+<a id="L802"></a>    try testStringify("true", true, .{});
+<a id="L803"></a>    try testStringify("null", @as(?u8, null), .{});
+<a id="L804"></a>    try testStringify("null", @as(?*u32, null), .{});
+<a id="L805"></a>    try testStringify("42", 42, .{});
+<a id="L806"></a>    try testStringify("42", 42.0, .{});
+<a id="L807"></a>    try testStringify("42", @as(u8, 42), .{});
+<a id="L808"></a>    try testStringify("42", @as(u128, 42), .{});
+<a id="L809"></a>    try testStringify("9999999999999999", 9999999999999999, .{});
+<a id="L810"></a>    try testStringify("42", @as(f32, 42), .{});
+<a id="L811"></a>    try testStringify("42", @as(f64, 42), .{});
+<a id="L812"></a>    try testStringify("\"ItBroke\"", @as(anyerror, error.ItBroke), .{});
+<a id="L813"></a>    try testStringify("\"ItBroke\"", error.ItBroke, .{});
+<a id="L814"></a>}
+<a id="L815"></a>
+<a id="L816"></a>test "stringify string" {
+<a id="L817"></a>    try testStringify("\"hello\"", "hello", .{});
+<a id="L818"></a>    try testStringify("\"with\\nescapes\\r\"", "with\nescapes\r", .{});
+<a id="L819"></a>    try testStringify("\"with\\nescapes\\r\"", "with\nescapes\r", .{ .escape_unicode = true });
+<a id="L820"></a>    try testStringify("\"with unicode\\u0001\"", "with unicode\u{1}", .{});
+<a id="L821"></a>    try testStringify("\"with unicode\\u0001\"", "with unicode\u{1}", .{ .escape_unicode = true });
+<a id="L822"></a>    try testStringify("\"with unicode\u{80}\"", "with unicode\u{80}", .{});
+<a id="L823"></a>    try testStringify("\"with unicode\\u0080\"", "with unicode\u{80}", .{ .escape_unicode = true });
+<a id="L824"></a>    try testStringify("\"with unicode\u{FF}\"", "with unicode\u{FF}", .{});
+<a id="L825"></a>    try testStringify("\"with unicode\\u00ff\"", "with unicode\u{FF}", .{ .escape_unicode = true });
+<a id="L826"></a>    try testStringify("\"with unicode\u{100}\"", "with unicode\u{100}", .{});
+<a id="L827"></a>    try testStringify("\"with unicode\\u0100\"", "with unicode\u{100}", .{ .escape_unicode = true });
+<a id="L828"></a>    try testStringify("\"with unicode\u{800}\"", "with unicode\u{800}", .{});
+<a id="L829"></a>    try testStringify("\"with unicode\\u0800\"", "with unicode\u{800}", .{ .escape_unicode = true });
+<a id="L830"></a>    try testStringify("\"with unicode\u{8000}\"", "with unicode\u{8000}", .{});
+<a id="L831"></a>    try testStringify("\"with unicode\\u8000\"", "with unicode\u{8000}", .{ .escape_unicode = true });
+<a id="L832"></a>    try testStringify("\"with unicode\u{D799}\"", "with unicode\u{D799}", .{});
+<a id="L833"></a>    try testStringify("\"with unicode\\ud799\"", "with unicode\u{D799}", .{ .escape_unicode = true });
+<a id="L834"></a>    try testStringify("\"with unicode\u{10000}\"", "with unicode\u{10000}", .{});
+<a id="L835"></a>    try testStringify("\"with unicode\\ud800\\udc00\"", "with unicode\u{10000}", .{ .escape_unicode = true });
+<a id="L836"></a>    try testStringify("\"with unicode\u{10FFFF}\"", "with unicode\u{10FFFF}", .{});
+<a id="L837"></a>    try testStringify("\"with unicode\\udbff\\udfff\"", "with unicode\u{10FFFF}", .{ .escape_unicode = true });
+<a id="L838"></a>}
+<a id="L839"></a>
+<a id="L840"></a>test "stringify many-item sentinel-terminated string" {
+<a id="L841"></a>    try testStringify("\"hello\"", @as([*:0]const u8, "hello"), .{});
+<a id="L842"></a>    try testStringify("\"with\\nescapes\\r\"", @as([*:0]const u8, "with\nescapes\r"), .{ .escape_unicode = true });
+<a id="L843"></a>    try testStringify("\"with unicode\\u0001\"", @as([*:0]const u8, "with unicode\u{1}"), .{ .escape_unicode = true });
+<a id="L844"></a>}
+<a id="L845"></a>
+<a id="L846"></a>test "stringify enums" {
+<a id="L847"></a>    const E = enum {
+<a id="L848"></a>        foo,
+<a id="L849"></a>        bar,
+<a id="L850"></a>    };
+<a id="L851"></a>    try testStringify("\"foo\"", E.foo, .{});
+<a id="L852"></a>    try testStringify("\"bar\"", E.bar, .{});
+<a id="L853"></a>}
+<a id="L854"></a>
+<a id="L855"></a>test "stringify non-exhaustive enum" {
+<a id="L856"></a>    const E = enum(u8) {
+<a id="L857"></a>        foo = 0,
+<a id="L858"></a>        _,
+<a id="L859"></a>    };
+<a id="L860"></a>    try testStringify("\"foo\"", E.foo, .{});
+<a id="L861"></a>    try testStringify("1", @as(E, @enumFromInt(1)), .{});
+<a id="L862"></a>}
+<a id="L863"></a>
+<a id="L864"></a>test "stringify enum literals" {
+<a id="L865"></a>    try testStringify("\"foo\"", .foo, .{});
+<a id="L866"></a>    try testStringify("\"bar\"", .bar, .{});
+<a id="L867"></a>}
+<a id="L868"></a>
+<a id="L869"></a>test "stringify tagged unions" {
+<a id="L870"></a>    const T = union(enum) {
+<a id="L871"></a>        nothing,
+<a id="L872"></a>        foo: u32,
+<a id="L873"></a>        bar: bool,
+<a id="L874"></a>    };
+<a id="L875"></a>    try testStringify("{\"nothing\":{}}", T{ .nothing = {} }, .{});
+<a id="L876"></a>    try testStringify("{\"foo\":42}", T{ .foo = 42 }, .{});
+<a id="L877"></a>    try testStringify("{\"bar\":true}", T{ .bar = true }, .{});
+<a id="L878"></a>}
+<a id="L879"></a>
+<a id="L880"></a>test "stringify struct" {
+<a id="L881"></a>    try testStringify("{\"foo\":42}", struct {
+<a id="L882"></a>        foo: u32,
+<a id="L883"></a>    }{ .foo = 42 }, .{});
+<a id="L884"></a>}
+<a id="L885"></a>
+<a id="L886"></a>test "emit_strings_as_arrays" {
+<a id="L887"></a>    // Should only affect string values, not object keys.
+<a id="L888"></a>    try testStringify("{\"foo\":\"bar\"}", .{ .foo = "bar" }, .{});
+<a id="L889"></a>    try testStringify("{\"foo\":[98,97,114]}", .{ .foo = "bar" }, .{ .emit_strings_as_arrays = true });
+<a id="L890"></a>    // Should *not* affect these types:
+<a id="L891"></a>    try testStringify("\"foo\"", @as(enum { foo, bar }, .foo), .{ .emit_strings_as_arrays = true });
+<a id="L892"></a>    try testStringify("\"ItBroke\"", error.ItBroke, .{ .emit_strings_as_arrays = true });
+<a id="L893"></a>    // Should work on these:
+<a id="L894"></a>    try testStringify("\"bar\"", @Vector(3, u8){ 'b', 'a', 'r' }, .{});
+<a id="L895"></a>    try testStringify("[98,97,114]", @Vector(3, u8){ 'b', 'a', 'r' }, .{ .emit_strings_as_arrays = true });
+<a id="L896"></a>    try testStringify("\"bar\"", [3]u8{ 'b', 'a', 'r' }, .{});
+<a id="L897"></a>    try testStringify("[98,97,114]", [3]u8{ 'b', 'a', 'r' }, .{ .emit_strings_as_arrays = true });
+<a id="L898"></a>}
+<a id="L899"></a>
+<a id="L900"></a>test "stringify struct with indentation" {
+<a id="L901"></a>    try testStringify(
+<a id="L902"></a>        \\{
+<a id="L903"></a>        \\    "foo": 42,
+<a id="L904"></a>        \\    "bar": [
+<a id="L905"></a>        \\        1,
+<a id="L906"></a>        \\        2,
+<a id="L907"></a>        \\        3
+<a id="L908"></a>        \\    ]
+<a id="L909"></a>        \\}
+<a id="L910"></a>    ,
+<a id="L911"></a>        struct {
+<a id="L912"></a>            foo: u32,
+<a id="L913"></a>            bar: [3]u32,
+<a id="L914"></a>        }{
+<a id="L915"></a>            .foo = 42,
+<a id="L916"></a>            .bar = .{ 1, 2, 3 },
+<a id="L917"></a>        },
+<a id="L918"></a>        .{ .whitespace = .indent_4 },
+<a id="L919"></a>    );
+<a id="L920"></a>    try testStringify(
+<a id="L921"></a>        "{\n\t\"foo\": 42,\n\t\"bar\": [\n\t\t1,\n\t\t2,\n\t\t3\n\t]\n}",
+<a id="L922"></a>        struct {
+<a id="L923"></a>            foo: u32,
+<a id="L924"></a>            bar: [3]u32,
+<a id="L925"></a>        }{
+<a id="L926"></a>            .foo = 42,
+<a id="L927"></a>            .bar = .{ 1, 2, 3 },
+<a id="L928"></a>        },
+<a id="L929"></a>        .{ .whitespace = .indent_tab },
+<a id="L930"></a>    );
+<a id="L931"></a>    try testStringify(
+<a id="L932"></a>        \\{"foo":42,"bar":[1,2,3]}
+<a id="L933"></a>    ,
+<a id="L934"></a>        struct {
+<a id="L935"></a>            foo: u32,
+<a id="L936"></a>            bar: [3]u32,
+<a id="L937"></a>        }{
+<a id="L938"></a>            .foo = 42,
+<a id="L939"></a>            .bar = .{ 1, 2, 3 },
+<a id="L940"></a>        },
+<a id="L941"></a>        .{ .whitespace = .minified },
+<a id="L942"></a>    );
+<a id="L943"></a>}
+<a id="L944"></a>
+<a id="L945"></a>test "stringify array of structs" {
+<a id="L946"></a>    const MyStruct = struct {
+<a id="L947"></a>        foo: u32,
+<a id="L948"></a>    };
+<a id="L949"></a>    try testStringify("[{\"foo\":42},{\"foo\":100},{\"foo\":1000}]", [_]MyStruct{
+<a id="L950"></a>        MyStruct{ .foo = 42 },
+<a id="L951"></a>        MyStruct{ .foo = 100 },
+<a id="L952"></a>        MyStruct{ .foo = 1000 },
+<a id="L953"></a>    }, .{});
+<a id="L954"></a>}
+<a id="L955"></a>
+<a id="L956"></a>test "stringify struct with custom stringifier" {
+<a id="L957"></a>    try testStringify("[\"something special\",42]", struct {
+<a id="L958"></a>        foo: u32,
+<a id="L959"></a>        const Self = @This();
+<a id="L960"></a>        pub fn jsonStringify(v: @This(), jws: anytype) !void {
+<a id="L961"></a>            _ = v;
+<a id="L962"></a>            try jws.beginArray();
+<a id="L963"></a>            try jws.write("something special");
+<a id="L964"></a>            try jws.write(42);
+<a id="L965"></a>            try jws.endArray();
+<a id="L966"></a>        }
+<a id="L967"></a>    }{ .foo = 42 }, .{});
+<a id="L968"></a>}
+<a id="L969"></a>
+<a id="L970"></a>fn testStringify(expected: []const u8, v: anytype, options: Options) !void {
+<a id="L971"></a>    var buffer: [4096]u8 = undefined;
+<a id="L972"></a>    var w: Writer = .fixed(&amp;buffer);
+<a id="L973"></a>    try value(v, options, &amp;w);
+<a id="L974"></a>    try std.testing.expectEqualStrings(expected, w.buffered());
+<a id="L975"></a>}
+<a id="L976"></a>
+<a id="L977"></a>test "raw streaming" {
+<a id="L978"></a>    var out_buf: [1024]u8 = undefined;
+<a id="L979"></a>    var out: Writer = .fixed(&amp;out_buf);
+<a id="L980"></a>
+<a id="L981"></a>    var w: Stringify = .{ .writer = &amp;out, .options = .{ .whitespace = .indent_2 } };
+<a id="L982"></a>    try w.beginObject();
+<a id="L983"></a>    try w.beginObjectFieldRaw();
+<a id="L984"></a>    try w.writer.writeAll("\"long");
+<a id="L985"></a>    try w.writer.writeAll(" key\"");
+<a id="L986"></a>    w.endObjectFieldRaw();
+<a id="L987"></a>    try w.beginWriteRaw();
+<a id="L988"></a>    try w.writer.writeAll("\"long");
+<a id="L989"></a>    try w.writer.writeAll(" value\"");
+<a id="L990"></a>    w.endWriteRaw();
+<a id="L991"></a>    try w.endObject();
+<a id="L992"></a>
+<a id="L993"></a>    const expected =
+<a id="L994"></a>        \\{
+<a id="L995"></a>        \\  "long key": "long value"
+<a id="L996"></a>        \\}
+<a id="L997"></a>    ;
+<a id="L998"></a>    try std.testing.expectEqualStrings(expected, w.writer.buffered());
+<a id="L999"></a>}
+</pre>
 </body>
 </html>

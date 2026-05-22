@@ -2,775 +2,778 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Source: zig-0.16.0-std/crypto/tls.zig</title>
+    <title>Source: crypto/tls.zig</title>
     <style>
         body { background: #1e1e1e; color: #d4d4d4; font-family: monospace; padding: 20px; }
         pre { white-space: pre-wrap; word-wrap: break-word; }
         .header { border-bottom: 1px solid #444; padding-bottom: 10px; margin-bottom: 20px; }
         a { color: #569cd6; }
+        a[id] { color: inherit; text-decoration: none; }
+        :target { background: #3a3a00; }
     </style>
 </head>
 <body>
     <div class="header">
-        <a href="/">Index</a> | <strong>File: zig-0.16.0-std/crypto/tls.zig</strong>
+        <a href="/">Index</a> | <strong>File: crypto/tls.zig</strong>
     </div>
-    <pre>//! Plaintext:
-//! * type: ContentType
-//! * legacy_record_version: u16 = 0x0303,
-//! * length: u16,
-//!   - The length (in bytes) of the following TLSPlaintext.fragment.  The
-//!     length MUST NOT exceed 2^14 bytes.
-//! * fragment: opaque
-//!   - the data being transmitted
-//!
-//! Ciphertext
-//! * ContentType opaque_type = application_data; /* 23 */
-//! * ProtocolVersion legacy_record_version = 0x0303; /* TLS v1.2 */
-//! * uint16 length;
-//! * opaque encrypted_record[TLSCiphertext.length];
-//!
-//! Handshake:
-//! * type: HandshakeType
-//! * length: u24
-//! * data: opaque
-//!
-//! ServerHello:
-//! * ProtocolVersion legacy_version = 0x0303;
-//! * Random random;
-//! * opaque legacy_session_id_echo&lt;0..32&gt;;
-//! * CipherSuite cipher_suite;
-//! * uint8 legacy_compression_method = 0;
-//! * Extension extensions&lt;6..2^16-1&gt;;
-//!
-//! Extension:
-//! * ExtensionType extension_type;
-//! * opaque extension_data&lt;0..2^16-1&gt;;
-
-const std = @import("../std.zig");
-const Tls = @This();
-const mem = std.mem;
-const crypto = std.crypto;
-const assert = std.debug.assert;
-
-pub const Client = @import("tls/Client.zig");
-
-pub const record_header_len = 5;
-pub const max_ciphertext_inner_record_len = 1 &lt;&lt; 14;
-pub const max_ciphertext_len = max_ciphertext_inner_record_len + 256;
-pub const max_ciphertext_record_len = max_ciphertext_len + record_header_len;
-pub const hello_retry_request_sequence = [32]u8{
-    0xCF, 0x21, 0xAD, 0x74, 0xE5, 0x9A, 0x61, 0x11, 0xBE, 0x1D, 0x8C, 0x02, 0x1E, 0x65, 0xB8, 0x91,
-    0xC2, 0xA2, 0x11, 0x16, 0x7A, 0xBB, 0x8C, 0x5E, 0x07, 0x9E, 0x09, 0xE2, 0xC8, 0xA8, 0x33, 0x9C,
-};
-
-pub const close_notify_alert = [_]u8{
-    @intFromEnum(Alert.Level.warning),
-    @intFromEnum(Alert.Description.close_notify),
-};
-
-pub const ProtocolVersion = enum(u16) {
-    tls_1_0 = 0x0301,
-    tls_1_1 = 0x0302,
-    tls_1_2 = 0x0303,
-    tls_1_3 = 0x0304,
-    _,
-};
-
-pub const ContentType = enum(u8) {
-    invalid = 0,
-    change_cipher_spec = 20,
-    alert = 21,
-    handshake = 22,
-    application_data = 23,
-    _,
-};
-
-pub const HandshakeType = enum(u8) {
-    hello_request = 0,
-    client_hello = 1,
-    server_hello = 2,
-    new_session_ticket = 4,
-    end_of_early_data = 5,
-    encrypted_extensions = 8,
-    certificate = 11,
-    server_key_exchange = 12,
-    certificate_request = 13,
-    server_hello_done = 14,
-    certificate_verify = 15,
-    client_key_exchange = 16,
-    finished = 20,
-    key_update = 24,
-    message_hash = 254,
-    _,
-};
-
-pub const ExtensionType = enum(u16) {
-    /// RFC 6066
-    server_name = 0,
-    /// RFC 6066
-    max_fragment_length = 1,
-    /// RFC 6066
-    status_request = 5,
-    /// RFC 8422, 7919
-    supported_groups = 10,
-    /// RFC 8446
-    signature_algorithms = 13,
-    /// RFC 5764
-    use_srtp = 14,
-    /// RFC 6520
-    heartbeat = 15,
-    /// RFC 7301
-    application_layer_protocol_negotiation = 16,
-    /// RFC 6962
-    signed_certificate_timestamp = 18,
-    /// RFC 7250
-    client_certificate_type = 19,
-    /// RFC 7250
-    server_certificate_type = 20,
-    /// RFC 7685
-    padding = 21,
-    /// RFC 8446
-    pre_shared_key = 41,
-    /// RFC 8446
-    early_data = 42,
-    /// RFC 8446
-    supported_versions = 43,
-    /// RFC 8446
-    cookie = 44,
-    /// RFC 8446
-    psk_key_exchange_modes = 45,
-    /// RFC 8446
-    certificate_authorities = 47,
-    /// RFC 8446
-    oid_filters = 48,
-    /// RFC 8446
-    post_handshake_auth = 49,
-    /// RFC 8446
-    signature_algorithms_cert = 50,
-    /// RFC 8446
-    key_share = 51,
-    /// RFC 9000
-    quic_transport_parameters = 57,
-
-    _,
-};
-
-pub const Alert = struct {
-    level: Level,
-    description: Description,
-
-    pub const Level = enum(u8) {
-        warning = 1,
-        fatal = 2,
-        _,
-    };
-
-    pub const Description = enum(u8) {
-        pub const Error = error{
-            TlsAlertUnexpectedMessage,
-            TlsAlertBadRecordMac,
-            TlsAlertRecordOverflow,
-            TlsAlertHandshakeFailure,
-            TlsAlertBadCertificate,
-            TlsAlertUnsupportedCertificate,
-            TlsAlertCertificateRevoked,
-            TlsAlertCertificateExpired,
-            TlsAlertCertificateUnknown,
-            TlsAlertIllegalParameter,
-            TlsAlertUnknownCa,
-            TlsAlertAccessDenied,
-            TlsAlertDecodeError,
-            TlsAlertDecryptError,
-            TlsAlertProtocolVersion,
-            TlsAlertInsufficientSecurity,
-            TlsAlertInternalError,
-            TlsAlertInappropriateFallback,
-            TlsAlertMissingExtension,
-            TlsAlertUnsupportedExtension,
-            TlsAlertUnrecognizedName,
-            TlsAlertBadCertificateStatusResponse,
-            TlsAlertUnknownPskIdentity,
-            TlsAlertCertificateRequired,
-            TlsAlertNoApplicationProtocol,
-            TlsAlertUnknown,
-        };
-
-        close_notify = 0,
-        unexpected_message = 10,
-        bad_record_mac = 20,
-        record_overflow = 22,
-        handshake_failure = 40,
-        bad_certificate = 42,
-        unsupported_certificate = 43,
-        certificate_revoked = 44,
-        certificate_expired = 45,
-        certificate_unknown = 46,
-        illegal_parameter = 47,
-        unknown_ca = 48,
-        access_denied = 49,
-        decode_error = 50,
-        decrypt_error = 51,
-        protocol_version = 70,
-        insufficient_security = 71,
-        internal_error = 80,
-        inappropriate_fallback = 86,
-        user_canceled = 90,
-        missing_extension = 109,
-        unsupported_extension = 110,
-        unrecognized_name = 112,
-        bad_certificate_status_response = 113,
-        unknown_psk_identity = 115,
-        certificate_required = 116,
-        no_application_protocol = 120,
-        _,
-
-        pub fn toError(description: Description) Error!void {
-            switch (description) {
-                .close_notify =&gt; {}, // not an error
-                .unexpected_message =&gt; return error.TlsAlertUnexpectedMessage,
-                .bad_record_mac =&gt; return error.TlsAlertBadRecordMac,
-                .record_overflow =&gt; return error.TlsAlertRecordOverflow,
-                .handshake_failure =&gt; return error.TlsAlertHandshakeFailure,
-                .bad_certificate =&gt; return error.TlsAlertBadCertificate,
-                .unsupported_certificate =&gt; return error.TlsAlertUnsupportedCertificate,
-                .certificate_revoked =&gt; return error.TlsAlertCertificateRevoked,
-                .certificate_expired =&gt; return error.TlsAlertCertificateExpired,
-                .certificate_unknown =&gt; return error.TlsAlertCertificateUnknown,
-                .illegal_parameter =&gt; return error.TlsAlertIllegalParameter,
-                .unknown_ca =&gt; return error.TlsAlertUnknownCa,
-                .access_denied =&gt; return error.TlsAlertAccessDenied,
-                .decode_error =&gt; return error.TlsAlertDecodeError,
-                .decrypt_error =&gt; return error.TlsAlertDecryptError,
-                .protocol_version =&gt; return error.TlsAlertProtocolVersion,
-                .insufficient_security =&gt; return error.TlsAlertInsufficientSecurity,
-                .internal_error =&gt; return error.TlsAlertInternalError,
-                .inappropriate_fallback =&gt; return error.TlsAlertInappropriateFallback,
-                .user_canceled =&gt; {}, // not an error
-                .missing_extension =&gt; return error.TlsAlertMissingExtension,
-                .unsupported_extension =&gt; return error.TlsAlertUnsupportedExtension,
-                .unrecognized_name =&gt; return error.TlsAlertUnrecognizedName,
-                .bad_certificate_status_response =&gt; return error.TlsAlertBadCertificateStatusResponse,
-                .unknown_psk_identity =&gt; return error.TlsAlertUnknownPskIdentity,
-                .certificate_required =&gt; return error.TlsAlertCertificateRequired,
-                .no_application_protocol =&gt; return error.TlsAlertNoApplicationProtocol,
-                _ =&gt; return error.TlsAlertUnknown,
-            }
-        }
-    };
-};
-
-pub const SignatureScheme = enum(u16) {
-    // RSASSA-PKCS1-v1_5 algorithms
-    rsa_pkcs1_sha256 = 0x0401,
-    rsa_pkcs1_sha384 = 0x0501,
-    rsa_pkcs1_sha512 = 0x0601,
-
-    // ECDSA algorithms
-    ecdsa_secp256r1_sha256 = 0x0403,
-    ecdsa_secp384r1_sha384 = 0x0503,
-    ecdsa_secp521r1_sha512 = 0x0603,
-
-    // RSASSA-PSS algorithms with public key OID rsaEncryption
-    rsa_pss_rsae_sha256 = 0x0804,
-    rsa_pss_rsae_sha384 = 0x0805,
-    rsa_pss_rsae_sha512 = 0x0806,
-
-    // EdDSA algorithms
-    ed25519 = 0x0807,
-    ed448 = 0x0808,
-
-    // RSASSA-PSS algorithms with public key OID RSASSA-PSS
-    rsa_pss_pss_sha256 = 0x0809,
-    rsa_pss_pss_sha384 = 0x080a,
-    rsa_pss_pss_sha512 = 0x080b,
-
-    // Legacy algorithms
-    rsa_pkcs1_sha1 = 0x0201,
-    ecdsa_sha1 = 0x0203,
-
-    ecdsa_brainpoolP256r1tls13_sha256 = 0x081a,
-    ecdsa_brainpoolP384r1tls13_sha384 = 0x081b,
-    ecdsa_brainpoolP512r1tls13_sha512 = 0x081c,
-
-    rsa_sha224 = 0x0301,
-    dsa_sha224 = 0x0302,
-    ecdsa_sha224 = 0x0303,
-    dsa_sha256 = 0x0402,
-    dsa_sha384 = 0x0502,
-    dsa_sha512 = 0x0602,
-
-    _,
-};
-
-pub const NamedGroup = enum(u16) {
-    // Elliptic Curve Groups (ECDHE)
-    secp256r1 = 0x0017,
-    secp384r1 = 0x0018,
-    secp521r1 = 0x0019,
-    x25519 = 0x001D,
-    x448 = 0x001E,
-
-    // Finite Field Groups (DHE)
-    ffdhe2048 = 0x0100,
-    ffdhe3072 = 0x0101,
-    ffdhe4096 = 0x0102,
-    ffdhe6144 = 0x0103,
-    ffdhe8192 = 0x0104,
-
-    // Hybrid post-quantum key agreements
-    secp256r1_ml_kem256 = 0x11EB,
-    x25519_ml_kem768 = 0x11EC,
-
-    _,
-};
-
-pub const PskKeyExchangeMode = enum(u8) {
-    psk_ke = 0,
-    psk_dhe_ke = 1,
-    _,
-};
-
-pub const CipherSuite = enum(u16) {
-    RSA_WITH_AES_128_CBC_SHA = 0x002F,
-    DHE_RSA_WITH_AES_128_CBC_SHA = 0x0033,
-    RSA_WITH_AES_256_CBC_SHA = 0x0035,
-    DHE_RSA_WITH_AES_256_CBC_SHA = 0x0039,
-    RSA_WITH_AES_128_CBC_SHA256 = 0x003C,
-    RSA_WITH_AES_256_CBC_SHA256 = 0x003D,
-    DHE_RSA_WITH_AES_128_CBC_SHA256 = 0x0067,
-    DHE_RSA_WITH_AES_256_CBC_SHA256 = 0x006B,
-    RSA_WITH_AES_128_GCM_SHA256 = 0x009C,
-    RSA_WITH_AES_256_GCM_SHA384 = 0x009D,
-    DHE_RSA_WITH_AES_128_GCM_SHA256 = 0x009E,
-    DHE_RSA_WITH_AES_256_GCM_SHA384 = 0x009F,
-    EMPTY_RENEGOTIATION_INFO_SCSV = 0x00FF,
-
-    AES_128_GCM_SHA256 = 0x1301,
-    AES_256_GCM_SHA384 = 0x1302,
-    CHACHA20_POLY1305_SHA256 = 0x1303,
-    AES_128_CCM_SHA256 = 0x1304,
-    AES_128_CCM_8_SHA256 = 0x1305,
-    AEGIS_256_SHA512 = 0x1306,
-    AEGIS_128L_SHA256 = 0x1307,
-
-    ECDHE_ECDSA_WITH_AES_128_CBC_SHA = 0xC009,
-    ECDHE_ECDSA_WITH_AES_256_CBC_SHA = 0xC00A,
-    ECDHE_RSA_WITH_AES_128_CBC_SHA = 0xC013,
-    ECDHE_RSA_WITH_AES_256_CBC_SHA = 0xC014,
-    ECDHE_ECDSA_WITH_AES_128_CBC_SHA256 = 0xC023,
-    ECDHE_ECDSA_WITH_AES_256_CBC_SHA384 = 0xC024,
-    ECDHE_RSA_WITH_AES_128_CBC_SHA256 = 0xC027,
-    ECDHE_RSA_WITH_AES_256_CBC_SHA384 = 0xC028,
-    ECDHE_ECDSA_WITH_AES_128_GCM_SHA256 = 0xC02B,
-    ECDHE_ECDSA_WITH_AES_256_GCM_SHA384 = 0xC02C,
-    ECDHE_RSA_WITH_AES_128_GCM_SHA256 = 0xC02F,
-    ECDHE_RSA_WITH_AES_256_GCM_SHA384 = 0xC030,
-
-    ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256 = 0xCCA8,
-    ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256 = 0xCCA9,
-    DHE_RSA_WITH_CHACHA20_POLY1305_SHA256 = 0xCCAA,
-
-    _,
-
-    pub const With = enum {
-        AES_128_CBC_SHA,
-        AES_256_CBC_SHA,
-        AES_128_CBC_SHA256,
-        AES_256_CBC_SHA256,
-        AES_256_CBC_SHA384,
-
-        AES_128_GCM_SHA256,
-        AES_256_GCM_SHA384,
-
-        CHACHA20_POLY1305_SHA256,
-
-        AES_128_CCM_SHA256,
-        AES_128_CCM_8_SHA256,
-
-        AEGIS_256_SHA512,
-        AEGIS_128L_SHA256,
-    };
-
-    pub fn with(cipher_suite: CipherSuite) With {
-        return switch (cipher_suite) {
-            .RSA_WITH_AES_128_CBC_SHA,
-            .DHE_RSA_WITH_AES_128_CBC_SHA,
-            .ECDHE_ECDSA_WITH_AES_128_CBC_SHA,
-            .ECDHE_RSA_WITH_AES_128_CBC_SHA,
-            =&gt; .AES_128_CBC_SHA,
-            .RSA_WITH_AES_256_CBC_SHA,
-            .DHE_RSA_WITH_AES_256_CBC_SHA,
-            .ECDHE_ECDSA_WITH_AES_256_CBC_SHA,
-            .ECDHE_RSA_WITH_AES_256_CBC_SHA,
-            =&gt; .AES_256_CBC_SHA,
-            .RSA_WITH_AES_128_CBC_SHA256,
-            .DHE_RSA_WITH_AES_128_CBC_SHA256,
-            .ECDHE_ECDSA_WITH_AES_128_CBC_SHA256,
-            .ECDHE_RSA_WITH_AES_128_CBC_SHA256,
-            =&gt; .AES_128_CBC_SHA256,
-            .RSA_WITH_AES_256_CBC_SHA256,
-            .DHE_RSA_WITH_AES_256_CBC_SHA256,
-            =&gt; .AES_256_CBC_SHA256,
-            .ECDHE_ECDSA_WITH_AES_256_CBC_SHA384,
-            .ECDHE_RSA_WITH_AES_256_CBC_SHA384,
-            =&gt; .AES_256_CBC_SHA384,
-
-            .RSA_WITH_AES_128_GCM_SHA256,
-            .DHE_RSA_WITH_AES_128_GCM_SHA256,
-            .AES_128_GCM_SHA256,
-            .ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
-            .ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-            =&gt; .AES_128_GCM_SHA256,
-            .RSA_WITH_AES_256_GCM_SHA384,
-            .DHE_RSA_WITH_AES_256_GCM_SHA384,
-            .AES_256_GCM_SHA384,
-            .ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
-            .ECDHE_RSA_WITH_AES_256_GCM_SHA384,
-            =&gt; .AES_256_GCM_SHA384,
-
-            .CHACHA20_POLY1305_SHA256,
-            .ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
-            .ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
-            .DHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
-            =&gt; .CHACHA20_POLY1305_SHA256,
-
-            .AES_128_CCM_SHA256 =&gt; .AES_128_CCM_SHA256,
-            .AES_128_CCM_8_SHA256 =&gt; .AES_128_CCM_8_SHA256,
-
-            .AEGIS_256_SHA512 =&gt; .AEGIS_256_SHA512,
-            .AEGIS_128L_SHA256 =&gt; .AEGIS_128L_SHA256,
-
-            .EMPTY_RENEGOTIATION_INFO_SCSV =&gt; unreachable,
-            _ =&gt; unreachable,
-        };
-    }
-};
-
-pub const CompressionMethod = enum(u8) {
-    null = 0,
-    _,
-};
-
-pub const CertificateType = enum(u8) {
-    X509 = 0,
-    RawPublicKey = 2,
-    _,
-};
-
-pub const KeyUpdateRequest = enum(u8) {
-    update_not_requested = 0,
-    update_requested = 1,
-    _,
-};
-
-pub const ChangeCipherSpecType = enum(u8) {
-    change_cipher_spec = 1,
-    _,
-};
-
-pub fn HandshakeCipherT(comptime AeadType: type, comptime HashType: type, comptime explicit_iv_length: comptime_int) type {
-    return struct {
-        pub const A = ApplicationCipherT(AeadType, HashType, explicit_iv_length);
-
-        transcript_hash: A.Hash,
-        version: union {
-            tls_1_2: struct {
-                expected_server_verify_data: [A.verify_data_length]u8,
-                app_cipher: A.Tls_1_2,
-            },
-            tls_1_3: struct {
-                handshake_secret: [A.Hkdf.prk_length]u8,
-                master_secret: [A.Hkdf.prk_length]u8,
-                client_handshake_key: [A.AEAD.key_length]u8,
-                server_handshake_key: [A.AEAD.key_length]u8,
-                client_finished_key: [A.Hmac.key_length]u8,
-                server_finished_key: [A.Hmac.key_length]u8,
-                client_handshake_iv: [A.AEAD.nonce_length]u8,
-                server_handshake_iv: [A.AEAD.nonce_length]u8,
-            },
-        },
-    };
-}
-
-pub const HandshakeCipher = union(enum) {
-    AES_128_GCM_SHA256: HandshakeCipherT(crypto.aead.aes_gcm.Aes128Gcm, crypto.hash.sha2.Sha256, 8),
-    AES_256_GCM_SHA384: HandshakeCipherT(crypto.aead.aes_gcm.Aes256Gcm, crypto.hash.sha2.Sha384, 8),
-    CHACHA20_POLY1305_SHA256: HandshakeCipherT(crypto.aead.chacha_poly.ChaCha20Poly1305, crypto.hash.sha2.Sha256, 0),
-    AEGIS_256_SHA512: HandshakeCipherT(crypto.aead.aegis.Aegis256, crypto.hash.sha2.Sha512, 0),
-    AEGIS_128L_SHA256: HandshakeCipherT(crypto.aead.aegis.Aegis128L, crypto.hash.sha2.Sha256, 0),
-};
-
-pub fn ApplicationCipherT(comptime AeadType: type, comptime HashType: type, comptime explicit_iv_length: comptime_int) type {
-    return union {
-        pub const AEAD = AeadType;
-        pub const Hash = HashType;
-        pub const Hmac = crypto.auth.hmac.Hmac(Hash);
-        pub const Hkdf = crypto.kdf.hkdf.Hkdf(Hmac);
-
-        pub const enc_key_length = AEAD.key_length;
-        pub const fixed_iv_length = AEAD.nonce_length - explicit_iv_length;
-        pub const record_iv_length = explicit_iv_length;
-        pub const mac_length = AEAD.tag_length;
-        pub const mac_key_length = Hmac.key_length_min;
-        pub const verify_data_length = 12;
-
-        tls_1_2: Tls_1_2,
-        tls_1_3: Tls_1_3,
-
-        pub const Tls_1_2 = extern struct {
-            client_write_MAC_key: [mac_key_length]u8,
-            server_write_MAC_key: [mac_key_length]u8,
-            client_write_key: [enc_key_length]u8,
-            server_write_key: [enc_key_length]u8,
-            client_write_IV: [fixed_iv_length]u8,
-            server_write_IV: [fixed_iv_length]u8,
-            // non-standard entropy
-            client_salt: [record_iv_length]u8,
-        };
-
-        pub const Tls_1_3 = struct {
-            client_secret: [Hash.digest_length]u8,
-            server_secret: [Hash.digest_length]u8,
-            client_key: [AEAD.key_length]u8,
-            server_key: [AEAD.key_length]u8,
-            client_iv: [AEAD.nonce_length]u8,
-            server_iv: [AEAD.nonce_length]u8,
-        };
-    };
-}
-
-/// Encryption parameters for application traffic.
-pub const ApplicationCipher = union(enum) {
-    AES_128_GCM_SHA256: ApplicationCipherT(crypto.aead.aes_gcm.Aes128Gcm, crypto.hash.sha2.Sha256, 8),
-    AES_256_GCM_SHA384: ApplicationCipherT(crypto.aead.aes_gcm.Aes256Gcm, crypto.hash.sha2.Sha384, 8),
-    CHACHA20_POLY1305_SHA256: ApplicationCipherT(crypto.aead.chacha_poly.ChaCha20Poly1305, crypto.hash.sha2.Sha256, 0),
-    AEGIS_256_SHA512: ApplicationCipherT(crypto.aead.aegis.Aegis256, crypto.hash.sha2.Sha512, 0),
-    AEGIS_128L_SHA256: ApplicationCipherT(crypto.aead.aegis.Aegis128L, crypto.hash.sha2.Sha256, 0),
-};
-
-pub fn hmacExpandLabel(
-    comptime Hmac: type,
-    secret: []const u8,
-    label_then_seed: []const []const u8,
-    comptime len: usize,
-) [len]u8 {
-    const initial_hmac: Hmac = .init(secret);
-    var a: [Hmac.mac_length]u8 = undefined;
-    var result: [std.mem.alignForwardAnyAlign(usize, len, Hmac.mac_length)]u8 = undefined;
-    var index: usize = 0;
-    while (index &lt; result.len) : (index += Hmac.mac_length) {
-        var a_hmac = initial_hmac;
-        if (index &gt; 0) a_hmac.update(&amp;a) else for (label_then_seed) |part| a_hmac.update(part);
-        a_hmac.final(&amp;a);
-
-        var result_hmac = initial_hmac;
-        result_hmac.update(&amp;a);
-        for (label_then_seed) |part| result_hmac.update(part);
-        result_hmac.final(result[index..][0..Hmac.mac_length]);
-    }
-    return result[0..len].*;
-}
-
-pub fn hkdfExpandLabel(
-    comptime Hkdf: type,
-    key: [Hkdf.prk_length]u8,
-    label: []const u8,
-    context: []const u8,
-    comptime len: usize,
-) [len]u8 {
-    const max_label_len = 255;
-    const max_context_len = 255;
-    const tls13 = "tls13 ";
-    var buf: [2 + 1 + tls13.len + max_label_len + 1 + max_context_len]u8 = undefined;
-    mem.writeInt(u16, buf[0..2], len, .big);
-    buf[2] = @as(u8, @intCast(tls13.len + label.len));
-    buf[3..][0..tls13.len].* = tls13.*;
-    var i: usize = 3 + tls13.len;
-    @memcpy(buf[i..][0..label.len], label);
-    i += label.len;
-    buf[i] = @as(u8, @intCast(context.len));
-    i += 1;
-    @memcpy(buf[i..][0..context.len], context);
-    i += context.len;
-
-    var result: [len]u8 = undefined;
-    Hkdf.expand(&amp;result, buf[0..i], key);
-    return result;
-}
-
-pub fn emptyHash(comptime Hash: type) [Hash.digest_length]u8 {
-    var result: [Hash.digest_length]u8 = undefined;
-    Hash.hash(&amp;.{}, &amp;result, .{});
-    return result;
-}
-
-pub fn hmac(comptime Hmac: type, message: []const u8, key: [Hmac.key_length]u8) [Hmac.mac_length]u8 {
-    var result: [Hmac.mac_length]u8 = undefined;
-    Hmac.create(&amp;result, message, &amp;key);
-    return result;
-}
-
-pub fn extension(et: ExtensionType, bytes: anytype) [2 + 2 + bytes.len]u8 {
-    return int(u16, @intFromEnum(et)) ++ array(u16, u8, bytes);
-}
-
-pub fn array(
-    comptime Len: type,
-    comptime Elem: type,
-    elems: anytype,
-) [@divExact(@bitSizeOf(Len), 8) + @divExact(@bitSizeOf(Elem), 8) * elems.len]u8 {
-    const len_size = @divExact(@bitSizeOf(Len), 8);
-    const elem_size = @divExact(@bitSizeOf(Elem), 8);
-    var arr: [len_size + elem_size * elems.len]u8 = undefined;
-    std.mem.writeInt(Len, arr[0..len_size], @intCast(elem_size * elems.len), .big);
-    const ElemInt = @Int(.unsigned, @bitSizeOf(Elem));
-    for (0.., @as([elems.len]Elem, elems)) |index, elem| {
-        std.mem.writeInt(
-            ElemInt,
-            arr[len_size + elem_size * index ..][0..elem_size],
-            switch (@typeInfo(Elem)) {
-                .int =&gt; @as(Elem, elem),
-                .@"enum" =&gt; @intFromEnum(@as(Elem, elem)),
-                else =&gt; @bitCast(@as(Elem, elem)),
-            },
-            .big,
-        );
-    }
-    return arr;
-}
-
-pub fn int(comptime Int: type, val: Int) [@divExact(@bitSizeOf(Int), 8)]u8 {
-    var arr: [@divExact(@bitSizeOf(Int), 8)]u8 = undefined;
-    std.mem.writeInt(Int, &amp;arr, val, .big);
-    return arr;
-}
-
-/// An abstraction to ensure that protocol-parsing code does not perform an
-/// out-of-bounds read.
-pub const Decoder = struct {
-    buf: []u8,
-    /// Points to the next byte in buffer that will be decoded.
-    idx: usize = 0,
-    /// Up to this point in `buf` we have already checked that `cap` is greater than it.
-    our_end: usize = 0,
-    /// Beyond this point in `buf` is extra tag-along bytes beyond the amount we
-    /// requested with `readAtLeast`.
-    their_end: usize = 0,
-    /// Points to the end within buffer that has been filled. Beyond this point
-    /// in buf is undefined bytes.
-    cap: usize = 0,
-    /// Debug helper to prevent illegal calls to read functions.
-    disable_reads: bool = false,
-
-    pub fn fromTheirSlice(buf: []u8) Decoder {
-        return .{
-            .buf = buf,
-            .their_end = buf.len,
-            .cap = buf.len,
-            .disable_reads = true,
-        };
-    }
-
-    /// Use this function to increase `their_end`.
-    pub fn readAtLeast(d: *Decoder, stream: *std.Io.Reader, their_amt: usize) !void {
-        assert(!d.disable_reads);
-        const existing_amt = d.cap - d.idx;
-        d.their_end = d.idx + their_amt;
-        if (their_amt &lt;= existing_amt) return;
-        const request_amt = their_amt - existing_amt;
-        const dest = d.buf[d.cap..];
-        if (request_amt &gt; dest.len) return error.TlsRecordOverflow;
-        stream.readSlice(dest[0..request_amt]) catch |err| switch (err) {
-            error.EndOfStream =&gt; return error.TlsConnectionTruncated,
-            error.ReadFailed =&gt; return error.ReadFailed,
-        };
-        d.cap += request_amt;
-    }
-
-    /// Same as `readAtLeast` but also increases `our_end` by exactly `our_amt`.
-    /// Use when `our_amt` is calculated by us, not by them.
-    pub fn readAtLeastOurAmt(d: *Decoder, stream: *std.Io.Reader, our_amt: usize) !void {
-        assert(!d.disable_reads);
-        try readAtLeast(d, stream, our_amt);
-        d.our_end = d.idx + our_amt;
-    }
-
-    /// Use this function to increase `our_end`.
-    /// This should always be called with an amount provided by us, not them.
-    pub fn ensure(d: *Decoder, amt: usize) !void {
-        d.our_end = @max(d.idx + amt, d.our_end);
-        if (d.our_end &gt; d.their_end) return error.TlsDecodeError;
-    }
-
-    /// Use this function to increase `idx`.
-    pub fn decode(d: *Decoder, comptime T: type) T {
-        switch (@typeInfo(T)) {
-            .int =&gt; |info| switch (info.bits) {
-                8 =&gt; {
-                    skip(d, 1);
-                    return d.buf[d.idx - 1];
-                },
-                16 =&gt; {
-                    skip(d, 2);
-                    const b0: u16 = d.buf[d.idx - 2];
-                    const b1: u16 = d.buf[d.idx - 1];
-                    return (b0 &lt;&lt; 8) | b1;
-                },
-                24 =&gt; {
-                    skip(d, 3);
-                    const b0: u24 = d.buf[d.idx - 3];
-                    const b1: u24 = d.buf[d.idx - 2];
-                    const b2: u24 = d.buf[d.idx - 1];
-                    return (b0 &lt;&lt; 16) | (b1 &lt;&lt; 8) | b2;
-                },
-                else =&gt; @compileError("unsupported int type: " ++ @typeName(T)),
-            },
-            .@"enum" =&gt; |info| {
-                if (info.is_exhaustive) @compileError("exhaustive enum cannot be used");
-                return @enumFromInt(d.decode(info.tag_type));
-            },
-            else =&gt; @compileError("unsupported type: " ++ @typeName(T)),
-        }
-    }
-
-    /// Use this function to increase `idx`.
-    pub fn array(d: *Decoder, comptime len: usize) *[len]u8 {
-        skip(d, len);
-        return d.buf[d.idx - len ..][0..len];
-    }
-
-    /// Use this function to increase `idx`.
-    pub fn slice(d: *Decoder, len: usize) []u8 {
-        skip(d, len);
-        return d.buf[d.idx - len ..][0..len];
-    }
-
-    /// Use this function to increase `idx`.
-    pub fn skip(d: *Decoder, amt: usize) void {
-        d.idx += amt;
-        assert(d.idx &lt;= d.our_end); // insufficient ensured bytes
-    }
-
-    pub fn eof(d: Decoder) bool {
-        assert(d.our_end &lt;= d.their_end);
-        assert(d.idx &lt;= d.our_end);
-        return d.idx == d.their_end;
-    }
-
-    /// Provide the length they claim, and receive a sub-decoder specific to that slice.
-    /// The parent decoder is advanced to the end.
-    pub fn sub(d: *Decoder, their_len: usize) !Decoder {
-        const end = d.idx + their_len;
-        if (end &gt; d.their_end) return error.TlsDecodeError;
-        const sub_buf = d.buf[d.idx..end];
-        d.idx = end;
-        d.our_end = end;
-        return fromTheirSlice(sub_buf);
-    }
-
-    pub fn rest(d: Decoder) []u8 {
-        return d.buf[d.idx..d.cap];
-    }
-};</pre>
+    <pre><a id="L1"></a>//! Plaintext:
+<a id="L2"></a>//! * type: ContentType
+<a id="L3"></a>//! * legacy_record_version: u16 = 0x0303,
+<a id="L4"></a>//! * length: u16,
+<a id="L5"></a>//!   - The length (in bytes) of the following TLSPlaintext.fragment.  The
+<a id="L6"></a>//!     length MUST NOT exceed 2^14 bytes.
+<a id="L7"></a>//! * fragment: opaque
+<a id="L8"></a>//!   - the data being transmitted
+<a id="L9"></a>//!
+<a id="L10"></a>//! Ciphertext
+<a id="L11"></a>//! * ContentType opaque_type = application_data; /* 23 */
+<a id="L12"></a>//! * ProtocolVersion legacy_record_version = 0x0303; /* TLS v1.2 */
+<a id="L13"></a>//! * uint16 length;
+<a id="L14"></a>//! * opaque encrypted_record[TLSCiphertext.length];
+<a id="L15"></a>//!
+<a id="L16"></a>//! Handshake:
+<a id="L17"></a>//! * type: HandshakeType
+<a id="L18"></a>//! * length: u24
+<a id="L19"></a>//! * data: opaque
+<a id="L20"></a>//!
+<a id="L21"></a>//! ServerHello:
+<a id="L22"></a>//! * ProtocolVersion legacy_version = 0x0303;
+<a id="L23"></a>//! * Random random;
+<a id="L24"></a>//! * opaque legacy_session_id_echo&lt;0..32&gt;;
+<a id="L25"></a>//! * CipherSuite cipher_suite;
+<a id="L26"></a>//! * uint8 legacy_compression_method = 0;
+<a id="L27"></a>//! * Extension extensions&lt;6..2^16-1&gt;;
+<a id="L28"></a>//!
+<a id="L29"></a>//! Extension:
+<a id="L30"></a>//! * ExtensionType extension_type;
+<a id="L31"></a>//! * opaque extension_data&lt;0..2^16-1&gt;;
+<a id="L32"></a>
+<a id="L33"></a>const std = @import("../std.zig");
+<a id="L34"></a>const Tls = @This();
+<a id="L35"></a>const mem = std.mem;
+<a id="L36"></a>const crypto = std.crypto;
+<a id="L37"></a>const assert = std.debug.assert;
+<a id="L38"></a>
+<a id="L39"></a>pub const Client = @import("tls/Client.zig");
+<a id="L40"></a>
+<a id="L41"></a>pub const record_header_len = 5;
+<a id="L42"></a>pub const max_ciphertext_inner_record_len = 1 &lt;&lt; 14;
+<a id="L43"></a>pub const max_ciphertext_len = max_ciphertext_inner_record_len + 256;
+<a id="L44"></a>pub const max_ciphertext_record_len = max_ciphertext_len + record_header_len;
+<a id="L45"></a>pub const hello_retry_request_sequence = [32]u8{
+<a id="L46"></a>    0xCF, 0x21, 0xAD, 0x74, 0xE5, 0x9A, 0x61, 0x11, 0xBE, 0x1D, 0x8C, 0x02, 0x1E, 0x65, 0xB8, 0x91,
+<a id="L47"></a>    0xC2, 0xA2, 0x11, 0x16, 0x7A, 0xBB, 0x8C, 0x5E, 0x07, 0x9E, 0x09, 0xE2, 0xC8, 0xA8, 0x33, 0x9C,
+<a id="L48"></a>};
+<a id="L49"></a>
+<a id="L50"></a>pub const close_notify_alert = [_]u8{
+<a id="L51"></a>    @intFromEnum(Alert.Level.warning),
+<a id="L52"></a>    @intFromEnum(Alert.Description.close_notify),
+<a id="L53"></a>};
+<a id="L54"></a>
+<a id="L55"></a>pub const ProtocolVersion = enum(u16) {
+<a id="L56"></a>    tls_1_0 = 0x0301,
+<a id="L57"></a>    tls_1_1 = 0x0302,
+<a id="L58"></a>    tls_1_2 = 0x0303,
+<a id="L59"></a>    tls_1_3 = 0x0304,
+<a id="L60"></a>    _,
+<a id="L61"></a>};
+<a id="L62"></a>
+<a id="L63"></a>pub const ContentType = enum(u8) {
+<a id="L64"></a>    invalid = 0,
+<a id="L65"></a>    change_cipher_spec = 20,
+<a id="L66"></a>    alert = 21,
+<a id="L67"></a>    handshake = 22,
+<a id="L68"></a>    application_data = 23,
+<a id="L69"></a>    _,
+<a id="L70"></a>};
+<a id="L71"></a>
+<a id="L72"></a>pub const HandshakeType = enum(u8) {
+<a id="L73"></a>    hello_request = 0,
+<a id="L74"></a>    client_hello = 1,
+<a id="L75"></a>    server_hello = 2,
+<a id="L76"></a>    new_session_ticket = 4,
+<a id="L77"></a>    end_of_early_data = 5,
+<a id="L78"></a>    encrypted_extensions = 8,
+<a id="L79"></a>    certificate = 11,
+<a id="L80"></a>    server_key_exchange = 12,
+<a id="L81"></a>    certificate_request = 13,
+<a id="L82"></a>    server_hello_done = 14,
+<a id="L83"></a>    certificate_verify = 15,
+<a id="L84"></a>    client_key_exchange = 16,
+<a id="L85"></a>    finished = 20,
+<a id="L86"></a>    key_update = 24,
+<a id="L87"></a>    message_hash = 254,
+<a id="L88"></a>    _,
+<a id="L89"></a>};
+<a id="L90"></a>
+<a id="L91"></a>pub const ExtensionType = enum(u16) {
+<a id="L92"></a>    /// RFC 6066
+<a id="L93"></a>    server_name = 0,
+<a id="L94"></a>    /// RFC 6066
+<a id="L95"></a>    max_fragment_length = 1,
+<a id="L96"></a>    /// RFC 6066
+<a id="L97"></a>    status_request = 5,
+<a id="L98"></a>    /// RFC 8422, 7919
+<a id="L99"></a>    supported_groups = 10,
+<a id="L100"></a>    /// RFC 8446
+<a id="L101"></a>    signature_algorithms = 13,
+<a id="L102"></a>    /// RFC 5764
+<a id="L103"></a>    use_srtp = 14,
+<a id="L104"></a>    /// RFC 6520
+<a id="L105"></a>    heartbeat = 15,
+<a id="L106"></a>    /// RFC 7301
+<a id="L107"></a>    application_layer_protocol_negotiation = 16,
+<a id="L108"></a>    /// RFC 6962
+<a id="L109"></a>    signed_certificate_timestamp = 18,
+<a id="L110"></a>    /// RFC 7250
+<a id="L111"></a>    client_certificate_type = 19,
+<a id="L112"></a>    /// RFC 7250
+<a id="L113"></a>    server_certificate_type = 20,
+<a id="L114"></a>    /// RFC 7685
+<a id="L115"></a>    padding = 21,
+<a id="L116"></a>    /// RFC 8446
+<a id="L117"></a>    pre_shared_key = 41,
+<a id="L118"></a>    /// RFC 8446
+<a id="L119"></a>    early_data = 42,
+<a id="L120"></a>    /// RFC 8446
+<a id="L121"></a>    supported_versions = 43,
+<a id="L122"></a>    /// RFC 8446
+<a id="L123"></a>    cookie = 44,
+<a id="L124"></a>    /// RFC 8446
+<a id="L125"></a>    psk_key_exchange_modes = 45,
+<a id="L126"></a>    /// RFC 8446
+<a id="L127"></a>    certificate_authorities = 47,
+<a id="L128"></a>    /// RFC 8446
+<a id="L129"></a>    oid_filters = 48,
+<a id="L130"></a>    /// RFC 8446
+<a id="L131"></a>    post_handshake_auth = 49,
+<a id="L132"></a>    /// RFC 8446
+<a id="L133"></a>    signature_algorithms_cert = 50,
+<a id="L134"></a>    /// RFC 8446
+<a id="L135"></a>    key_share = 51,
+<a id="L136"></a>    /// RFC 9000
+<a id="L137"></a>    quic_transport_parameters = 57,
+<a id="L138"></a>
+<a id="L139"></a>    _,
+<a id="L140"></a>};
+<a id="L141"></a>
+<a id="L142"></a>pub const Alert = struct {
+<a id="L143"></a>    level: Level,
+<a id="L144"></a>    description: Description,
+<a id="L145"></a>
+<a id="L146"></a>    pub const Level = enum(u8) {
+<a id="L147"></a>        warning = 1,
+<a id="L148"></a>        fatal = 2,
+<a id="L149"></a>        _,
+<a id="L150"></a>    };
+<a id="L151"></a>
+<a id="L152"></a>    pub const Description = enum(u8) {
+<a id="L153"></a>        pub const Error = error{
+<a id="L154"></a>            TlsAlertUnexpectedMessage,
+<a id="L155"></a>            TlsAlertBadRecordMac,
+<a id="L156"></a>            TlsAlertRecordOverflow,
+<a id="L157"></a>            TlsAlertHandshakeFailure,
+<a id="L158"></a>            TlsAlertBadCertificate,
+<a id="L159"></a>            TlsAlertUnsupportedCertificate,
+<a id="L160"></a>            TlsAlertCertificateRevoked,
+<a id="L161"></a>            TlsAlertCertificateExpired,
+<a id="L162"></a>            TlsAlertCertificateUnknown,
+<a id="L163"></a>            TlsAlertIllegalParameter,
+<a id="L164"></a>            TlsAlertUnknownCa,
+<a id="L165"></a>            TlsAlertAccessDenied,
+<a id="L166"></a>            TlsAlertDecodeError,
+<a id="L167"></a>            TlsAlertDecryptError,
+<a id="L168"></a>            TlsAlertProtocolVersion,
+<a id="L169"></a>            TlsAlertInsufficientSecurity,
+<a id="L170"></a>            TlsAlertInternalError,
+<a id="L171"></a>            TlsAlertInappropriateFallback,
+<a id="L172"></a>            TlsAlertMissingExtension,
+<a id="L173"></a>            TlsAlertUnsupportedExtension,
+<a id="L174"></a>            TlsAlertUnrecognizedName,
+<a id="L175"></a>            TlsAlertBadCertificateStatusResponse,
+<a id="L176"></a>            TlsAlertUnknownPskIdentity,
+<a id="L177"></a>            TlsAlertCertificateRequired,
+<a id="L178"></a>            TlsAlertNoApplicationProtocol,
+<a id="L179"></a>            TlsAlertUnknown,
+<a id="L180"></a>        };
+<a id="L181"></a>
+<a id="L182"></a>        close_notify = 0,
+<a id="L183"></a>        unexpected_message = 10,
+<a id="L184"></a>        bad_record_mac = 20,
+<a id="L185"></a>        record_overflow = 22,
+<a id="L186"></a>        handshake_failure = 40,
+<a id="L187"></a>        bad_certificate = 42,
+<a id="L188"></a>        unsupported_certificate = 43,
+<a id="L189"></a>        certificate_revoked = 44,
+<a id="L190"></a>        certificate_expired = 45,
+<a id="L191"></a>        certificate_unknown = 46,
+<a id="L192"></a>        illegal_parameter = 47,
+<a id="L193"></a>        unknown_ca = 48,
+<a id="L194"></a>        access_denied = 49,
+<a id="L195"></a>        decode_error = 50,
+<a id="L196"></a>        decrypt_error = 51,
+<a id="L197"></a>        protocol_version = 70,
+<a id="L198"></a>        insufficient_security = 71,
+<a id="L199"></a>        internal_error = 80,
+<a id="L200"></a>        inappropriate_fallback = 86,
+<a id="L201"></a>        user_canceled = 90,
+<a id="L202"></a>        missing_extension = 109,
+<a id="L203"></a>        unsupported_extension = 110,
+<a id="L204"></a>        unrecognized_name = 112,
+<a id="L205"></a>        bad_certificate_status_response = 113,
+<a id="L206"></a>        unknown_psk_identity = 115,
+<a id="L207"></a>        certificate_required = 116,
+<a id="L208"></a>        no_application_protocol = 120,
+<a id="L209"></a>        _,
+<a id="L210"></a>
+<a id="L211"></a>        pub fn toError(description: Description) Error!void {
+<a id="L212"></a>            switch (description) {
+<a id="L213"></a>                .close_notify =&gt; {}, // not an error
+<a id="L214"></a>                .unexpected_message =&gt; return error.TlsAlertUnexpectedMessage,
+<a id="L215"></a>                .bad_record_mac =&gt; return error.TlsAlertBadRecordMac,
+<a id="L216"></a>                .record_overflow =&gt; return error.TlsAlertRecordOverflow,
+<a id="L217"></a>                .handshake_failure =&gt; return error.TlsAlertHandshakeFailure,
+<a id="L218"></a>                .bad_certificate =&gt; return error.TlsAlertBadCertificate,
+<a id="L219"></a>                .unsupported_certificate =&gt; return error.TlsAlertUnsupportedCertificate,
+<a id="L220"></a>                .certificate_revoked =&gt; return error.TlsAlertCertificateRevoked,
+<a id="L221"></a>                .certificate_expired =&gt; return error.TlsAlertCertificateExpired,
+<a id="L222"></a>                .certificate_unknown =&gt; return error.TlsAlertCertificateUnknown,
+<a id="L223"></a>                .illegal_parameter =&gt; return error.TlsAlertIllegalParameter,
+<a id="L224"></a>                .unknown_ca =&gt; return error.TlsAlertUnknownCa,
+<a id="L225"></a>                .access_denied =&gt; return error.TlsAlertAccessDenied,
+<a id="L226"></a>                .decode_error =&gt; return error.TlsAlertDecodeError,
+<a id="L227"></a>                .decrypt_error =&gt; return error.TlsAlertDecryptError,
+<a id="L228"></a>                .protocol_version =&gt; return error.TlsAlertProtocolVersion,
+<a id="L229"></a>                .insufficient_security =&gt; return error.TlsAlertInsufficientSecurity,
+<a id="L230"></a>                .internal_error =&gt; return error.TlsAlertInternalError,
+<a id="L231"></a>                .inappropriate_fallback =&gt; return error.TlsAlertInappropriateFallback,
+<a id="L232"></a>                .user_canceled =&gt; {}, // not an error
+<a id="L233"></a>                .missing_extension =&gt; return error.TlsAlertMissingExtension,
+<a id="L234"></a>                .unsupported_extension =&gt; return error.TlsAlertUnsupportedExtension,
+<a id="L235"></a>                .unrecognized_name =&gt; return error.TlsAlertUnrecognizedName,
+<a id="L236"></a>                .bad_certificate_status_response =&gt; return error.TlsAlertBadCertificateStatusResponse,
+<a id="L237"></a>                .unknown_psk_identity =&gt; return error.TlsAlertUnknownPskIdentity,
+<a id="L238"></a>                .certificate_required =&gt; return error.TlsAlertCertificateRequired,
+<a id="L239"></a>                .no_application_protocol =&gt; return error.TlsAlertNoApplicationProtocol,
+<a id="L240"></a>                _ =&gt; return error.TlsAlertUnknown,
+<a id="L241"></a>            }
+<a id="L242"></a>        }
+<a id="L243"></a>    };
+<a id="L244"></a>};
+<a id="L245"></a>
+<a id="L246"></a>pub const SignatureScheme = enum(u16) {
+<a id="L247"></a>    // RSASSA-PKCS1-v1_5 algorithms
+<a id="L248"></a>    rsa_pkcs1_sha256 = 0x0401,
+<a id="L249"></a>    rsa_pkcs1_sha384 = 0x0501,
+<a id="L250"></a>    rsa_pkcs1_sha512 = 0x0601,
+<a id="L251"></a>
+<a id="L252"></a>    // ECDSA algorithms
+<a id="L253"></a>    ecdsa_secp256r1_sha256 = 0x0403,
+<a id="L254"></a>    ecdsa_secp384r1_sha384 = 0x0503,
+<a id="L255"></a>    ecdsa_secp521r1_sha512 = 0x0603,
+<a id="L256"></a>
+<a id="L257"></a>    // RSASSA-PSS algorithms with public key OID rsaEncryption
+<a id="L258"></a>    rsa_pss_rsae_sha256 = 0x0804,
+<a id="L259"></a>    rsa_pss_rsae_sha384 = 0x0805,
+<a id="L260"></a>    rsa_pss_rsae_sha512 = 0x0806,
+<a id="L261"></a>
+<a id="L262"></a>    // EdDSA algorithms
+<a id="L263"></a>    ed25519 = 0x0807,
+<a id="L264"></a>    ed448 = 0x0808,
+<a id="L265"></a>
+<a id="L266"></a>    // RSASSA-PSS algorithms with public key OID RSASSA-PSS
+<a id="L267"></a>    rsa_pss_pss_sha256 = 0x0809,
+<a id="L268"></a>    rsa_pss_pss_sha384 = 0x080a,
+<a id="L269"></a>    rsa_pss_pss_sha512 = 0x080b,
+<a id="L270"></a>
+<a id="L271"></a>    // Legacy algorithms
+<a id="L272"></a>    rsa_pkcs1_sha1 = 0x0201,
+<a id="L273"></a>    ecdsa_sha1 = 0x0203,
+<a id="L274"></a>
+<a id="L275"></a>    ecdsa_brainpoolP256r1tls13_sha256 = 0x081a,
+<a id="L276"></a>    ecdsa_brainpoolP384r1tls13_sha384 = 0x081b,
+<a id="L277"></a>    ecdsa_brainpoolP512r1tls13_sha512 = 0x081c,
+<a id="L278"></a>
+<a id="L279"></a>    rsa_sha224 = 0x0301,
+<a id="L280"></a>    dsa_sha224 = 0x0302,
+<a id="L281"></a>    ecdsa_sha224 = 0x0303,
+<a id="L282"></a>    dsa_sha256 = 0x0402,
+<a id="L283"></a>    dsa_sha384 = 0x0502,
+<a id="L284"></a>    dsa_sha512 = 0x0602,
+<a id="L285"></a>
+<a id="L286"></a>    _,
+<a id="L287"></a>};
+<a id="L288"></a>
+<a id="L289"></a>pub const NamedGroup = enum(u16) {
+<a id="L290"></a>    // Elliptic Curve Groups (ECDHE)
+<a id="L291"></a>    secp256r1 = 0x0017,
+<a id="L292"></a>    secp384r1 = 0x0018,
+<a id="L293"></a>    secp521r1 = 0x0019,
+<a id="L294"></a>    x25519 = 0x001D,
+<a id="L295"></a>    x448 = 0x001E,
+<a id="L296"></a>
+<a id="L297"></a>    // Finite Field Groups (DHE)
+<a id="L298"></a>    ffdhe2048 = 0x0100,
+<a id="L299"></a>    ffdhe3072 = 0x0101,
+<a id="L300"></a>    ffdhe4096 = 0x0102,
+<a id="L301"></a>    ffdhe6144 = 0x0103,
+<a id="L302"></a>    ffdhe8192 = 0x0104,
+<a id="L303"></a>
+<a id="L304"></a>    // Hybrid post-quantum key agreements
+<a id="L305"></a>    secp256r1_ml_kem256 = 0x11EB,
+<a id="L306"></a>    x25519_ml_kem768 = 0x11EC,
+<a id="L307"></a>
+<a id="L308"></a>    _,
+<a id="L309"></a>};
+<a id="L310"></a>
+<a id="L311"></a>pub const PskKeyExchangeMode = enum(u8) {
+<a id="L312"></a>    psk_ke = 0,
+<a id="L313"></a>    psk_dhe_ke = 1,
+<a id="L314"></a>    _,
+<a id="L315"></a>};
+<a id="L316"></a>
+<a id="L317"></a>pub const CipherSuite = enum(u16) {
+<a id="L318"></a>    RSA_WITH_AES_128_CBC_SHA = 0x002F,
+<a id="L319"></a>    DHE_RSA_WITH_AES_128_CBC_SHA = 0x0033,
+<a id="L320"></a>    RSA_WITH_AES_256_CBC_SHA = 0x0035,
+<a id="L321"></a>    DHE_RSA_WITH_AES_256_CBC_SHA = 0x0039,
+<a id="L322"></a>    RSA_WITH_AES_128_CBC_SHA256 = 0x003C,
+<a id="L323"></a>    RSA_WITH_AES_256_CBC_SHA256 = 0x003D,
+<a id="L324"></a>    DHE_RSA_WITH_AES_128_CBC_SHA256 = 0x0067,
+<a id="L325"></a>    DHE_RSA_WITH_AES_256_CBC_SHA256 = 0x006B,
+<a id="L326"></a>    RSA_WITH_AES_128_GCM_SHA256 = 0x009C,
+<a id="L327"></a>    RSA_WITH_AES_256_GCM_SHA384 = 0x009D,
+<a id="L328"></a>    DHE_RSA_WITH_AES_128_GCM_SHA256 = 0x009E,
+<a id="L329"></a>    DHE_RSA_WITH_AES_256_GCM_SHA384 = 0x009F,
+<a id="L330"></a>    EMPTY_RENEGOTIATION_INFO_SCSV = 0x00FF,
+<a id="L331"></a>
+<a id="L332"></a>    AES_128_GCM_SHA256 = 0x1301,
+<a id="L333"></a>    AES_256_GCM_SHA384 = 0x1302,
+<a id="L334"></a>    CHACHA20_POLY1305_SHA256 = 0x1303,
+<a id="L335"></a>    AES_128_CCM_SHA256 = 0x1304,
+<a id="L336"></a>    AES_128_CCM_8_SHA256 = 0x1305,
+<a id="L337"></a>    AEGIS_256_SHA512 = 0x1306,
+<a id="L338"></a>    AEGIS_128L_SHA256 = 0x1307,
+<a id="L339"></a>
+<a id="L340"></a>    ECDHE_ECDSA_WITH_AES_128_CBC_SHA = 0xC009,
+<a id="L341"></a>    ECDHE_ECDSA_WITH_AES_256_CBC_SHA = 0xC00A,
+<a id="L342"></a>    ECDHE_RSA_WITH_AES_128_CBC_SHA = 0xC013,
+<a id="L343"></a>    ECDHE_RSA_WITH_AES_256_CBC_SHA = 0xC014,
+<a id="L344"></a>    ECDHE_ECDSA_WITH_AES_128_CBC_SHA256 = 0xC023,
+<a id="L345"></a>    ECDHE_ECDSA_WITH_AES_256_CBC_SHA384 = 0xC024,
+<a id="L346"></a>    ECDHE_RSA_WITH_AES_128_CBC_SHA256 = 0xC027,
+<a id="L347"></a>    ECDHE_RSA_WITH_AES_256_CBC_SHA384 = 0xC028,
+<a id="L348"></a>    ECDHE_ECDSA_WITH_AES_128_GCM_SHA256 = 0xC02B,
+<a id="L349"></a>    ECDHE_ECDSA_WITH_AES_256_GCM_SHA384 = 0xC02C,
+<a id="L350"></a>    ECDHE_RSA_WITH_AES_128_GCM_SHA256 = 0xC02F,
+<a id="L351"></a>    ECDHE_RSA_WITH_AES_256_GCM_SHA384 = 0xC030,
+<a id="L352"></a>
+<a id="L353"></a>    ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256 = 0xCCA8,
+<a id="L354"></a>    ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256 = 0xCCA9,
+<a id="L355"></a>    DHE_RSA_WITH_CHACHA20_POLY1305_SHA256 = 0xCCAA,
+<a id="L356"></a>
+<a id="L357"></a>    _,
+<a id="L358"></a>
+<a id="L359"></a>    pub const With = enum {
+<a id="L360"></a>        AES_128_CBC_SHA,
+<a id="L361"></a>        AES_256_CBC_SHA,
+<a id="L362"></a>        AES_128_CBC_SHA256,
+<a id="L363"></a>        AES_256_CBC_SHA256,
+<a id="L364"></a>        AES_256_CBC_SHA384,
+<a id="L365"></a>
+<a id="L366"></a>        AES_128_GCM_SHA256,
+<a id="L367"></a>        AES_256_GCM_SHA384,
+<a id="L368"></a>
+<a id="L369"></a>        CHACHA20_POLY1305_SHA256,
+<a id="L370"></a>
+<a id="L371"></a>        AES_128_CCM_SHA256,
+<a id="L372"></a>        AES_128_CCM_8_SHA256,
+<a id="L373"></a>
+<a id="L374"></a>        AEGIS_256_SHA512,
+<a id="L375"></a>        AEGIS_128L_SHA256,
+<a id="L376"></a>    };
+<a id="L377"></a>
+<a id="L378"></a>    pub fn with(cipher_suite: CipherSuite) With {
+<a id="L379"></a>        return switch (cipher_suite) {
+<a id="L380"></a>            .RSA_WITH_AES_128_CBC_SHA,
+<a id="L381"></a>            .DHE_RSA_WITH_AES_128_CBC_SHA,
+<a id="L382"></a>            .ECDHE_ECDSA_WITH_AES_128_CBC_SHA,
+<a id="L383"></a>            .ECDHE_RSA_WITH_AES_128_CBC_SHA,
+<a id="L384"></a>            =&gt; .AES_128_CBC_SHA,
+<a id="L385"></a>            .RSA_WITH_AES_256_CBC_SHA,
+<a id="L386"></a>            .DHE_RSA_WITH_AES_256_CBC_SHA,
+<a id="L387"></a>            .ECDHE_ECDSA_WITH_AES_256_CBC_SHA,
+<a id="L388"></a>            .ECDHE_RSA_WITH_AES_256_CBC_SHA,
+<a id="L389"></a>            =&gt; .AES_256_CBC_SHA,
+<a id="L390"></a>            .RSA_WITH_AES_128_CBC_SHA256,
+<a id="L391"></a>            .DHE_RSA_WITH_AES_128_CBC_SHA256,
+<a id="L392"></a>            .ECDHE_ECDSA_WITH_AES_128_CBC_SHA256,
+<a id="L393"></a>            .ECDHE_RSA_WITH_AES_128_CBC_SHA256,
+<a id="L394"></a>            =&gt; .AES_128_CBC_SHA256,
+<a id="L395"></a>            .RSA_WITH_AES_256_CBC_SHA256,
+<a id="L396"></a>            .DHE_RSA_WITH_AES_256_CBC_SHA256,
+<a id="L397"></a>            =&gt; .AES_256_CBC_SHA256,
+<a id="L398"></a>            .ECDHE_ECDSA_WITH_AES_256_CBC_SHA384,
+<a id="L399"></a>            .ECDHE_RSA_WITH_AES_256_CBC_SHA384,
+<a id="L400"></a>            =&gt; .AES_256_CBC_SHA384,
+<a id="L401"></a>
+<a id="L402"></a>            .RSA_WITH_AES_128_GCM_SHA256,
+<a id="L403"></a>            .DHE_RSA_WITH_AES_128_GCM_SHA256,
+<a id="L404"></a>            .AES_128_GCM_SHA256,
+<a id="L405"></a>            .ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+<a id="L406"></a>            .ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+<a id="L407"></a>            =&gt; .AES_128_GCM_SHA256,
+<a id="L408"></a>            .RSA_WITH_AES_256_GCM_SHA384,
+<a id="L409"></a>            .DHE_RSA_WITH_AES_256_GCM_SHA384,
+<a id="L410"></a>            .AES_256_GCM_SHA384,
+<a id="L411"></a>            .ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+<a id="L412"></a>            .ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+<a id="L413"></a>            =&gt; .AES_256_GCM_SHA384,
+<a id="L414"></a>
+<a id="L415"></a>            .CHACHA20_POLY1305_SHA256,
+<a id="L416"></a>            .ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+<a id="L417"></a>            .ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+<a id="L418"></a>            .DHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+<a id="L419"></a>            =&gt; .CHACHA20_POLY1305_SHA256,
+<a id="L420"></a>
+<a id="L421"></a>            .AES_128_CCM_SHA256 =&gt; .AES_128_CCM_SHA256,
+<a id="L422"></a>            .AES_128_CCM_8_SHA256 =&gt; .AES_128_CCM_8_SHA256,
+<a id="L423"></a>
+<a id="L424"></a>            .AEGIS_256_SHA512 =&gt; .AEGIS_256_SHA512,
+<a id="L425"></a>            .AEGIS_128L_SHA256 =&gt; .AEGIS_128L_SHA256,
+<a id="L426"></a>
+<a id="L427"></a>            .EMPTY_RENEGOTIATION_INFO_SCSV =&gt; unreachable,
+<a id="L428"></a>            _ =&gt; unreachable,
+<a id="L429"></a>        };
+<a id="L430"></a>    }
+<a id="L431"></a>};
+<a id="L432"></a>
+<a id="L433"></a>pub const CompressionMethod = enum(u8) {
+<a id="L434"></a>    null = 0,
+<a id="L435"></a>    _,
+<a id="L436"></a>};
+<a id="L437"></a>
+<a id="L438"></a>pub const CertificateType = enum(u8) {
+<a id="L439"></a>    X509 = 0,
+<a id="L440"></a>    RawPublicKey = 2,
+<a id="L441"></a>    _,
+<a id="L442"></a>};
+<a id="L443"></a>
+<a id="L444"></a>pub const KeyUpdateRequest = enum(u8) {
+<a id="L445"></a>    update_not_requested = 0,
+<a id="L446"></a>    update_requested = 1,
+<a id="L447"></a>    _,
+<a id="L448"></a>};
+<a id="L449"></a>
+<a id="L450"></a>pub const ChangeCipherSpecType = enum(u8) {
+<a id="L451"></a>    change_cipher_spec = 1,
+<a id="L452"></a>    _,
+<a id="L453"></a>};
+<a id="L454"></a>
+<a id="L455"></a>pub fn HandshakeCipherT(comptime AeadType: type, comptime HashType: type, comptime explicit_iv_length: comptime_int) type {
+<a id="L456"></a>    return struct {
+<a id="L457"></a>        pub const A = ApplicationCipherT(AeadType, HashType, explicit_iv_length);
+<a id="L458"></a>
+<a id="L459"></a>        transcript_hash: A.Hash,
+<a id="L460"></a>        version: union {
+<a id="L461"></a>            tls_1_2: struct {
+<a id="L462"></a>                expected_server_verify_data: [A.verify_data_length]u8,
+<a id="L463"></a>                app_cipher: A.Tls_1_2,
+<a id="L464"></a>            },
+<a id="L465"></a>            tls_1_3: struct {
+<a id="L466"></a>                handshake_secret: [A.Hkdf.prk_length]u8,
+<a id="L467"></a>                master_secret: [A.Hkdf.prk_length]u8,
+<a id="L468"></a>                client_handshake_key: [A.AEAD.key_length]u8,
+<a id="L469"></a>                server_handshake_key: [A.AEAD.key_length]u8,
+<a id="L470"></a>                client_finished_key: [A.Hmac.key_length]u8,
+<a id="L471"></a>                server_finished_key: [A.Hmac.key_length]u8,
+<a id="L472"></a>                client_handshake_iv: [A.AEAD.nonce_length]u8,
+<a id="L473"></a>                server_handshake_iv: [A.AEAD.nonce_length]u8,
+<a id="L474"></a>            },
+<a id="L475"></a>        },
+<a id="L476"></a>    };
+<a id="L477"></a>}
+<a id="L478"></a>
+<a id="L479"></a>pub const HandshakeCipher = union(enum) {
+<a id="L480"></a>    AES_128_GCM_SHA256: HandshakeCipherT(crypto.aead.aes_gcm.Aes128Gcm, crypto.hash.sha2.Sha256, 8),
+<a id="L481"></a>    AES_256_GCM_SHA384: HandshakeCipherT(crypto.aead.aes_gcm.Aes256Gcm, crypto.hash.sha2.Sha384, 8),
+<a id="L482"></a>    CHACHA20_POLY1305_SHA256: HandshakeCipherT(crypto.aead.chacha_poly.ChaCha20Poly1305, crypto.hash.sha2.Sha256, 0),
+<a id="L483"></a>    AEGIS_256_SHA512: HandshakeCipherT(crypto.aead.aegis.Aegis256, crypto.hash.sha2.Sha512, 0),
+<a id="L484"></a>    AEGIS_128L_SHA256: HandshakeCipherT(crypto.aead.aegis.Aegis128L, crypto.hash.sha2.Sha256, 0),
+<a id="L485"></a>};
+<a id="L486"></a>
+<a id="L487"></a>pub fn ApplicationCipherT(comptime AeadType: type, comptime HashType: type, comptime explicit_iv_length: comptime_int) type {
+<a id="L488"></a>    return union {
+<a id="L489"></a>        pub const AEAD = AeadType;
+<a id="L490"></a>        pub const Hash = HashType;
+<a id="L491"></a>        pub const Hmac = crypto.auth.hmac.Hmac(Hash);
+<a id="L492"></a>        pub const Hkdf = crypto.kdf.hkdf.Hkdf(Hmac);
+<a id="L493"></a>
+<a id="L494"></a>        pub const enc_key_length = AEAD.key_length;
+<a id="L495"></a>        pub const fixed_iv_length = AEAD.nonce_length - explicit_iv_length;
+<a id="L496"></a>        pub const record_iv_length = explicit_iv_length;
+<a id="L497"></a>        pub const mac_length = AEAD.tag_length;
+<a id="L498"></a>        pub const mac_key_length = Hmac.key_length_min;
+<a id="L499"></a>        pub const verify_data_length = 12;
+<a id="L500"></a>
+<a id="L501"></a>        tls_1_2: Tls_1_2,
+<a id="L502"></a>        tls_1_3: Tls_1_3,
+<a id="L503"></a>
+<a id="L504"></a>        pub const Tls_1_2 = extern struct {
+<a id="L505"></a>            client_write_MAC_key: [mac_key_length]u8,
+<a id="L506"></a>            server_write_MAC_key: [mac_key_length]u8,
+<a id="L507"></a>            client_write_key: [enc_key_length]u8,
+<a id="L508"></a>            server_write_key: [enc_key_length]u8,
+<a id="L509"></a>            client_write_IV: [fixed_iv_length]u8,
+<a id="L510"></a>            server_write_IV: [fixed_iv_length]u8,
+<a id="L511"></a>            // non-standard entropy
+<a id="L512"></a>            client_salt: [record_iv_length]u8,
+<a id="L513"></a>        };
+<a id="L514"></a>
+<a id="L515"></a>        pub const Tls_1_3 = struct {
+<a id="L516"></a>            client_secret: [Hash.digest_length]u8,
+<a id="L517"></a>            server_secret: [Hash.digest_length]u8,
+<a id="L518"></a>            client_key: [AEAD.key_length]u8,
+<a id="L519"></a>            server_key: [AEAD.key_length]u8,
+<a id="L520"></a>            client_iv: [AEAD.nonce_length]u8,
+<a id="L521"></a>            server_iv: [AEAD.nonce_length]u8,
+<a id="L522"></a>        };
+<a id="L523"></a>    };
+<a id="L524"></a>}
+<a id="L525"></a>
+<a id="L526"></a>/// Encryption parameters for application traffic.
+<a id="L527"></a>pub const ApplicationCipher = union(enum) {
+<a id="L528"></a>    AES_128_GCM_SHA256: ApplicationCipherT(crypto.aead.aes_gcm.Aes128Gcm, crypto.hash.sha2.Sha256, 8),
+<a id="L529"></a>    AES_256_GCM_SHA384: ApplicationCipherT(crypto.aead.aes_gcm.Aes256Gcm, crypto.hash.sha2.Sha384, 8),
+<a id="L530"></a>    CHACHA20_POLY1305_SHA256: ApplicationCipherT(crypto.aead.chacha_poly.ChaCha20Poly1305, crypto.hash.sha2.Sha256, 0),
+<a id="L531"></a>    AEGIS_256_SHA512: ApplicationCipherT(crypto.aead.aegis.Aegis256, crypto.hash.sha2.Sha512, 0),
+<a id="L532"></a>    AEGIS_128L_SHA256: ApplicationCipherT(crypto.aead.aegis.Aegis128L, crypto.hash.sha2.Sha256, 0),
+<a id="L533"></a>};
+<a id="L534"></a>
+<a id="L535"></a>pub fn hmacExpandLabel(
+<a id="L536"></a>    comptime Hmac: type,
+<a id="L537"></a>    secret: []const u8,
+<a id="L538"></a>    label_then_seed: []const []const u8,
+<a id="L539"></a>    comptime len: usize,
+<a id="L540"></a>) [len]u8 {
+<a id="L541"></a>    const initial_hmac: Hmac = .init(secret);
+<a id="L542"></a>    var a: [Hmac.mac_length]u8 = undefined;
+<a id="L543"></a>    var result: [std.mem.alignForwardAnyAlign(usize, len, Hmac.mac_length)]u8 = undefined;
+<a id="L544"></a>    var index: usize = 0;
+<a id="L545"></a>    while (index &lt; result.len) : (index += Hmac.mac_length) {
+<a id="L546"></a>        var a_hmac = initial_hmac;
+<a id="L547"></a>        if (index &gt; 0) a_hmac.update(&amp;a) else for (label_then_seed) |part| a_hmac.update(part);
+<a id="L548"></a>        a_hmac.final(&amp;a);
+<a id="L549"></a>
+<a id="L550"></a>        var result_hmac = initial_hmac;
+<a id="L551"></a>        result_hmac.update(&amp;a);
+<a id="L552"></a>        for (label_then_seed) |part| result_hmac.update(part);
+<a id="L553"></a>        result_hmac.final(result[index..][0..Hmac.mac_length]);
+<a id="L554"></a>    }
+<a id="L555"></a>    return result[0..len].*;
+<a id="L556"></a>}
+<a id="L557"></a>
+<a id="L558"></a>pub fn hkdfExpandLabel(
+<a id="L559"></a>    comptime Hkdf: type,
+<a id="L560"></a>    key: [Hkdf.prk_length]u8,
+<a id="L561"></a>    label: []const u8,
+<a id="L562"></a>    context: []const u8,
+<a id="L563"></a>    comptime len: usize,
+<a id="L564"></a>) [len]u8 {
+<a id="L565"></a>    const max_label_len = 255;
+<a id="L566"></a>    const max_context_len = 255;
+<a id="L567"></a>    const tls13 = "tls13 ";
+<a id="L568"></a>    var buf: [2 + 1 + tls13.len + max_label_len + 1 + max_context_len]u8 = undefined;
+<a id="L569"></a>    mem.writeInt(u16, buf[0..2], len, .big);
+<a id="L570"></a>    buf[2] = @as(u8, @intCast(tls13.len + label.len));
+<a id="L571"></a>    buf[3..][0..tls13.len].* = tls13.*;
+<a id="L572"></a>    var i: usize = 3 + tls13.len;
+<a id="L573"></a>    @memcpy(buf[i..][0..label.len], label);
+<a id="L574"></a>    i += label.len;
+<a id="L575"></a>    buf[i] = @as(u8, @intCast(context.len));
+<a id="L576"></a>    i += 1;
+<a id="L577"></a>    @memcpy(buf[i..][0..context.len], context);
+<a id="L578"></a>    i += context.len;
+<a id="L579"></a>
+<a id="L580"></a>    var result: [len]u8 = undefined;
+<a id="L581"></a>    Hkdf.expand(&amp;result, buf[0..i], key);
+<a id="L582"></a>    return result;
+<a id="L583"></a>}
+<a id="L584"></a>
+<a id="L585"></a>pub fn emptyHash(comptime Hash: type) [Hash.digest_length]u8 {
+<a id="L586"></a>    var result: [Hash.digest_length]u8 = undefined;
+<a id="L587"></a>    Hash.hash(&amp;.{}, &amp;result, .{});
+<a id="L588"></a>    return result;
+<a id="L589"></a>}
+<a id="L590"></a>
+<a id="L591"></a>pub fn hmac(comptime Hmac: type, message: []const u8, key: [Hmac.key_length]u8) [Hmac.mac_length]u8 {
+<a id="L592"></a>    var result: [Hmac.mac_length]u8 = undefined;
+<a id="L593"></a>    Hmac.create(&amp;result, message, &amp;key);
+<a id="L594"></a>    return result;
+<a id="L595"></a>}
+<a id="L596"></a>
+<a id="L597"></a>pub fn extension(et: ExtensionType, bytes: anytype) [2 + 2 + bytes.len]u8 {
+<a id="L598"></a>    return int(u16, @intFromEnum(et)) ++ array(u16, u8, bytes);
+<a id="L599"></a>}
+<a id="L600"></a>
+<a id="L601"></a>pub fn array(
+<a id="L602"></a>    comptime Len: type,
+<a id="L603"></a>    comptime Elem: type,
+<a id="L604"></a>    elems: anytype,
+<a id="L605"></a>) [@divExact(@bitSizeOf(Len), 8) + @divExact(@bitSizeOf(Elem), 8) * elems.len]u8 {
+<a id="L606"></a>    const len_size = @divExact(@bitSizeOf(Len), 8);
+<a id="L607"></a>    const elem_size = @divExact(@bitSizeOf(Elem), 8);
+<a id="L608"></a>    var arr: [len_size + elem_size * elems.len]u8 = undefined;
+<a id="L609"></a>    std.mem.writeInt(Len, arr[0..len_size], @intCast(elem_size * elems.len), .big);
+<a id="L610"></a>    const ElemInt = @Int(.unsigned, @bitSizeOf(Elem));
+<a id="L611"></a>    for (0.., @as([elems.len]Elem, elems)) |index, elem| {
+<a id="L612"></a>        std.mem.writeInt(
+<a id="L613"></a>            ElemInt,
+<a id="L614"></a>            arr[len_size + elem_size * index ..][0..elem_size],
+<a id="L615"></a>            switch (@typeInfo(Elem)) {
+<a id="L616"></a>                .int =&gt; @as(Elem, elem),
+<a id="L617"></a>                .@"enum" =&gt; @intFromEnum(@as(Elem, elem)),
+<a id="L618"></a>                else =&gt; @bitCast(@as(Elem, elem)),
+<a id="L619"></a>            },
+<a id="L620"></a>            .big,
+<a id="L621"></a>        );
+<a id="L622"></a>    }
+<a id="L623"></a>    return arr;
+<a id="L624"></a>}
+<a id="L625"></a>
+<a id="L626"></a>pub fn int(comptime Int: type, val: Int) [@divExact(@bitSizeOf(Int), 8)]u8 {
+<a id="L627"></a>    var arr: [@divExact(@bitSizeOf(Int), 8)]u8 = undefined;
+<a id="L628"></a>    std.mem.writeInt(Int, &amp;arr, val, .big);
+<a id="L629"></a>    return arr;
+<a id="L630"></a>}
+<a id="L631"></a>
+<a id="L632"></a>/// An abstraction to ensure that protocol-parsing code does not perform an
+<a id="L633"></a>/// out-of-bounds read.
+<a id="L634"></a>pub const Decoder = struct {
+<a id="L635"></a>    buf: []u8,
+<a id="L636"></a>    /// Points to the next byte in buffer that will be decoded.
+<a id="L637"></a>    idx: usize = 0,
+<a id="L638"></a>    /// Up to this point in `buf` we have already checked that `cap` is greater than it.
+<a id="L639"></a>    our_end: usize = 0,
+<a id="L640"></a>    /// Beyond this point in `buf` is extra tag-along bytes beyond the amount we
+<a id="L641"></a>    /// requested with `readAtLeast`.
+<a id="L642"></a>    their_end: usize = 0,
+<a id="L643"></a>    /// Points to the end within buffer that has been filled. Beyond this point
+<a id="L644"></a>    /// in buf is undefined bytes.
+<a id="L645"></a>    cap: usize = 0,
+<a id="L646"></a>    /// Debug helper to prevent illegal calls to read functions.
+<a id="L647"></a>    disable_reads: bool = false,
+<a id="L648"></a>
+<a id="L649"></a>    pub fn fromTheirSlice(buf: []u8) Decoder {
+<a id="L650"></a>        return .{
+<a id="L651"></a>            .buf = buf,
+<a id="L652"></a>            .their_end = buf.len,
+<a id="L653"></a>            .cap = buf.len,
+<a id="L654"></a>            .disable_reads = true,
+<a id="L655"></a>        };
+<a id="L656"></a>    }
+<a id="L657"></a>
+<a id="L658"></a>    /// Use this function to increase `their_end`.
+<a id="L659"></a>    pub fn readAtLeast(d: *Decoder, stream: *std.Io.Reader, their_amt: usize) !void {
+<a id="L660"></a>        assert(!d.disable_reads);
+<a id="L661"></a>        const existing_amt = d.cap - d.idx;
+<a id="L662"></a>        d.their_end = d.idx + their_amt;
+<a id="L663"></a>        if (their_amt &lt;= existing_amt) return;
+<a id="L664"></a>        const request_amt = their_amt - existing_amt;
+<a id="L665"></a>        const dest = d.buf[d.cap..];
+<a id="L666"></a>        if (request_amt &gt; dest.len) return error.TlsRecordOverflow;
+<a id="L667"></a>        stream.readSlice(dest[0..request_amt]) catch |err| switch (err) {
+<a id="L668"></a>            error.EndOfStream =&gt; return error.TlsConnectionTruncated,
+<a id="L669"></a>            error.ReadFailed =&gt; return error.ReadFailed,
+<a id="L670"></a>        };
+<a id="L671"></a>        d.cap += request_amt;
+<a id="L672"></a>    }
+<a id="L673"></a>
+<a id="L674"></a>    /// Same as `readAtLeast` but also increases `our_end` by exactly `our_amt`.
+<a id="L675"></a>    /// Use when `our_amt` is calculated by us, not by them.
+<a id="L676"></a>    pub fn readAtLeastOurAmt(d: *Decoder, stream: *std.Io.Reader, our_amt: usize) !void {
+<a id="L677"></a>        assert(!d.disable_reads);
+<a id="L678"></a>        try readAtLeast(d, stream, our_amt);
+<a id="L679"></a>        d.our_end = d.idx + our_amt;
+<a id="L680"></a>    }
+<a id="L681"></a>
+<a id="L682"></a>    /// Use this function to increase `our_end`.
+<a id="L683"></a>    /// This should always be called with an amount provided by us, not them.
+<a id="L684"></a>    pub fn ensure(d: *Decoder, amt: usize) !void {
+<a id="L685"></a>        d.our_end = @max(d.idx + amt, d.our_end);
+<a id="L686"></a>        if (d.our_end &gt; d.their_end) return error.TlsDecodeError;
+<a id="L687"></a>    }
+<a id="L688"></a>
+<a id="L689"></a>    /// Use this function to increase `idx`.
+<a id="L690"></a>    pub fn decode(d: *Decoder, comptime T: type) T {
+<a id="L691"></a>        switch (@typeInfo(T)) {
+<a id="L692"></a>            .int =&gt; |info| switch (info.bits) {
+<a id="L693"></a>                8 =&gt; {
+<a id="L694"></a>                    skip(d, 1);
+<a id="L695"></a>                    return d.buf[d.idx - 1];
+<a id="L696"></a>                },
+<a id="L697"></a>                16 =&gt; {
+<a id="L698"></a>                    skip(d, 2);
+<a id="L699"></a>                    const b0: u16 = d.buf[d.idx - 2];
+<a id="L700"></a>                    const b1: u16 = d.buf[d.idx - 1];
+<a id="L701"></a>                    return (b0 &lt;&lt; 8) | b1;
+<a id="L702"></a>                },
+<a id="L703"></a>                24 =&gt; {
+<a id="L704"></a>                    skip(d, 3);
+<a id="L705"></a>                    const b0: u24 = d.buf[d.idx - 3];
+<a id="L706"></a>                    const b1: u24 = d.buf[d.idx - 2];
+<a id="L707"></a>                    const b2: u24 = d.buf[d.idx - 1];
+<a id="L708"></a>                    return (b0 &lt;&lt; 16) | (b1 &lt;&lt; 8) | b2;
+<a id="L709"></a>                },
+<a id="L710"></a>                else =&gt; @compileError("unsupported int type: " ++ @typeName(T)),
+<a id="L711"></a>            },
+<a id="L712"></a>            .@"enum" =&gt; |info| {
+<a id="L713"></a>                if (info.is_exhaustive) @compileError("exhaustive enum cannot be used");
+<a id="L714"></a>                return @enumFromInt(d.decode(info.tag_type));
+<a id="L715"></a>            },
+<a id="L716"></a>            else =&gt; @compileError("unsupported type: " ++ @typeName(T)),
+<a id="L717"></a>        }
+<a id="L718"></a>    }
+<a id="L719"></a>
+<a id="L720"></a>    /// Use this function to increase `idx`.
+<a id="L721"></a>    pub fn array(d: *Decoder, comptime len: usize) *[len]u8 {
+<a id="L722"></a>        skip(d, len);
+<a id="L723"></a>        return d.buf[d.idx - len ..][0..len];
+<a id="L724"></a>    }
+<a id="L725"></a>
+<a id="L726"></a>    /// Use this function to increase `idx`.
+<a id="L727"></a>    pub fn slice(d: *Decoder, len: usize) []u8 {
+<a id="L728"></a>        skip(d, len);
+<a id="L729"></a>        return d.buf[d.idx - len ..][0..len];
+<a id="L730"></a>    }
+<a id="L731"></a>
+<a id="L732"></a>    /// Use this function to increase `idx`.
+<a id="L733"></a>    pub fn skip(d: *Decoder, amt: usize) void {
+<a id="L734"></a>        d.idx += amt;
+<a id="L735"></a>        assert(d.idx &lt;= d.our_end); // insufficient ensured bytes
+<a id="L736"></a>    }
+<a id="L737"></a>
+<a id="L738"></a>    pub fn eof(d: Decoder) bool {
+<a id="L739"></a>        assert(d.our_end &lt;= d.their_end);
+<a id="L740"></a>        assert(d.idx &lt;= d.our_end);
+<a id="L741"></a>        return d.idx == d.their_end;
+<a id="L742"></a>    }
+<a id="L743"></a>
+<a id="L744"></a>    /// Provide the length they claim, and receive a sub-decoder specific to that slice.
+<a id="L745"></a>    /// The parent decoder is advanced to the end.
+<a id="L746"></a>    pub fn sub(d: *Decoder, their_len: usize) !Decoder {
+<a id="L747"></a>        const end = d.idx + their_len;
+<a id="L748"></a>        if (end &gt; d.their_end) return error.TlsDecodeError;
+<a id="L749"></a>        const sub_buf = d.buf[d.idx..end];
+<a id="L750"></a>        d.idx = end;
+<a id="L751"></a>        d.our_end = end;
+<a id="L752"></a>        return fromTheirSlice(sub_buf);
+<a id="L753"></a>    }
+<a id="L754"></a>
+<a id="L755"></a>    pub fn rest(d: Decoder) []u8 {
+<a id="L756"></a>        return d.buf[d.idx..d.cap];
+<a id="L757"></a>    }
+<a id="L758"></a>};
+</pre>
 </body>
 </html>

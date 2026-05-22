@@ -2,487 +2,490 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Source: zig-0.16.0-std/debug/Dwarf/Unwind/VirtualMachine.zig</title>
+    <title>Source: debug/Dwarf/Unwind/VirtualMachine.zig</title>
     <style>
         body { background: #1e1e1e; color: #d4d4d4; font-family: monospace; padding: 20px; }
         pre { white-space: pre-wrap; word-wrap: break-word; }
         .header { border-bottom: 1px solid #444; padding-bottom: 10px; margin-bottom: 20px; }
         a { color: #569cd6; }
+        a[id] { color: inherit; text-decoration: none; }
+        :target { background: #3a3a00; }
     </style>
 </head>
 <body>
     <div class="header">
-        <a href="/">Index</a> | <strong>File: zig-0.16.0-std/debug/Dwarf/Unwind/VirtualMachine.zig</strong>
+        <a href="/">Index</a> | <strong>File: debug/Dwarf/Unwind/VirtualMachine.zig</strong>
     </div>
-    <pre>//! Virtual machine that evaluates DWARF call frame instructions
-
-/// See section 6.4.1 of the DWARF5 specification for details on each
-pub const RegisterRule = union(enum) {
-    /// The spec says that the default rule for each column is the undefined rule.
-    /// However, it also allows ABI / compiler authors to specify alternate defaults, so
-    /// there is a distinction made here.
-    default,
-    undefined,
-    same_value,
-    /// offset(N)
-    offset: i64,
-    /// val_offset(N)
-    val_offset: i64,
-    /// register(R)
-    register: u8,
-    /// expression(E)
-    expression: []const u8,
-    /// val_expression(E)
-    val_expression: []const u8,
-};
-
-pub const CfaRule = union(enum) {
-    none,
-    reg_off: struct {
-        register: u8,
-        offset: i64,
-    },
-    expression: []const u8,
-};
-
-/// Each row contains unwinding rules for a set of registers.
-pub const Row = struct {
-    /// Offset from `FrameDescriptionEntry.pc_begin`
-    offset: u64 = 0,
-    cfa: CfaRule = .none,
-    /// The register fields in these columns define the register the rule applies to.
-    columns: ColumnRange = .{ .start = undefined, .len = 0 },
-};
-
-pub const Column = struct {
-    register: u8,
-    rule: RegisterRule,
-};
-
-const ColumnRange = struct {
-    start: usize,
-    len: u8,
-};
-
-columns: std.ArrayList(Column) = .empty,
-stack: std.ArrayList(struct {
-    cfa: CfaRule,
-    columns: ColumnRange,
-}) = .empty,
-current_row: Row = .{},
-
-/// The result of executing the CIE's initial_instructions
-cie_row: ?Row = null,
-
-pub fn deinit(self: *VirtualMachine, gpa: Allocator) void {
-    self.stack.deinit(gpa);
-    self.columns.deinit(gpa);
-    self.* = undefined;
-}
-
-pub fn reset(self: *VirtualMachine) void {
-    self.stack.clearRetainingCapacity();
-    self.columns.clearRetainingCapacity();
-    self.current_row = .{};
-    self.cie_row = null;
-}
-
-/// Return a slice backed by the row's non-CFA columns
-pub fn rowColumns(self: *const VirtualMachine, row: *const Row) []Column {
-    if (row.columns.len == 0) return &amp;.{};
-    return self.columns.items[row.columns.start..][0..row.columns.len];
-}
-
-/// Either retrieves or adds a column for `register` (non-CFA) in the current row.
-fn getOrAddColumn(self: *VirtualMachine, gpa: Allocator, register: u8) !*Column {
-    for (self.rowColumns(&amp;self.current_row)) |*c| {
-        if (c.register == register) return c;
-    }
-
-    if (self.current_row.columns.len == 0) {
-        self.current_row.columns.start = self.columns.items.len;
-    } else {
-        assert(self.current_row.columns.start + self.current_row.columns.len == self.columns.items.len);
-    }
-    self.current_row.columns.len += 1;
-
-    const column = try self.columns.addOne(gpa);
-    column.* = .{
-        .register = register,
-        .rule = .default,
-    };
-
-    return column;
-}
-
-pub fn populateCieLastRow(
-    gpa: Allocator,
-    cie: *Unwind.CommonInformationEntry,
-    addr_size_bytes: u8,
-    endian: std.builtin.Endian,
-) !void {
-    assert(cie.last_row == null);
-
-    var vm: VirtualMachine = .{};
-    defer vm.deinit(gpa);
-
-    try vm.evalInstructions(
-        gpa,
-        cie,
-        std.math.maxInt(u64),
-        cie.initial_instructions,
-        addr_size_bytes,
-        endian,
-    );
-
-    cie.last_row = .{
-        .offset = vm.current_row.offset,
-        .cfa = vm.current_row.cfa,
-        .cols = try gpa.dupe(Column, vm.rowColumns(&amp;vm.current_row)),
-    };
-}
-
-/// Runs the CIE instructions, then the FDE instructions. Execution halts
-/// once the row that corresponds to `pc` is known, and the row is returned.
-pub fn runTo(
-    vm: *VirtualMachine,
-    gpa: Allocator,
-    pc: u64,
-    cie: *const Unwind.CommonInformationEntry,
-    fde: *const Unwind.FrameDescriptionEntry,
-    addr_size_bytes: u8,
-    endian: std.builtin.Endian,
-) !Row {
-    assert(vm.cie_row == null);
-
-    const target_offset = pc - fde.pc_begin;
-    assert(target_offset &lt; fde.pc_range);
-
-    const instruction_bytes: []const u8 = insts: {
-        if (target_offset &lt; cie.last_row.?.offset) {
-            break :insts cie.initial_instructions;
-        }
-        // This is the more common case: start from the CIE's last row.
-        assert(vm.columns.items.len == 0);
-        vm.current_row = .{
-            .offset = cie.last_row.?.offset,
-            .cfa = cie.last_row.?.cfa,
-            .columns = .{
-                .start = 0,
-                .len = @intCast(cie.last_row.?.cols.len),
-            },
-        };
-        try vm.columns.appendSlice(gpa, cie.last_row.?.cols);
-        vm.cie_row = vm.current_row;
-        break :insts fde.instructions;
-    };
-
-    try vm.evalInstructions(
-        gpa,
-        cie,
-        target_offset,
-        instruction_bytes,
-        addr_size_bytes,
-        endian,
-    );
-    return vm.current_row;
-}
-
-/// Evaluates instructions from `instruction_bytes` until `target_addr` is reached or all
-/// instructions have been evaluated.
-fn evalInstructions(
-    vm: *VirtualMachine,
-    gpa: Allocator,
-    cie: *const Unwind.CommonInformationEntry,
-    target_addr: u64,
-    instruction_bytes: []const u8,
-    addr_size_bytes: u8,
-    endian: std.builtin.Endian,
-) !void {
-    var fr: std.Io.Reader = .fixed(instruction_bytes);
-    while (fr.seek &lt; fr.buffer.len) {
-        switch (try Instruction.read(&amp;fr, addr_size_bytes, endian)) {
-            .nop =&gt; {
-                // If there was one nop, there's a good chance we've reached the padding and so
-                // everything left is a nop, which is represented by a 0 byte.
-                if (std.mem.allEqual(u8, fr.buffered(), 0)) return;
-            },
-
-            .remember_state =&gt; {
-                try vm.stack.append(gpa, .{
-                    .cfa = vm.current_row.cfa,
-                    .columns = vm.current_row.columns,
-                });
-                const cols_len = vm.current_row.columns.len;
-                const copy_start = vm.columns.items.len;
-                assert(vm.current_row.columns.start == copy_start - cols_len);
-                try vm.columns.ensureUnusedCapacity(gpa, cols_len); // to prevent aliasing issues
-                vm.columns.appendSliceAssumeCapacity(vm.columns.items[copy_start - cols_len ..]);
-                vm.current_row.columns.start = copy_start;
-            },
-            .restore_state =&gt; {
-                const restored = vm.stack.pop() orelse return error.InvalidOperation;
-                vm.columns.shrinkRetainingCapacity(restored.columns.start + restored.columns.len);
-
-                vm.current_row.cfa = restored.cfa;
-                vm.current_row.columns = restored.columns;
-            },
-
-            .advance_loc =&gt; |delta| {
-                const new_addr = vm.current_row.offset + delta * cie.code_alignment_factor;
-                if (new_addr &gt; target_addr) return;
-                vm.current_row.offset = new_addr;
-            },
-            .set_loc =&gt; |new_addr| {
-                if (new_addr &lt;= vm.current_row.offset) return error.InvalidOperation;
-                if (cie.segment_selector_size != 0) return error.InvalidOperation; // unsupported
-                // TODO: Check cie.segment_selector_size != 0 for DWARFV4
-
-                if (new_addr &gt; target_addr) return;
-                vm.current_row.offset = new_addr;
-            },
-
-            .register =&gt; |reg| {
-                const column = try vm.getOrAddColumn(gpa, reg.index);
-                column.rule = switch (reg.rule) {
-                    .restore =&gt; rule: {
-                        const cie_row = &amp;(vm.cie_row orelse return error.InvalidOperation);
-                        for (vm.rowColumns(cie_row)) |cie_col| {
-                            if (cie_col.register == reg.index) break :rule cie_col.rule;
-                        }
-                        break :rule .default;
-                    },
-                    .undefined =&gt; .undefined,
-                    .same_value =&gt; .same_value,
-                    .offset_uf =&gt; |off| .{ .offset = @as(i64, @intCast(off)) * cie.data_alignment_factor },
-                    .offset_sf =&gt; |off| .{ .offset = off * cie.data_alignment_factor },
-                    .val_offset_uf =&gt; |off| .{ .val_offset = @as(i64, @intCast(off)) * cie.data_alignment_factor },
-                    .val_offset_sf =&gt; |off| .{ .val_offset = off * cie.data_alignment_factor },
-                    .register =&gt; |callee_reg| .{ .register = callee_reg },
-                    .expr =&gt; |len| .{ .expression = try takeExprBlock(&amp;fr, len) },
-                    .val_expr =&gt; |len| .{ .val_expression = try takeExprBlock(&amp;fr, len) },
-                };
-            },
-            .def_cfa =&gt; |cfa| vm.current_row.cfa = .{ .reg_off = .{
-                .register = cfa.register,
-                .offset = @intCast(cfa.offset),
-            } },
-            .def_cfa_sf =&gt; |cfa| vm.current_row.cfa = .{ .reg_off = .{
-                .register = cfa.register,
-                .offset = cfa.offset_sf * cie.data_alignment_factor,
-            } },
-            .def_cfa_reg =&gt; |register| switch (vm.current_row.cfa) {
-                .none =&gt; {
-                    // According to the DWARF specification, this is not valid, because this
-                    // instruction can only be used to replace the register if the rule is already a
-                    // `.reg_off`. However, this is emitted in practice by GNU toolchains for some
-                    // targets, and so by convention is interpreted as equivalent to `.def_cfa` with
-                    // an offset of 0.
-                    vm.current_row.cfa = .{ .reg_off = .{
-                        .register = register,
-                        .offset = 0,
-                    } };
-                },
-                .expression =&gt; return error.InvalidOperation,
-                .reg_off =&gt; |*ro| ro.register = register,
-            },
-            .def_cfa_offset =&gt; |offset| switch (vm.current_row.cfa) {
-                .none, .expression =&gt; return error.InvalidOperation,
-                .reg_off =&gt; |*ro| ro.offset = @intCast(offset),
-            },
-            .def_cfa_offset_sf =&gt; |offset_sf| switch (vm.current_row.cfa) {
-                .none, .expression =&gt; return error.InvalidOperation,
-                .reg_off =&gt; |*ro| ro.offset = offset_sf * cie.data_alignment_factor,
-            },
-            .def_cfa_expr =&gt; |len| {
-                vm.current_row.cfa = .{ .expression = try takeExprBlock(&amp;fr, len) };
-            },
-        }
-    }
-}
-
-fn takeExprBlock(r: *std.Io.Reader, len: usize) error{ ReadFailed, InvalidOperand }![]const u8 {
-    return r.take(len) catch |err| switch (err) {
-        error.ReadFailed =&gt; |e| return e,
-        error.EndOfStream =&gt; return error.InvalidOperand,
-    };
-}
-
-const OpcodeByte = packed struct(u8) {
-    low: packed union {
-        operand: u6,
-        extended: enum(u6) {
-            nop = 0,
-            set_loc = 1,
-            advance_loc1 = 2,
-            advance_loc2 = 3,
-            advance_loc4 = 4,
-            offset_extended = 5,
-            restore_extended = 6,
-            undefined = 7,
-            same_value = 8,
-            register = 9,
-            remember_state = 10,
-            restore_state = 11,
-            def_cfa = 12,
-            def_cfa_register = 13,
-            def_cfa_offset = 14,
-            def_cfa_expression = 15,
-            expression = 16,
-            offset_extended_sf = 17,
-            def_cfa_sf = 18,
-            def_cfa_offset_sf = 19,
-            val_offset = 20,
-            val_offset_sf = 21,
-            val_expression = 22,
-            _,
-        },
-    },
-    opcode: enum(u2) {
-        extended = 0,
-        advance_loc = 1,
-        offset = 2,
-        restore = 3,
-    },
-};
-
-pub const Instruction = union(enum) {
-    nop,
-    remember_state,
-    restore_state,
-    advance_loc: u32,
-    set_loc: u64,
-
-    register: struct {
-        index: u8,
-        rule: union(enum) {
-            restore, // restore from cie
-            undefined,
-            same_value,
-            offset_uf: u64,
-            offset_sf: i64,
-            val_offset_uf: u64,
-            val_offset_sf: i64,
-            register: u8,
-            /// Value is the number of bytes in the DWARF expression, which the caller must read.
-            expr: usize,
-            /// Value is the number of bytes in the DWARF expression, which the caller must read.
-            val_expr: usize,
-        },
-    },
-
-    def_cfa: struct {
-        register: u8,
-        offset: u64,
-    },
-    def_cfa_sf: struct {
-        register: u8,
-        offset_sf: i64,
-    },
-    def_cfa_reg: u8,
-    def_cfa_offset: u64,
-    def_cfa_offset_sf: i64,
-    /// Value is the number of bytes in the DWARF expression, which the caller must read.
-    def_cfa_expr: usize,
-
-    pub fn read(
-        reader: *std.Io.Reader,
-        addr_size_bytes: u8,
-        endian: std.builtin.Endian,
-    ) !Instruction {
-        const inst: OpcodeByte = @bitCast(try reader.takeByte());
-        return switch (inst.opcode) {
-            .advance_loc =&gt; .{ .advance_loc = inst.low.operand },
-            .offset =&gt; .{ .register = .{
-                .index = inst.low.operand,
-                .rule = .{ .offset_uf = try reader.takeLeb128(u64) },
-            } },
-            .restore =&gt; .{ .register = .{
-                .index = inst.low.operand,
-                .rule = .restore,
-            } },
-            .extended =&gt; switch (inst.low.extended) {
-                .nop =&gt; .nop,
-                .remember_state =&gt; .remember_state,
-                .restore_state =&gt; .restore_state,
-                .advance_loc1 =&gt; .{ .advance_loc = try reader.takeByte() },
-                .advance_loc2 =&gt; .{ .advance_loc = try reader.takeInt(u16, endian) },
-                .advance_loc4 =&gt; .{ .advance_loc = try reader.takeInt(u32, endian) },
-                .set_loc =&gt; .{ .set_loc = switch (addr_size_bytes) {
-                    2 =&gt; try reader.takeInt(u16, endian),
-                    4 =&gt; try reader.takeInt(u32, endian),
-                    8 =&gt; try reader.takeInt(u64, endian),
-                    else =&gt; return error.UnsupportedAddrSize,
-                } },
-
-                .offset_extended =&gt; .{ .register = .{
-                    .index = try reader.takeLeb128(u8),
-                    .rule = .{ .offset_uf = try reader.takeLeb128(u64) },
-                } },
-                .offset_extended_sf =&gt; .{ .register = .{
-                    .index = try reader.takeLeb128(u8),
-                    .rule = .{ .offset_sf = try reader.takeLeb128(i64) },
-                } },
-                .restore_extended =&gt; .{ .register = .{
-                    .index = try reader.takeLeb128(u8),
-                    .rule = .restore,
-                } },
-                .undefined =&gt; .{ .register = .{
-                    .index = try reader.takeLeb128(u8),
-                    .rule = .undefined,
-                } },
-                .same_value =&gt; .{ .register = .{
-                    .index = try reader.takeLeb128(u8),
-                    .rule = .same_value,
-                } },
-                .register =&gt; .{ .register = .{
-                    .index = try reader.takeLeb128(u8),
-                    .rule = .{ .register = try reader.takeLeb128(u8) },
-                } },
-                .val_offset =&gt; .{ .register = .{
-                    .index = try reader.takeLeb128(u8),
-                    .rule = .{ .val_offset_uf = try reader.takeLeb128(u64) },
-                } },
-                .val_offset_sf =&gt; .{ .register = .{
-                    .index = try reader.takeLeb128(u8),
-                    .rule = .{ .val_offset_sf = try reader.takeLeb128(i64) },
-                } },
-                .expression =&gt; .{ .register = .{
-                    .index = try reader.takeLeb128(u8),
-                    .rule = .{ .expr = try reader.takeLeb128(usize) },
-                } },
-                .val_expression =&gt; .{ .register = .{
-                    .index = try reader.takeLeb128(u8),
-                    .rule = .{ .val_expr = try reader.takeLeb128(usize) },
-                } },
-
-                .def_cfa =&gt; .{ .def_cfa = .{
-                    .register = try reader.takeLeb128(u8),
-                    .offset = try reader.takeLeb128(u64),
-                } },
-                .def_cfa_sf =&gt; .{ .def_cfa_sf = .{
-                    .register = try reader.takeLeb128(u8),
-                    .offset_sf = try reader.takeLeb128(i64),
-                } },
-                .def_cfa_register =&gt; .{ .def_cfa_reg = try reader.takeLeb128(u8) },
-                .def_cfa_offset =&gt; .{ .def_cfa_offset = try reader.takeLeb128(u64) },
-                .def_cfa_offset_sf =&gt; .{ .def_cfa_offset_sf = try reader.takeLeb128(i64) },
-                .def_cfa_expression =&gt; .{ .def_cfa_expr = try reader.takeLeb128(usize) },
-
-                _ =&gt; switch (@intFromEnum(inst.low.extended)) {
-                    0x1C...0x3F =&gt; return error.UnimplementedUserOpcode,
-                    else =&gt; return error.InvalidOpcode,
-                },
-            },
-        };
-    }
-};
-
-const std = @import("../../../std.zig");
-const assert = std.debug.assert;
-const Allocator = std.mem.Allocator;
-const Unwind = std.debug.Dwarf.Unwind;
-
-const VirtualMachine = @This();</pre>
+    <pre><a id="L1"></a>//! Virtual machine that evaluates DWARF call frame instructions
+<a id="L2"></a>
+<a id="L3"></a>/// See section 6.4.1 of the DWARF5 specification for details on each
+<a id="L4"></a>pub const RegisterRule = union(enum) {
+<a id="L5"></a>    /// The spec says that the default rule for each column is the undefined rule.
+<a id="L6"></a>    /// However, it also allows ABI / compiler authors to specify alternate defaults, so
+<a id="L7"></a>    /// there is a distinction made here.
+<a id="L8"></a>    default,
+<a id="L9"></a>    undefined,
+<a id="L10"></a>    same_value,
+<a id="L11"></a>    /// offset(N)
+<a id="L12"></a>    offset: i64,
+<a id="L13"></a>    /// val_offset(N)
+<a id="L14"></a>    val_offset: i64,
+<a id="L15"></a>    /// register(R)
+<a id="L16"></a>    register: u8,
+<a id="L17"></a>    /// expression(E)
+<a id="L18"></a>    expression: []const u8,
+<a id="L19"></a>    /// val_expression(E)
+<a id="L20"></a>    val_expression: []const u8,
+<a id="L21"></a>};
+<a id="L22"></a>
+<a id="L23"></a>pub const CfaRule = union(enum) {
+<a id="L24"></a>    none,
+<a id="L25"></a>    reg_off: struct {
+<a id="L26"></a>        register: u8,
+<a id="L27"></a>        offset: i64,
+<a id="L28"></a>    },
+<a id="L29"></a>    expression: []const u8,
+<a id="L30"></a>};
+<a id="L31"></a>
+<a id="L32"></a>/// Each row contains unwinding rules for a set of registers.
+<a id="L33"></a>pub const Row = struct {
+<a id="L34"></a>    /// Offset from `FrameDescriptionEntry.pc_begin`
+<a id="L35"></a>    offset: u64 = 0,
+<a id="L36"></a>    cfa: CfaRule = .none,
+<a id="L37"></a>    /// The register fields in these columns define the register the rule applies to.
+<a id="L38"></a>    columns: ColumnRange = .{ .start = undefined, .len = 0 },
+<a id="L39"></a>};
+<a id="L40"></a>
+<a id="L41"></a>pub const Column = struct {
+<a id="L42"></a>    register: u8,
+<a id="L43"></a>    rule: RegisterRule,
+<a id="L44"></a>};
+<a id="L45"></a>
+<a id="L46"></a>const ColumnRange = struct {
+<a id="L47"></a>    start: usize,
+<a id="L48"></a>    len: u8,
+<a id="L49"></a>};
+<a id="L50"></a>
+<a id="L51"></a>columns: std.ArrayList(Column) = .empty,
+<a id="L52"></a>stack: std.ArrayList(struct {
+<a id="L53"></a>    cfa: CfaRule,
+<a id="L54"></a>    columns: ColumnRange,
+<a id="L55"></a>}) = .empty,
+<a id="L56"></a>current_row: Row = .{},
+<a id="L57"></a>
+<a id="L58"></a>/// The result of executing the CIE's initial_instructions
+<a id="L59"></a>cie_row: ?Row = null,
+<a id="L60"></a>
+<a id="L61"></a>pub fn deinit(self: *VirtualMachine, gpa: Allocator) void {
+<a id="L62"></a>    self.stack.deinit(gpa);
+<a id="L63"></a>    self.columns.deinit(gpa);
+<a id="L64"></a>    self.* = undefined;
+<a id="L65"></a>}
+<a id="L66"></a>
+<a id="L67"></a>pub fn reset(self: *VirtualMachine) void {
+<a id="L68"></a>    self.stack.clearRetainingCapacity();
+<a id="L69"></a>    self.columns.clearRetainingCapacity();
+<a id="L70"></a>    self.current_row = .{};
+<a id="L71"></a>    self.cie_row = null;
+<a id="L72"></a>}
+<a id="L73"></a>
+<a id="L74"></a>/// Return a slice backed by the row's non-CFA columns
+<a id="L75"></a>pub fn rowColumns(self: *const VirtualMachine, row: *const Row) []Column {
+<a id="L76"></a>    if (row.columns.len == 0) return &amp;.{};
+<a id="L77"></a>    return self.columns.items[row.columns.start..][0..row.columns.len];
+<a id="L78"></a>}
+<a id="L79"></a>
+<a id="L80"></a>/// Either retrieves or adds a column for `register` (non-CFA) in the current row.
+<a id="L81"></a>fn getOrAddColumn(self: *VirtualMachine, gpa: Allocator, register: u8) !*Column {
+<a id="L82"></a>    for (self.rowColumns(&amp;self.current_row)) |*c| {
+<a id="L83"></a>        if (c.register == register) return c;
+<a id="L84"></a>    }
+<a id="L85"></a>
+<a id="L86"></a>    if (self.current_row.columns.len == 0) {
+<a id="L87"></a>        self.current_row.columns.start = self.columns.items.len;
+<a id="L88"></a>    } else {
+<a id="L89"></a>        assert(self.current_row.columns.start + self.current_row.columns.len == self.columns.items.len);
+<a id="L90"></a>    }
+<a id="L91"></a>    self.current_row.columns.len += 1;
+<a id="L92"></a>
+<a id="L93"></a>    const column = try self.columns.addOne(gpa);
+<a id="L94"></a>    column.* = .{
+<a id="L95"></a>        .register = register,
+<a id="L96"></a>        .rule = .default,
+<a id="L97"></a>    };
+<a id="L98"></a>
+<a id="L99"></a>    return column;
+<a id="L100"></a>}
+<a id="L101"></a>
+<a id="L102"></a>pub fn populateCieLastRow(
+<a id="L103"></a>    gpa: Allocator,
+<a id="L104"></a>    cie: *Unwind.CommonInformationEntry,
+<a id="L105"></a>    addr_size_bytes: u8,
+<a id="L106"></a>    endian: std.builtin.Endian,
+<a id="L107"></a>) !void {
+<a id="L108"></a>    assert(cie.last_row == null);
+<a id="L109"></a>
+<a id="L110"></a>    var vm: VirtualMachine = .{};
+<a id="L111"></a>    defer vm.deinit(gpa);
+<a id="L112"></a>
+<a id="L113"></a>    try vm.evalInstructions(
+<a id="L114"></a>        gpa,
+<a id="L115"></a>        cie,
+<a id="L116"></a>        std.math.maxInt(u64),
+<a id="L117"></a>        cie.initial_instructions,
+<a id="L118"></a>        addr_size_bytes,
+<a id="L119"></a>        endian,
+<a id="L120"></a>    );
+<a id="L121"></a>
+<a id="L122"></a>    cie.last_row = .{
+<a id="L123"></a>        .offset = vm.current_row.offset,
+<a id="L124"></a>        .cfa = vm.current_row.cfa,
+<a id="L125"></a>        .cols = try gpa.dupe(Column, vm.rowColumns(&amp;vm.current_row)),
+<a id="L126"></a>    };
+<a id="L127"></a>}
+<a id="L128"></a>
+<a id="L129"></a>/// Runs the CIE instructions, then the FDE instructions. Execution halts
+<a id="L130"></a>/// once the row that corresponds to `pc` is known, and the row is returned.
+<a id="L131"></a>pub fn runTo(
+<a id="L132"></a>    vm: *VirtualMachine,
+<a id="L133"></a>    gpa: Allocator,
+<a id="L134"></a>    pc: u64,
+<a id="L135"></a>    cie: *const Unwind.CommonInformationEntry,
+<a id="L136"></a>    fde: *const Unwind.FrameDescriptionEntry,
+<a id="L137"></a>    addr_size_bytes: u8,
+<a id="L138"></a>    endian: std.builtin.Endian,
+<a id="L139"></a>) !Row {
+<a id="L140"></a>    assert(vm.cie_row == null);
+<a id="L141"></a>
+<a id="L142"></a>    const target_offset = pc - fde.pc_begin;
+<a id="L143"></a>    assert(target_offset &lt; fde.pc_range);
+<a id="L144"></a>
+<a id="L145"></a>    const instruction_bytes: []const u8 = insts: {
+<a id="L146"></a>        if (target_offset &lt; cie.last_row.?.offset) {
+<a id="L147"></a>            break :insts cie.initial_instructions;
+<a id="L148"></a>        }
+<a id="L149"></a>        // This is the more common case: start from the CIE's last row.
+<a id="L150"></a>        assert(vm.columns.items.len == 0);
+<a id="L151"></a>        vm.current_row = .{
+<a id="L152"></a>            .offset = cie.last_row.?.offset,
+<a id="L153"></a>            .cfa = cie.last_row.?.cfa,
+<a id="L154"></a>            .columns = .{
+<a id="L155"></a>                .start = 0,
+<a id="L156"></a>                .len = @intCast(cie.last_row.?.cols.len),
+<a id="L157"></a>            },
+<a id="L158"></a>        };
+<a id="L159"></a>        try vm.columns.appendSlice(gpa, cie.last_row.?.cols);
+<a id="L160"></a>        vm.cie_row = vm.current_row;
+<a id="L161"></a>        break :insts fde.instructions;
+<a id="L162"></a>    };
+<a id="L163"></a>
+<a id="L164"></a>    try vm.evalInstructions(
+<a id="L165"></a>        gpa,
+<a id="L166"></a>        cie,
+<a id="L167"></a>        target_offset,
+<a id="L168"></a>        instruction_bytes,
+<a id="L169"></a>        addr_size_bytes,
+<a id="L170"></a>        endian,
+<a id="L171"></a>    );
+<a id="L172"></a>    return vm.current_row;
+<a id="L173"></a>}
+<a id="L174"></a>
+<a id="L175"></a>/// Evaluates instructions from `instruction_bytes` until `target_addr` is reached or all
+<a id="L176"></a>/// instructions have been evaluated.
+<a id="L177"></a>fn evalInstructions(
+<a id="L178"></a>    vm: *VirtualMachine,
+<a id="L179"></a>    gpa: Allocator,
+<a id="L180"></a>    cie: *const Unwind.CommonInformationEntry,
+<a id="L181"></a>    target_addr: u64,
+<a id="L182"></a>    instruction_bytes: []const u8,
+<a id="L183"></a>    addr_size_bytes: u8,
+<a id="L184"></a>    endian: std.builtin.Endian,
+<a id="L185"></a>) !void {
+<a id="L186"></a>    var fr: std.Io.Reader = .fixed(instruction_bytes);
+<a id="L187"></a>    while (fr.seek &lt; fr.buffer.len) {
+<a id="L188"></a>        switch (try Instruction.read(&amp;fr, addr_size_bytes, endian)) {
+<a id="L189"></a>            .nop =&gt; {
+<a id="L190"></a>                // If there was one nop, there's a good chance we've reached the padding and so
+<a id="L191"></a>                // everything left is a nop, which is represented by a 0 byte.
+<a id="L192"></a>                if (std.mem.allEqual(u8, fr.buffered(), 0)) return;
+<a id="L193"></a>            },
+<a id="L194"></a>
+<a id="L195"></a>            .remember_state =&gt; {
+<a id="L196"></a>                try vm.stack.append(gpa, .{
+<a id="L197"></a>                    .cfa = vm.current_row.cfa,
+<a id="L198"></a>                    .columns = vm.current_row.columns,
+<a id="L199"></a>                });
+<a id="L200"></a>                const cols_len = vm.current_row.columns.len;
+<a id="L201"></a>                const copy_start = vm.columns.items.len;
+<a id="L202"></a>                assert(vm.current_row.columns.start == copy_start - cols_len);
+<a id="L203"></a>                try vm.columns.ensureUnusedCapacity(gpa, cols_len); // to prevent aliasing issues
+<a id="L204"></a>                vm.columns.appendSliceAssumeCapacity(vm.columns.items[copy_start - cols_len ..]);
+<a id="L205"></a>                vm.current_row.columns.start = copy_start;
+<a id="L206"></a>            },
+<a id="L207"></a>            .restore_state =&gt; {
+<a id="L208"></a>                const restored = vm.stack.pop() orelse return error.InvalidOperation;
+<a id="L209"></a>                vm.columns.shrinkRetainingCapacity(restored.columns.start + restored.columns.len);
+<a id="L210"></a>
+<a id="L211"></a>                vm.current_row.cfa = restored.cfa;
+<a id="L212"></a>                vm.current_row.columns = restored.columns;
+<a id="L213"></a>            },
+<a id="L214"></a>
+<a id="L215"></a>            .advance_loc =&gt; |delta| {
+<a id="L216"></a>                const new_addr = vm.current_row.offset + delta * cie.code_alignment_factor;
+<a id="L217"></a>                if (new_addr &gt; target_addr) return;
+<a id="L218"></a>                vm.current_row.offset = new_addr;
+<a id="L219"></a>            },
+<a id="L220"></a>            .set_loc =&gt; |new_addr| {
+<a id="L221"></a>                if (new_addr &lt;= vm.current_row.offset) return error.InvalidOperation;
+<a id="L222"></a>                if (cie.segment_selector_size != 0) return error.InvalidOperation; // unsupported
+<a id="L223"></a>                // TODO: Check cie.segment_selector_size != 0 for DWARFV4
+<a id="L224"></a>
+<a id="L225"></a>                if (new_addr &gt; target_addr) return;
+<a id="L226"></a>                vm.current_row.offset = new_addr;
+<a id="L227"></a>            },
+<a id="L228"></a>
+<a id="L229"></a>            .register =&gt; |reg| {
+<a id="L230"></a>                const column = try vm.getOrAddColumn(gpa, reg.index);
+<a id="L231"></a>                column.rule = switch (reg.rule) {
+<a id="L232"></a>                    .restore =&gt; rule: {
+<a id="L233"></a>                        const cie_row = &amp;(vm.cie_row orelse return error.InvalidOperation);
+<a id="L234"></a>                        for (vm.rowColumns(cie_row)) |cie_col| {
+<a id="L235"></a>                            if (cie_col.register == reg.index) break :rule cie_col.rule;
+<a id="L236"></a>                        }
+<a id="L237"></a>                        break :rule .default;
+<a id="L238"></a>                    },
+<a id="L239"></a>                    .undefined =&gt; .undefined,
+<a id="L240"></a>                    .same_value =&gt; .same_value,
+<a id="L241"></a>                    .offset_uf =&gt; |off| .{ .offset = @as(i64, @intCast(off)) * cie.data_alignment_factor },
+<a id="L242"></a>                    .offset_sf =&gt; |off| .{ .offset = off * cie.data_alignment_factor },
+<a id="L243"></a>                    .val_offset_uf =&gt; |off| .{ .val_offset = @as(i64, @intCast(off)) * cie.data_alignment_factor },
+<a id="L244"></a>                    .val_offset_sf =&gt; |off| .{ .val_offset = off * cie.data_alignment_factor },
+<a id="L245"></a>                    .register =&gt; |callee_reg| .{ .register = callee_reg },
+<a id="L246"></a>                    .expr =&gt; |len| .{ .expression = try takeExprBlock(&amp;fr, len) },
+<a id="L247"></a>                    .val_expr =&gt; |len| .{ .val_expression = try takeExprBlock(&amp;fr, len) },
+<a id="L248"></a>                };
+<a id="L249"></a>            },
+<a id="L250"></a>            .def_cfa =&gt; |cfa| vm.current_row.cfa = .{ .reg_off = .{
+<a id="L251"></a>                .register = cfa.register,
+<a id="L252"></a>                .offset = @intCast(cfa.offset),
+<a id="L253"></a>            } },
+<a id="L254"></a>            .def_cfa_sf =&gt; |cfa| vm.current_row.cfa = .{ .reg_off = .{
+<a id="L255"></a>                .register = cfa.register,
+<a id="L256"></a>                .offset = cfa.offset_sf * cie.data_alignment_factor,
+<a id="L257"></a>            } },
+<a id="L258"></a>            .def_cfa_reg =&gt; |register| switch (vm.current_row.cfa) {
+<a id="L259"></a>                .none =&gt; {
+<a id="L260"></a>                    // According to the DWARF specification, this is not valid, because this
+<a id="L261"></a>                    // instruction can only be used to replace the register if the rule is already a
+<a id="L262"></a>                    // `.reg_off`. However, this is emitted in practice by GNU toolchains for some
+<a id="L263"></a>                    // targets, and so by convention is interpreted as equivalent to `.def_cfa` with
+<a id="L264"></a>                    // an offset of 0.
+<a id="L265"></a>                    vm.current_row.cfa = .{ .reg_off = .{
+<a id="L266"></a>                        .register = register,
+<a id="L267"></a>                        .offset = 0,
+<a id="L268"></a>                    } };
+<a id="L269"></a>                },
+<a id="L270"></a>                .expression =&gt; return error.InvalidOperation,
+<a id="L271"></a>                .reg_off =&gt; |*ro| ro.register = register,
+<a id="L272"></a>            },
+<a id="L273"></a>            .def_cfa_offset =&gt; |offset| switch (vm.current_row.cfa) {
+<a id="L274"></a>                .none, .expression =&gt; return error.InvalidOperation,
+<a id="L275"></a>                .reg_off =&gt; |*ro| ro.offset = @intCast(offset),
+<a id="L276"></a>            },
+<a id="L277"></a>            .def_cfa_offset_sf =&gt; |offset_sf| switch (vm.current_row.cfa) {
+<a id="L278"></a>                .none, .expression =&gt; return error.InvalidOperation,
+<a id="L279"></a>                .reg_off =&gt; |*ro| ro.offset = offset_sf * cie.data_alignment_factor,
+<a id="L280"></a>            },
+<a id="L281"></a>            .def_cfa_expr =&gt; |len| {
+<a id="L282"></a>                vm.current_row.cfa = .{ .expression = try takeExprBlock(&amp;fr, len) };
+<a id="L283"></a>            },
+<a id="L284"></a>        }
+<a id="L285"></a>    }
+<a id="L286"></a>}
+<a id="L287"></a>
+<a id="L288"></a>fn takeExprBlock(r: *std.Io.Reader, len: usize) error{ ReadFailed, InvalidOperand }![]const u8 {
+<a id="L289"></a>    return r.take(len) catch |err| switch (err) {
+<a id="L290"></a>        error.ReadFailed =&gt; |e| return e,
+<a id="L291"></a>        error.EndOfStream =&gt; return error.InvalidOperand,
+<a id="L292"></a>    };
+<a id="L293"></a>}
+<a id="L294"></a>
+<a id="L295"></a>const OpcodeByte = packed struct(u8) {
+<a id="L296"></a>    low: packed union {
+<a id="L297"></a>        operand: u6,
+<a id="L298"></a>        extended: enum(u6) {
+<a id="L299"></a>            nop = 0,
+<a id="L300"></a>            set_loc = 1,
+<a id="L301"></a>            advance_loc1 = 2,
+<a id="L302"></a>            advance_loc2 = 3,
+<a id="L303"></a>            advance_loc4 = 4,
+<a id="L304"></a>            offset_extended = 5,
+<a id="L305"></a>            restore_extended = 6,
+<a id="L306"></a>            undefined = 7,
+<a id="L307"></a>            same_value = 8,
+<a id="L308"></a>            register = 9,
+<a id="L309"></a>            remember_state = 10,
+<a id="L310"></a>            restore_state = 11,
+<a id="L311"></a>            def_cfa = 12,
+<a id="L312"></a>            def_cfa_register = 13,
+<a id="L313"></a>            def_cfa_offset = 14,
+<a id="L314"></a>            def_cfa_expression = 15,
+<a id="L315"></a>            expression = 16,
+<a id="L316"></a>            offset_extended_sf = 17,
+<a id="L317"></a>            def_cfa_sf = 18,
+<a id="L318"></a>            def_cfa_offset_sf = 19,
+<a id="L319"></a>            val_offset = 20,
+<a id="L320"></a>            val_offset_sf = 21,
+<a id="L321"></a>            val_expression = 22,
+<a id="L322"></a>            _,
+<a id="L323"></a>        },
+<a id="L324"></a>    },
+<a id="L325"></a>    opcode: enum(u2) {
+<a id="L326"></a>        extended = 0,
+<a id="L327"></a>        advance_loc = 1,
+<a id="L328"></a>        offset = 2,
+<a id="L329"></a>        restore = 3,
+<a id="L330"></a>    },
+<a id="L331"></a>};
+<a id="L332"></a>
+<a id="L333"></a>pub const Instruction = union(enum) {
+<a id="L334"></a>    nop,
+<a id="L335"></a>    remember_state,
+<a id="L336"></a>    restore_state,
+<a id="L337"></a>    advance_loc: u32,
+<a id="L338"></a>    set_loc: u64,
+<a id="L339"></a>
+<a id="L340"></a>    register: struct {
+<a id="L341"></a>        index: u8,
+<a id="L342"></a>        rule: union(enum) {
+<a id="L343"></a>            restore, // restore from cie
+<a id="L344"></a>            undefined,
+<a id="L345"></a>            same_value,
+<a id="L346"></a>            offset_uf: u64,
+<a id="L347"></a>            offset_sf: i64,
+<a id="L348"></a>            val_offset_uf: u64,
+<a id="L349"></a>            val_offset_sf: i64,
+<a id="L350"></a>            register: u8,
+<a id="L351"></a>            /// Value is the number of bytes in the DWARF expression, which the caller must read.
+<a id="L352"></a>            expr: usize,
+<a id="L353"></a>            /// Value is the number of bytes in the DWARF expression, which the caller must read.
+<a id="L354"></a>            val_expr: usize,
+<a id="L355"></a>        },
+<a id="L356"></a>    },
+<a id="L357"></a>
+<a id="L358"></a>    def_cfa: struct {
+<a id="L359"></a>        register: u8,
+<a id="L360"></a>        offset: u64,
+<a id="L361"></a>    },
+<a id="L362"></a>    def_cfa_sf: struct {
+<a id="L363"></a>        register: u8,
+<a id="L364"></a>        offset_sf: i64,
+<a id="L365"></a>    },
+<a id="L366"></a>    def_cfa_reg: u8,
+<a id="L367"></a>    def_cfa_offset: u64,
+<a id="L368"></a>    def_cfa_offset_sf: i64,
+<a id="L369"></a>    /// Value is the number of bytes in the DWARF expression, which the caller must read.
+<a id="L370"></a>    def_cfa_expr: usize,
+<a id="L371"></a>
+<a id="L372"></a>    pub fn read(
+<a id="L373"></a>        reader: *std.Io.Reader,
+<a id="L374"></a>        addr_size_bytes: u8,
+<a id="L375"></a>        endian: std.builtin.Endian,
+<a id="L376"></a>    ) !Instruction {
+<a id="L377"></a>        const inst: OpcodeByte = @bitCast(try reader.takeByte());
+<a id="L378"></a>        return switch (inst.opcode) {
+<a id="L379"></a>            .advance_loc =&gt; .{ .advance_loc = inst.low.operand },
+<a id="L380"></a>            .offset =&gt; .{ .register = .{
+<a id="L381"></a>                .index = inst.low.operand,
+<a id="L382"></a>                .rule = .{ .offset_uf = try reader.takeLeb128(u64) },
+<a id="L383"></a>            } },
+<a id="L384"></a>            .restore =&gt; .{ .register = .{
+<a id="L385"></a>                .index = inst.low.operand,
+<a id="L386"></a>                .rule = .restore,
+<a id="L387"></a>            } },
+<a id="L388"></a>            .extended =&gt; switch (inst.low.extended) {
+<a id="L389"></a>                .nop =&gt; .nop,
+<a id="L390"></a>                .remember_state =&gt; .remember_state,
+<a id="L391"></a>                .restore_state =&gt; .restore_state,
+<a id="L392"></a>                .advance_loc1 =&gt; .{ .advance_loc = try reader.takeByte() },
+<a id="L393"></a>                .advance_loc2 =&gt; .{ .advance_loc = try reader.takeInt(u16, endian) },
+<a id="L394"></a>                .advance_loc4 =&gt; .{ .advance_loc = try reader.takeInt(u32, endian) },
+<a id="L395"></a>                .set_loc =&gt; .{ .set_loc = switch (addr_size_bytes) {
+<a id="L396"></a>                    2 =&gt; try reader.takeInt(u16, endian),
+<a id="L397"></a>                    4 =&gt; try reader.takeInt(u32, endian),
+<a id="L398"></a>                    8 =&gt; try reader.takeInt(u64, endian),
+<a id="L399"></a>                    else =&gt; return error.UnsupportedAddrSize,
+<a id="L400"></a>                } },
+<a id="L401"></a>
+<a id="L402"></a>                .offset_extended =&gt; .{ .register = .{
+<a id="L403"></a>                    .index = try reader.takeLeb128(u8),
+<a id="L404"></a>                    .rule = .{ .offset_uf = try reader.takeLeb128(u64) },
+<a id="L405"></a>                } },
+<a id="L406"></a>                .offset_extended_sf =&gt; .{ .register = .{
+<a id="L407"></a>                    .index = try reader.takeLeb128(u8),
+<a id="L408"></a>                    .rule = .{ .offset_sf = try reader.takeLeb128(i64) },
+<a id="L409"></a>                } },
+<a id="L410"></a>                .restore_extended =&gt; .{ .register = .{
+<a id="L411"></a>                    .index = try reader.takeLeb128(u8),
+<a id="L412"></a>                    .rule = .restore,
+<a id="L413"></a>                } },
+<a id="L414"></a>                .undefined =&gt; .{ .register = .{
+<a id="L415"></a>                    .index = try reader.takeLeb128(u8),
+<a id="L416"></a>                    .rule = .undefined,
+<a id="L417"></a>                } },
+<a id="L418"></a>                .same_value =&gt; .{ .register = .{
+<a id="L419"></a>                    .index = try reader.takeLeb128(u8),
+<a id="L420"></a>                    .rule = .same_value,
+<a id="L421"></a>                } },
+<a id="L422"></a>                .register =&gt; .{ .register = .{
+<a id="L423"></a>                    .index = try reader.takeLeb128(u8),
+<a id="L424"></a>                    .rule = .{ .register = try reader.takeLeb128(u8) },
+<a id="L425"></a>                } },
+<a id="L426"></a>                .val_offset =&gt; .{ .register = .{
+<a id="L427"></a>                    .index = try reader.takeLeb128(u8),
+<a id="L428"></a>                    .rule = .{ .val_offset_uf = try reader.takeLeb128(u64) },
+<a id="L429"></a>                } },
+<a id="L430"></a>                .val_offset_sf =&gt; .{ .register = .{
+<a id="L431"></a>                    .index = try reader.takeLeb128(u8),
+<a id="L432"></a>                    .rule = .{ .val_offset_sf = try reader.takeLeb128(i64) },
+<a id="L433"></a>                } },
+<a id="L434"></a>                .expression =&gt; .{ .register = .{
+<a id="L435"></a>                    .index = try reader.takeLeb128(u8),
+<a id="L436"></a>                    .rule = .{ .expr = try reader.takeLeb128(usize) },
+<a id="L437"></a>                } },
+<a id="L438"></a>                .val_expression =&gt; .{ .register = .{
+<a id="L439"></a>                    .index = try reader.takeLeb128(u8),
+<a id="L440"></a>                    .rule = .{ .val_expr = try reader.takeLeb128(usize) },
+<a id="L441"></a>                } },
+<a id="L442"></a>
+<a id="L443"></a>                .def_cfa =&gt; .{ .def_cfa = .{
+<a id="L444"></a>                    .register = try reader.takeLeb128(u8),
+<a id="L445"></a>                    .offset = try reader.takeLeb128(u64),
+<a id="L446"></a>                } },
+<a id="L447"></a>                .def_cfa_sf =&gt; .{ .def_cfa_sf = .{
+<a id="L448"></a>                    .register = try reader.takeLeb128(u8),
+<a id="L449"></a>                    .offset_sf = try reader.takeLeb128(i64),
+<a id="L450"></a>                } },
+<a id="L451"></a>                .def_cfa_register =&gt; .{ .def_cfa_reg = try reader.takeLeb128(u8) },
+<a id="L452"></a>                .def_cfa_offset =&gt; .{ .def_cfa_offset = try reader.takeLeb128(u64) },
+<a id="L453"></a>                .def_cfa_offset_sf =&gt; .{ .def_cfa_offset_sf = try reader.takeLeb128(i64) },
+<a id="L454"></a>                .def_cfa_expression =&gt; .{ .def_cfa_expr = try reader.takeLeb128(usize) },
+<a id="L455"></a>
+<a id="L456"></a>                _ =&gt; switch (@intFromEnum(inst.low.extended)) {
+<a id="L457"></a>                    0x1C...0x3F =&gt; return error.UnimplementedUserOpcode,
+<a id="L458"></a>                    else =&gt; return error.InvalidOpcode,
+<a id="L459"></a>                },
+<a id="L460"></a>            },
+<a id="L461"></a>        };
+<a id="L462"></a>    }
+<a id="L463"></a>};
+<a id="L464"></a>
+<a id="L465"></a>const std = @import("../../../std.zig");
+<a id="L466"></a>const assert = std.debug.assert;
+<a id="L467"></a>const Allocator = std.mem.Allocator;
+<a id="L468"></a>const Unwind = std.debug.Dwarf.Unwind;
+<a id="L469"></a>
+<a id="L470"></a>const VirtualMachine = @This();
+</pre>
 </body>
 </html>

@@ -2,1233 +2,1236 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Source: zig-0.16.0-std/zig/system.zig</title>
+    <title>Source: zig/system.zig</title>
     <style>
         body { background: #1e1e1e; color: #d4d4d4; font-family: monospace; padding: 20px; }
         pre { white-space: pre-wrap; word-wrap: break-word; }
         .header { border-bottom: 1px solid #444; padding-bottom: 10px; margin-bottom: 20px; }
         a { color: #569cd6; }
+        a[id] { color: inherit; text-decoration: none; }
+        :target { background: #3a3a00; }
     </style>
 </head>
 <body>
     <div class="header">
-        <a href="/">Index</a> | <strong>File: zig-0.16.0-std/zig/system.zig</strong>
+        <a href="/">Index</a> | <strong>File: zig/system.zig</strong>
     </div>
-    <pre>const builtin = @import("builtin");
-const native_endian = builtin.cpu.arch.endian();
-
-const std = @import("../std.zig");
-const mem = std.mem;
-const elf = std.elf;
-const fs = std.fs;
-const assert = std.debug.assert;
-const Target = std.Target;
-const posix = std.posix;
-const Io = std.Io;
-
-pub const NativePaths = @import("system/NativePaths.zig");
-
-pub const windows = @import("system/windows.zig");
-pub const darwin = @import("system/darwin.zig");
-pub const linux = @import("system/linux.zig");
-
-pub const Executor = union(enum) {
-    native,
-    rosetta,
-    qemu: []const u8,
-    wine: []const u8,
-    wasmtime: []const u8,
-    darling: []const u8,
-    bad_dl: []const u8,
-    bad_os_or_cpu,
-};
-
-pub const GetExternalExecutorOptions = struct {
-    allow_darling: bool = true,
-    allow_qemu: bool = true,
-    allow_rosetta: bool = true,
-    allow_wasmtime: bool = true,
-    allow_wine: bool = true,
-    qemu_fixes_dl: bool = false,
-    link_libc: bool = false,
-};
-
-/// Return whether or not the given host is capable of running executables of
-/// the other target.
-pub fn getExternalExecutor(
-    io: Io,
-    host: *const std.Target,
-    candidate: *const std.Target,
-    options: GetExternalExecutorOptions,
-) Executor {
-    const os_match = host.os.tag == candidate.os.tag;
-    const cpu_ok = cpu_ok: {
-        if (host.cpu.arch == candidate.cpu.arch)
-            break :cpu_ok true;
-
-        if (host.cpu.arch == .x86_64 and candidate.cpu.arch == .x86)
-            break :cpu_ok true;
-
-        if (host.cpu.arch == .aarch64 and candidate.cpu.arch == .arm)
-            break :cpu_ok true;
-
-        if (host.cpu.arch == .aarch64_be and candidate.cpu.arch == .armeb)
-            break :cpu_ok true;
-
-        // TODO additionally detect incompatible CPU features.
-        // Note that in some cases the OS kernel will emulate missing CPU features
-        // when an illegal instruction is encountered.
-
-        break :cpu_ok false;
-    };
-
-    var bad_result: Executor = .bad_os_or_cpu;
-
-    if (os_match and cpu_ok) native: {
-        if (options.link_libc) {
-            if (candidate.dynamic_linker.get()) |candidate_dl| {
-                Io.Dir.cwd().access(io, candidate_dl, .{}) catch {
-                    bad_result = .{ .bad_dl = candidate_dl };
-                    break :native;
-                };
-            }
-        }
-        return .native;
-    }
-
-    // If the OS match and OS is macOS and CPU is arm64, we can use Rosetta 2
-    // to emulate the foreign architecture.
-    if (options.allow_rosetta and os_match and
-        (host.os.tag == .maccatalyst or host.os.tag == .macos) and host.cpu.arch == .aarch64)
-    {
-        switch (candidate.cpu.arch) {
-            .x86_64 =&gt; return .rosetta,
-            else =&gt; return bad_result,
-        }
-    }
-
-    // If the OS matches, we can use QEMU to emulate a foreign architecture.
-    if (options.allow_qemu and os_match and (!cpu_ok or options.qemu_fixes_dl)) {
-        return switch (candidate.cpu.arch) {
-            inline .aarch64,
-            .arm,
-            .riscv64,
-            .x86,
-            .x86_64,
-            =&gt; |t| switch (candidate.os.tag) {
-                .linux,
-                .freebsd,
-                =&gt; .{ .qemu = switch (t) {
-                    .x86 =&gt; "qemu-i386",
-                    .x86_64 =&gt; switch (candidate.abi) {
-                        .gnux32, .muslx32 =&gt; return bad_result,
-                        else =&gt; "qemu-x86_64",
-                    },
-                    else =&gt; "qemu-" ++ @tagName(t),
-                } },
-                else =&gt; bad_result,
-            },
-            inline .aarch64_be,
-            .alpha,
-            .armeb,
-            .hexagon,
-            .hppa,
-            .loongarch64,
-            .m68k,
-            .microblaze,
-            .microblazeel,
-            .mips,
-            .mipsel,
-            .mips64,
-            .mips64el,
-            .or1k,
-            .powerpc,
-            .powerpc64,
-            .powerpc64le,
-            .riscv32,
-            .s390x,
-            .sh,
-            .sheb,
-            .sparc,
-            .sparc64,
-            .thumb,
-            .thumbeb,
-            .xtensa,
-            .xtensaeb,
-            =&gt; |t| switch (candidate.os.tag) {
-                .linux,
-                =&gt; .{
-                    .qemu = switch (t) {
-                        .powerpc =&gt; "qemu-ppc",
-                        .powerpc64 =&gt; "qemu-ppc64",
-                        .powerpc64le =&gt; "qemu-ppc64le",
-                        .mips64, .mips64el =&gt; switch (candidate.abi) {
-                            .gnuabin32, .muslabin32 =&gt; if (t == .mips64el) "qemu-mipsn32el" else "qemu-mipsn32",
-                            else =&gt; "qemu-" ++ @tagName(t),
-                        },
-                        // TODO: Actually check the SuperH version.
-                        .sh =&gt; "qemu-sh4",
-                        .sheb =&gt; "qemu-sh4eb",
-                        .sparc =&gt; if (candidate.cpu.has(.sparc, .v8plus)) "qemu-sparc32plus" else "qemu-sparc",
-                        .thumb =&gt; "qemu-arm",
-                        .thumbeb =&gt; "qemu-armeb",
-                        else =&gt; "qemu-" ++ @tagName(t),
-                    },
-                },
-                else =&gt; bad_result,
-            },
-            else =&gt; bad_result,
-        };
-    }
-
-    if (options.allow_wasmtime and candidate.cpu.arch.isWasm()) {
-        return .{ .wasmtime = "wasmtime" };
-    }
-
-    switch (candidate.os.tag) {
-        .windows =&gt; {
-            if (options.allow_wine) {
-                const wine_supported = switch (candidate.cpu.arch) {
-                    .thumb =&gt; switch (host.cpu.arch) {
-                        .arm, .thumb, .aarch64 =&gt; true,
-                        else =&gt; false,
-                    },
-                    .aarch64 =&gt; host.cpu.arch == .aarch64,
-                    .x86 =&gt; host.cpu.arch.isX86(),
-                    .x86_64 =&gt; host.cpu.arch == .x86_64,
-                    else =&gt; false,
-                };
-                return if (wine_supported) .{ .wine = "wine" } else bad_result;
-            }
-            return bad_result;
-        },
-        .driverkit, .macos =&gt; {
-            if (options.allow_darling) {
-                // This check can be loosened once darling adds a QEMU-based emulation
-                // layer for non-host architectures:
-                // https://github.com/darlinghq/darling/issues/863
-                if (candidate.cpu.arch != host.cpu.arch) {
-                    return bad_result;
-                }
-                return .{ .darling = "darling" };
-            }
-            return bad_result;
-        },
-        else =&gt; return bad_result,
-    }
-}
-
-pub const DetectError = error{
-    FileSystem,
-    SystemResources,
-    SymLinkLoop,
-    ProcessFdQuotaExceeded,
-    SystemFdQuotaExceeded,
-    DeviceBusy,
-    OSVersionDetectionFail,
-    Unexpected,
-    /// Android-only. Querying API level through `getprop` failed.
-    ApiLevelQueryFailed,
-} || Io.Cancelable;
-
-/// Given a `Target.Query`, which specifies in detail which parts of the
-/// target should be detected natively, which should be standard or default,
-/// and which are provided explicitly, this function resolves the native
-/// components by detecting the native system, and then resolves
-/// standard/default parts relative to that.
-pub fn resolveTargetQuery(io: Io, query: Target.Query) DetectError!Target {
-    // Until https://github.com/ziglang/zig/issues/4592 is implemented (support detecting the
-    // native CPU architecture as being different than the current target), we use this:
-    const query_cpu_arch = query.cpu_arch orelse builtin.cpu.arch;
-    const query_os_tag = query.os_tag orelse builtin.os.tag;
-    const query_abi = query.abi orelse builtin.abi;
-    var os = query_os_tag.defaultVersionRange(query_cpu_arch, query_abi);
-    if (query.os_tag == null) {
-        switch (builtin.target.os.tag) {
-            .linux, .illumos =&gt; {
-                const uts = posix.uname();
-                const release = mem.sliceTo(&amp;uts.release, 0);
-                // The release field sometimes has a weird format,
-                // `Version.parse` will attempt to find some meaningful interpretation.
-                if (std.SemanticVersion.parse(release)) |ver| {
-                    var stripped = ver;
-                    stripped.pre = null;
-                    stripped.build = null;
-                    os.version_range.linux.range.min = stripped;
-                    os.version_range.linux.range.max = stripped;
-                } else |err| switch (err) {
-                    error.Overflow =&gt; {},
-                    error.InvalidVersion =&gt; {},
-                }
-            },
-            .windows =&gt; {
-                const detected_version = windows.detectRuntimeVersion();
-                os.version_range.windows.min = detected_version;
-                os.version_range.windows.max = detected_version;
-            },
-            .macos =&gt; try darwin.macos.detect(io, &amp;os),
-            .freebsd, .netbsd, .dragonfly =&gt; {
-                const key = switch (builtin.target.os.tag) {
-                    .freebsd =&gt; "kern.osreldate",
-                    .netbsd, .dragonfly =&gt; "kern.osrevision",
-                    else =&gt; unreachable,
-                };
-                var value: u32 = undefined;
-                var len: usize = @sizeOf(@TypeOf(value));
-
-                switch (posix.errno(posix.system.sysctlbyname(key, &amp;value, &amp;len, null, 0))) {
-                    .SUCCESS =&gt; {},
-                    .FAULT =&gt; unreachable,
-                    .PERM =&gt; unreachable, // only when setting values,
-                    .NOMEM =&gt; unreachable, // memory already on the stack
-                    .NOENT =&gt; unreachable, // constant, known good value
-                    else =&gt; return error.OSVersionDetectionFail,
-                }
-
-                switch (builtin.target.os.tag) {
-                    .freebsd =&gt; {
-                        // https://www.freebsd.org/doc/en_US.ISO8859-1/books/porters-handbook/versions.html
-                        // Major * 100,000 has been convention since FreeBSD 2.2 (1997)
-                        // Minor * 1(0),000 summed has been convention since FreeBSD 2.2 (1997)
-                        // e.g. 492101 = 4.11-STABLE = 4.(9+2)
-                        const major = value / 100_000;
-                        const minor1 = value % 100_000 / 10_000; // usually 0 since 5.1
-                        const minor2 = value % 10_000 / 1_000; // 0 before 5.1, minor version since
-                        const patch = value % 1_000;
-                        os.version_range.semver.min = .{ .major = major, .minor = minor1 + minor2, .patch = patch };
-                        os.version_range.semver.max = os.version_range.semver.min;
-                    },
-                    .netbsd =&gt; {
-                        // #define __NetBSD_Version__ MMmmrrpp00
-                        //
-                        // M = major version
-                        // m = minor version; a minor number of 99 indicates current.
-                        // r = 0 (*)
-                        // p = patchlevel
-                        const major = value / 100_000_000;
-                        const minor = value % 100_000_000 / 1_000_000;
-                        const patch = value % 10_000 / 100;
-                        os.version_range.semver.min = .{ .major = major, .minor = minor, .patch = patch };
-                        os.version_range.semver.max = os.version_range.semver.min;
-                    },
-                    .dragonfly =&gt; {
-                        // https://github.com/DragonFlyBSD/DragonFlyBSD/blob/cb2cde83771754aeef9bb3251ee48959138dec87/Makefile.inc1#L15-L17
-                        // flat base10 format: Mmmmpp
-                        //   M = major
-                        //   m = minor; odd-numbers indicate current dev branch
-                        //   p = patch
-                        const major = value / 100_000;
-                        const minor = value % 100_000 / 100;
-                        const patch = value % 100;
-                        os.version_range.semver.min = .{ .major = major, .minor = minor, .patch = patch };
-                        os.version_range.semver.max = os.version_range.semver.min;
-                    },
-                    else =&gt; unreachable,
-                }
-            },
-            .openbsd =&gt; {
-                const mib: [2]c_int = [_]c_int{
-                    posix.CTL.KERN,
-                    posix.KERN.OSRELEASE,
-                };
-                var buf: [64:0]u8 = undefined;
-                // consider that sysctl result includes null-termination
-                var len: usize = buf.len + 1;
-
-                posix.sysctl(&amp;mib, &amp;buf, &amp;len, null, 0) catch |err| switch (err) {
-                    error.NameTooLong =&gt; unreachable, // constant, known good value
-                    error.PermissionDenied =&gt; unreachable, // only when setting values,
-                    error.SystemResources =&gt; unreachable, // memory already on the stack
-                    error.UnknownName =&gt; unreachable, // constant, known good value
-                    error.Unexpected =&gt; return error.OSVersionDetectionFail,
-                };
-
-                if (Target.Query.parseVersion(buf[0 .. len - 1 :0])) |ver| {
-                    assert(ver.build == null);
-                    assert(ver.pre == null);
-                    os.version_range.semver.min = ver;
-                    os.version_range.semver.max = ver;
-                } else |_| {
-                    return error.OSVersionDetectionFail;
-                }
-            },
-            else =&gt; {
-                // Unimplemented, fall back to default version range.
-            },
-        }
-    }
-
-    if (query.os_version_min) |min| switch (min) {
-        .none =&gt; {},
-        .semver =&gt; |semver| switch (os.tag.versionRangeTag()) {
-            inline .hurd, .linux =&gt; |t| @field(os.version_range, @tagName(t)).range.min = semver,
-            else =&gt; os.version_range.semver.min = semver,
-        },
-        .windows =&gt; |win_ver| os.version_range.windows.min = win_ver,
-    };
-
-    if (query.os_version_max) |max| switch (max) {
-        .none =&gt; {},
-        .semver =&gt; |semver| switch (os.tag.versionRangeTag()) {
-            inline .hurd, .linux =&gt; |t| @field(os.version_range, @tagName(t)).range.max = semver,
-            else =&gt; os.version_range.semver.max = semver,
-        },
-        .windows =&gt; |win_ver| os.version_range.windows.max = win_ver,
-    };
-
-    if (query.glibc_version) |glibc| {
-        switch (os.tag.versionRangeTag()) {
-            inline .hurd, .linux =&gt; |t| @field(os.version_range, @tagName(t)).glibc = glibc,
-            else =&gt; {},
-        }
-    }
-
-    if (query.android_api_level) |android| {
-        os.version_range.linux.android = android;
-    }
-
-    var cpu = switch (query.cpu_model) {
-        .native =&gt; detectNativeCpuAndFeatures(io, query_cpu_arch, os, query),
-        .baseline =&gt; Target.Cpu.baseline(query_cpu_arch, os),
-        .determined_by_arch_os =&gt; if (query.cpu_arch == null)
-            detectNativeCpuAndFeatures(io, query_cpu_arch, os, query)
-        else
-            Target.Cpu.baseline(query_cpu_arch, os),
-        .explicit =&gt; |model| model.toCpu(query_cpu_arch),
-    } orelse backup_cpu_detection: {
-        break :backup_cpu_detection Target.Cpu.baseline(query_cpu_arch, os);
-    };
-
-    // For x86, we need to populate some CPU feature flags depending on architecture
-    // and mode:
-    //  * 16bit_mode =&gt; if the arch is x86_16
-    //  * 32bit_mode =&gt; if the arch is x86
-    // However, the "mode" flags can be used as overrides, so if the user explicitly
-    // sets one of them, that takes precedence.
-    switch (query_cpu_arch) {
-        .x86_16 =&gt; {
-            cpu.features.addFeature(@intFromEnum(Target.x86.Feature.@"16bit_mode"));
-        },
-        .x86 =&gt; {
-            if (!Target.x86.featureSetHasAny(query.cpu_features_add, .{
-                .@"16bit_mode", .@"32bit_mode",
-            })) {
-                cpu.features.addFeature(@intFromEnum(Target.x86.Feature.@"32bit_mode"));
-            }
-        },
-        .arm, .armeb =&gt; {
-            // XXX What do we do if the target has the noarm feature?
-            //     What do we do if the user specifies +thumb_mode?
-        },
-        .thumb, .thumbeb =&gt; {
-            cpu.features.addFeature(@intFromEnum(Target.arm.Feature.thumb_mode));
-        },
-        else =&gt; {},
-    }
-    updateCpuFeatures(
-        &amp;cpu.features,
-        cpu.arch.allFeaturesList(),
-        query.cpu_features_add,
-        query.cpu_features_sub,
-    );
-
-    var result = detectAbiAndDynamicLinker(io, cpu, os, query) catch |err| switch (err) {
-        error.Canceled =&gt; |e| return e,
-        error.Unexpected =&gt; |e| return e,
-        error.WouldBlock =&gt; return error.Unexpected,
-        error.ConnectionResetByPeer =&gt; return error.Unexpected,
-        error.NotOpenForReading =&gt; return error.Unexpected,
-        error.SocketUnconnected =&gt; return error.Unexpected,
-        error.ReadOnlyFileSystem =&gt; return error.Unexpected,
-
-        error.AccessDenied,
-        error.SymLinkLoop,
-        error.ProcessFdQuotaExceeded,
-        error.SystemFdQuotaExceeded,
-        error.SystemResources,
-        error.IsDir,
-        error.DeviceBusy,
-        error.InputOutput,
-        error.LockViolation,
-        error.FileSystem,
-
-        error.UnableToOpenElfFile,
-        error.UnhelpfulFile,
-        error.InvalidElfFile,
-        error.RelativeShebang,
-        =&gt; return defaultAbiAndDynamicLinker(cpu, os, query),
-    };
-
-    // These CPU feature hacks have to come after ABI detection.
-    {
-        if (result.cpu.arch == .hexagon) {
-            // Both LLVM and LLD have broken support for the small data area. Yet LLVM has the
-            // feature on by default for all Hexagon CPUs. Clang sort of solves this by defaulting
-            // the `-gpsize` command line parameter for the Hexagon backend to 0, so that no
-            // constants get placed in the SDA. (This of course breaks down if the user passes
-            // `-G &lt;n&gt;` to Clang...) We can't do the `-gpsize` hack because we can have multiple
-            // concurrent LLVM emit jobs, and command line options in LLVM are shared globally. So
-            // just force this feature off. Lovely stuff.
-            result.cpu.features.removeFeature(@intFromEnum(Target.hexagon.Feature.small_data));
-        }
-
-        // https://github.com/llvm/llvm-project/issues/105978
-        if (result.cpu.arch.isArm() and result.abi.float() == .soft) {
-            result.cpu.features.removeFeature(@intFromEnum(Target.arm.Feature.vfp2));
-        }
-
-        // https://github.com/llvm/llvm-project/issues/135283
-        if (result.cpu.arch.isMIPS() and result.abi.float() == .soft) {
-            result.cpu.features.addFeature(@intFromEnum(Target.mips.Feature.soft_float));
-        }
-
-        // https://github.com/llvm/llvm-project/issues/168992
-        if (result.cpu.arch == .s390x) {
-            result.cpu.features.removeFeature(@intFromEnum(Target.s390x.Feature.vector));
-        }
-    }
-
-    // It's possible that we detect the native ABI, but fail to detect the OS version or were told
-    // to use the default OS version range. In that case, while we can't determine the exact native
-    // OS version, we do at least know that some ABIs require a particular OS version (by way of
-    // `std.zig.target.available_libcs`). So in this case, adjust the OS version to the minimum that
-    // we know is required.
-    if (result.abi != query_abi and query.os_version_min == null) {
-        const result_ver_range = &amp;result.os.version_range;
-        const abi_ver_range = result.os.tag.defaultVersionRange(result.cpu.arch, result.abi).version_range;
-
-        switch (result.os.tag.versionRangeTag()) {
-            .none =&gt; {},
-            .semver =&gt; if (result_ver_range.semver.min.order(abi_ver_range.semver.min) == .lt) {
-                result_ver_range.semver.min = abi_ver_range.semver.min;
-            },
-            inline .hurd, .linux =&gt; |t| {
-                if (@field(result_ver_range, @tagName(t)).range.min.order(@field(abi_ver_range, @tagName(t)).range.min) == .lt) {
-                    @field(result_ver_range, @tagName(t)).range.min = @field(abi_ver_range, @tagName(t)).range.min;
-                }
-
-                if (@field(result_ver_range, @tagName(t)).glibc.order(@field(abi_ver_range, @tagName(t)).glibc) == .lt and
-                    query.glibc_version == null)
-                {
-                    @field(result_ver_range, @tagName(t)).glibc = @field(abi_ver_range, @tagName(t)).glibc;
-                }
-            },
-            .windows =&gt; if (!result_ver_range.windows.min.isAtLeast(abi_ver_range.windows.min)) {
-                result_ver_range.windows.min = abi_ver_range.windows.min;
-            },
-        }
-    }
-
-    if (builtin.os.tag == .linux and result.isBionicLibC() and query.os_tag == null and query.android_api_level == null) {
-        result.os.version_range.linux.android = detectAndroidApiLevel(io) catch |err| return switch (err) {
-            error.InvalidWtf8,
-            error.InvalidBatchScriptArg,
-            =&gt; unreachable, // Windows-only
-            error.ApiLevelQueryFailed =&gt; |e| e,
-            else =&gt; blk: {
-                std.log.err("spawning or reading from getprop failed ({s})", .{@errorName(err)});
-                switch (err) {
-                    error.SystemResources,
-                    error.FileSystem,
-                    error.ProcessFdQuotaExceeded,
-                    error.SystemFdQuotaExceeded,
-                    error.SymLinkLoop,
-                    =&gt; |e| break :blk e,
-                    else =&gt; break :blk error.ApiLevelQueryFailed,
-                }
-            },
-        };
-    }
-
-    return result;
-}
-
-fn updateCpuFeatures(
-    set: *Target.Cpu.Feature.Set,
-    all_features_list: []const Target.Cpu.Feature,
-    add_set: Target.Cpu.Feature.Set,
-    sub_set: Target.Cpu.Feature.Set,
-) void {
-    set.removeFeatureSet(sub_set);
-    set.addFeatureSet(add_set);
-    set.populateDependencies(all_features_list);
-    set.removeFeatureSet(sub_set);
-}
-
-fn detectNativeCpuAndFeatures(io: Io, cpu_arch: Target.Cpu.Arch, os: Target.Os, query: Target.Query) ?Target.Cpu {
-    // Here we switch on a comptime value rather than `cpu_arch`. This is valid because `cpu_arch`,
-    // although it is a runtime value, is guaranteed to be one of the architectures in the set
-    // of the respective switch prong.
-    switch (builtin.cpu.arch) {
-        .loongarch32, .loongarch64 =&gt; return @import("system/loongarch.zig").detectNativeCpuAndFeatures(cpu_arch, os, query),
-        .x86_64, .x86 =&gt; return @import("system/x86.zig").detectNativeCpuAndFeatures(cpu_arch, os, query),
-        else =&gt; {},
-    }
-
-    switch (builtin.os.tag) {
-        .linux =&gt; return linux.detectNativeCpuAndFeatures(io),
-        .macos =&gt; return darwin.macos.detectNativeCpuAndFeatures(),
-        .windows =&gt; return windows.detectNativeCpuAndFeatures(),
-        else =&gt; {},
-    }
-
-    // This architecture does not have CPU model &amp; feature detection yet.
-    // See https://github.com/ziglang/zig/issues/4591
-    return null;
-}
-
-pub const AbiAndDynamicLinkerFromFileError = error{
-    Canceled,
-    AccessDenied,
-    Unexpected,
-    Unseekable,
-    ReadFailed,
-    EndOfStream,
-    NameTooLong,
-    StaticElfFile,
-    InvalidElfFile,
-    StreamTooLong,
-    Timeout,
-    SymLinkLoop,
-    SystemResources,
-    ProcessFdQuotaExceeded,
-    SystemFdQuotaExceeded,
-    IsDir,
-    WouldBlock,
-    InputOutput,
-    BrokenPipe,
-    ConnectionResetByPeer,
-    NotOpenForReading,
-    SocketUnconnected,
-    LockViolation,
-    FileSystem,
-};
-
-fn abiAndDynamicLinkerFromFile(
-    file_reader: *Io.File.Reader,
-    header: *const elf.Header,
-    cpu: Target.Cpu,
-    os: Target.Os,
-    ld_info_list: []const LdInfo,
-    query: Target.Query,
-) AbiAndDynamicLinkerFromFileError!Target {
-    const io = file_reader.io;
-    var result: Target = .{
-        .cpu = cpu,
-        .os = os,
-        .abi = query.abi orelse Target.Abi.default(cpu.arch, os.tag),
-        .ofmt = query.ofmt orelse Target.ObjectFormat.default(os.tag, cpu.arch),
-        .dynamic_linker = query.dynamic_linker orelse .none,
-    };
-    var rpath_offset: ?u64 = null; // Found inside PT_DYNAMIC
-    const look_for_ld = query.dynamic_linker == null;
-
-    var got_dyn_section: bool = false;
-    {
-        var it = header.iterateProgramHeaders(file_reader);
-        while (try it.next()) |phdr| switch (phdr.p_type) {
-            elf.PT_INTERP =&gt; {
-                got_dyn_section = true;
-
-                if (look_for_ld) {
-                    const p_filesz = phdr.p_filesz;
-                    if (p_filesz &gt; result.dynamic_linker.buffer.len) return error.NameTooLong;
-                    const filesz: usize = @intCast(p_filesz);
-                    try file_reader.seekTo(phdr.p_offset);
-                    try file_reader.interface.readSliceAll(result.dynamic_linker.buffer[0..filesz]);
-                    // PT_INTERP includes a null byte in filesz.
-                    const len = filesz - 1;
-                    // dynamic_linker.max_byte is "max", not "len".
-                    // We know it will fit in u8 because we check against dynamic_linker.buffer.len above.
-                    result.dynamic_linker.len = @intCast(len);
-
-                    // Use it to determine ABI.
-                    const full_ld_path = result.dynamic_linker.buffer[0..len];
-                    for (ld_info_list) |ld_info| {
-                        const standard_ld_basename = fs.path.basename(ld_info.ld.get().?);
-                        if (std.mem.endsWith(u8, full_ld_path, standard_ld_basename)) {
-                            result.abi = ld_info.abi;
-                            break;
-                        }
-                    }
-                }
-            },
-            // We only need this for detecting glibc version.
-            elf.PT_DYNAMIC =&gt; {
-                got_dyn_section = true;
-
-                if (builtin.target.os.tag == .linux and result.isGnuLibC() and query.glibc_version == null) {
-                    var dyn_it = header.iterateDynamicSection(file_reader, phdr.p_offset, phdr.p_filesz);
-                    while (try dyn_it.next()) |dyn| {
-                        if (dyn.d_tag == elf.DT_RUNPATH) {
-                            rpath_offset = dyn.d_val;
-                            break;
-                        }
-                    }
-                }
-            },
-            else =&gt; continue,
-        };
-    }
-
-    if (!got_dyn_section) {
-        return error.StaticElfFile;
-    }
-
-    if (builtin.target.os.tag == .linux and result.isGnuLibC() and query.glibc_version == null) {
-        const str_section_off = header.shoff + @as(u64, header.shentsize) * @as(u64, header.shstrndx);
-        try file_reader.seekTo(str_section_off);
-        const shstr = try elf.takeSectionHeader(&amp;file_reader.interface, header.is_64, header.endian);
-        var strtab_buf: [4096]u8 = undefined;
-        const shstrtab = strtab_buf[0..@min(shstr.sh_size, strtab_buf.len)];
-        try file_reader.seekTo(shstr.sh_offset);
-        try file_reader.interface.readSliceAll(shstrtab);
-        const dynstr: ?struct { offset: u64, size: u64 } = find_dyn_str: {
-            var it = header.iterateSectionHeaders(file_reader);
-            while (try it.next()) |shdr| {
-                const end = mem.findScalarPos(u8, shstrtab, shdr.sh_name, 0) orelse continue;
-                const sh_name = shstrtab[shdr.sh_name..end :0];
-                if (mem.eql(u8, sh_name, ".dynstr")) break :find_dyn_str .{
-                    .offset = shdr.sh_offset,
-                    .size = shdr.sh_size,
-                };
-            } else break :find_dyn_str null;
-        };
-        if (dynstr) |ds| {
-            if (rpath_offset) |rpoff| {
-                if (rpoff &gt; ds.size) return error.InvalidElfFile;
-                const rpoff_file = ds.offset + rpoff;
-                const rp_max_size = ds.size - rpoff;
-
-                try file_reader.seekTo(rpoff_file);
-                const rpath_list = try file_reader.interface.takeSentinel(0);
-                if (rpath_list.len &gt; rp_max_size) return error.StreamTooLong;
-
-                var it = mem.tokenizeScalar(u8, rpath_list, ':');
-                while (it.next()) |rpath| {
-                    if (glibcVerFromRPath(io, rpath)) |ver| {
-                        result.os.version_range.linux.glibc = ver;
-                        return result;
-                    } else |err| switch (err) {
-                        error.GLibCNotFound =&gt; continue,
-                        else =&gt; |e| return e,
-                    }
-                }
-            }
-        }
-
-        if (result.dynamic_linker.get()) |dl_path| glibc_ver: {
-            // There is no DT_RUNPATH so we try to find libc.so.6 inside the same
-            // directory as the dynamic linker.
-            if (fs.path.dirname(dl_path)) |rpath| {
-                if (glibcVerFromRPath(io, rpath)) |ver| {
-                    result.os.version_range.linux.glibc = ver;
-                    return result;
-                } else |err| switch (err) {
-                    error.GLibCNotFound =&gt; {},
-                    else =&gt; |e| return e,
-                }
-            }
-
-            // So far, no luck. Next we try to see if the information is
-            // present in the symlink data for the dynamic linker path.
-            var link_buffer: [posix.PATH_MAX]u8 = undefined;
-            const link_name = if (Io.Dir.readLinkAbsolute(io, dl_path, &amp;link_buffer)) |n|
-                link_buffer[0..n]
-            else |err| switch (err) {
-                error.NameTooLong =&gt; unreachable,
-                error.BadPathName =&gt; unreachable, // Windows only
-                error.UnsupportedReparsePointType =&gt; unreachable, // Windows only
-                error.NetworkNotFound =&gt; unreachable, // Windows only
-                error.AntivirusInterference =&gt; unreachable, // Windows only
-                error.FileBusy =&gt; unreachable, // Windows only
-
-                error.AccessDenied,
-                error.PermissionDenied,
-                error.FileNotFound,
-                error.NotLink,
-                error.NotDir,
-                =&gt; break :glibc_ver,
-
-                error.SystemResources,
-                error.FileSystem,
-                error.SymLinkLoop,
-                error.Canceled,
-                error.Unexpected,
-                =&gt; |e| return e,
-            };
-            result.os.version_range.linux.glibc = glibcVerFromLinkName(
-                fs.path.basename(link_name),
-                "ld-",
-            ) catch |err| switch (err) {
-                error.UnrecognizedGnuLibCFileName,
-                error.InvalidGnuLibCVersion,
-                =&gt; break :glibc_ver,
-            };
-            return result;
-        }
-
-        // Nothing worked so far. Finally we fall back to hard-coded search paths.
-        // Some distros such as Debian keep their libc.so.6 in `/lib/$triple/`.
-        var path_buf: [posix.PATH_MAX]u8 = undefined;
-        var index: usize = 0;
-        const prefix = "/lib/";
-        const cpu_arch = @tagName(result.cpu.arch);
-        const os_tag = @tagName(result.os.tag);
-        const abi = @tagName(result.abi);
-        @memcpy(path_buf[index..][0..prefix.len], prefix);
-        index += prefix.len;
-        @memcpy(path_buf[index..][0..cpu_arch.len], cpu_arch);
-        index += cpu_arch.len;
-        path_buf[index] = '-';
-        index += 1;
-        @memcpy(path_buf[index..][0..os_tag.len], os_tag);
-        index += os_tag.len;
-        path_buf[index] = '-';
-        index += 1;
-        @memcpy(path_buf[index..][0..abi.len], abi);
-        index += abi.len;
-        const rpath = path_buf[0..index];
-        if (glibcVerFromRPath(io, rpath)) |ver| {
-            result.os.version_range.linux.glibc = ver;
-            return result;
-        } else |err| switch (err) {
-            error.GLibCNotFound =&gt; {},
-            else =&gt; |e| return e,
-        }
-    }
-
-    return result;
-}
-
-fn glibcVerFromLinkName(link_name: []const u8, prefix: []const u8) error{ UnrecognizedGnuLibCFileName, InvalidGnuLibCVersion }!std.SemanticVersion {
-    // example: "libc-2.3.4.so"
-    // example: "libc-2.27.so"
-    // example: "ld-2.33.so"
-    const suffix = ".so";
-    if (!mem.startsWith(u8, link_name, prefix) or !mem.endsWith(u8, link_name, suffix)) {
-        return error.UnrecognizedGnuLibCFileName;
-    }
-    // chop off "libc-" and ".so"
-    const link_name_chopped = link_name[prefix.len .. link_name.len - suffix.len];
-    return Target.Query.parseVersion(link_name_chopped) catch |err| switch (err) {
-        error.Overflow =&gt; return error.InvalidGnuLibCVersion,
-        error.InvalidVersion =&gt; return error.InvalidGnuLibCVersion,
-    };
-}
-
-test glibcVerFromLinkName {
-    try std.testing.expectError(error.UnrecognizedGnuLibCFileName, glibcVerFromLinkName("ld-2.37.so", "this-prefix-does-not-exist"));
-    try std.testing.expectError(error.UnrecognizedGnuLibCFileName, glibcVerFromLinkName("libc-2.37.so-is-not-end", "libc-"));
-
-    try std.testing.expectError(error.InvalidGnuLibCVersion, glibcVerFromLinkName("ld-2.so", "ld-"));
-    try std.testing.expectEqual(std.SemanticVersion{ .major = 2, .minor = 37, .patch = 0 }, try glibcVerFromLinkName("ld-2.37.so", "ld-"));
-    try std.testing.expectEqual(std.SemanticVersion{ .major = 2, .minor = 37, .patch = 0 }, try glibcVerFromLinkName("ld-2.37.0.so", "ld-"));
-    try std.testing.expectEqual(std.SemanticVersion{ .major = 2, .minor = 37, .patch = 1 }, try glibcVerFromLinkName("ld-2.37.1.so", "ld-"));
-    try std.testing.expectError(error.InvalidGnuLibCVersion, glibcVerFromLinkName("ld-2.37.4.5.so", "ld-"));
-}
-
-fn glibcVerFromRPath(io: Io, rpath: []const u8) !std.SemanticVersion {
-    const cwd: Io.Dir = .cwd();
-
-    var dir = cwd.openDir(io, rpath, .{}) catch |err| switch (err) {
-        error.NameTooLong =&gt; return error.Unexpected,
-        error.BadPathName =&gt; return error.Unexpected,
-        error.NetworkNotFound =&gt; return error.Unexpected, // Windows-only
-
-        error.FileNotFound =&gt; return error.GLibCNotFound,
-        error.NotDir =&gt; return error.GLibCNotFound,
-        error.AccessDenied =&gt; return error.GLibCNotFound,
-        error.PermissionDenied =&gt; return error.GLibCNotFound,
-        error.NoDevice =&gt; return error.GLibCNotFound,
-
-        error.ProcessFdQuotaExceeded =&gt; |e| return e,
-        error.SystemFdQuotaExceeded =&gt; |e| return e,
-        error.SystemResources =&gt; |e| return e,
-        error.SymLinkLoop =&gt; |e| return e,
-        error.Unexpected =&gt; |e| return e,
-        error.Canceled =&gt; |e| return e,
-    };
-    defer dir.close(io);
-
-    // Now we have a candidate for the path to libc shared object. In
-    // the past, we used readlink() here because the link name would
-    // reveal the glibc version. However, in more recent GNU/Linux
-    // installations, there is no symlink. Thus we instead use a more
-    // robust check of opening the libc shared object and looking at the
-    // .dynstr section, and finding the max version number of symbols
-    // that start with "GLIBC_2.".
-    const glibc_so_basename = "libc.so.6";
-    var file = dir.openFile(io, glibc_so_basename, .{}) catch |err| switch (err) {
-        error.NameTooLong =&gt; return error.Unexpected,
-        error.BadPathName =&gt; return error.Unexpected,
-        error.PipeBusy =&gt; return error.Unexpected, // Windows-only
-        error.NetworkNotFound =&gt; return error.Unexpected, // Windows-only
-        error.AntivirusInterference =&gt; return error.Unexpected, // Windows-only
-        error.FileLocksUnsupported =&gt; return error.Unexpected, // No lock requested.
-        error.NoSpaceLeft =&gt; return error.Unexpected, // read-only
-        error.PathAlreadyExists =&gt; return error.Unexpected, // read-only
-        error.DeviceBusy =&gt; return error.Unexpected, // read-only
-        error.FileBusy =&gt; return error.Unexpected, // read-only
-        error.ReadOnlyFileSystem =&gt; return error.Unexpected, // read-only
-        error.NoDevice =&gt; return error.Unexpected, // not asking for a special device
-        error.FileTooBig =&gt; return error.Unexpected,
-        error.WouldBlock =&gt; return error.Unexpected, // not opened in non-blocking
-
-        error.AccessDenied =&gt; return error.GLibCNotFound,
-        error.PermissionDenied =&gt; return error.GLibCNotFound,
-        error.FileNotFound =&gt; return error.GLibCNotFound,
-        error.NotDir =&gt; return error.GLibCNotFound,
-        error.IsDir =&gt; return error.GLibCNotFound,
-
-        error.ProcessFdQuotaExceeded =&gt; |e| return e,
-        error.SystemFdQuotaExceeded =&gt; |e| return e,
-        error.SystemResources =&gt; |e| return e,
-        error.SymLinkLoop =&gt; |e| return e,
-        error.Unexpected =&gt; |e| return e,
-        error.Canceled =&gt; |e| return e,
-    };
-    defer file.close(io);
-
-    // Empirically, glibc 2.34 libc.so .dynstr section is 32441 bytes on my system.
-    var buffer: [8000]u8 = undefined;
-    var file_reader: Io.File.Reader = .init(file, io, &amp;buffer);
-
-    return glibcVerFromSoFile(&amp;file_reader) catch |err| switch (err) {
-        error.InvalidElfMagic,
-        error.InvalidElfEndian,
-        error.InvalidElfClass,
-        error.InvalidElfVersion,
-        error.InvalidGnuLibCVersion,
-        error.EndOfStream,
-        =&gt; return error.GLibCNotFound,
-
-        error.ReadFailed =&gt; return file_reader.err.?,
-        else =&gt; |e| return e,
-    };
-}
-
-fn glibcVerFromSoFile(file_reader: *Io.File.Reader) !std.SemanticVersion {
-    const header = try elf.Header.read(&amp;file_reader.interface);
-    const str_section_off = header.shoff + @as(u64, header.shentsize) * @as(u64, header.shstrndx);
-    try file_reader.seekTo(str_section_off);
-    const shstr = try elf.takeSectionHeader(&amp;file_reader.interface, header.is_64, header.endian);
-    var strtab_buf: [4096]u8 = undefined;
-    const shstrtab = strtab_buf[0..@min(shstr.sh_size, strtab_buf.len)];
-    try file_reader.seekTo(shstr.sh_offset);
-    try file_reader.interface.readSliceAll(shstrtab);
-    const dynstr: struct { offset: u64, size: u64 } = find_dyn_str: {
-        var it = header.iterateSectionHeaders(file_reader);
-        while (try it.next()) |shdr| {
-            const end = mem.findScalarPos(u8, shstrtab, shdr.sh_name, 0) orelse continue;
-            const sh_name = shstrtab[shdr.sh_name..end :0];
-            if (mem.eql(u8, sh_name, ".dynstr")) break :find_dyn_str .{
-                .offset = shdr.sh_offset,
-                .size = shdr.sh_size,
-            };
-        } else return error.InvalidGnuLibCVersion;
-    };
-
-    // Here we loop over all the strings in the dynstr string table, assuming that any
-    // strings that start with "GLIBC_2." indicate the existence of such a glibc version,
-    // and furthermore, that the system-installed glibc is at minimum that version.
-    var max_ver: std.SemanticVersion = .{ .major = 2, .minor = 2, .patch = 5 };
-    var offset: u64 = 0;
-    try file_reader.seekTo(dynstr.offset);
-    while (offset &lt; dynstr.size) {
-        if (file_reader.interface.takeSentinel(0)) |s| {
-            if (mem.startsWith(u8, s, "GLIBC_2.")) {
-                const chopped = s["GLIBC_".len..];
-                const ver = Target.Query.parseVersion(chopped) catch |err| switch (err) {
-                    error.Overflow =&gt; return error.InvalidGnuLibCVersion,
-                    error.InvalidVersion =&gt; return error.InvalidGnuLibCVersion,
-                };
-                switch (ver.order(max_ver)) {
-                    .gt =&gt; max_ver = ver,
-                    .lt, .eq =&gt; continue,
-                }
-            }
-            offset += s.len + 1;
-        } else |err| switch (err) {
-            error.EndOfStream, error.StreamTooLong =&gt; break,
-            error.ReadFailed =&gt; |e| return e,
-        }
-    }
-
-    return max_ver;
-}
-
-/// In the past, this function attempted to use the executable's own binary if it was dynamically
-/// linked to answer both the C ABI question and the dynamic linker question. However, this
-/// could be problematic on a system that uses a RUNPATH for the compiler binary, locking
-/// it to an older glibc version, while system binaries such as /usr/bin/env use a newer glibc
-/// version. The problem is that libc.so.6 glibc version will match that of the system while
-/// the dynamic linker will match that of the compiler binary. Executables with these versions
-/// mismatching will fail to run.
-///
-/// Therefore, this function works the same regardless of whether the compiler binary is
-/// dynamically or statically linked. It inspects `/usr/bin/env` as an ELF file to find the
-/// answer to these questions, or if there is a shebang line, then it chases the referenced
-/// file recursively. If that does not provide the answer, then the function falls back to
-/// defaults.
-fn detectAbiAndDynamicLinker(io: Io, cpu: Target.Cpu, os: Target.Os, query: Target.Query) !Target {
-    const native_target_has_ld = comptime Target.DynamicLinker.kind(builtin.os.tag) != .none;
-    const is_linux = builtin.target.os.tag == .linux;
-    const is_illumos = builtin.target.os.tag == .illumos;
-    const is_darwin = builtin.target.os.tag.isDarwin();
-    const have_all_info = query.dynamic_linker != null and
-        query.abi != null and (!is_linux or query.abi.?.isGnu());
-    const os_is_non_native = query.os_tag != null;
-    // The illumos environment is always the same.
-    if (!native_target_has_ld or have_all_info or os_is_non_native or is_illumos or is_darwin) {
-        return defaultAbiAndDynamicLinker(cpu, os, query);
-    }
-    if (query.abi) |abi| {
-        if (abi.isMusl()) {
-            // musl implies static linking.
-            return defaultAbiAndDynamicLinker(cpu, os, query);
-        }
-    }
-    // The current target's ABI cannot be relied on for this. For example, we may build the zig
-    // compiler for target riscv64-linux-musl and provide a tarball for users to download.
-    // A user could then run that zig compiler on riscv64-linux-gnu. This use case is well-defined
-    // and supported by Zig. But that means that we must detect the system ABI here rather than
-    // relying on `builtin.target`.
-    const all_abis = comptime blk: {
-        assert(@intFromEnum(Target.Abi.none) == 0);
-        const fields = std.meta.fields(Target.Abi)[1..];
-        var array: [fields.len]Target.Abi = undefined;
-        for (fields, 0..) |field, i| {
-            array[i] = @field(Target.Abi, field.name);
-        }
-        break :blk array;
-    };
-    var ld_info_list_buffer: [all_abis.len]LdInfo = undefined;
-    var ld_info_list_len: usize = 0;
-
-    switch (Target.DynamicLinker.kind(os.tag)) {
-        // The OS has no dynamic linker. Leave the list empty and rely on `Abi.default()` to pick
-        // something sensible in `abiAndDynamicLinkerFromFile()`.
-        .none =&gt; {},
-        // The OS has a system-wide dynamic linker. Unfortunately, this implies that there's no
-        // useful ABI information that we can glean from it merely being present. That means the
-        // best we can do for this case (for now) is also `Abi.default()`.
-        .arch_os =&gt; {},
-        // The OS can have different dynamic linker paths depending on libc/ABI. In this case, we
-        // need to gather all the valid arch/OS/ABI combinations. `abiAndDynamicLinkerFromFile()`
-        // will then look for a dynamic linker with a matching path on the system and pick the ABI
-        // we associated it with here.
-        .arch_os_abi =&gt; for (all_abis) |abi| {
-            const ld = Target.DynamicLinker.standard(cpu, os, abi);
-
-            // Does the generated target triple actually have a standard dynamic linker path?
-            if (ld.get() == null) continue;
-
-            ld_info_list_buffer[ld_info_list_len] = .{
-                .ld = ld,
-                .abi = abi,
-            };
-            ld_info_list_len += 1;
-        },
-    }
-
-    const ld_info_list = ld_info_list_buffer[0..ld_info_list_len];
-
-    var file_reader: Io.File.Reader = undefined;
-    // According to `man 2 execve`:
-    //
-    // The kernel imposes a maximum length on the text
-    // that follows the "#!" characters at the start of a script;
-    // characters beyond the limit are ignored.
-    // Before Linux 5.1, the limit is 127 characters.
-    // Since Linux 5.1, the limit is 255 characters.
-    //
-    // Tests show that bash and zsh consider 255 as total limit,
-    // *including* "#!" characters and ignoring newline.
-    // For safety, we set max length as 255 + \n (1).
-    const max_shebang_line_size = 256;
-    var file_reader_buffer: [4096]u8 = undefined;
-    comptime assert(file_reader_buffer.len &gt;= max_shebang_line_size);
-
-    // Best case scenario: the executable is dynamically linked, and we can iterate
-    // over our own shared objects and find a dynamic linker.
-    const header = elf_file: {
-        // This block looks for a shebang line in "/usr/bin/env". If it finds
-        // one, then instead of using "/usr/bin/env" as the ELF file to examine,
-        // it uses the file it references instead, doing the same logic
-        // recursively in case it finds another shebang line.
-
-        var file_name: []const u8 = switch (os.tag) {
-            // Since /usr/bin/env is hard-coded into the shebang line of many
-            // portable scripts, it's a reasonably reliable path to start with.
-            else =&gt; "/usr/bin/env",
-            // Haiku does not have a /usr root directory.
-            .haiku =&gt; "/bin/env",
-        };
-
-        while (true) {
-            const file = Io.Dir.openFileAbsolute(io, file_name, .{}) catch |err| switch (err) {
-                error.NoSpaceLeft =&gt; return error.Unexpected,
-                error.NameTooLong =&gt; return error.Unexpected,
-                error.PathAlreadyExists =&gt; return error.Unexpected,
-                error.BadPathName =&gt; return error.Unexpected,
-                error.PipeBusy =&gt; return error.Unexpected,
-                error.FileLocksUnsupported =&gt; return error.Unexpected,
-                error.FileBusy =&gt; return error.Unexpected, // opened without write permissions
-                error.AntivirusInterference =&gt; return error.Unexpected, // Windows-only error
-
-                error.IsDir,
-                error.NotDir,
-                error.AccessDenied,
-                error.PermissionDenied,
-                error.NoDevice,
-                error.FileNotFound,
-                error.NetworkNotFound,
-                error.FileTooBig,
-                error.Unexpected,
-                =&gt; |e| if (e == error.FileNotFound and os.tag == .linux and mem.eql(u8, file_name, "/usr/bin/env")) {
-                    // Android does not have a /usr directory, so try again
-                    file_name = "/system/bin/env";
-                    continue;
-                } else return error.UnableToOpenElfFile,
-                else =&gt; |e| return e,
-            };
-            var is_elf_file = false;
-            defer if (!is_elf_file) file.close(io);
-
-            file_reader = .init(file, io, &amp;file_reader_buffer);
-            file_name = undefined; // it aliases file_reader_buffer
-
-            const header = elf.Header.read(&amp;file_reader.interface) catch |hdr_err| switch (hdr_err) {
-                error.EndOfStream,
-                error.InvalidElfMagic,
-                =&gt; {
-                    const shebang_line = file_reader.interface.takeSentinel('\n') catch |err| switch (err) {
-                        error.ReadFailed =&gt; return file_reader.err.?,
-                        // It's neither an ELF file nor file with shebang line.
-                        error.EndOfStream, error.StreamTooLong =&gt; return error.UnhelpfulFile,
-                    };
-                    if (!mem.startsWith(u8, shebang_line, "#!")) return error.UnhelpfulFile;
-                    // We detected shebang, now parse entire line.
-
-                    // Trim leading "#!", spaces and tabs.
-                    const trimmed_line = mem.trimStart(u8, shebang_line[2..], &amp;.{ ' ', '\t' });
-
-                    // This line can have:
-                    // * Interpreter path only,
-                    // * Interpreter path and arguments, all separated by space, tab or NUL character.
-                    // And optionally newline at the end.
-                    const path_maybe_args = mem.trimEnd(u8, trimmed_line, "\n");
-
-                    // Separate path and args.
-                    const path_end = mem.findAny(u8, path_maybe_args, &amp;.{ ' ', '\t', 0 }) orelse path_maybe_args.len;
-                    const unvalidated_path = path_maybe_args[0..path_end];
-                    file_name = if (fs.path.isAbsolute(unvalidated_path)) unvalidated_path else return error.RelativeShebang;
-                    continue;
-                },
-
-                error.InvalidElfVersion,
-                error.InvalidElfClass,
-                error.InvalidElfEndian,
-                =&gt; return error.InvalidElfFile,
-
-                error.ReadFailed =&gt; return file_reader.err.?,
-            };
-            is_elf_file = true;
-            break :elf_file header;
-        }
-    };
-    defer file_reader.file.close(io);
-
-    return abiAndDynamicLinkerFromFile(&amp;file_reader, &amp;header, cpu, os, ld_info_list, query) catch |err| switch (err) {
-        error.FileSystem,
-        error.SystemResources,
-        error.SymLinkLoop,
-        error.ProcessFdQuotaExceeded,
-        error.SystemFdQuotaExceeded,
-        error.Canceled,
-        =&gt; |e| return e,
-
-        error.ReadFailed =&gt; return file_reader.err.?,
-
-        else =&gt; |e| {
-            std.log.warn("encountered {t}; falling back to default ABI and dynamic linker", .{e});
-            return defaultAbiAndDynamicLinker(cpu, os, query);
-        },
-    };
-}
-
-fn defaultAbiAndDynamicLinker(cpu: Target.Cpu, os: Target.Os, query: Target.Query) Target {
-    const abi = query.abi orelse Target.Abi.default(cpu.arch, os.tag);
-    return .{
-        .cpu = cpu,
-        .os = os,
-        .abi = abi,
-        .ofmt = query.ofmt orelse Target.ObjectFormat.default(os.tag, cpu.arch),
-        .dynamic_linker = query.dynamic_linker orelse .standard(cpu, os, abi),
-    };
-}
-
-const LdInfo = struct {
-    ld: Target.DynamicLinker,
-    abi: Target.Abi,
-};
-
-fn detectAndroidApiLevel(io: Io) !u32 {
-    comptime if (builtin.os.tag != .linux) unreachable;
-
-    var child = try std.process.spawn(io, .{
-        .argv = &amp;.{
-            "/system/bin/getprop",
-            "ro.build.version.sdk",
-        },
-        .stdin = .ignore,
-        .stdout = .pipe,
-        .stderr = .ignore,
-    });
-    errdefer child.kill(io);
-
-    // PROP_VALUE_MAX is 92, output is value + newline.
-    // Currently API levels are two-digit numbers, but we want to make sure we never read a partial value.
-    var stdout_buf: [92 + 1]u8 = undefined;
-    var reader = child.stdout.?.readerStreaming(io, &amp;.{});
-    const n = try reader.interface.readSliceShort(&amp;stdout_buf);
-    const api_level = std.fmt.parseInt(u32, stdout_buf[0 .. n - 1], 10) catch |e| {
-        std.log.err(
-            "Could not parse API level, unexpected getprop output '{s}' ({s})",
-            .{ stdout_buf[0 .. n - 1], @errorName(e) },
-        );
-        return error.ApiLevelQueryFailed;
-    };
-
-    switch (try child.wait(io)) {
-        .exited =&gt; |code| if (code != 0) {
-            std.log.err("getprop terminated abnormally with exit code: {d}", .{code});
-            return error.ApiLevelQueryFailed;
-        },
-        .signal =&gt; |sig| {
-            std.log.err("getprop terminated abnormally with signal: {t}", .{sig});
-            return error.ApiLevelQueryFailed;
-        },
-        .stopped =&gt; |sig| {
-            std.log.err("getprop stopped abnormally with signal: {t}", .{sig});
-            return error.ApiLevelQueryFailed;
-        },
-        .unknown =&gt; {
-            std.log.err("getprop terminated abnormally", .{});
-            return error.ApiLevelQueryFailed;
-        },
-    }
-
-    return api_level;
-}
-
-test {
-    _ = NativePaths;
-
-    _ = darwin;
-    _ = linux;
-    _ = windows;
-}</pre>
+    <pre><a id="L1"></a>const builtin = @import("builtin");
+<a id="L2"></a>const native_endian = builtin.cpu.arch.endian();
+<a id="L3"></a>
+<a id="L4"></a>const std = @import("../std.zig");
+<a id="L5"></a>const mem = std.mem;
+<a id="L6"></a>const elf = std.elf;
+<a id="L7"></a>const fs = std.fs;
+<a id="L8"></a>const assert = std.debug.assert;
+<a id="L9"></a>const Target = std.Target;
+<a id="L10"></a>const posix = std.posix;
+<a id="L11"></a>const Io = std.Io;
+<a id="L12"></a>
+<a id="L13"></a>pub const NativePaths = @import("system/NativePaths.zig");
+<a id="L14"></a>
+<a id="L15"></a>pub const windows = @import("system/windows.zig");
+<a id="L16"></a>pub const darwin = @import("system/darwin.zig");
+<a id="L17"></a>pub const linux = @import("system/linux.zig");
+<a id="L18"></a>
+<a id="L19"></a>pub const Executor = union(enum) {
+<a id="L20"></a>    native,
+<a id="L21"></a>    rosetta,
+<a id="L22"></a>    qemu: []const u8,
+<a id="L23"></a>    wine: []const u8,
+<a id="L24"></a>    wasmtime: []const u8,
+<a id="L25"></a>    darling: []const u8,
+<a id="L26"></a>    bad_dl: []const u8,
+<a id="L27"></a>    bad_os_or_cpu,
+<a id="L28"></a>};
+<a id="L29"></a>
+<a id="L30"></a>pub const GetExternalExecutorOptions = struct {
+<a id="L31"></a>    allow_darling: bool = true,
+<a id="L32"></a>    allow_qemu: bool = true,
+<a id="L33"></a>    allow_rosetta: bool = true,
+<a id="L34"></a>    allow_wasmtime: bool = true,
+<a id="L35"></a>    allow_wine: bool = true,
+<a id="L36"></a>    qemu_fixes_dl: bool = false,
+<a id="L37"></a>    link_libc: bool = false,
+<a id="L38"></a>};
+<a id="L39"></a>
+<a id="L40"></a>/// Return whether or not the given host is capable of running executables of
+<a id="L41"></a>/// the other target.
+<a id="L42"></a>pub fn getExternalExecutor(
+<a id="L43"></a>    io: Io,
+<a id="L44"></a>    host: *const std.Target,
+<a id="L45"></a>    candidate: *const std.Target,
+<a id="L46"></a>    options: GetExternalExecutorOptions,
+<a id="L47"></a>) Executor {
+<a id="L48"></a>    const os_match = host.os.tag == candidate.os.tag;
+<a id="L49"></a>    const cpu_ok = cpu_ok: {
+<a id="L50"></a>        if (host.cpu.arch == candidate.cpu.arch)
+<a id="L51"></a>            break :cpu_ok true;
+<a id="L52"></a>
+<a id="L53"></a>        if (host.cpu.arch == .x86_64 and candidate.cpu.arch == .x86)
+<a id="L54"></a>            break :cpu_ok true;
+<a id="L55"></a>
+<a id="L56"></a>        if (host.cpu.arch == .aarch64 and candidate.cpu.arch == .arm)
+<a id="L57"></a>            break :cpu_ok true;
+<a id="L58"></a>
+<a id="L59"></a>        if (host.cpu.arch == .aarch64_be and candidate.cpu.arch == .armeb)
+<a id="L60"></a>            break :cpu_ok true;
+<a id="L61"></a>
+<a id="L62"></a>        // TODO additionally detect incompatible CPU features.
+<a id="L63"></a>        // Note that in some cases the OS kernel will emulate missing CPU features
+<a id="L64"></a>        // when an illegal instruction is encountered.
+<a id="L65"></a>
+<a id="L66"></a>        break :cpu_ok false;
+<a id="L67"></a>    };
+<a id="L68"></a>
+<a id="L69"></a>    var bad_result: Executor = .bad_os_or_cpu;
+<a id="L70"></a>
+<a id="L71"></a>    if (os_match and cpu_ok) native: {
+<a id="L72"></a>        if (options.link_libc) {
+<a id="L73"></a>            if (candidate.dynamic_linker.get()) |candidate_dl| {
+<a id="L74"></a>                Io.Dir.cwd().access(io, candidate_dl, .{}) catch {
+<a id="L75"></a>                    bad_result = .{ .bad_dl = candidate_dl };
+<a id="L76"></a>                    break :native;
+<a id="L77"></a>                };
+<a id="L78"></a>            }
+<a id="L79"></a>        }
+<a id="L80"></a>        return .native;
+<a id="L81"></a>    }
+<a id="L82"></a>
+<a id="L83"></a>    // If the OS match and OS is macOS and CPU is arm64, we can use Rosetta 2
+<a id="L84"></a>    // to emulate the foreign architecture.
+<a id="L85"></a>    if (options.allow_rosetta and os_match and
+<a id="L86"></a>        (host.os.tag == .maccatalyst or host.os.tag == .macos) and host.cpu.arch == .aarch64)
+<a id="L87"></a>    {
+<a id="L88"></a>        switch (candidate.cpu.arch) {
+<a id="L89"></a>            .x86_64 =&gt; return .rosetta,
+<a id="L90"></a>            else =&gt; return bad_result,
+<a id="L91"></a>        }
+<a id="L92"></a>    }
+<a id="L93"></a>
+<a id="L94"></a>    // If the OS matches, we can use QEMU to emulate a foreign architecture.
+<a id="L95"></a>    if (options.allow_qemu and os_match and (!cpu_ok or options.qemu_fixes_dl)) {
+<a id="L96"></a>        return switch (candidate.cpu.arch) {
+<a id="L97"></a>            inline .aarch64,
+<a id="L98"></a>            .arm,
+<a id="L99"></a>            .riscv64,
+<a id="L100"></a>            .x86,
+<a id="L101"></a>            .x86_64,
+<a id="L102"></a>            =&gt; |t| switch (candidate.os.tag) {
+<a id="L103"></a>                .linux,
+<a id="L104"></a>                .freebsd,
+<a id="L105"></a>                =&gt; .{ .qemu = switch (t) {
+<a id="L106"></a>                    .x86 =&gt; "qemu-i386",
+<a id="L107"></a>                    .x86_64 =&gt; switch (candidate.abi) {
+<a id="L108"></a>                        .gnux32, .muslx32 =&gt; return bad_result,
+<a id="L109"></a>                        else =&gt; "qemu-x86_64",
+<a id="L110"></a>                    },
+<a id="L111"></a>                    else =&gt; "qemu-" ++ @tagName(t),
+<a id="L112"></a>                } },
+<a id="L113"></a>                else =&gt; bad_result,
+<a id="L114"></a>            },
+<a id="L115"></a>            inline .aarch64_be,
+<a id="L116"></a>            .alpha,
+<a id="L117"></a>            .armeb,
+<a id="L118"></a>            .hexagon,
+<a id="L119"></a>            .hppa,
+<a id="L120"></a>            .loongarch64,
+<a id="L121"></a>            .m68k,
+<a id="L122"></a>            .microblaze,
+<a id="L123"></a>            .microblazeel,
+<a id="L124"></a>            .mips,
+<a id="L125"></a>            .mipsel,
+<a id="L126"></a>            .mips64,
+<a id="L127"></a>            .mips64el,
+<a id="L128"></a>            .or1k,
+<a id="L129"></a>            .powerpc,
+<a id="L130"></a>            .powerpc64,
+<a id="L131"></a>            .powerpc64le,
+<a id="L132"></a>            .riscv32,
+<a id="L133"></a>            .s390x,
+<a id="L134"></a>            .sh,
+<a id="L135"></a>            .sheb,
+<a id="L136"></a>            .sparc,
+<a id="L137"></a>            .sparc64,
+<a id="L138"></a>            .thumb,
+<a id="L139"></a>            .thumbeb,
+<a id="L140"></a>            .xtensa,
+<a id="L141"></a>            .xtensaeb,
+<a id="L142"></a>            =&gt; |t| switch (candidate.os.tag) {
+<a id="L143"></a>                .linux,
+<a id="L144"></a>                =&gt; .{
+<a id="L145"></a>                    .qemu = switch (t) {
+<a id="L146"></a>                        .powerpc =&gt; "qemu-ppc",
+<a id="L147"></a>                        .powerpc64 =&gt; "qemu-ppc64",
+<a id="L148"></a>                        .powerpc64le =&gt; "qemu-ppc64le",
+<a id="L149"></a>                        .mips64, .mips64el =&gt; switch (candidate.abi) {
+<a id="L150"></a>                            .gnuabin32, .muslabin32 =&gt; if (t == .mips64el) "qemu-mipsn32el" else "qemu-mipsn32",
+<a id="L151"></a>                            else =&gt; "qemu-" ++ @tagName(t),
+<a id="L152"></a>                        },
+<a id="L153"></a>                        // TODO: Actually check the SuperH version.
+<a id="L154"></a>                        .sh =&gt; "qemu-sh4",
+<a id="L155"></a>                        .sheb =&gt; "qemu-sh4eb",
+<a id="L156"></a>                        .sparc =&gt; if (candidate.cpu.has(.sparc, .v8plus)) "qemu-sparc32plus" else "qemu-sparc",
+<a id="L157"></a>                        .thumb =&gt; "qemu-arm",
+<a id="L158"></a>                        .thumbeb =&gt; "qemu-armeb",
+<a id="L159"></a>                        else =&gt; "qemu-" ++ @tagName(t),
+<a id="L160"></a>                    },
+<a id="L161"></a>                },
+<a id="L162"></a>                else =&gt; bad_result,
+<a id="L163"></a>            },
+<a id="L164"></a>            else =&gt; bad_result,
+<a id="L165"></a>        };
+<a id="L166"></a>    }
+<a id="L167"></a>
+<a id="L168"></a>    if (options.allow_wasmtime and candidate.cpu.arch.isWasm()) {
+<a id="L169"></a>        return .{ .wasmtime = "wasmtime" };
+<a id="L170"></a>    }
+<a id="L171"></a>
+<a id="L172"></a>    switch (candidate.os.tag) {
+<a id="L173"></a>        .windows =&gt; {
+<a id="L174"></a>            if (options.allow_wine) {
+<a id="L175"></a>                const wine_supported = switch (candidate.cpu.arch) {
+<a id="L176"></a>                    .thumb =&gt; switch (host.cpu.arch) {
+<a id="L177"></a>                        .arm, .thumb, .aarch64 =&gt; true,
+<a id="L178"></a>                        else =&gt; false,
+<a id="L179"></a>                    },
+<a id="L180"></a>                    .aarch64 =&gt; host.cpu.arch == .aarch64,
+<a id="L181"></a>                    .x86 =&gt; host.cpu.arch.isX86(),
+<a id="L182"></a>                    .x86_64 =&gt; host.cpu.arch == .x86_64,
+<a id="L183"></a>                    else =&gt; false,
+<a id="L184"></a>                };
+<a id="L185"></a>                return if (wine_supported) .{ .wine = "wine" } else bad_result;
+<a id="L186"></a>            }
+<a id="L187"></a>            return bad_result;
+<a id="L188"></a>        },
+<a id="L189"></a>        .driverkit, .macos =&gt; {
+<a id="L190"></a>            if (options.allow_darling) {
+<a id="L191"></a>                // This check can be loosened once darling adds a QEMU-based emulation
+<a id="L192"></a>                // layer for non-host architectures:
+<a id="L193"></a>                // https://github.com/darlinghq/darling/issues/863
+<a id="L194"></a>                if (candidate.cpu.arch != host.cpu.arch) {
+<a id="L195"></a>                    return bad_result;
+<a id="L196"></a>                }
+<a id="L197"></a>                return .{ .darling = "darling" };
+<a id="L198"></a>            }
+<a id="L199"></a>            return bad_result;
+<a id="L200"></a>        },
+<a id="L201"></a>        else =&gt; return bad_result,
+<a id="L202"></a>    }
+<a id="L203"></a>}
+<a id="L204"></a>
+<a id="L205"></a>pub const DetectError = error{
+<a id="L206"></a>    FileSystem,
+<a id="L207"></a>    SystemResources,
+<a id="L208"></a>    SymLinkLoop,
+<a id="L209"></a>    ProcessFdQuotaExceeded,
+<a id="L210"></a>    SystemFdQuotaExceeded,
+<a id="L211"></a>    DeviceBusy,
+<a id="L212"></a>    OSVersionDetectionFail,
+<a id="L213"></a>    Unexpected,
+<a id="L214"></a>    /// Android-only. Querying API level through `getprop` failed.
+<a id="L215"></a>    ApiLevelQueryFailed,
+<a id="L216"></a>} || Io.Cancelable;
+<a id="L217"></a>
+<a id="L218"></a>/// Given a `Target.Query`, which specifies in detail which parts of the
+<a id="L219"></a>/// target should be detected natively, which should be standard or default,
+<a id="L220"></a>/// and which are provided explicitly, this function resolves the native
+<a id="L221"></a>/// components by detecting the native system, and then resolves
+<a id="L222"></a>/// standard/default parts relative to that.
+<a id="L223"></a>pub fn resolveTargetQuery(io: Io, query: Target.Query) DetectError!Target {
+<a id="L224"></a>    // Until https://github.com/ziglang/zig/issues/4592 is implemented (support detecting the
+<a id="L225"></a>    // native CPU architecture as being different than the current target), we use this:
+<a id="L226"></a>    const query_cpu_arch = query.cpu_arch orelse builtin.cpu.arch;
+<a id="L227"></a>    const query_os_tag = query.os_tag orelse builtin.os.tag;
+<a id="L228"></a>    const query_abi = query.abi orelse builtin.abi;
+<a id="L229"></a>    var os = query_os_tag.defaultVersionRange(query_cpu_arch, query_abi);
+<a id="L230"></a>    if (query.os_tag == null) {
+<a id="L231"></a>        switch (builtin.target.os.tag) {
+<a id="L232"></a>            .linux, .illumos =&gt; {
+<a id="L233"></a>                const uts = posix.uname();
+<a id="L234"></a>                const release = mem.sliceTo(&amp;uts.release, 0);
+<a id="L235"></a>                // The release field sometimes has a weird format,
+<a id="L236"></a>                // `Version.parse` will attempt to find some meaningful interpretation.
+<a id="L237"></a>                if (std.SemanticVersion.parse(release)) |ver| {
+<a id="L238"></a>                    var stripped = ver;
+<a id="L239"></a>                    stripped.pre = null;
+<a id="L240"></a>                    stripped.build = null;
+<a id="L241"></a>                    os.version_range.linux.range.min = stripped;
+<a id="L242"></a>                    os.version_range.linux.range.max = stripped;
+<a id="L243"></a>                } else |err| switch (err) {
+<a id="L244"></a>                    error.Overflow =&gt; {},
+<a id="L245"></a>                    error.InvalidVersion =&gt; {},
+<a id="L246"></a>                }
+<a id="L247"></a>            },
+<a id="L248"></a>            .windows =&gt; {
+<a id="L249"></a>                const detected_version = windows.detectRuntimeVersion();
+<a id="L250"></a>                os.version_range.windows.min = detected_version;
+<a id="L251"></a>                os.version_range.windows.max = detected_version;
+<a id="L252"></a>            },
+<a id="L253"></a>            .macos =&gt; try darwin.macos.detect(io, &amp;os),
+<a id="L254"></a>            .freebsd, .netbsd, .dragonfly =&gt; {
+<a id="L255"></a>                const key = switch (builtin.target.os.tag) {
+<a id="L256"></a>                    .freebsd =&gt; "kern.osreldate",
+<a id="L257"></a>                    .netbsd, .dragonfly =&gt; "kern.osrevision",
+<a id="L258"></a>                    else =&gt; unreachable,
+<a id="L259"></a>                };
+<a id="L260"></a>                var value: u32 = undefined;
+<a id="L261"></a>                var len: usize = @sizeOf(@TypeOf(value));
+<a id="L262"></a>
+<a id="L263"></a>                switch (posix.errno(posix.system.sysctlbyname(key, &amp;value, &amp;len, null, 0))) {
+<a id="L264"></a>                    .SUCCESS =&gt; {},
+<a id="L265"></a>                    .FAULT =&gt; unreachable,
+<a id="L266"></a>                    .PERM =&gt; unreachable, // only when setting values,
+<a id="L267"></a>                    .NOMEM =&gt; unreachable, // memory already on the stack
+<a id="L268"></a>                    .NOENT =&gt; unreachable, // constant, known good value
+<a id="L269"></a>                    else =&gt; return error.OSVersionDetectionFail,
+<a id="L270"></a>                }
+<a id="L271"></a>
+<a id="L272"></a>                switch (builtin.target.os.tag) {
+<a id="L273"></a>                    .freebsd =&gt; {
+<a id="L274"></a>                        // https://www.freebsd.org/doc/en_US.ISO8859-1/books/porters-handbook/versions.html
+<a id="L275"></a>                        // Major * 100,000 has been convention since FreeBSD 2.2 (1997)
+<a id="L276"></a>                        // Minor * 1(0),000 summed has been convention since FreeBSD 2.2 (1997)
+<a id="L277"></a>                        // e.g. 492101 = 4.11-STABLE = 4.(9+2)
+<a id="L278"></a>                        const major = value / 100_000;
+<a id="L279"></a>                        const minor1 = value % 100_000 / 10_000; // usually 0 since 5.1
+<a id="L280"></a>                        const minor2 = value % 10_000 / 1_000; // 0 before 5.1, minor version since
+<a id="L281"></a>                        const patch = value % 1_000;
+<a id="L282"></a>                        os.version_range.semver.min = .{ .major = major, .minor = minor1 + minor2, .patch = patch };
+<a id="L283"></a>                        os.version_range.semver.max = os.version_range.semver.min;
+<a id="L284"></a>                    },
+<a id="L285"></a>                    .netbsd =&gt; {
+<a id="L286"></a>                        // #define __NetBSD_Version__ MMmmrrpp00
+<a id="L287"></a>                        //
+<a id="L288"></a>                        // M = major version
+<a id="L289"></a>                        // m = minor version; a minor number of 99 indicates current.
+<a id="L290"></a>                        // r = 0 (*)
+<a id="L291"></a>                        // p = patchlevel
+<a id="L292"></a>                        const major = value / 100_000_000;
+<a id="L293"></a>                        const minor = value % 100_000_000 / 1_000_000;
+<a id="L294"></a>                        const patch = value % 10_000 / 100;
+<a id="L295"></a>                        os.version_range.semver.min = .{ .major = major, .minor = minor, .patch = patch };
+<a id="L296"></a>                        os.version_range.semver.max = os.version_range.semver.min;
+<a id="L297"></a>                    },
+<a id="L298"></a>                    .dragonfly =&gt; {
+<a id="L299"></a>                        // https://github.com/DragonFlyBSD/DragonFlyBSD/blob/cb2cde83771754aeef9bb3251ee48959138dec87/Makefile.inc1#L15-L17
+<a id="L300"></a>                        // flat base10 format: Mmmmpp
+<a id="L301"></a>                        //   M = major
+<a id="L302"></a>                        //   m = minor; odd-numbers indicate current dev branch
+<a id="L303"></a>                        //   p = patch
+<a id="L304"></a>                        const major = value / 100_000;
+<a id="L305"></a>                        const minor = value % 100_000 / 100;
+<a id="L306"></a>                        const patch = value % 100;
+<a id="L307"></a>                        os.version_range.semver.min = .{ .major = major, .minor = minor, .patch = patch };
+<a id="L308"></a>                        os.version_range.semver.max = os.version_range.semver.min;
+<a id="L309"></a>                    },
+<a id="L310"></a>                    else =&gt; unreachable,
+<a id="L311"></a>                }
+<a id="L312"></a>            },
+<a id="L313"></a>            .openbsd =&gt; {
+<a id="L314"></a>                const mib: [2]c_int = [_]c_int{
+<a id="L315"></a>                    posix.CTL.KERN,
+<a id="L316"></a>                    posix.KERN.OSRELEASE,
+<a id="L317"></a>                };
+<a id="L318"></a>                var buf: [64:0]u8 = undefined;
+<a id="L319"></a>                // consider that sysctl result includes null-termination
+<a id="L320"></a>                var len: usize = buf.len + 1;
+<a id="L321"></a>
+<a id="L322"></a>                posix.sysctl(&amp;mib, &amp;buf, &amp;len, null, 0) catch |err| switch (err) {
+<a id="L323"></a>                    error.NameTooLong =&gt; unreachable, // constant, known good value
+<a id="L324"></a>                    error.PermissionDenied =&gt; unreachable, // only when setting values,
+<a id="L325"></a>                    error.SystemResources =&gt; unreachable, // memory already on the stack
+<a id="L326"></a>                    error.UnknownName =&gt; unreachable, // constant, known good value
+<a id="L327"></a>                    error.Unexpected =&gt; return error.OSVersionDetectionFail,
+<a id="L328"></a>                };
+<a id="L329"></a>
+<a id="L330"></a>                if (Target.Query.parseVersion(buf[0 .. len - 1 :0])) |ver| {
+<a id="L331"></a>                    assert(ver.build == null);
+<a id="L332"></a>                    assert(ver.pre == null);
+<a id="L333"></a>                    os.version_range.semver.min = ver;
+<a id="L334"></a>                    os.version_range.semver.max = ver;
+<a id="L335"></a>                } else |_| {
+<a id="L336"></a>                    return error.OSVersionDetectionFail;
+<a id="L337"></a>                }
+<a id="L338"></a>            },
+<a id="L339"></a>            else =&gt; {
+<a id="L340"></a>                // Unimplemented, fall back to default version range.
+<a id="L341"></a>            },
+<a id="L342"></a>        }
+<a id="L343"></a>    }
+<a id="L344"></a>
+<a id="L345"></a>    if (query.os_version_min) |min| switch (min) {
+<a id="L346"></a>        .none =&gt; {},
+<a id="L347"></a>        .semver =&gt; |semver| switch (os.tag.versionRangeTag()) {
+<a id="L348"></a>            inline .hurd, .linux =&gt; |t| @field(os.version_range, @tagName(t)).range.min = semver,
+<a id="L349"></a>            else =&gt; os.version_range.semver.min = semver,
+<a id="L350"></a>        },
+<a id="L351"></a>        .windows =&gt; |win_ver| os.version_range.windows.min = win_ver,
+<a id="L352"></a>    };
+<a id="L353"></a>
+<a id="L354"></a>    if (query.os_version_max) |max| switch (max) {
+<a id="L355"></a>        .none =&gt; {},
+<a id="L356"></a>        .semver =&gt; |semver| switch (os.tag.versionRangeTag()) {
+<a id="L357"></a>            inline .hurd, .linux =&gt; |t| @field(os.version_range, @tagName(t)).range.max = semver,
+<a id="L358"></a>            else =&gt; os.version_range.semver.max = semver,
+<a id="L359"></a>        },
+<a id="L360"></a>        .windows =&gt; |win_ver| os.version_range.windows.max = win_ver,
+<a id="L361"></a>    };
+<a id="L362"></a>
+<a id="L363"></a>    if (query.glibc_version) |glibc| {
+<a id="L364"></a>        switch (os.tag.versionRangeTag()) {
+<a id="L365"></a>            inline .hurd, .linux =&gt; |t| @field(os.version_range, @tagName(t)).glibc = glibc,
+<a id="L366"></a>            else =&gt; {},
+<a id="L367"></a>        }
+<a id="L368"></a>    }
+<a id="L369"></a>
+<a id="L370"></a>    if (query.android_api_level) |android| {
+<a id="L371"></a>        os.version_range.linux.android = android;
+<a id="L372"></a>    }
+<a id="L373"></a>
+<a id="L374"></a>    var cpu = switch (query.cpu_model) {
+<a id="L375"></a>        .native =&gt; detectNativeCpuAndFeatures(io, query_cpu_arch, os, query),
+<a id="L376"></a>        .baseline =&gt; Target.Cpu.baseline(query_cpu_arch, os),
+<a id="L377"></a>        .determined_by_arch_os =&gt; if (query.cpu_arch == null)
+<a id="L378"></a>            detectNativeCpuAndFeatures(io, query_cpu_arch, os, query)
+<a id="L379"></a>        else
+<a id="L380"></a>            Target.Cpu.baseline(query_cpu_arch, os),
+<a id="L381"></a>        .explicit =&gt; |model| model.toCpu(query_cpu_arch),
+<a id="L382"></a>    } orelse backup_cpu_detection: {
+<a id="L383"></a>        break :backup_cpu_detection Target.Cpu.baseline(query_cpu_arch, os);
+<a id="L384"></a>    };
+<a id="L385"></a>
+<a id="L386"></a>    // For x86, we need to populate some CPU feature flags depending on architecture
+<a id="L387"></a>    // and mode:
+<a id="L388"></a>    //  * 16bit_mode =&gt; if the arch is x86_16
+<a id="L389"></a>    //  * 32bit_mode =&gt; if the arch is x86
+<a id="L390"></a>    // However, the "mode" flags can be used as overrides, so if the user explicitly
+<a id="L391"></a>    // sets one of them, that takes precedence.
+<a id="L392"></a>    switch (query_cpu_arch) {
+<a id="L393"></a>        .x86_16 =&gt; {
+<a id="L394"></a>            cpu.features.addFeature(@intFromEnum(Target.x86.Feature.@"16bit_mode"));
+<a id="L395"></a>        },
+<a id="L396"></a>        .x86 =&gt; {
+<a id="L397"></a>            if (!Target.x86.featureSetHasAny(query.cpu_features_add, .{
+<a id="L398"></a>                .@"16bit_mode", .@"32bit_mode",
+<a id="L399"></a>            })) {
+<a id="L400"></a>                cpu.features.addFeature(@intFromEnum(Target.x86.Feature.@"32bit_mode"));
+<a id="L401"></a>            }
+<a id="L402"></a>        },
+<a id="L403"></a>        .arm, .armeb =&gt; {
+<a id="L404"></a>            // XXX What do we do if the target has the noarm feature?
+<a id="L405"></a>            //     What do we do if the user specifies +thumb_mode?
+<a id="L406"></a>        },
+<a id="L407"></a>        .thumb, .thumbeb =&gt; {
+<a id="L408"></a>            cpu.features.addFeature(@intFromEnum(Target.arm.Feature.thumb_mode));
+<a id="L409"></a>        },
+<a id="L410"></a>        else =&gt; {},
+<a id="L411"></a>    }
+<a id="L412"></a>    updateCpuFeatures(
+<a id="L413"></a>        &amp;cpu.features,
+<a id="L414"></a>        cpu.arch.allFeaturesList(),
+<a id="L415"></a>        query.cpu_features_add,
+<a id="L416"></a>        query.cpu_features_sub,
+<a id="L417"></a>    );
+<a id="L418"></a>
+<a id="L419"></a>    var result = detectAbiAndDynamicLinker(io, cpu, os, query) catch |err| switch (err) {
+<a id="L420"></a>        error.Canceled =&gt; |e| return e,
+<a id="L421"></a>        error.Unexpected =&gt; |e| return e,
+<a id="L422"></a>        error.WouldBlock =&gt; return error.Unexpected,
+<a id="L423"></a>        error.ConnectionResetByPeer =&gt; return error.Unexpected,
+<a id="L424"></a>        error.NotOpenForReading =&gt; return error.Unexpected,
+<a id="L425"></a>        error.SocketUnconnected =&gt; return error.Unexpected,
+<a id="L426"></a>        error.ReadOnlyFileSystem =&gt; return error.Unexpected,
+<a id="L427"></a>
+<a id="L428"></a>        error.AccessDenied,
+<a id="L429"></a>        error.SymLinkLoop,
+<a id="L430"></a>        error.ProcessFdQuotaExceeded,
+<a id="L431"></a>        error.SystemFdQuotaExceeded,
+<a id="L432"></a>        error.SystemResources,
+<a id="L433"></a>        error.IsDir,
+<a id="L434"></a>        error.DeviceBusy,
+<a id="L435"></a>        error.InputOutput,
+<a id="L436"></a>        error.LockViolation,
+<a id="L437"></a>        error.FileSystem,
+<a id="L438"></a>
+<a id="L439"></a>        error.UnableToOpenElfFile,
+<a id="L440"></a>        error.UnhelpfulFile,
+<a id="L441"></a>        error.InvalidElfFile,
+<a id="L442"></a>        error.RelativeShebang,
+<a id="L443"></a>        =&gt; return defaultAbiAndDynamicLinker(cpu, os, query),
+<a id="L444"></a>    };
+<a id="L445"></a>
+<a id="L446"></a>    // These CPU feature hacks have to come after ABI detection.
+<a id="L447"></a>    {
+<a id="L448"></a>        if (result.cpu.arch == .hexagon) {
+<a id="L449"></a>            // Both LLVM and LLD have broken support for the small data area. Yet LLVM has the
+<a id="L450"></a>            // feature on by default for all Hexagon CPUs. Clang sort of solves this by defaulting
+<a id="L451"></a>            // the `-gpsize` command line parameter for the Hexagon backend to 0, so that no
+<a id="L452"></a>            // constants get placed in the SDA. (This of course breaks down if the user passes
+<a id="L453"></a>            // `-G &lt;n&gt;` to Clang...) We can't do the `-gpsize` hack because we can have multiple
+<a id="L454"></a>            // concurrent LLVM emit jobs, and command line options in LLVM are shared globally. So
+<a id="L455"></a>            // just force this feature off. Lovely stuff.
+<a id="L456"></a>            result.cpu.features.removeFeature(@intFromEnum(Target.hexagon.Feature.small_data));
+<a id="L457"></a>        }
+<a id="L458"></a>
+<a id="L459"></a>        // https://github.com/llvm/llvm-project/issues/105978
+<a id="L460"></a>        if (result.cpu.arch.isArm() and result.abi.float() == .soft) {
+<a id="L461"></a>            result.cpu.features.removeFeature(@intFromEnum(Target.arm.Feature.vfp2));
+<a id="L462"></a>        }
+<a id="L463"></a>
+<a id="L464"></a>        // https://github.com/llvm/llvm-project/issues/135283
+<a id="L465"></a>        if (result.cpu.arch.isMIPS() and result.abi.float() == .soft) {
+<a id="L466"></a>            result.cpu.features.addFeature(@intFromEnum(Target.mips.Feature.soft_float));
+<a id="L467"></a>        }
+<a id="L468"></a>
+<a id="L469"></a>        // https://github.com/llvm/llvm-project/issues/168992
+<a id="L470"></a>        if (result.cpu.arch == .s390x) {
+<a id="L471"></a>            result.cpu.features.removeFeature(@intFromEnum(Target.s390x.Feature.vector));
+<a id="L472"></a>        }
+<a id="L473"></a>    }
+<a id="L474"></a>
+<a id="L475"></a>    // It's possible that we detect the native ABI, but fail to detect the OS version or were told
+<a id="L476"></a>    // to use the default OS version range. In that case, while we can't determine the exact native
+<a id="L477"></a>    // OS version, we do at least know that some ABIs require a particular OS version (by way of
+<a id="L478"></a>    // `std.zig.target.available_libcs`). So in this case, adjust the OS version to the minimum that
+<a id="L479"></a>    // we know is required.
+<a id="L480"></a>    if (result.abi != query_abi and query.os_version_min == null) {
+<a id="L481"></a>        const result_ver_range = &amp;result.os.version_range;
+<a id="L482"></a>        const abi_ver_range = result.os.tag.defaultVersionRange(result.cpu.arch, result.abi).version_range;
+<a id="L483"></a>
+<a id="L484"></a>        switch (result.os.tag.versionRangeTag()) {
+<a id="L485"></a>            .none =&gt; {},
+<a id="L486"></a>            .semver =&gt; if (result_ver_range.semver.min.order(abi_ver_range.semver.min) == .lt) {
+<a id="L487"></a>                result_ver_range.semver.min = abi_ver_range.semver.min;
+<a id="L488"></a>            },
+<a id="L489"></a>            inline .hurd, .linux =&gt; |t| {
+<a id="L490"></a>                if (@field(result_ver_range, @tagName(t)).range.min.order(@field(abi_ver_range, @tagName(t)).range.min) == .lt) {
+<a id="L491"></a>                    @field(result_ver_range, @tagName(t)).range.min = @field(abi_ver_range, @tagName(t)).range.min;
+<a id="L492"></a>                }
+<a id="L493"></a>
+<a id="L494"></a>                if (@field(result_ver_range, @tagName(t)).glibc.order(@field(abi_ver_range, @tagName(t)).glibc) == .lt and
+<a id="L495"></a>                    query.glibc_version == null)
+<a id="L496"></a>                {
+<a id="L497"></a>                    @field(result_ver_range, @tagName(t)).glibc = @field(abi_ver_range, @tagName(t)).glibc;
+<a id="L498"></a>                }
+<a id="L499"></a>            },
+<a id="L500"></a>            .windows =&gt; if (!result_ver_range.windows.min.isAtLeast(abi_ver_range.windows.min)) {
+<a id="L501"></a>                result_ver_range.windows.min = abi_ver_range.windows.min;
+<a id="L502"></a>            },
+<a id="L503"></a>        }
+<a id="L504"></a>    }
+<a id="L505"></a>
+<a id="L506"></a>    if (builtin.os.tag == .linux and result.isBionicLibC() and query.os_tag == null and query.android_api_level == null) {
+<a id="L507"></a>        result.os.version_range.linux.android = detectAndroidApiLevel(io) catch |err| return switch (err) {
+<a id="L508"></a>            error.InvalidWtf8,
+<a id="L509"></a>            error.InvalidBatchScriptArg,
+<a id="L510"></a>            =&gt; unreachable, // Windows-only
+<a id="L511"></a>            error.ApiLevelQueryFailed =&gt; |e| e,
+<a id="L512"></a>            else =&gt; blk: {
+<a id="L513"></a>                std.log.err("spawning or reading from getprop failed ({s})", .{@errorName(err)});
+<a id="L514"></a>                switch (err) {
+<a id="L515"></a>                    error.SystemResources,
+<a id="L516"></a>                    error.FileSystem,
+<a id="L517"></a>                    error.ProcessFdQuotaExceeded,
+<a id="L518"></a>                    error.SystemFdQuotaExceeded,
+<a id="L519"></a>                    error.SymLinkLoop,
+<a id="L520"></a>                    =&gt; |e| break :blk e,
+<a id="L521"></a>                    else =&gt; break :blk error.ApiLevelQueryFailed,
+<a id="L522"></a>                }
+<a id="L523"></a>            },
+<a id="L524"></a>        };
+<a id="L525"></a>    }
+<a id="L526"></a>
+<a id="L527"></a>    return result;
+<a id="L528"></a>}
+<a id="L529"></a>
+<a id="L530"></a>fn updateCpuFeatures(
+<a id="L531"></a>    set: *Target.Cpu.Feature.Set,
+<a id="L532"></a>    all_features_list: []const Target.Cpu.Feature,
+<a id="L533"></a>    add_set: Target.Cpu.Feature.Set,
+<a id="L534"></a>    sub_set: Target.Cpu.Feature.Set,
+<a id="L535"></a>) void {
+<a id="L536"></a>    set.removeFeatureSet(sub_set);
+<a id="L537"></a>    set.addFeatureSet(add_set);
+<a id="L538"></a>    set.populateDependencies(all_features_list);
+<a id="L539"></a>    set.removeFeatureSet(sub_set);
+<a id="L540"></a>}
+<a id="L541"></a>
+<a id="L542"></a>fn detectNativeCpuAndFeatures(io: Io, cpu_arch: Target.Cpu.Arch, os: Target.Os, query: Target.Query) ?Target.Cpu {
+<a id="L543"></a>    // Here we switch on a comptime value rather than `cpu_arch`. This is valid because `cpu_arch`,
+<a id="L544"></a>    // although it is a runtime value, is guaranteed to be one of the architectures in the set
+<a id="L545"></a>    // of the respective switch prong.
+<a id="L546"></a>    switch (builtin.cpu.arch) {
+<a id="L547"></a>        .loongarch32, .loongarch64 =&gt; return @import("system/loongarch.zig").detectNativeCpuAndFeatures(cpu_arch, os, query),
+<a id="L548"></a>        .x86_64, .x86 =&gt; return @import("system/x86.zig").detectNativeCpuAndFeatures(cpu_arch, os, query),
+<a id="L549"></a>        else =&gt; {},
+<a id="L550"></a>    }
+<a id="L551"></a>
+<a id="L552"></a>    switch (builtin.os.tag) {
+<a id="L553"></a>        .linux =&gt; return linux.detectNativeCpuAndFeatures(io),
+<a id="L554"></a>        .macos =&gt; return darwin.macos.detectNativeCpuAndFeatures(),
+<a id="L555"></a>        .windows =&gt; return windows.detectNativeCpuAndFeatures(),
+<a id="L556"></a>        else =&gt; {},
+<a id="L557"></a>    }
+<a id="L558"></a>
+<a id="L559"></a>    // This architecture does not have CPU model &amp; feature detection yet.
+<a id="L560"></a>    // See https://github.com/ziglang/zig/issues/4591
+<a id="L561"></a>    return null;
+<a id="L562"></a>}
+<a id="L563"></a>
+<a id="L564"></a>pub const AbiAndDynamicLinkerFromFileError = error{
+<a id="L565"></a>    Canceled,
+<a id="L566"></a>    AccessDenied,
+<a id="L567"></a>    Unexpected,
+<a id="L568"></a>    Unseekable,
+<a id="L569"></a>    ReadFailed,
+<a id="L570"></a>    EndOfStream,
+<a id="L571"></a>    NameTooLong,
+<a id="L572"></a>    StaticElfFile,
+<a id="L573"></a>    InvalidElfFile,
+<a id="L574"></a>    StreamTooLong,
+<a id="L575"></a>    Timeout,
+<a id="L576"></a>    SymLinkLoop,
+<a id="L577"></a>    SystemResources,
+<a id="L578"></a>    ProcessFdQuotaExceeded,
+<a id="L579"></a>    SystemFdQuotaExceeded,
+<a id="L580"></a>    IsDir,
+<a id="L581"></a>    WouldBlock,
+<a id="L582"></a>    InputOutput,
+<a id="L583"></a>    BrokenPipe,
+<a id="L584"></a>    ConnectionResetByPeer,
+<a id="L585"></a>    NotOpenForReading,
+<a id="L586"></a>    SocketUnconnected,
+<a id="L587"></a>    LockViolation,
+<a id="L588"></a>    FileSystem,
+<a id="L589"></a>};
+<a id="L590"></a>
+<a id="L591"></a>fn abiAndDynamicLinkerFromFile(
+<a id="L592"></a>    file_reader: *Io.File.Reader,
+<a id="L593"></a>    header: *const elf.Header,
+<a id="L594"></a>    cpu: Target.Cpu,
+<a id="L595"></a>    os: Target.Os,
+<a id="L596"></a>    ld_info_list: []const LdInfo,
+<a id="L597"></a>    query: Target.Query,
+<a id="L598"></a>) AbiAndDynamicLinkerFromFileError!Target {
+<a id="L599"></a>    const io = file_reader.io;
+<a id="L600"></a>    var result: Target = .{
+<a id="L601"></a>        .cpu = cpu,
+<a id="L602"></a>        .os = os,
+<a id="L603"></a>        .abi = query.abi orelse Target.Abi.default(cpu.arch, os.tag),
+<a id="L604"></a>        .ofmt = query.ofmt orelse Target.ObjectFormat.default(os.tag, cpu.arch),
+<a id="L605"></a>        .dynamic_linker = query.dynamic_linker orelse .none,
+<a id="L606"></a>    };
+<a id="L607"></a>    var rpath_offset: ?u64 = null; // Found inside PT_DYNAMIC
+<a id="L608"></a>    const look_for_ld = query.dynamic_linker == null;
+<a id="L609"></a>
+<a id="L610"></a>    var got_dyn_section: bool = false;
+<a id="L611"></a>    {
+<a id="L612"></a>        var it = header.iterateProgramHeaders(file_reader);
+<a id="L613"></a>        while (try it.next()) |phdr| switch (phdr.p_type) {
+<a id="L614"></a>            elf.PT_INTERP =&gt; {
+<a id="L615"></a>                got_dyn_section = true;
+<a id="L616"></a>
+<a id="L617"></a>                if (look_for_ld) {
+<a id="L618"></a>                    const p_filesz = phdr.p_filesz;
+<a id="L619"></a>                    if (p_filesz &gt; result.dynamic_linker.buffer.len) return error.NameTooLong;
+<a id="L620"></a>                    const filesz: usize = @intCast(p_filesz);
+<a id="L621"></a>                    try file_reader.seekTo(phdr.p_offset);
+<a id="L622"></a>                    try file_reader.interface.readSliceAll(result.dynamic_linker.buffer[0..filesz]);
+<a id="L623"></a>                    // PT_INTERP includes a null byte in filesz.
+<a id="L624"></a>                    const len = filesz - 1;
+<a id="L625"></a>                    // dynamic_linker.max_byte is "max", not "len".
+<a id="L626"></a>                    // We know it will fit in u8 because we check against dynamic_linker.buffer.len above.
+<a id="L627"></a>                    result.dynamic_linker.len = @intCast(len);
+<a id="L628"></a>
+<a id="L629"></a>                    // Use it to determine ABI.
+<a id="L630"></a>                    const full_ld_path = result.dynamic_linker.buffer[0..len];
+<a id="L631"></a>                    for (ld_info_list) |ld_info| {
+<a id="L632"></a>                        const standard_ld_basename = fs.path.basename(ld_info.ld.get().?);
+<a id="L633"></a>                        if (std.mem.endsWith(u8, full_ld_path, standard_ld_basename)) {
+<a id="L634"></a>                            result.abi = ld_info.abi;
+<a id="L635"></a>                            break;
+<a id="L636"></a>                        }
+<a id="L637"></a>                    }
+<a id="L638"></a>                }
+<a id="L639"></a>            },
+<a id="L640"></a>            // We only need this for detecting glibc version.
+<a id="L641"></a>            elf.PT_DYNAMIC =&gt; {
+<a id="L642"></a>                got_dyn_section = true;
+<a id="L643"></a>
+<a id="L644"></a>                if (builtin.target.os.tag == .linux and result.isGnuLibC() and query.glibc_version == null) {
+<a id="L645"></a>                    var dyn_it = header.iterateDynamicSection(file_reader, phdr.p_offset, phdr.p_filesz);
+<a id="L646"></a>                    while (try dyn_it.next()) |dyn| {
+<a id="L647"></a>                        if (dyn.d_tag == elf.DT_RUNPATH) {
+<a id="L648"></a>                            rpath_offset = dyn.d_val;
+<a id="L649"></a>                            break;
+<a id="L650"></a>                        }
+<a id="L651"></a>                    }
+<a id="L652"></a>                }
+<a id="L653"></a>            },
+<a id="L654"></a>            else =&gt; continue,
+<a id="L655"></a>        };
+<a id="L656"></a>    }
+<a id="L657"></a>
+<a id="L658"></a>    if (!got_dyn_section) {
+<a id="L659"></a>        return error.StaticElfFile;
+<a id="L660"></a>    }
+<a id="L661"></a>
+<a id="L662"></a>    if (builtin.target.os.tag == .linux and result.isGnuLibC() and query.glibc_version == null) {
+<a id="L663"></a>        const str_section_off = header.shoff + @as(u64, header.shentsize) * @as(u64, header.shstrndx);
+<a id="L664"></a>        try file_reader.seekTo(str_section_off);
+<a id="L665"></a>        const shstr = try elf.takeSectionHeader(&amp;file_reader.interface, header.is_64, header.endian);
+<a id="L666"></a>        var strtab_buf: [4096]u8 = undefined;
+<a id="L667"></a>        const shstrtab = strtab_buf[0..@min(shstr.sh_size, strtab_buf.len)];
+<a id="L668"></a>        try file_reader.seekTo(shstr.sh_offset);
+<a id="L669"></a>        try file_reader.interface.readSliceAll(shstrtab);
+<a id="L670"></a>        const dynstr: ?struct { offset: u64, size: u64 } = find_dyn_str: {
+<a id="L671"></a>            var it = header.iterateSectionHeaders(file_reader);
+<a id="L672"></a>            while (try it.next()) |shdr| {
+<a id="L673"></a>                const end = mem.findScalarPos(u8, shstrtab, shdr.sh_name, 0) orelse continue;
+<a id="L674"></a>                const sh_name = shstrtab[shdr.sh_name..end :0];
+<a id="L675"></a>                if (mem.eql(u8, sh_name, ".dynstr")) break :find_dyn_str .{
+<a id="L676"></a>                    .offset = shdr.sh_offset,
+<a id="L677"></a>                    .size = shdr.sh_size,
+<a id="L678"></a>                };
+<a id="L679"></a>            } else break :find_dyn_str null;
+<a id="L680"></a>        };
+<a id="L681"></a>        if (dynstr) |ds| {
+<a id="L682"></a>            if (rpath_offset) |rpoff| {
+<a id="L683"></a>                if (rpoff &gt; ds.size) return error.InvalidElfFile;
+<a id="L684"></a>                const rpoff_file = ds.offset + rpoff;
+<a id="L685"></a>                const rp_max_size = ds.size - rpoff;
+<a id="L686"></a>
+<a id="L687"></a>                try file_reader.seekTo(rpoff_file);
+<a id="L688"></a>                const rpath_list = try file_reader.interface.takeSentinel(0);
+<a id="L689"></a>                if (rpath_list.len &gt; rp_max_size) return error.StreamTooLong;
+<a id="L690"></a>
+<a id="L691"></a>                var it = mem.tokenizeScalar(u8, rpath_list, ':');
+<a id="L692"></a>                while (it.next()) |rpath| {
+<a id="L693"></a>                    if (glibcVerFromRPath(io, rpath)) |ver| {
+<a id="L694"></a>                        result.os.version_range.linux.glibc = ver;
+<a id="L695"></a>                        return result;
+<a id="L696"></a>                    } else |err| switch (err) {
+<a id="L697"></a>                        error.GLibCNotFound =&gt; continue,
+<a id="L698"></a>                        else =&gt; |e| return e,
+<a id="L699"></a>                    }
+<a id="L700"></a>                }
+<a id="L701"></a>            }
+<a id="L702"></a>        }
+<a id="L703"></a>
+<a id="L704"></a>        if (result.dynamic_linker.get()) |dl_path| glibc_ver: {
+<a id="L705"></a>            // There is no DT_RUNPATH so we try to find libc.so.6 inside the same
+<a id="L706"></a>            // directory as the dynamic linker.
+<a id="L707"></a>            if (fs.path.dirname(dl_path)) |rpath| {
+<a id="L708"></a>                if (glibcVerFromRPath(io, rpath)) |ver| {
+<a id="L709"></a>                    result.os.version_range.linux.glibc = ver;
+<a id="L710"></a>                    return result;
+<a id="L711"></a>                } else |err| switch (err) {
+<a id="L712"></a>                    error.GLibCNotFound =&gt; {},
+<a id="L713"></a>                    else =&gt; |e| return e,
+<a id="L714"></a>                }
+<a id="L715"></a>            }
+<a id="L716"></a>
+<a id="L717"></a>            // So far, no luck. Next we try to see if the information is
+<a id="L718"></a>            // present in the symlink data for the dynamic linker path.
+<a id="L719"></a>            var link_buffer: [posix.PATH_MAX]u8 = undefined;
+<a id="L720"></a>            const link_name = if (Io.Dir.readLinkAbsolute(io, dl_path, &amp;link_buffer)) |n|
+<a id="L721"></a>                link_buffer[0..n]
+<a id="L722"></a>            else |err| switch (err) {
+<a id="L723"></a>                error.NameTooLong =&gt; unreachable,
+<a id="L724"></a>                error.BadPathName =&gt; unreachable, // Windows only
+<a id="L725"></a>                error.UnsupportedReparsePointType =&gt; unreachable, // Windows only
+<a id="L726"></a>                error.NetworkNotFound =&gt; unreachable, // Windows only
+<a id="L727"></a>                error.AntivirusInterference =&gt; unreachable, // Windows only
+<a id="L728"></a>                error.FileBusy =&gt; unreachable, // Windows only
+<a id="L729"></a>
+<a id="L730"></a>                error.AccessDenied,
+<a id="L731"></a>                error.PermissionDenied,
+<a id="L732"></a>                error.FileNotFound,
+<a id="L733"></a>                error.NotLink,
+<a id="L734"></a>                error.NotDir,
+<a id="L735"></a>                =&gt; break :glibc_ver,
+<a id="L736"></a>
+<a id="L737"></a>                error.SystemResources,
+<a id="L738"></a>                error.FileSystem,
+<a id="L739"></a>                error.SymLinkLoop,
+<a id="L740"></a>                error.Canceled,
+<a id="L741"></a>                error.Unexpected,
+<a id="L742"></a>                =&gt; |e| return e,
+<a id="L743"></a>            };
+<a id="L744"></a>            result.os.version_range.linux.glibc = glibcVerFromLinkName(
+<a id="L745"></a>                fs.path.basename(link_name),
+<a id="L746"></a>                "ld-",
+<a id="L747"></a>            ) catch |err| switch (err) {
+<a id="L748"></a>                error.UnrecognizedGnuLibCFileName,
+<a id="L749"></a>                error.InvalidGnuLibCVersion,
+<a id="L750"></a>                =&gt; break :glibc_ver,
+<a id="L751"></a>            };
+<a id="L752"></a>            return result;
+<a id="L753"></a>        }
+<a id="L754"></a>
+<a id="L755"></a>        // Nothing worked so far. Finally we fall back to hard-coded search paths.
+<a id="L756"></a>        // Some distros such as Debian keep their libc.so.6 in `/lib/$triple/`.
+<a id="L757"></a>        var path_buf: [posix.PATH_MAX]u8 = undefined;
+<a id="L758"></a>        var index: usize = 0;
+<a id="L759"></a>        const prefix = "/lib/";
+<a id="L760"></a>        const cpu_arch = @tagName(result.cpu.arch);
+<a id="L761"></a>        const os_tag = @tagName(result.os.tag);
+<a id="L762"></a>        const abi = @tagName(result.abi);
+<a id="L763"></a>        @memcpy(path_buf[index..][0..prefix.len], prefix);
+<a id="L764"></a>        index += prefix.len;
+<a id="L765"></a>        @memcpy(path_buf[index..][0..cpu_arch.len], cpu_arch);
+<a id="L766"></a>        index += cpu_arch.len;
+<a id="L767"></a>        path_buf[index] = '-';
+<a id="L768"></a>        index += 1;
+<a id="L769"></a>        @memcpy(path_buf[index..][0..os_tag.len], os_tag);
+<a id="L770"></a>        index += os_tag.len;
+<a id="L771"></a>        path_buf[index] = '-';
+<a id="L772"></a>        index += 1;
+<a id="L773"></a>        @memcpy(path_buf[index..][0..abi.len], abi);
+<a id="L774"></a>        index += abi.len;
+<a id="L775"></a>        const rpath = path_buf[0..index];
+<a id="L776"></a>        if (glibcVerFromRPath(io, rpath)) |ver| {
+<a id="L777"></a>            result.os.version_range.linux.glibc = ver;
+<a id="L778"></a>            return result;
+<a id="L779"></a>        } else |err| switch (err) {
+<a id="L780"></a>            error.GLibCNotFound =&gt; {},
+<a id="L781"></a>            else =&gt; |e| return e,
+<a id="L782"></a>        }
+<a id="L783"></a>    }
+<a id="L784"></a>
+<a id="L785"></a>    return result;
+<a id="L786"></a>}
+<a id="L787"></a>
+<a id="L788"></a>fn glibcVerFromLinkName(link_name: []const u8, prefix: []const u8) error{ UnrecognizedGnuLibCFileName, InvalidGnuLibCVersion }!std.SemanticVersion {
+<a id="L789"></a>    // example: "libc-2.3.4.so"
+<a id="L790"></a>    // example: "libc-2.27.so"
+<a id="L791"></a>    // example: "ld-2.33.so"
+<a id="L792"></a>    const suffix = ".so";
+<a id="L793"></a>    if (!mem.startsWith(u8, link_name, prefix) or !mem.endsWith(u8, link_name, suffix)) {
+<a id="L794"></a>        return error.UnrecognizedGnuLibCFileName;
+<a id="L795"></a>    }
+<a id="L796"></a>    // chop off "libc-" and ".so"
+<a id="L797"></a>    const link_name_chopped = link_name[prefix.len .. link_name.len - suffix.len];
+<a id="L798"></a>    return Target.Query.parseVersion(link_name_chopped) catch |err| switch (err) {
+<a id="L799"></a>        error.Overflow =&gt; return error.InvalidGnuLibCVersion,
+<a id="L800"></a>        error.InvalidVersion =&gt; return error.InvalidGnuLibCVersion,
+<a id="L801"></a>    };
+<a id="L802"></a>}
+<a id="L803"></a>
+<a id="L804"></a>test glibcVerFromLinkName {
+<a id="L805"></a>    try std.testing.expectError(error.UnrecognizedGnuLibCFileName, glibcVerFromLinkName("ld-2.37.so", "this-prefix-does-not-exist"));
+<a id="L806"></a>    try std.testing.expectError(error.UnrecognizedGnuLibCFileName, glibcVerFromLinkName("libc-2.37.so-is-not-end", "libc-"));
+<a id="L807"></a>
+<a id="L808"></a>    try std.testing.expectError(error.InvalidGnuLibCVersion, glibcVerFromLinkName("ld-2.so", "ld-"));
+<a id="L809"></a>    try std.testing.expectEqual(std.SemanticVersion{ .major = 2, .minor = 37, .patch = 0 }, try glibcVerFromLinkName("ld-2.37.so", "ld-"));
+<a id="L810"></a>    try std.testing.expectEqual(std.SemanticVersion{ .major = 2, .minor = 37, .patch = 0 }, try glibcVerFromLinkName("ld-2.37.0.so", "ld-"));
+<a id="L811"></a>    try std.testing.expectEqual(std.SemanticVersion{ .major = 2, .minor = 37, .patch = 1 }, try glibcVerFromLinkName("ld-2.37.1.so", "ld-"));
+<a id="L812"></a>    try std.testing.expectError(error.InvalidGnuLibCVersion, glibcVerFromLinkName("ld-2.37.4.5.so", "ld-"));
+<a id="L813"></a>}
+<a id="L814"></a>
+<a id="L815"></a>fn glibcVerFromRPath(io: Io, rpath: []const u8) !std.SemanticVersion {
+<a id="L816"></a>    const cwd: Io.Dir = .cwd();
+<a id="L817"></a>
+<a id="L818"></a>    var dir = cwd.openDir(io, rpath, .{}) catch |err| switch (err) {
+<a id="L819"></a>        error.NameTooLong =&gt; return error.Unexpected,
+<a id="L820"></a>        error.BadPathName =&gt; return error.Unexpected,
+<a id="L821"></a>        error.NetworkNotFound =&gt; return error.Unexpected, // Windows-only
+<a id="L822"></a>
+<a id="L823"></a>        error.FileNotFound =&gt; return error.GLibCNotFound,
+<a id="L824"></a>        error.NotDir =&gt; return error.GLibCNotFound,
+<a id="L825"></a>        error.AccessDenied =&gt; return error.GLibCNotFound,
+<a id="L826"></a>        error.PermissionDenied =&gt; return error.GLibCNotFound,
+<a id="L827"></a>        error.NoDevice =&gt; return error.GLibCNotFound,
+<a id="L828"></a>
+<a id="L829"></a>        error.ProcessFdQuotaExceeded =&gt; |e| return e,
+<a id="L830"></a>        error.SystemFdQuotaExceeded =&gt; |e| return e,
+<a id="L831"></a>        error.SystemResources =&gt; |e| return e,
+<a id="L832"></a>        error.SymLinkLoop =&gt; |e| return e,
+<a id="L833"></a>        error.Unexpected =&gt; |e| return e,
+<a id="L834"></a>        error.Canceled =&gt; |e| return e,
+<a id="L835"></a>    };
+<a id="L836"></a>    defer dir.close(io);
+<a id="L837"></a>
+<a id="L838"></a>    // Now we have a candidate for the path to libc shared object. In
+<a id="L839"></a>    // the past, we used readlink() here because the link name would
+<a id="L840"></a>    // reveal the glibc version. However, in more recent GNU/Linux
+<a id="L841"></a>    // installations, there is no symlink. Thus we instead use a more
+<a id="L842"></a>    // robust check of opening the libc shared object and looking at the
+<a id="L843"></a>    // .dynstr section, and finding the max version number of symbols
+<a id="L844"></a>    // that start with "GLIBC_2.".
+<a id="L845"></a>    const glibc_so_basename = "libc.so.6";
+<a id="L846"></a>    var file = dir.openFile(io, glibc_so_basename, .{}) catch |err| switch (err) {
+<a id="L847"></a>        error.NameTooLong =&gt; return error.Unexpected,
+<a id="L848"></a>        error.BadPathName =&gt; return error.Unexpected,
+<a id="L849"></a>        error.PipeBusy =&gt; return error.Unexpected, // Windows-only
+<a id="L850"></a>        error.NetworkNotFound =&gt; return error.Unexpected, // Windows-only
+<a id="L851"></a>        error.AntivirusInterference =&gt; return error.Unexpected, // Windows-only
+<a id="L852"></a>        error.FileLocksUnsupported =&gt; return error.Unexpected, // No lock requested.
+<a id="L853"></a>        error.NoSpaceLeft =&gt; return error.Unexpected, // read-only
+<a id="L854"></a>        error.PathAlreadyExists =&gt; return error.Unexpected, // read-only
+<a id="L855"></a>        error.DeviceBusy =&gt; return error.Unexpected, // read-only
+<a id="L856"></a>        error.FileBusy =&gt; return error.Unexpected, // read-only
+<a id="L857"></a>        error.ReadOnlyFileSystem =&gt; return error.Unexpected, // read-only
+<a id="L858"></a>        error.NoDevice =&gt; return error.Unexpected, // not asking for a special device
+<a id="L859"></a>        error.FileTooBig =&gt; return error.Unexpected,
+<a id="L860"></a>        error.WouldBlock =&gt; return error.Unexpected, // not opened in non-blocking
+<a id="L861"></a>
+<a id="L862"></a>        error.AccessDenied =&gt; return error.GLibCNotFound,
+<a id="L863"></a>        error.PermissionDenied =&gt; return error.GLibCNotFound,
+<a id="L864"></a>        error.FileNotFound =&gt; return error.GLibCNotFound,
+<a id="L865"></a>        error.NotDir =&gt; return error.GLibCNotFound,
+<a id="L866"></a>        error.IsDir =&gt; return error.GLibCNotFound,
+<a id="L867"></a>
+<a id="L868"></a>        error.ProcessFdQuotaExceeded =&gt; |e| return e,
+<a id="L869"></a>        error.SystemFdQuotaExceeded =&gt; |e| return e,
+<a id="L870"></a>        error.SystemResources =&gt; |e| return e,
+<a id="L871"></a>        error.SymLinkLoop =&gt; |e| return e,
+<a id="L872"></a>        error.Unexpected =&gt; |e| return e,
+<a id="L873"></a>        error.Canceled =&gt; |e| return e,
+<a id="L874"></a>    };
+<a id="L875"></a>    defer file.close(io);
+<a id="L876"></a>
+<a id="L877"></a>    // Empirically, glibc 2.34 libc.so .dynstr section is 32441 bytes on my system.
+<a id="L878"></a>    var buffer: [8000]u8 = undefined;
+<a id="L879"></a>    var file_reader: Io.File.Reader = .init(file, io, &amp;buffer);
+<a id="L880"></a>
+<a id="L881"></a>    return glibcVerFromSoFile(&amp;file_reader) catch |err| switch (err) {
+<a id="L882"></a>        error.InvalidElfMagic,
+<a id="L883"></a>        error.InvalidElfEndian,
+<a id="L884"></a>        error.InvalidElfClass,
+<a id="L885"></a>        error.InvalidElfVersion,
+<a id="L886"></a>        error.InvalidGnuLibCVersion,
+<a id="L887"></a>        error.EndOfStream,
+<a id="L888"></a>        =&gt; return error.GLibCNotFound,
+<a id="L889"></a>
+<a id="L890"></a>        error.ReadFailed =&gt; return file_reader.err.?,
+<a id="L891"></a>        else =&gt; |e| return e,
+<a id="L892"></a>    };
+<a id="L893"></a>}
+<a id="L894"></a>
+<a id="L895"></a>fn glibcVerFromSoFile(file_reader: *Io.File.Reader) !std.SemanticVersion {
+<a id="L896"></a>    const header = try elf.Header.read(&amp;file_reader.interface);
+<a id="L897"></a>    const str_section_off = header.shoff + @as(u64, header.shentsize) * @as(u64, header.shstrndx);
+<a id="L898"></a>    try file_reader.seekTo(str_section_off);
+<a id="L899"></a>    const shstr = try elf.takeSectionHeader(&amp;file_reader.interface, header.is_64, header.endian);
+<a id="L900"></a>    var strtab_buf: [4096]u8 = undefined;
+<a id="L901"></a>    const shstrtab = strtab_buf[0..@min(shstr.sh_size, strtab_buf.len)];
+<a id="L902"></a>    try file_reader.seekTo(shstr.sh_offset);
+<a id="L903"></a>    try file_reader.interface.readSliceAll(shstrtab);
+<a id="L904"></a>    const dynstr: struct { offset: u64, size: u64 } = find_dyn_str: {
+<a id="L905"></a>        var it = header.iterateSectionHeaders(file_reader);
+<a id="L906"></a>        while (try it.next()) |shdr| {
+<a id="L907"></a>            const end = mem.findScalarPos(u8, shstrtab, shdr.sh_name, 0) orelse continue;
+<a id="L908"></a>            const sh_name = shstrtab[shdr.sh_name..end :0];
+<a id="L909"></a>            if (mem.eql(u8, sh_name, ".dynstr")) break :find_dyn_str .{
+<a id="L910"></a>                .offset = shdr.sh_offset,
+<a id="L911"></a>                .size = shdr.sh_size,
+<a id="L912"></a>            };
+<a id="L913"></a>        } else return error.InvalidGnuLibCVersion;
+<a id="L914"></a>    };
+<a id="L915"></a>
+<a id="L916"></a>    // Here we loop over all the strings in the dynstr string table, assuming that any
+<a id="L917"></a>    // strings that start with "GLIBC_2." indicate the existence of such a glibc version,
+<a id="L918"></a>    // and furthermore, that the system-installed glibc is at minimum that version.
+<a id="L919"></a>    var max_ver: std.SemanticVersion = .{ .major = 2, .minor = 2, .patch = 5 };
+<a id="L920"></a>    var offset: u64 = 0;
+<a id="L921"></a>    try file_reader.seekTo(dynstr.offset);
+<a id="L922"></a>    while (offset &lt; dynstr.size) {
+<a id="L923"></a>        if (file_reader.interface.takeSentinel(0)) |s| {
+<a id="L924"></a>            if (mem.startsWith(u8, s, "GLIBC_2.")) {
+<a id="L925"></a>                const chopped = s["GLIBC_".len..];
+<a id="L926"></a>                const ver = Target.Query.parseVersion(chopped) catch |err| switch (err) {
+<a id="L927"></a>                    error.Overflow =&gt; return error.InvalidGnuLibCVersion,
+<a id="L928"></a>                    error.InvalidVersion =&gt; return error.InvalidGnuLibCVersion,
+<a id="L929"></a>                };
+<a id="L930"></a>                switch (ver.order(max_ver)) {
+<a id="L931"></a>                    .gt =&gt; max_ver = ver,
+<a id="L932"></a>                    .lt, .eq =&gt; continue,
+<a id="L933"></a>                }
+<a id="L934"></a>            }
+<a id="L935"></a>            offset += s.len + 1;
+<a id="L936"></a>        } else |err| switch (err) {
+<a id="L937"></a>            error.EndOfStream, error.StreamTooLong =&gt; break,
+<a id="L938"></a>            error.ReadFailed =&gt; |e| return e,
+<a id="L939"></a>        }
+<a id="L940"></a>    }
+<a id="L941"></a>
+<a id="L942"></a>    return max_ver;
+<a id="L943"></a>}
+<a id="L944"></a>
+<a id="L945"></a>/// In the past, this function attempted to use the executable's own binary if it was dynamically
+<a id="L946"></a>/// linked to answer both the C ABI question and the dynamic linker question. However, this
+<a id="L947"></a>/// could be problematic on a system that uses a RUNPATH for the compiler binary, locking
+<a id="L948"></a>/// it to an older glibc version, while system binaries such as /usr/bin/env use a newer glibc
+<a id="L949"></a>/// version. The problem is that libc.so.6 glibc version will match that of the system while
+<a id="L950"></a>/// the dynamic linker will match that of the compiler binary. Executables with these versions
+<a id="L951"></a>/// mismatching will fail to run.
+<a id="L952"></a>///
+<a id="L953"></a>/// Therefore, this function works the same regardless of whether the compiler binary is
+<a id="L954"></a>/// dynamically or statically linked. It inspects `/usr/bin/env` as an ELF file to find the
+<a id="L955"></a>/// answer to these questions, or if there is a shebang line, then it chases the referenced
+<a id="L956"></a>/// file recursively. If that does not provide the answer, then the function falls back to
+<a id="L957"></a>/// defaults.
+<a id="L958"></a>fn detectAbiAndDynamicLinker(io: Io, cpu: Target.Cpu, os: Target.Os, query: Target.Query) !Target {
+<a id="L959"></a>    const native_target_has_ld = comptime Target.DynamicLinker.kind(builtin.os.tag) != .none;
+<a id="L960"></a>    const is_linux = builtin.target.os.tag == .linux;
+<a id="L961"></a>    const is_illumos = builtin.target.os.tag == .illumos;
+<a id="L962"></a>    const is_darwin = builtin.target.os.tag.isDarwin();
+<a id="L963"></a>    const have_all_info = query.dynamic_linker != null and
+<a id="L964"></a>        query.abi != null and (!is_linux or query.abi.?.isGnu());
+<a id="L965"></a>    const os_is_non_native = query.os_tag != null;
+<a id="L966"></a>    // The illumos environment is always the same.
+<a id="L967"></a>    if (!native_target_has_ld or have_all_info or os_is_non_native or is_illumos or is_darwin) {
+<a id="L968"></a>        return defaultAbiAndDynamicLinker(cpu, os, query);
+<a id="L969"></a>    }
+<a id="L970"></a>    if (query.abi) |abi| {
+<a id="L971"></a>        if (abi.isMusl()) {
+<a id="L972"></a>            // musl implies static linking.
+<a id="L973"></a>            return defaultAbiAndDynamicLinker(cpu, os, query);
+<a id="L974"></a>        }
+<a id="L975"></a>    }
+<a id="L976"></a>    // The current target's ABI cannot be relied on for this. For example, we may build the zig
+<a id="L977"></a>    // compiler for target riscv64-linux-musl and provide a tarball for users to download.
+<a id="L978"></a>    // A user could then run that zig compiler on riscv64-linux-gnu. This use case is well-defined
+<a id="L979"></a>    // and supported by Zig. But that means that we must detect the system ABI here rather than
+<a id="L980"></a>    // relying on `builtin.target`.
+<a id="L981"></a>    const all_abis = comptime blk: {
+<a id="L982"></a>        assert(@intFromEnum(Target.Abi.none) == 0);
+<a id="L983"></a>        const fields = std.meta.fields(Target.Abi)[1..];
+<a id="L984"></a>        var array: [fields.len]Target.Abi = undefined;
+<a id="L985"></a>        for (fields, 0..) |field, i| {
+<a id="L986"></a>            array[i] = @field(Target.Abi, field.name);
+<a id="L987"></a>        }
+<a id="L988"></a>        break :blk array;
+<a id="L989"></a>    };
+<a id="L990"></a>    var ld_info_list_buffer: [all_abis.len]LdInfo = undefined;
+<a id="L991"></a>    var ld_info_list_len: usize = 0;
+<a id="L992"></a>
+<a id="L993"></a>    switch (Target.DynamicLinker.kind(os.tag)) {
+<a id="L994"></a>        // The OS has no dynamic linker. Leave the list empty and rely on `Abi.default()` to pick
+<a id="L995"></a>        // something sensible in `abiAndDynamicLinkerFromFile()`.
+<a id="L996"></a>        .none =&gt; {},
+<a id="L997"></a>        // The OS has a system-wide dynamic linker. Unfortunately, this implies that there's no
+<a id="L998"></a>        // useful ABI information that we can glean from it merely being present. That means the
+<a id="L999"></a>        // best we can do for this case (for now) is also `Abi.default()`.
+<a id="L1000"></a>        .arch_os =&gt; {},
+<a id="L1001"></a>        // The OS can have different dynamic linker paths depending on libc/ABI. In this case, we
+<a id="L1002"></a>        // need to gather all the valid arch/OS/ABI combinations. `abiAndDynamicLinkerFromFile()`
+<a id="L1003"></a>        // will then look for a dynamic linker with a matching path on the system and pick the ABI
+<a id="L1004"></a>        // we associated it with here.
+<a id="L1005"></a>        .arch_os_abi =&gt; for (all_abis) |abi| {
+<a id="L1006"></a>            const ld = Target.DynamicLinker.standard(cpu, os, abi);
+<a id="L1007"></a>
+<a id="L1008"></a>            // Does the generated target triple actually have a standard dynamic linker path?
+<a id="L1009"></a>            if (ld.get() == null) continue;
+<a id="L1010"></a>
+<a id="L1011"></a>            ld_info_list_buffer[ld_info_list_len] = .{
+<a id="L1012"></a>                .ld = ld,
+<a id="L1013"></a>                .abi = abi,
+<a id="L1014"></a>            };
+<a id="L1015"></a>            ld_info_list_len += 1;
+<a id="L1016"></a>        },
+<a id="L1017"></a>    }
+<a id="L1018"></a>
+<a id="L1019"></a>    const ld_info_list = ld_info_list_buffer[0..ld_info_list_len];
+<a id="L1020"></a>
+<a id="L1021"></a>    var file_reader: Io.File.Reader = undefined;
+<a id="L1022"></a>    // According to `man 2 execve`:
+<a id="L1023"></a>    //
+<a id="L1024"></a>    // The kernel imposes a maximum length on the text
+<a id="L1025"></a>    // that follows the "#!" characters at the start of a script;
+<a id="L1026"></a>    // characters beyond the limit are ignored.
+<a id="L1027"></a>    // Before Linux 5.1, the limit is 127 characters.
+<a id="L1028"></a>    // Since Linux 5.1, the limit is 255 characters.
+<a id="L1029"></a>    //
+<a id="L1030"></a>    // Tests show that bash and zsh consider 255 as total limit,
+<a id="L1031"></a>    // *including* "#!" characters and ignoring newline.
+<a id="L1032"></a>    // For safety, we set max length as 255 + \n (1).
+<a id="L1033"></a>    const max_shebang_line_size = 256;
+<a id="L1034"></a>    var file_reader_buffer: [4096]u8 = undefined;
+<a id="L1035"></a>    comptime assert(file_reader_buffer.len &gt;= max_shebang_line_size);
+<a id="L1036"></a>
+<a id="L1037"></a>    // Best case scenario: the executable is dynamically linked, and we can iterate
+<a id="L1038"></a>    // over our own shared objects and find a dynamic linker.
+<a id="L1039"></a>    const header = elf_file: {
+<a id="L1040"></a>        // This block looks for a shebang line in "/usr/bin/env". If it finds
+<a id="L1041"></a>        // one, then instead of using "/usr/bin/env" as the ELF file to examine,
+<a id="L1042"></a>        // it uses the file it references instead, doing the same logic
+<a id="L1043"></a>        // recursively in case it finds another shebang line.
+<a id="L1044"></a>
+<a id="L1045"></a>        var file_name: []const u8 = switch (os.tag) {
+<a id="L1046"></a>            // Since /usr/bin/env is hard-coded into the shebang line of many
+<a id="L1047"></a>            // portable scripts, it's a reasonably reliable path to start with.
+<a id="L1048"></a>            else =&gt; "/usr/bin/env",
+<a id="L1049"></a>            // Haiku does not have a /usr root directory.
+<a id="L1050"></a>            .haiku =&gt; "/bin/env",
+<a id="L1051"></a>        };
+<a id="L1052"></a>
+<a id="L1053"></a>        while (true) {
+<a id="L1054"></a>            const file = Io.Dir.openFileAbsolute(io, file_name, .{}) catch |err| switch (err) {
+<a id="L1055"></a>                error.NoSpaceLeft =&gt; return error.Unexpected,
+<a id="L1056"></a>                error.NameTooLong =&gt; return error.Unexpected,
+<a id="L1057"></a>                error.PathAlreadyExists =&gt; return error.Unexpected,
+<a id="L1058"></a>                error.BadPathName =&gt; return error.Unexpected,
+<a id="L1059"></a>                error.PipeBusy =&gt; return error.Unexpected,
+<a id="L1060"></a>                error.FileLocksUnsupported =&gt; return error.Unexpected,
+<a id="L1061"></a>                error.FileBusy =&gt; return error.Unexpected, // opened without write permissions
+<a id="L1062"></a>                error.AntivirusInterference =&gt; return error.Unexpected, // Windows-only error
+<a id="L1063"></a>
+<a id="L1064"></a>                error.IsDir,
+<a id="L1065"></a>                error.NotDir,
+<a id="L1066"></a>                error.AccessDenied,
+<a id="L1067"></a>                error.PermissionDenied,
+<a id="L1068"></a>                error.NoDevice,
+<a id="L1069"></a>                error.FileNotFound,
+<a id="L1070"></a>                error.NetworkNotFound,
+<a id="L1071"></a>                error.FileTooBig,
+<a id="L1072"></a>                error.Unexpected,
+<a id="L1073"></a>                =&gt; |e| if (e == error.FileNotFound and os.tag == .linux and mem.eql(u8, file_name, "/usr/bin/env")) {
+<a id="L1074"></a>                    // Android does not have a /usr directory, so try again
+<a id="L1075"></a>                    file_name = "/system/bin/env";
+<a id="L1076"></a>                    continue;
+<a id="L1077"></a>                } else return error.UnableToOpenElfFile,
+<a id="L1078"></a>                else =&gt; |e| return e,
+<a id="L1079"></a>            };
+<a id="L1080"></a>            var is_elf_file = false;
+<a id="L1081"></a>            defer if (!is_elf_file) file.close(io);
+<a id="L1082"></a>
+<a id="L1083"></a>            file_reader = .init(file, io, &amp;file_reader_buffer);
+<a id="L1084"></a>            file_name = undefined; // it aliases file_reader_buffer
+<a id="L1085"></a>
+<a id="L1086"></a>            const header = elf.Header.read(&amp;file_reader.interface) catch |hdr_err| switch (hdr_err) {
+<a id="L1087"></a>                error.EndOfStream,
+<a id="L1088"></a>                error.InvalidElfMagic,
+<a id="L1089"></a>                =&gt; {
+<a id="L1090"></a>                    const shebang_line = file_reader.interface.takeSentinel('\n') catch |err| switch (err) {
+<a id="L1091"></a>                        error.ReadFailed =&gt; return file_reader.err.?,
+<a id="L1092"></a>                        // It's neither an ELF file nor file with shebang line.
+<a id="L1093"></a>                        error.EndOfStream, error.StreamTooLong =&gt; return error.UnhelpfulFile,
+<a id="L1094"></a>                    };
+<a id="L1095"></a>                    if (!mem.startsWith(u8, shebang_line, "#!")) return error.UnhelpfulFile;
+<a id="L1096"></a>                    // We detected shebang, now parse entire line.
+<a id="L1097"></a>
+<a id="L1098"></a>                    // Trim leading "#!", spaces and tabs.
+<a id="L1099"></a>                    const trimmed_line = mem.trimStart(u8, shebang_line[2..], &amp;.{ ' ', '\t' });
+<a id="L1100"></a>
+<a id="L1101"></a>                    // This line can have:
+<a id="L1102"></a>                    // * Interpreter path only,
+<a id="L1103"></a>                    // * Interpreter path and arguments, all separated by space, tab or NUL character.
+<a id="L1104"></a>                    // And optionally newline at the end.
+<a id="L1105"></a>                    const path_maybe_args = mem.trimEnd(u8, trimmed_line, "\n");
+<a id="L1106"></a>
+<a id="L1107"></a>                    // Separate path and args.
+<a id="L1108"></a>                    const path_end = mem.findAny(u8, path_maybe_args, &amp;.{ ' ', '\t', 0 }) orelse path_maybe_args.len;
+<a id="L1109"></a>                    const unvalidated_path = path_maybe_args[0..path_end];
+<a id="L1110"></a>                    file_name = if (fs.path.isAbsolute(unvalidated_path)) unvalidated_path else return error.RelativeShebang;
+<a id="L1111"></a>                    continue;
+<a id="L1112"></a>                },
+<a id="L1113"></a>
+<a id="L1114"></a>                error.InvalidElfVersion,
+<a id="L1115"></a>                error.InvalidElfClass,
+<a id="L1116"></a>                error.InvalidElfEndian,
+<a id="L1117"></a>                =&gt; return error.InvalidElfFile,
+<a id="L1118"></a>
+<a id="L1119"></a>                error.ReadFailed =&gt; return file_reader.err.?,
+<a id="L1120"></a>            };
+<a id="L1121"></a>            is_elf_file = true;
+<a id="L1122"></a>            break :elf_file header;
+<a id="L1123"></a>        }
+<a id="L1124"></a>    };
+<a id="L1125"></a>    defer file_reader.file.close(io);
+<a id="L1126"></a>
+<a id="L1127"></a>    return abiAndDynamicLinkerFromFile(&amp;file_reader, &amp;header, cpu, os, ld_info_list, query) catch |err| switch (err) {
+<a id="L1128"></a>        error.FileSystem,
+<a id="L1129"></a>        error.SystemResources,
+<a id="L1130"></a>        error.SymLinkLoop,
+<a id="L1131"></a>        error.ProcessFdQuotaExceeded,
+<a id="L1132"></a>        error.SystemFdQuotaExceeded,
+<a id="L1133"></a>        error.Canceled,
+<a id="L1134"></a>        =&gt; |e| return e,
+<a id="L1135"></a>
+<a id="L1136"></a>        error.ReadFailed =&gt; return file_reader.err.?,
+<a id="L1137"></a>
+<a id="L1138"></a>        else =&gt; |e| {
+<a id="L1139"></a>            std.log.warn("encountered {t}; falling back to default ABI and dynamic linker", .{e});
+<a id="L1140"></a>            return defaultAbiAndDynamicLinker(cpu, os, query);
+<a id="L1141"></a>        },
+<a id="L1142"></a>    };
+<a id="L1143"></a>}
+<a id="L1144"></a>
+<a id="L1145"></a>fn defaultAbiAndDynamicLinker(cpu: Target.Cpu, os: Target.Os, query: Target.Query) Target {
+<a id="L1146"></a>    const abi = query.abi orelse Target.Abi.default(cpu.arch, os.tag);
+<a id="L1147"></a>    return .{
+<a id="L1148"></a>        .cpu = cpu,
+<a id="L1149"></a>        .os = os,
+<a id="L1150"></a>        .abi = abi,
+<a id="L1151"></a>        .ofmt = query.ofmt orelse Target.ObjectFormat.default(os.tag, cpu.arch),
+<a id="L1152"></a>        .dynamic_linker = query.dynamic_linker orelse .standard(cpu, os, abi),
+<a id="L1153"></a>    };
+<a id="L1154"></a>}
+<a id="L1155"></a>
+<a id="L1156"></a>const LdInfo = struct {
+<a id="L1157"></a>    ld: Target.DynamicLinker,
+<a id="L1158"></a>    abi: Target.Abi,
+<a id="L1159"></a>};
+<a id="L1160"></a>
+<a id="L1161"></a>fn detectAndroidApiLevel(io: Io) !u32 {
+<a id="L1162"></a>    comptime if (builtin.os.tag != .linux) unreachable;
+<a id="L1163"></a>
+<a id="L1164"></a>    var child = try std.process.spawn(io, .{
+<a id="L1165"></a>        .argv = &amp;.{
+<a id="L1166"></a>            "/system/bin/getprop",
+<a id="L1167"></a>            "ro.build.version.sdk",
+<a id="L1168"></a>        },
+<a id="L1169"></a>        .stdin = .ignore,
+<a id="L1170"></a>        .stdout = .pipe,
+<a id="L1171"></a>        .stderr = .ignore,
+<a id="L1172"></a>    });
+<a id="L1173"></a>    errdefer child.kill(io);
+<a id="L1174"></a>
+<a id="L1175"></a>    // PROP_VALUE_MAX is 92, output is value + newline.
+<a id="L1176"></a>    // Currently API levels are two-digit numbers, but we want to make sure we never read a partial value.
+<a id="L1177"></a>    var stdout_buf: [92 + 1]u8 = undefined;
+<a id="L1178"></a>    var reader = child.stdout.?.readerStreaming(io, &amp;.{});
+<a id="L1179"></a>    const n = try reader.interface.readSliceShort(&amp;stdout_buf);
+<a id="L1180"></a>    const api_level = std.fmt.parseInt(u32, stdout_buf[0 .. n - 1], 10) catch |e| {
+<a id="L1181"></a>        std.log.err(
+<a id="L1182"></a>            "Could not parse API level, unexpected getprop output '{s}' ({s})",
+<a id="L1183"></a>            .{ stdout_buf[0 .. n - 1], @errorName(e) },
+<a id="L1184"></a>        );
+<a id="L1185"></a>        return error.ApiLevelQueryFailed;
+<a id="L1186"></a>    };
+<a id="L1187"></a>
+<a id="L1188"></a>    switch (try child.wait(io)) {
+<a id="L1189"></a>        .exited =&gt; |code| if (code != 0) {
+<a id="L1190"></a>            std.log.err("getprop terminated abnormally with exit code: {d}", .{code});
+<a id="L1191"></a>            return error.ApiLevelQueryFailed;
+<a id="L1192"></a>        },
+<a id="L1193"></a>        .signal =&gt; |sig| {
+<a id="L1194"></a>            std.log.err("getprop terminated abnormally with signal: {t}", .{sig});
+<a id="L1195"></a>            return error.ApiLevelQueryFailed;
+<a id="L1196"></a>        },
+<a id="L1197"></a>        .stopped =&gt; |sig| {
+<a id="L1198"></a>            std.log.err("getprop stopped abnormally with signal: {t}", .{sig});
+<a id="L1199"></a>            return error.ApiLevelQueryFailed;
+<a id="L1200"></a>        },
+<a id="L1201"></a>        .unknown =&gt; {
+<a id="L1202"></a>            std.log.err("getprop terminated abnormally", .{});
+<a id="L1203"></a>            return error.ApiLevelQueryFailed;
+<a id="L1204"></a>        },
+<a id="L1205"></a>    }
+<a id="L1206"></a>
+<a id="L1207"></a>    return api_level;
+<a id="L1208"></a>}
+<a id="L1209"></a>
+<a id="L1210"></a>test {
+<a id="L1211"></a>    _ = NativePaths;
+<a id="L1212"></a>
+<a id="L1213"></a>    _ = darwin;
+<a id="L1214"></a>    _ = linux;
+<a id="L1215"></a>    _ = windows;
+<a id="L1216"></a>}
+</pre>
 </body>
 </html>

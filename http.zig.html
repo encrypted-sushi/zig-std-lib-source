@@ -2,1066 +2,1069 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Source: zig-0.16.0-std/http.zig</title>
+    <title>Source: http.zig</title>
     <style>
         body { background: #1e1e1e; color: #d4d4d4; font-family: monospace; padding: 20px; }
         pre { white-space: pre-wrap; word-wrap: break-word; }
         .header { border-bottom: 1px solid #444; padding-bottom: 10px; margin-bottom: 20px; }
         a { color: #569cd6; }
+        a[id] { color: inherit; text-decoration: none; }
+        :target { background: #3a3a00; }
     </style>
 </head>
 <body>
     <div class="header">
-        <a href="/">Index</a> | <strong>File: zig-0.16.0-std/http.zig</strong>
+        <a href="/">Index</a> | <strong>File: http.zig</strong>
     </div>
-    <pre>const builtin = @import("builtin");
-const std = @import("std.zig");
-const assert = std.debug.assert;
-const Writer = std.Io.Writer;
-const File = std.Io.File;
-
-pub const Client = @import("http/Client.zig");
-pub const Server = @import("http/Server.zig");
-pub const HeadParser = @import("http/HeadParser.zig");
-pub const ChunkParser = @import("http/ChunkParser.zig");
-pub const HeaderIterator = @import("http/HeaderIterator.zig");
-
-pub const Version = enum {
-    @"HTTP/1.0",
-    @"HTTP/1.1",
-};
-
-/// https://developer.mozilla.org/en-US/docs/Web/HTTP/Methods
-///
-/// https://datatracker.ietf.org/doc/html/rfc7231#section-4 Initial definition
-///
-/// https://datatracker.ietf.org/doc/html/rfc5789#section-2 PATCH
-pub const Method = enum {
-    GET,
-    HEAD,
-    POST,
-    PUT,
-    DELETE,
-    CONNECT,
-    OPTIONS,
-    TRACE,
-    PATCH,
-
-    /// Returns true if a request of this method is allowed to have a body
-    /// Actual behavior from servers may vary and should still be checked
-    pub fn requestHasBody(m: Method) bool {
-        return switch (m) {
-            .POST, .PUT, .PATCH =&gt; true,
-            .GET, .HEAD, .DELETE, .CONNECT, .OPTIONS, .TRACE =&gt; false,
-        };
-    }
-
-    /// Returns true if a response to this method is allowed to have a body
-    /// Actual behavior from clients may vary and should still be checked
-    pub fn responseHasBody(m: Method) bool {
-        return switch (m) {
-            .GET, .POST, .PUT, .DELETE, .CONNECT, .OPTIONS, .PATCH =&gt; true,
-            .HEAD, .TRACE =&gt; false,
-        };
-    }
-
-    /// An HTTP method is safe if it doesn't alter the state of the server.
-    ///
-    /// https://developer.mozilla.org/en-US/docs/Glossary/Safe/HTTP
-    ///
-    /// https://datatracker.ietf.org/doc/html/rfc7231#section-4.2.1
-    pub fn safe(m: Method) bool {
-        return switch (m) {
-            .GET, .HEAD, .OPTIONS, .TRACE =&gt; true,
-            .POST, .PUT, .DELETE, .CONNECT, .PATCH =&gt; false,
-        };
-    }
-
-    /// An HTTP method is idempotent if an identical request can be made once
-    /// or several times in a row with the same effect while leaving the server
-    /// in the same state.
-    ///
-    /// https://developer.mozilla.org/en-US/docs/Glossary/Idempotent
-    ///
-    /// https://datatracker.ietf.org/doc/html/rfc7231#section-4.2.2
-    pub fn idempotent(m: Method) bool {
-        return switch (m) {
-            .GET, .HEAD, .PUT, .DELETE, .OPTIONS, .TRACE =&gt; true,
-            .CONNECT, .POST, .PATCH =&gt; false,
-        };
-    }
-
-    /// A cacheable response can be stored to be retrieved and used later,
-    /// saving a new request to the server.
-    ///
-    /// https://developer.mozilla.org/en-US/docs/Glossary/cacheable
-    ///
-    /// https://datatracker.ietf.org/doc/html/rfc7231#section-4.2.3
-    pub fn cacheable(m: Method) bool {
-        return switch (m) {
-            .GET, .HEAD =&gt; true,
-            .POST, .PUT, .DELETE, .CONNECT, .OPTIONS, .TRACE, .PATCH =&gt; false,
-        };
-    }
-};
-
-/// https://developer.mozilla.org/en-US/docs/Web/HTTP/Status
-pub const Status = enum(u10) {
-    @"continue" = 100, // RFC7231, Section 6.2.1
-    switching_protocols = 101, // RFC7231, Section 6.2.2
-    processing = 102, // RFC2518
-    early_hints = 103, // RFC8297
-
-    ok = 200, // RFC7231, Section 6.3.1
-    created = 201, // RFC7231, Section 6.3.2
-    accepted = 202, // RFC7231, Section 6.3.3
-    non_authoritative_info = 203, // RFC7231, Section 6.3.4
-    no_content = 204, // RFC7231, Section 6.3.5
-    reset_content = 205, // RFC7231, Section 6.3.6
-    partial_content = 206, // RFC7233, Section 4.1
-    multi_status = 207, // RFC4918
-    already_reported = 208, // RFC5842
-    im_used = 226, // RFC3229
-
-    multiple_choice = 300, // RFC7231, Section 6.4.1
-    moved_permanently = 301, // RFC7231, Section 6.4.2
-    found = 302, // RFC7231, Section 6.4.3
-    see_other = 303, // RFC7231, Section 6.4.4
-    not_modified = 304, // RFC7232, Section 4.1
-    use_proxy = 305, // RFC7231, Section 6.4.5
-    temporary_redirect = 307, // RFC7231, Section 6.4.7
-    permanent_redirect = 308, // RFC7538
-
-    bad_request = 400, // RFC7231, Section 6.5.1
-    unauthorized = 401, // RFC7235, Section 3.1
-    payment_required = 402, // RFC7231, Section 6.5.2
-    forbidden = 403, // RFC7231, Section 6.5.3
-    not_found = 404, // RFC7231, Section 6.5.4
-    method_not_allowed = 405, // RFC7231, Section 6.5.5
-    not_acceptable = 406, // RFC7231, Section 6.5.6
-    proxy_auth_required = 407, // RFC7235, Section 3.2
-    request_timeout = 408, // RFC7231, Section 6.5.7
-    conflict = 409, // RFC7231, Section 6.5.8
-    gone = 410, // RFC7231, Section 6.5.9
-    length_required = 411, // RFC7231, Section 6.5.10
-    precondition_failed = 412, // RFC7232, Section 4.2][RFC8144, Section 3.2
-    payload_too_large = 413, // RFC7231, Section 6.5.11
-    uri_too_long = 414, // RFC7231, Section 6.5.12
-    unsupported_media_type = 415, // RFC7231, Section 6.5.13][RFC7694, Section 3
-    range_not_satisfiable = 416, // RFC7233, Section 4.4
-    expectation_failed = 417, // RFC7231, Section 6.5.14
-    teapot = 418, // RFC 7168, 2.3.3
-    misdirected_request = 421, // RFC7540, Section 9.1.2
-    unprocessable_entity = 422, // RFC4918
-    locked = 423, // RFC4918
-    failed_dependency = 424, // RFC4918
-    too_early = 425, // RFC8470
-    upgrade_required = 426, // RFC7231, Section 6.5.15
-    precondition_required = 428, // RFC6585
-    too_many_requests = 429, // RFC6585
-    request_header_fields_too_large = 431, // RFC6585
-    unavailable_for_legal_reasons = 451, // RFC7725
-
-    internal_server_error = 500, // RFC7231, Section 6.6.1
-    not_implemented = 501, // RFC7231, Section 6.6.2
-    bad_gateway = 502, // RFC7231, Section 6.6.3
-    service_unavailable = 503, // RFC7231, Section 6.6.4
-    gateway_timeout = 504, // RFC7231, Section 6.6.5
-    http_version_not_supported = 505, // RFC7231, Section 6.6.6
-    variant_also_negotiates = 506, // RFC2295
-    insufficient_storage = 507, // RFC4918
-    loop_detected = 508, // RFC5842
-    not_extended = 510, // RFC2774
-    network_authentication_required = 511, // RFC6585
-
-    _,
-
-    pub fn phrase(self: Status) ?[]const u8 {
-        return switch (self) {
-            // 1xx statuses
-            .@"continue" =&gt; "Continue",
-            .switching_protocols =&gt; "Switching Protocols",
-            .processing =&gt; "Processing",
-            .early_hints =&gt; "Early Hints",
-
-            // 2xx statuses
-            .ok =&gt; "OK",
-            .created =&gt; "Created",
-            .accepted =&gt; "Accepted",
-            .non_authoritative_info =&gt; "Non-Authoritative Information",
-            .no_content =&gt; "No Content",
-            .reset_content =&gt; "Reset Content",
-            .partial_content =&gt; "Partial Content",
-            .multi_status =&gt; "Multi-Status",
-            .already_reported =&gt; "Already Reported",
-            .im_used =&gt; "IM Used",
-
-            // 3xx statuses
-            .multiple_choice =&gt; "Multiple Choice",
-            .moved_permanently =&gt; "Moved Permanently",
-            .found =&gt; "Found",
-            .see_other =&gt; "See Other",
-            .not_modified =&gt; "Not Modified",
-            .use_proxy =&gt; "Use Proxy",
-            .temporary_redirect =&gt; "Temporary Redirect",
-            .permanent_redirect =&gt; "Permanent Redirect",
-
-            // 4xx statuses
-            .bad_request =&gt; "Bad Request",
-            .unauthorized =&gt; "Unauthorized",
-            .payment_required =&gt; "Payment Required",
-            .forbidden =&gt; "Forbidden",
-            .not_found =&gt; "Not Found",
-            .method_not_allowed =&gt; "Method Not Allowed",
-            .not_acceptable =&gt; "Not Acceptable",
-            .proxy_auth_required =&gt; "Proxy Authentication Required",
-            .request_timeout =&gt; "Request Timeout",
-            .conflict =&gt; "Conflict",
-            .gone =&gt; "Gone",
-            .length_required =&gt; "Length Required",
-            .precondition_failed =&gt; "Precondition Failed",
-            .payload_too_large =&gt; "Payload Too Large",
-            .uri_too_long =&gt; "URI Too Long",
-            .unsupported_media_type =&gt; "Unsupported Media Type",
-            .range_not_satisfiable =&gt; "Range Not Satisfiable",
-            .expectation_failed =&gt; "Expectation Failed",
-            .teapot =&gt; "I'm a teapot",
-            .misdirected_request =&gt; "Misdirected Request",
-            .unprocessable_entity =&gt; "Unprocessable Entity",
-            .locked =&gt; "Locked",
-            .failed_dependency =&gt; "Failed Dependency",
-            .too_early =&gt; "Too Early",
-            .upgrade_required =&gt; "Upgrade Required",
-            .precondition_required =&gt; "Precondition Required",
-            .too_many_requests =&gt; "Too Many Requests",
-            .request_header_fields_too_large =&gt; "Request Header Fields Too Large",
-            .unavailable_for_legal_reasons =&gt; "Unavailable For Legal Reasons",
-
-            // 5xx statuses
-            .internal_server_error =&gt; "Internal Server Error",
-            .not_implemented =&gt; "Not Implemented",
-            .bad_gateway =&gt; "Bad Gateway",
-            .service_unavailable =&gt; "Service Unavailable",
-            .gateway_timeout =&gt; "Gateway Timeout",
-            .http_version_not_supported =&gt; "HTTP Version Not Supported",
-            .variant_also_negotiates =&gt; "Variant Also Negotiates",
-            .insufficient_storage =&gt; "Insufficient Storage",
-            .loop_detected =&gt; "Loop Detected",
-            .not_extended =&gt; "Not Extended",
-            .network_authentication_required =&gt; "Network Authentication Required",
-
-            else =&gt; return null,
-        };
-    }
-
-    pub const Class = enum {
-        informational,
-        success,
-        redirect,
-        client_error,
-        server_error,
-    };
-
-    pub fn class(self: Status) Class {
-        return switch (@intFromEnum(self)) {
-            100...199 =&gt; .informational,
-            200...299 =&gt; .success,
-            300...399 =&gt; .redirect,
-            400...499 =&gt; .client_error,
-            else =&gt; .server_error,
-        };
-    }
-
-    test {
-        try std.testing.expectEqualStrings("OK", Status.ok.phrase().?);
-        try std.testing.expectEqualStrings("Not Found", Status.not_found.phrase().?);
-    }
-
-    test {
-        try std.testing.expectEqual(Status.Class.success, Status.ok.class());
-        try std.testing.expectEqual(Status.Class.client_error, Status.not_found.class());
-    }
-};
-
-/// compression is intentionally omitted here since it is handled in `ContentEncoding`.
-pub const TransferEncoding = enum {
-    chunked,
-    none,
-};
-
-pub const ContentEncoding = enum {
-    zstd,
-    gzip,
-    deflate,
-    compress,
-    identity,
-
-    pub fn fromString(s: []const u8) ?ContentEncoding {
-        const map = std.StaticStringMap(ContentEncoding).initComptime(.{
-            .{ "zstd", .zstd },
-            .{ "gzip", .gzip },
-            .{ "x-gzip", .gzip },
-            .{ "deflate", .deflate },
-            .{ "compress", .compress },
-            .{ "x-compress", .compress },
-            .{ "identity", .identity },
-        });
-        return map.get(s);
-    }
-
-    pub fn minBufferCapacity(ce: ContentEncoding) usize {
-        return switch (ce) {
-            .zstd =&gt; std.compress.zstd.default_window_len,
-            .gzip, .deflate =&gt; std.compress.flate.max_window_len,
-            .compress, .identity =&gt; 0,
-        };
-    }
-};
-
-pub const Connection = enum {
-    keep_alive,
-    close,
-};
-
-pub const Header = struct {
-    name: []const u8,
-    value: []const u8,
-};
-
-pub const Reader = struct {
-    in: *std.Io.Reader,
-    /// This is preallocated memory that might be used by `bodyReader`. That
-    /// function might return a pointer to this field, or a different
-    /// `*std.Io.Reader`. Advisable to not access this field directly.
-    interface: std.Io.Reader,
-    /// Keeps track of whether the stream is ready to accept a new request,
-    /// making invalid API usage cause assertion failures rather than HTTP
-    /// protocol violations.
-    state: State,
-    /// HTTP trailer bytes. These are at the end of a transfer-encoding:
-    /// chunked message. This data is available only after calling one of the
-    /// "end" functions and points to data inside the buffer of `in`, and is
-    /// therefore invalidated on the next call to `receiveHead`, or any other
-    /// read from `in`.
-    trailers: []const u8 = &amp;.{},
-    body_err: ?BodyError = null,
-    max_head_len: usize,
-
-    pub const RemainingChunkLen = enum(u64) {
-        head = 0,
-        n = 1,
-        rn = 2,
-        _,
-
-        pub fn init(integer: u64) RemainingChunkLen {
-            return @enumFromInt(integer);
-        }
-
-        pub fn int(rcl: RemainingChunkLen) u64 {
-            return @intFromEnum(rcl);
-        }
-    };
-
-    pub const State = union(enum) {
-        /// The stream is available to be used for the first time, or reused.
-        ready,
-        received_head,
-        /// The stream goes until the connection is closed.
-        body_none,
-        body_remaining_content_length: u64,
-        body_remaining_chunk_len: RemainingChunkLen,
-        /// The stream would be eligible for another HTTP request, however the
-        /// client and server did not negotiate a persistent connection.
-        closing,
-    };
-
-    pub const BodyError = error{
-        HttpChunkInvalid,
-        HttpChunkTruncated,
-        HttpHeadersOversize,
-    };
-
-    pub const HeadError = error{
-        /// Too many bytes of HTTP headers.
-        ///
-        /// The HTTP specification suggests to respond with a 431 status code
-        /// before closing the connection.
-        HttpHeadersOversize,
-        /// Partial HTTP request was received but the connection was closed
-        /// before fully receiving the headers.
-        HttpRequestTruncated,
-        /// The client sent 0 bytes of headers before closing the stream. This
-        /// happens when a keep-alive connection is finally closed.
-        HttpConnectionClosing,
-        /// Transitive error occurred reading from `in`.
-        ReadFailed,
-    };
-
-    /// Buffers the entire head inside `in`.
-    ///
-    /// The resulting memory is invalidated by any subsequent consumption of
-    /// the input stream.
-    pub fn receiveHead(reader: *Reader) HeadError![]const u8 {
-        reader.trailers = &amp;.{};
-        const in = reader.in;
-        const max_head_len = reader.max_head_len;
-        var hp: HeadParser = .{};
-        var head_len: usize = 0;
-        while (true) {
-            if (head_len &gt;= max_head_len) return error.HttpHeadersOversize;
-            const remaining = in.buffered()[head_len..];
-            if (remaining.len == 0) {
-                in.fillMore() catch |err| switch (err) {
-                    error.EndOfStream =&gt; switch (head_len) {
-                        0 =&gt; return error.HttpConnectionClosing,
-                        else =&gt; return error.HttpRequestTruncated,
-                    },
-                    error.ReadFailed =&gt; return error.ReadFailed,
-                };
-                continue;
-            }
-            head_len += hp.feed(remaining);
-            if (hp.state == .finished) {
-                reader.state = .received_head;
-                const head_buffer = in.buffered()[0..head_len];
-                in.toss(head_len);
-                return head_buffer;
-            }
-        }
-    }
-
-    /// If compressed body has been negotiated this will return compressed bytes.
-    ///
-    /// Asserts only called once and after `receiveHead`.
-    ///
-    /// See also:
-    /// * `interfaceDecompressing`
-    pub fn bodyReader(
-        reader: *Reader,
-        transfer_buffer: []u8,
-        transfer_encoding: TransferEncoding,
-        content_length: ?u64,
-    ) *std.Io.Reader {
-        assert(reader.state == .received_head);
-        switch (transfer_encoding) {
-            .chunked =&gt; {
-                reader.state = .{ .body_remaining_chunk_len = .head };
-                reader.interface = .{
-                    .buffer = transfer_buffer,
-                    .seek = 0,
-                    .end = 0,
-                    .vtable = &amp;.{
-                        .stream = chunkedStream,
-                        .discard = chunkedDiscard,
-                    },
-                };
-                return &amp;reader.interface;
-            },
-            .none =&gt; {
-                if (content_length) |len| {
-                    reader.state = if (len == 0) .ready else .{ .body_remaining_content_length = len };
-                    reader.interface = .{
-                        .buffer = transfer_buffer,
-                        .seek = 0,
-                        .end = 0,
-                        .vtable = &amp;.{
-                            .stream = contentLengthStream,
-                            .discard = contentLengthDiscard,
-                        },
-                    };
-                    return &amp;reader.interface;
-                } else {
-                    reader.state = .body_none;
-                    return reader.in;
-                }
-            },
-        }
-    }
-
-    /// If compressed body has been negotiated this will return decompressed bytes.
-    ///
-    /// Asserts only called once and after `receiveHead`.
-    ///
-    /// See also:
-    /// * `interface`
-    pub fn bodyReaderDecompressing(
-        reader: *Reader,
-        transfer_buffer: []u8,
-        transfer_encoding: TransferEncoding,
-        content_length: ?u64,
-        content_encoding: ContentEncoding,
-        decompress: *Decompress,
-        decompress_buffer: []u8,
-    ) *std.Io.Reader {
-        if (transfer_encoding == .none and content_length == null) {
-            assert(reader.state == .received_head);
-            reader.state = .body_none;
-            switch (content_encoding) {
-                .identity =&gt; {
-                    return reader.in;
-                },
-                .deflate =&gt; {
-                    decompress.* = .{ .flate = .init(reader.in, .zlib, decompress_buffer) };
-                    return &amp;decompress.flate.reader;
-                },
-                .gzip =&gt; {
-                    decompress.* = .{ .flate = .init(reader.in, .gzip, decompress_buffer) };
-                    return &amp;decompress.flate.reader;
-                },
-                .zstd =&gt; {
-                    decompress.* = .{ .zstd = .init(reader.in, decompress_buffer, .{ .verify_checksum = false }) };
-                    return &amp;decompress.zstd.reader;
-                },
-                .compress =&gt; unreachable,
-            }
-        }
-        const transfer_reader = bodyReader(reader, transfer_buffer, transfer_encoding, content_length);
-        return decompress.init(transfer_reader, decompress_buffer, content_encoding);
-    }
-
-    fn contentLengthStream(
-        io_r: *std.Io.Reader,
-        w: *Writer,
-        limit: std.Io.Limit,
-    ) std.Io.Reader.StreamError!usize {
-        const reader: *Reader = @alignCast(@fieldParentPtr("interface", io_r));
-        if (reader.state == .ready) return error.EndOfStream;
-        const remaining_content_length = &amp;reader.state.body_remaining_content_length;
-        const remaining = remaining_content_length.*;
-        const n = try reader.in.stream(w, limit.min(.limited64(remaining)));
-        if (n == remaining) {
-            reader.state = .ready;
-        } else {
-            remaining_content_length.* = remaining - n;
-        }
-        return n;
-    }
-
-    fn contentLengthDiscard(io_r: *std.Io.Reader, limit: std.Io.Limit) std.Io.Reader.Error!usize {
-        const reader: *Reader = @alignCast(@fieldParentPtr("interface", io_r));
-        if (reader.state == .ready) return error.EndOfStream;
-        const remaining_content_length = &amp;reader.state.body_remaining_content_length;
-        const remaining = remaining_content_length.*;
-        const n = try reader.in.discard(limit.min(.limited64(remaining)));
-        if (n == remaining) {
-            reader.state = .ready;
-        } else {
-            remaining_content_length.* = remaining - n;
-        }
-        return n;
-    }
-
-    fn chunkedStream(io_r: *std.Io.Reader, w: *Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
-        const reader: *Reader = @alignCast(@fieldParentPtr("interface", io_r));
-        const chunk_len_ptr = switch (reader.state) {
-            .ready =&gt; return error.EndOfStream,
-            .body_remaining_chunk_len =&gt; |*x| x,
-            else =&gt; unreachable,
-        };
-        return chunkedReadEndless(reader, w, limit, chunk_len_ptr) catch |err| switch (err) {
-            error.ReadFailed =&gt; return error.ReadFailed,
-            error.WriteFailed =&gt; return error.WriteFailed,
-            error.EndOfStream =&gt; {
-                reader.body_err = error.HttpChunkTruncated;
-                return error.ReadFailed;
-            },
-            else =&gt; |e| {
-                reader.body_err = e;
-                return error.ReadFailed;
-            },
-        };
-    }
-
-    fn chunkedReadEndless(
-        reader: *Reader,
-        w: *Writer,
-        limit: std.Io.Limit,
-        chunk_len_ptr: *RemainingChunkLen,
-    ) (BodyError || std.Io.Reader.StreamError)!usize {
-        const in = reader.in;
-        len: switch (chunk_len_ptr.*) {
-            .head =&gt; {
-                var cp: ChunkParser = .init;
-                while (true) {
-                    const i = cp.feed(in.buffered());
-                    switch (cp.state) {
-                        .invalid =&gt; return error.HttpChunkInvalid,
-                        .data =&gt; {
-                            in.toss(i);
-                            break;
-                        },
-                        else =&gt; {
-                            in.toss(i);
-                            try in.fillMore();
-                            continue;
-                        },
-                    }
-                }
-                if (cp.chunk_len == 0) return parseTrailers(reader, 0);
-                const n = try in.stream(w, limit.min(.limited64(cp.chunk_len)));
-                chunk_len_ptr.* = .init(cp.chunk_len + 2 - n);
-                return n;
-            },
-            .n =&gt; {
-                if ((try in.peekByte()) != '\n') return error.HttpChunkInvalid;
-                in.toss(1);
-                continue :len .head;
-            },
-            .rn =&gt; {
-                const rn = try in.peekArray(2);
-                if (rn[0] != '\r' or rn[1] != '\n') return error.HttpChunkInvalid;
-                in.toss(2);
-                continue :len .head;
-            },
-            else =&gt; |remaining_chunk_len| {
-                const n = try in.stream(w, limit.min(.limited64(@intFromEnum(remaining_chunk_len) - 2)));
-                chunk_len_ptr.* = .init(@intFromEnum(remaining_chunk_len) - n);
-                return n;
-            },
-        }
-    }
-
-    fn chunkedDiscard(io_r: *std.Io.Reader, limit: std.Io.Limit) std.Io.Reader.Error!usize {
-        const reader: *Reader = @alignCast(@fieldParentPtr("interface", io_r));
-        const chunk_len_ptr = switch (reader.state) {
-            .ready =&gt; return error.EndOfStream,
-            .body_remaining_chunk_len =&gt; |*x| x,
-            else =&gt; unreachable,
-        };
-        return chunkedDiscardEndless(reader, limit, chunk_len_ptr) catch |err| switch (err) {
-            error.ReadFailed =&gt; return error.ReadFailed,
-            error.EndOfStream =&gt; {
-                reader.body_err = error.HttpChunkTruncated;
-                return error.ReadFailed;
-            },
-            else =&gt; |e| {
-                reader.body_err = e;
-                return error.ReadFailed;
-            },
-        };
-    }
-
-    fn chunkedDiscardEndless(
-        reader: *Reader,
-        limit: std.Io.Limit,
-        chunk_len_ptr: *RemainingChunkLen,
-    ) (BodyError || std.Io.Reader.Error)!usize {
-        const in = reader.in;
-        len: switch (chunk_len_ptr.*) {
-            .head =&gt; {
-                var cp: ChunkParser = .init;
-                while (true) {
-                    const i = cp.feed(in.buffered());
-                    switch (cp.state) {
-                        .invalid =&gt; return error.HttpChunkInvalid,
-                        .data =&gt; {
-                            in.toss(i);
-                            break;
-                        },
-                        else =&gt; {
-                            in.toss(i);
-                            try in.fillMore();
-                            continue;
-                        },
-                    }
-                }
-                if (cp.chunk_len == 0) return parseTrailers(reader, 0);
-                const n = try in.discard(limit.min(.limited64(cp.chunk_len)));
-                chunk_len_ptr.* = .init(cp.chunk_len + 2 - n);
-                return n;
-            },
-            .n =&gt; {
-                if ((try in.peekByte()) != '\n') return error.HttpChunkInvalid;
-                in.toss(1);
-                continue :len .head;
-            },
-            .rn =&gt; {
-                const rn = try in.peekArray(2);
-                if (rn[0] != '\r' or rn[1] != '\n') return error.HttpChunkInvalid;
-                in.toss(2);
-                continue :len .head;
-            },
-            else =&gt; |remaining_chunk_len| {
-                const n = try in.discard(limit.min(.limited64(remaining_chunk_len.int() - 2)));
-                chunk_len_ptr.* = .init(remaining_chunk_len.int() - n);
-                return n;
-            },
-        }
-    }
-
-    /// Called when next bytes in the stream are trailers, or "\r\n" to indicate
-    /// end of chunked body.
-    fn parseTrailers(reader: *Reader, amt_read: usize) (BodyError || std.Io.Reader.Error)!usize {
-        const in = reader.in;
-        const rn = try in.peekArray(2);
-        if (rn[0] == '\r' and rn[1] == '\n') {
-            in.toss(2);
-            reader.state = .ready;
-            assert(reader.trailers.len == 0);
-            return amt_read;
-        }
-        var hp: HeadParser = .{ .state = .seen_rn };
-        var trailers_len: usize = 2;
-        while (true) {
-            if (in.buffer.len - trailers_len == 0) return error.HttpHeadersOversize;
-            const remaining = in.buffered()[trailers_len..];
-            if (remaining.len == 0) {
-                try in.fillMore();
-                continue;
-            }
-            trailers_len += hp.feed(remaining);
-            if (hp.state == .finished) {
-                reader.state = .ready;
-                reader.trailers = in.buffered()[0..trailers_len];
-                in.toss(trailers_len);
-                return amt_read;
-            }
-        }
-    }
-};
-
-pub const Decompress = union(enum) {
-    flate: std.compress.flate.Decompress,
-    zstd: std.compress.zstd.Decompress,
-    none: *std.Io.Reader,
-
-    pub fn init(
-        decompress: *Decompress,
-        transfer_reader: *std.Io.Reader,
-        buffer: []u8,
-        content_encoding: ContentEncoding,
-    ) *std.Io.Reader {
-        switch (content_encoding) {
-            .identity =&gt; {
-                decompress.* = .{ .none = transfer_reader };
-                return transfer_reader;
-            },
-            .deflate =&gt; {
-                decompress.* = .{ .flate = .init(transfer_reader, .zlib, buffer) };
-                return &amp;decompress.flate.reader;
-            },
-            .gzip =&gt; {
-                decompress.* = .{ .flate = .init(transfer_reader, .gzip, buffer) };
-                return &amp;decompress.flate.reader;
-            },
-            .zstd =&gt; {
-                decompress.* = .{ .zstd = .init(transfer_reader, buffer, .{ .verify_checksum = false }) };
-                return &amp;decompress.zstd.reader;
-            },
-            .compress =&gt; unreachable,
-        }
-    }
-};
-
-/// Request or response body.
-pub const BodyWriter = struct {
-    /// Until the lifetime of `BodyWriter` ends, it is illegal to modify the
-    /// state of this other than via methods of `BodyWriter`.
-    http_protocol_output: *Writer,
-    state: State,
-    writer: Writer,
-
-    pub const Error = Writer.Error;
-
-    /// How many zeroes to reserve for hex-encoded chunk length.
-    const chunk_len_digits = 8;
-    const max_chunk_len: usize = std.math.pow(u64, 16, chunk_len_digits) - 1;
-    const chunk_header_template = ("0" ** chunk_len_digits) ++ "\r\n";
-
-    comptime {
-        assert(max_chunk_len == std.math.maxInt(u32));
-    }
-
-    pub const State = union(enum) {
-        /// End of connection signals the end of the stream.
-        none,
-        /// As a debugging utility, counts down to zero as bytes are written.
-        content_length: u64,
-        /// Each chunk is wrapped in a header and trailer.
-        /// This length is the the number of bytes to be written before the
-        /// next header. This includes +2 for the `\r\n` trailer and is zero
-        /// for the beginning of the stream.
-        chunk_len: usize,
-        /// Cleanly finished stream; connection can be reused.
-        end,
-
-        pub const init_chunked: State = .{ .chunk_len = 0 };
-    };
-
-    pub fn isEliding(w: *const BodyWriter) bool {
-        return w.writer.vtable.drain == elidingDrain;
-    }
-
-    /// Sends all buffered data across `BodyWriter.http_protocol_output`.
-    pub fn flush(w: *BodyWriter) Error!void {
-        const out = w.http_protocol_output;
-        switch (w.state) {
-            .end, .none, .content_length, .chunk_len =&gt; return out.flush(),
-        }
-    }
-
-    /// When using content-length, asserts that the amount of data sent matches
-    /// the value sent in the header, then flushes `http_protocol_output`.
-    ///
-    /// When using transfer-encoding: chunked, writes the end-of-stream message
-    /// with empty trailers, then flushes the stream to the system. Asserts any
-    /// started chunk has been completely finished.
-    ///
-    /// Respects the value of `isEliding` to omit all data after the headers.
-    ///
-    /// See also:
-    /// * `endUnflushed`
-    /// * `endChunked`
-    pub fn end(w: *BodyWriter) Error!void {
-        try endUnflushed(w);
-        try w.http_protocol_output.flush();
-    }
-
-    /// When using content-length, asserts that the amount of data sent matches
-    /// the value sent in the header.
-    ///
-    /// Otherwise, transfer-encoding: chunked is being used, and it writes the
-    /// end-of-stream message with empty trailers.
-    ///
-    /// Respects the value of `isEliding` to omit all data after the headers.
-    ///
-    /// Does not flush `http_protocol_output`, but does flush `writer`.
-    ///
-    /// See also:
-    /// * `end`
-    /// * `endChunked`
-    pub fn endUnflushed(w: *BodyWriter) Error!void {
-        try w.writer.flush();
-        switch (w.state) {
-            .end =&gt; unreachable,
-            .content_length =&gt; |len| {
-                assert(len == 0); // Trips when end() called before all bytes written.
-                w.state = .end;
-            },
-            .none =&gt; {},
-            .chunk_len =&gt; return endChunkedUnflushed(w, .{}),
-        }
-    }
-
-    pub const EndChunkedOptions = struct {
-        trailers: []const Header = &amp;.{},
-    };
-
-    /// Writes the end-of-stream message and any optional trailers, flushing
-    /// the underlying stream.
-    ///
-    /// Asserts that the BodyWriter is using transfer-encoding: chunked.
-    ///
-    /// Respects the value of `isEliding` to omit all data after the headers.
-    ///
-    /// See also:
-    /// * `endChunkedUnflushed`
-    /// * `end`
-    pub fn endChunked(w: *BodyWriter, options: EndChunkedOptions) Error!void {
-        try endChunkedUnflushed(w, options);
-        try w.http_protocol_output.flush();
-    }
-
-    /// Writes the end-of-stream message and any optional trailers.
-    ///
-    /// Does not flush.
-    ///
-    /// Asserts that the BodyWriter is using transfer-encoding: chunked.
-    ///
-    /// Respects the value of `isEliding` to omit all data after the headers.
-    ///
-    /// See also:
-    /// * `endChunked`
-    /// * `endUnflushed`
-    /// * `end`
-    pub fn endChunkedUnflushed(w: *BodyWriter, options: EndChunkedOptions) Error!void {
-        if (w.isEliding()) {
-            w.state = .end;
-            return;
-        }
-        const bw = w.http_protocol_output;
-        switch (w.state.chunk_len) {
-            0 =&gt; {},
-            1 =&gt; unreachable, // Wrote more data than specified in chunk header.
-            2 =&gt; try bw.writeAll("\r\n"),
-            else =&gt; unreachable, // An earlier write call indicated more data would follow.
-        }
-        try bw.writeAll("0\r\n");
-        for (options.trailers) |trailer| {
-            try bw.writeAll(trailer.name);
-            try bw.writeAll(": ");
-            try bw.writeAll(trailer.value);
-            try bw.writeAll("\r\n");
-        }
-        try bw.writeAll("\r\n");
-        w.state = .end;
-    }
-
-    pub fn contentLengthDrain(w: *Writer, data: []const []const u8, splat: usize) Error!usize {
-        const bw: *BodyWriter = @alignCast(@fieldParentPtr("writer", w));
-        assert(!bw.isEliding());
-        const out = bw.http_protocol_output;
-        const n = try out.writeSplatHeader(w.buffered(), data, splat);
-        bw.state.content_length -= n;
-        return w.consume(n);
-    }
-
-    pub fn noneDrain(w: *Writer, data: []const []const u8, splat: usize) Error!usize {
-        const bw: *BodyWriter = @alignCast(@fieldParentPtr("writer", w));
-        assert(!bw.isEliding());
-        const out = bw.http_protocol_output;
-        const n = try out.writeSplatHeader(w.buffered(), data, splat);
-        return w.consume(n);
-    }
-
-    pub fn elidingDrain(w: *Writer, data: []const []const u8, splat: usize) Error!usize {
-        const bw: *BodyWriter = @alignCast(@fieldParentPtr("writer", w));
-        const slice = data[0 .. data.len - 1];
-        const pattern = data[slice.len];
-        var written: usize = pattern.len * splat;
-        for (slice) |bytes| written += bytes.len;
-        switch (bw.state) {
-            .content_length =&gt; |*len| len.* -= written + w.end,
-            else =&gt; {},
-        }
-        w.end = 0;
-        return written;
-    }
-
-    pub fn elidingSendFile(w: *Writer, file_reader: *File.Reader, limit: std.Io.Limit) Writer.FileError!usize {
-        const bw: *BodyWriter = @alignCast(@fieldParentPtr("writer", w));
-        if (File.Handle == void) return error.Unimplemented;
-        if (builtin.zig_backend == .stage2_aarch64) return error.Unimplemented;
-        switch (bw.state) {
-            .content_length =&gt; |*len| len.* -= w.end,
-            else =&gt; {},
-        }
-        w.end = 0;
-        if (limit == .nothing) return 0;
-        if (file_reader.getSize()) |size| {
-            const n = limit.minInt64(size - file_reader.pos);
-            if (n == 0) return error.EndOfStream;
-            file_reader.seekBy(@intCast(n)) catch return error.Unimplemented;
-            switch (bw.state) {
-                .content_length =&gt; |*len| len.* -= n,
-                else =&gt; {},
-            }
-            return n;
-        } else |_| {
-            // Error is observable on `file_reader` instance, and it is better to
-            // treat the file as a pipe.
-            return error.Unimplemented;
-        }
-    }
-
-    /// Returns `null` if size cannot be computed without making any syscalls.
-    pub fn noneSendFile(w: *Writer, file_reader: *File.Reader, limit: std.Io.Limit) Writer.FileError!usize {
-        const bw: *BodyWriter = @alignCast(@fieldParentPtr("writer", w));
-        assert(!bw.isEliding());
-        const out = bw.http_protocol_output;
-        const n = try out.sendFileHeader(w.buffered(), file_reader, limit);
-        return w.consume(n);
-    }
-
-    pub fn contentLengthSendFile(w: *Writer, file_reader: *File.Reader, limit: std.Io.Limit) Writer.FileError!usize {
-        const bw: *BodyWriter = @alignCast(@fieldParentPtr("writer", w));
-        assert(!bw.isEliding());
-        const out = bw.http_protocol_output;
-        const n = try out.sendFileHeader(w.buffered(), file_reader, limit);
-        bw.state.content_length -= n;
-        return w.consume(n);
-    }
-
-    pub fn chunkedSendFile(w: *Writer, file_reader: *File.Reader, limit: std.Io.Limit) Writer.FileError!usize {
-        const bw: *BodyWriter = @alignCast(@fieldParentPtr("writer", w));
-        assert(!bw.isEliding());
-        const data_len = Writer.countSendFileLowerBound(w.end, file_reader, limit) orelse {
-            // If the file size is unknown, we cannot lower to a `sendFile` since we would
-            // have to flush the chunk header before knowing the chunk length.
-            return error.Unimplemented;
-        };
-        if (data_len == 0) return error.EndOfStream;
-        const out = bw.http_protocol_output;
-        l: switch (bw.state.chunk_len) {
-            0 =&gt; {
-                const header_buf = try out.writableArray(chunk_header_template.len);
-                @memcpy(header_buf, chunk_header_template);
-                writeHex(header_buf[0..chunk_len_digits], data_len);
-                bw.state.chunk_len = data_len + 2;
-                continue :l bw.state.chunk_len;
-            },
-            1 =&gt; unreachable, // Wrote more data than specified in chunk header.
-            2 =&gt; {
-                try out.writeAll("\r\n");
-                bw.state.chunk_len = 0;
-                continue :l 0;
-            },
-            else =&gt; {
-                const chunk_limit: std.Io.Limit = .limited(bw.state.chunk_len - 2);
-                const n = if (chunk_limit.subtract(w.buffered().len)) |sendfile_limit|
-                    try out.sendFileHeader(w.buffered(), file_reader, sendfile_limit.min(limit))
-                else
-                    try out.write(chunk_limit.slice(w.buffered()));
-                bw.state.chunk_len -= n;
-                return w.consume(n);
-            },
-        }
-    }
-
-    pub fn chunkedDrain(w: *Writer, data: []const []const u8, splat: usize) Error!usize {
-        const bw: *BodyWriter = @alignCast(@fieldParentPtr("writer", w));
-        assert(!bw.isEliding());
-        const out = bw.http_protocol_output;
-        const data_len = w.end + Writer.countSplat(data, splat);
-        l: switch (bw.state.chunk_len) {
-            0 =&gt; {
-                const header_buf = try out.writableArray(chunk_header_template.len);
-                @memcpy(header_buf, chunk_header_template);
-                writeHex(header_buf[0..chunk_len_digits], data_len);
-                bw.state.chunk_len = data_len + 2;
-                continue :l bw.state.chunk_len;
-            },
-            1 =&gt; unreachable, // Wrote more data than specified in chunk header.
-            2 =&gt; {
-                try out.writeAll("\r\n");
-                bw.state.chunk_len = 0;
-                continue :l 0;
-            },
-            else =&gt; {
-                const n = try out.writeSplatHeaderLimit(w.buffered(), data, splat, .limited(bw.state.chunk_len - 2));
-                bw.state.chunk_len -= n;
-                return w.consume(n);
-            },
-        }
-    }
-
-    /// Writes an integer as base 16 to `buf`, right-aligned, assuming the
-    /// buffer has already been filled with zeroes.
-    fn writeHex(buf: []u8, x: usize) void {
-        assert(std.mem.allEqual(u8, buf, '0'));
-        const base = 16;
-        var index: usize = buf.len;
-        var a = x;
-        while (a &gt; 0) {
-            const digit = a % base;
-            index -= 1;
-            buf[index] = std.fmt.digitToChar(@intCast(digit), .lower);
-            a /= base;
-        }
-    }
-};
-
-test {
-    _ = Server;
-    _ = Status;
-    _ = Method;
-    _ = ChunkParser;
-    _ = HeadParser;
-
-    if (builtin.os.tag != .wasi) {
-        _ = Client;
-        _ = @import("http/test.zig");
-    }
-}</pre>
+    <pre><a id="L1"></a>const builtin = @import("builtin");
+<a id="L2"></a>const std = @import("std.zig");
+<a id="L3"></a>const assert = std.debug.assert;
+<a id="L4"></a>const Writer = std.Io.Writer;
+<a id="L5"></a>const File = std.Io.File;
+<a id="L6"></a>
+<a id="L7"></a>pub const Client = @import("http/Client.zig");
+<a id="L8"></a>pub const Server = @import("http/Server.zig");
+<a id="L9"></a>pub const HeadParser = @import("http/HeadParser.zig");
+<a id="L10"></a>pub const ChunkParser = @import("http/ChunkParser.zig");
+<a id="L11"></a>pub const HeaderIterator = @import("http/HeaderIterator.zig");
+<a id="L12"></a>
+<a id="L13"></a>pub const Version = enum {
+<a id="L14"></a>    @"HTTP/1.0",
+<a id="L15"></a>    @"HTTP/1.1",
+<a id="L16"></a>};
+<a id="L17"></a>
+<a id="L18"></a>/// https://developer.mozilla.org/en-US/docs/Web/HTTP/Methods
+<a id="L19"></a>///
+<a id="L20"></a>/// https://datatracker.ietf.org/doc/html/rfc7231#section-4 Initial definition
+<a id="L21"></a>///
+<a id="L22"></a>/// https://datatracker.ietf.org/doc/html/rfc5789#section-2 PATCH
+<a id="L23"></a>pub const Method = enum {
+<a id="L24"></a>    GET,
+<a id="L25"></a>    HEAD,
+<a id="L26"></a>    POST,
+<a id="L27"></a>    PUT,
+<a id="L28"></a>    DELETE,
+<a id="L29"></a>    CONNECT,
+<a id="L30"></a>    OPTIONS,
+<a id="L31"></a>    TRACE,
+<a id="L32"></a>    PATCH,
+<a id="L33"></a>
+<a id="L34"></a>    /// Returns true if a request of this method is allowed to have a body
+<a id="L35"></a>    /// Actual behavior from servers may vary and should still be checked
+<a id="L36"></a>    pub fn requestHasBody(m: Method) bool {
+<a id="L37"></a>        return switch (m) {
+<a id="L38"></a>            .POST, .PUT, .PATCH =&gt; true,
+<a id="L39"></a>            .GET, .HEAD, .DELETE, .CONNECT, .OPTIONS, .TRACE =&gt; false,
+<a id="L40"></a>        };
+<a id="L41"></a>    }
+<a id="L42"></a>
+<a id="L43"></a>    /// Returns true if a response to this method is allowed to have a body
+<a id="L44"></a>    /// Actual behavior from clients may vary and should still be checked
+<a id="L45"></a>    pub fn responseHasBody(m: Method) bool {
+<a id="L46"></a>        return switch (m) {
+<a id="L47"></a>            .GET, .POST, .PUT, .DELETE, .CONNECT, .OPTIONS, .PATCH =&gt; true,
+<a id="L48"></a>            .HEAD, .TRACE =&gt; false,
+<a id="L49"></a>        };
+<a id="L50"></a>    }
+<a id="L51"></a>
+<a id="L52"></a>    /// An HTTP method is safe if it doesn't alter the state of the server.
+<a id="L53"></a>    ///
+<a id="L54"></a>    /// https://developer.mozilla.org/en-US/docs/Glossary/Safe/HTTP
+<a id="L55"></a>    ///
+<a id="L56"></a>    /// https://datatracker.ietf.org/doc/html/rfc7231#section-4.2.1
+<a id="L57"></a>    pub fn safe(m: Method) bool {
+<a id="L58"></a>        return switch (m) {
+<a id="L59"></a>            .GET, .HEAD, .OPTIONS, .TRACE =&gt; true,
+<a id="L60"></a>            .POST, .PUT, .DELETE, .CONNECT, .PATCH =&gt; false,
+<a id="L61"></a>        };
+<a id="L62"></a>    }
+<a id="L63"></a>
+<a id="L64"></a>    /// An HTTP method is idempotent if an identical request can be made once
+<a id="L65"></a>    /// or several times in a row with the same effect while leaving the server
+<a id="L66"></a>    /// in the same state.
+<a id="L67"></a>    ///
+<a id="L68"></a>    /// https://developer.mozilla.org/en-US/docs/Glossary/Idempotent
+<a id="L69"></a>    ///
+<a id="L70"></a>    /// https://datatracker.ietf.org/doc/html/rfc7231#section-4.2.2
+<a id="L71"></a>    pub fn idempotent(m: Method) bool {
+<a id="L72"></a>        return switch (m) {
+<a id="L73"></a>            .GET, .HEAD, .PUT, .DELETE, .OPTIONS, .TRACE =&gt; true,
+<a id="L74"></a>            .CONNECT, .POST, .PATCH =&gt; false,
+<a id="L75"></a>        };
+<a id="L76"></a>    }
+<a id="L77"></a>
+<a id="L78"></a>    /// A cacheable response can be stored to be retrieved and used later,
+<a id="L79"></a>    /// saving a new request to the server.
+<a id="L80"></a>    ///
+<a id="L81"></a>    /// https://developer.mozilla.org/en-US/docs/Glossary/cacheable
+<a id="L82"></a>    ///
+<a id="L83"></a>    /// https://datatracker.ietf.org/doc/html/rfc7231#section-4.2.3
+<a id="L84"></a>    pub fn cacheable(m: Method) bool {
+<a id="L85"></a>        return switch (m) {
+<a id="L86"></a>            .GET, .HEAD =&gt; true,
+<a id="L87"></a>            .POST, .PUT, .DELETE, .CONNECT, .OPTIONS, .TRACE, .PATCH =&gt; false,
+<a id="L88"></a>        };
+<a id="L89"></a>    }
+<a id="L90"></a>};
+<a id="L91"></a>
+<a id="L92"></a>/// https://developer.mozilla.org/en-US/docs/Web/HTTP/Status
+<a id="L93"></a>pub const Status = enum(u10) {
+<a id="L94"></a>    @"continue" = 100, // RFC7231, Section 6.2.1
+<a id="L95"></a>    switching_protocols = 101, // RFC7231, Section 6.2.2
+<a id="L96"></a>    processing = 102, // RFC2518
+<a id="L97"></a>    early_hints = 103, // RFC8297
+<a id="L98"></a>
+<a id="L99"></a>    ok = 200, // RFC7231, Section 6.3.1
+<a id="L100"></a>    created = 201, // RFC7231, Section 6.3.2
+<a id="L101"></a>    accepted = 202, // RFC7231, Section 6.3.3
+<a id="L102"></a>    non_authoritative_info = 203, // RFC7231, Section 6.3.4
+<a id="L103"></a>    no_content = 204, // RFC7231, Section 6.3.5
+<a id="L104"></a>    reset_content = 205, // RFC7231, Section 6.3.6
+<a id="L105"></a>    partial_content = 206, // RFC7233, Section 4.1
+<a id="L106"></a>    multi_status = 207, // RFC4918
+<a id="L107"></a>    already_reported = 208, // RFC5842
+<a id="L108"></a>    im_used = 226, // RFC3229
+<a id="L109"></a>
+<a id="L110"></a>    multiple_choice = 300, // RFC7231, Section 6.4.1
+<a id="L111"></a>    moved_permanently = 301, // RFC7231, Section 6.4.2
+<a id="L112"></a>    found = 302, // RFC7231, Section 6.4.3
+<a id="L113"></a>    see_other = 303, // RFC7231, Section 6.4.4
+<a id="L114"></a>    not_modified = 304, // RFC7232, Section 4.1
+<a id="L115"></a>    use_proxy = 305, // RFC7231, Section 6.4.5
+<a id="L116"></a>    temporary_redirect = 307, // RFC7231, Section 6.4.7
+<a id="L117"></a>    permanent_redirect = 308, // RFC7538
+<a id="L118"></a>
+<a id="L119"></a>    bad_request = 400, // RFC7231, Section 6.5.1
+<a id="L120"></a>    unauthorized = 401, // RFC7235, Section 3.1
+<a id="L121"></a>    payment_required = 402, // RFC7231, Section 6.5.2
+<a id="L122"></a>    forbidden = 403, // RFC7231, Section 6.5.3
+<a id="L123"></a>    not_found = 404, // RFC7231, Section 6.5.4
+<a id="L124"></a>    method_not_allowed = 405, // RFC7231, Section 6.5.5
+<a id="L125"></a>    not_acceptable = 406, // RFC7231, Section 6.5.6
+<a id="L126"></a>    proxy_auth_required = 407, // RFC7235, Section 3.2
+<a id="L127"></a>    request_timeout = 408, // RFC7231, Section 6.5.7
+<a id="L128"></a>    conflict = 409, // RFC7231, Section 6.5.8
+<a id="L129"></a>    gone = 410, // RFC7231, Section 6.5.9
+<a id="L130"></a>    length_required = 411, // RFC7231, Section 6.5.10
+<a id="L131"></a>    precondition_failed = 412, // RFC7232, Section 4.2][RFC8144, Section 3.2
+<a id="L132"></a>    payload_too_large = 413, // RFC7231, Section 6.5.11
+<a id="L133"></a>    uri_too_long = 414, // RFC7231, Section 6.5.12
+<a id="L134"></a>    unsupported_media_type = 415, // RFC7231, Section 6.5.13][RFC7694, Section 3
+<a id="L135"></a>    range_not_satisfiable = 416, // RFC7233, Section 4.4
+<a id="L136"></a>    expectation_failed = 417, // RFC7231, Section 6.5.14
+<a id="L137"></a>    teapot = 418, // RFC 7168, 2.3.3
+<a id="L138"></a>    misdirected_request = 421, // RFC7540, Section 9.1.2
+<a id="L139"></a>    unprocessable_entity = 422, // RFC4918
+<a id="L140"></a>    locked = 423, // RFC4918
+<a id="L141"></a>    failed_dependency = 424, // RFC4918
+<a id="L142"></a>    too_early = 425, // RFC8470
+<a id="L143"></a>    upgrade_required = 426, // RFC7231, Section 6.5.15
+<a id="L144"></a>    precondition_required = 428, // RFC6585
+<a id="L145"></a>    too_many_requests = 429, // RFC6585
+<a id="L146"></a>    request_header_fields_too_large = 431, // RFC6585
+<a id="L147"></a>    unavailable_for_legal_reasons = 451, // RFC7725
+<a id="L148"></a>
+<a id="L149"></a>    internal_server_error = 500, // RFC7231, Section 6.6.1
+<a id="L150"></a>    not_implemented = 501, // RFC7231, Section 6.6.2
+<a id="L151"></a>    bad_gateway = 502, // RFC7231, Section 6.6.3
+<a id="L152"></a>    service_unavailable = 503, // RFC7231, Section 6.6.4
+<a id="L153"></a>    gateway_timeout = 504, // RFC7231, Section 6.6.5
+<a id="L154"></a>    http_version_not_supported = 505, // RFC7231, Section 6.6.6
+<a id="L155"></a>    variant_also_negotiates = 506, // RFC2295
+<a id="L156"></a>    insufficient_storage = 507, // RFC4918
+<a id="L157"></a>    loop_detected = 508, // RFC5842
+<a id="L158"></a>    not_extended = 510, // RFC2774
+<a id="L159"></a>    network_authentication_required = 511, // RFC6585
+<a id="L160"></a>
+<a id="L161"></a>    _,
+<a id="L162"></a>
+<a id="L163"></a>    pub fn phrase(self: Status) ?[]const u8 {
+<a id="L164"></a>        return switch (self) {
+<a id="L165"></a>            // 1xx statuses
+<a id="L166"></a>            .@"continue" =&gt; "Continue",
+<a id="L167"></a>            .switching_protocols =&gt; "Switching Protocols",
+<a id="L168"></a>            .processing =&gt; "Processing",
+<a id="L169"></a>            .early_hints =&gt; "Early Hints",
+<a id="L170"></a>
+<a id="L171"></a>            // 2xx statuses
+<a id="L172"></a>            .ok =&gt; "OK",
+<a id="L173"></a>            .created =&gt; "Created",
+<a id="L174"></a>            .accepted =&gt; "Accepted",
+<a id="L175"></a>            .non_authoritative_info =&gt; "Non-Authoritative Information",
+<a id="L176"></a>            .no_content =&gt; "No Content",
+<a id="L177"></a>            .reset_content =&gt; "Reset Content",
+<a id="L178"></a>            .partial_content =&gt; "Partial Content",
+<a id="L179"></a>            .multi_status =&gt; "Multi-Status",
+<a id="L180"></a>            .already_reported =&gt; "Already Reported",
+<a id="L181"></a>            .im_used =&gt; "IM Used",
+<a id="L182"></a>
+<a id="L183"></a>            // 3xx statuses
+<a id="L184"></a>            .multiple_choice =&gt; "Multiple Choice",
+<a id="L185"></a>            .moved_permanently =&gt; "Moved Permanently",
+<a id="L186"></a>            .found =&gt; "Found",
+<a id="L187"></a>            .see_other =&gt; "See Other",
+<a id="L188"></a>            .not_modified =&gt; "Not Modified",
+<a id="L189"></a>            .use_proxy =&gt; "Use Proxy",
+<a id="L190"></a>            .temporary_redirect =&gt; "Temporary Redirect",
+<a id="L191"></a>            .permanent_redirect =&gt; "Permanent Redirect",
+<a id="L192"></a>
+<a id="L193"></a>            // 4xx statuses
+<a id="L194"></a>            .bad_request =&gt; "Bad Request",
+<a id="L195"></a>            .unauthorized =&gt; "Unauthorized",
+<a id="L196"></a>            .payment_required =&gt; "Payment Required",
+<a id="L197"></a>            .forbidden =&gt; "Forbidden",
+<a id="L198"></a>            .not_found =&gt; "Not Found",
+<a id="L199"></a>            .method_not_allowed =&gt; "Method Not Allowed",
+<a id="L200"></a>            .not_acceptable =&gt; "Not Acceptable",
+<a id="L201"></a>            .proxy_auth_required =&gt; "Proxy Authentication Required",
+<a id="L202"></a>            .request_timeout =&gt; "Request Timeout",
+<a id="L203"></a>            .conflict =&gt; "Conflict",
+<a id="L204"></a>            .gone =&gt; "Gone",
+<a id="L205"></a>            .length_required =&gt; "Length Required",
+<a id="L206"></a>            .precondition_failed =&gt; "Precondition Failed",
+<a id="L207"></a>            .payload_too_large =&gt; "Payload Too Large",
+<a id="L208"></a>            .uri_too_long =&gt; "URI Too Long",
+<a id="L209"></a>            .unsupported_media_type =&gt; "Unsupported Media Type",
+<a id="L210"></a>            .range_not_satisfiable =&gt; "Range Not Satisfiable",
+<a id="L211"></a>            .expectation_failed =&gt; "Expectation Failed",
+<a id="L212"></a>            .teapot =&gt; "I'm a teapot",
+<a id="L213"></a>            .misdirected_request =&gt; "Misdirected Request",
+<a id="L214"></a>            .unprocessable_entity =&gt; "Unprocessable Entity",
+<a id="L215"></a>            .locked =&gt; "Locked",
+<a id="L216"></a>            .failed_dependency =&gt; "Failed Dependency",
+<a id="L217"></a>            .too_early =&gt; "Too Early",
+<a id="L218"></a>            .upgrade_required =&gt; "Upgrade Required",
+<a id="L219"></a>            .precondition_required =&gt; "Precondition Required",
+<a id="L220"></a>            .too_many_requests =&gt; "Too Many Requests",
+<a id="L221"></a>            .request_header_fields_too_large =&gt; "Request Header Fields Too Large",
+<a id="L222"></a>            .unavailable_for_legal_reasons =&gt; "Unavailable For Legal Reasons",
+<a id="L223"></a>
+<a id="L224"></a>            // 5xx statuses
+<a id="L225"></a>            .internal_server_error =&gt; "Internal Server Error",
+<a id="L226"></a>            .not_implemented =&gt; "Not Implemented",
+<a id="L227"></a>            .bad_gateway =&gt; "Bad Gateway",
+<a id="L228"></a>            .service_unavailable =&gt; "Service Unavailable",
+<a id="L229"></a>            .gateway_timeout =&gt; "Gateway Timeout",
+<a id="L230"></a>            .http_version_not_supported =&gt; "HTTP Version Not Supported",
+<a id="L231"></a>            .variant_also_negotiates =&gt; "Variant Also Negotiates",
+<a id="L232"></a>            .insufficient_storage =&gt; "Insufficient Storage",
+<a id="L233"></a>            .loop_detected =&gt; "Loop Detected",
+<a id="L234"></a>            .not_extended =&gt; "Not Extended",
+<a id="L235"></a>            .network_authentication_required =&gt; "Network Authentication Required",
+<a id="L236"></a>
+<a id="L237"></a>            else =&gt; return null,
+<a id="L238"></a>        };
+<a id="L239"></a>    }
+<a id="L240"></a>
+<a id="L241"></a>    pub const Class = enum {
+<a id="L242"></a>        informational,
+<a id="L243"></a>        success,
+<a id="L244"></a>        redirect,
+<a id="L245"></a>        client_error,
+<a id="L246"></a>        server_error,
+<a id="L247"></a>    };
+<a id="L248"></a>
+<a id="L249"></a>    pub fn class(self: Status) Class {
+<a id="L250"></a>        return switch (@intFromEnum(self)) {
+<a id="L251"></a>            100...199 =&gt; .informational,
+<a id="L252"></a>            200...299 =&gt; .success,
+<a id="L253"></a>            300...399 =&gt; .redirect,
+<a id="L254"></a>            400...499 =&gt; .client_error,
+<a id="L255"></a>            else =&gt; .server_error,
+<a id="L256"></a>        };
+<a id="L257"></a>    }
+<a id="L258"></a>
+<a id="L259"></a>    test {
+<a id="L260"></a>        try std.testing.expectEqualStrings("OK", Status.ok.phrase().?);
+<a id="L261"></a>        try std.testing.expectEqualStrings("Not Found", Status.not_found.phrase().?);
+<a id="L262"></a>    }
+<a id="L263"></a>
+<a id="L264"></a>    test {
+<a id="L265"></a>        try std.testing.expectEqual(Status.Class.success, Status.ok.class());
+<a id="L266"></a>        try std.testing.expectEqual(Status.Class.client_error, Status.not_found.class());
+<a id="L267"></a>    }
+<a id="L268"></a>};
+<a id="L269"></a>
+<a id="L270"></a>/// compression is intentionally omitted here since it is handled in `ContentEncoding`.
+<a id="L271"></a>pub const TransferEncoding = enum {
+<a id="L272"></a>    chunked,
+<a id="L273"></a>    none,
+<a id="L274"></a>};
+<a id="L275"></a>
+<a id="L276"></a>pub const ContentEncoding = enum {
+<a id="L277"></a>    zstd,
+<a id="L278"></a>    gzip,
+<a id="L279"></a>    deflate,
+<a id="L280"></a>    compress,
+<a id="L281"></a>    identity,
+<a id="L282"></a>
+<a id="L283"></a>    pub fn fromString(s: []const u8) ?ContentEncoding {
+<a id="L284"></a>        const map = std.StaticStringMap(ContentEncoding).initComptime(.{
+<a id="L285"></a>            .{ "zstd", .zstd },
+<a id="L286"></a>            .{ "gzip", .gzip },
+<a id="L287"></a>            .{ "x-gzip", .gzip },
+<a id="L288"></a>            .{ "deflate", .deflate },
+<a id="L289"></a>            .{ "compress", .compress },
+<a id="L290"></a>            .{ "x-compress", .compress },
+<a id="L291"></a>            .{ "identity", .identity },
+<a id="L292"></a>        });
+<a id="L293"></a>        return map.get(s);
+<a id="L294"></a>    }
+<a id="L295"></a>
+<a id="L296"></a>    pub fn minBufferCapacity(ce: ContentEncoding) usize {
+<a id="L297"></a>        return switch (ce) {
+<a id="L298"></a>            .zstd =&gt; std.compress.zstd.default_window_len,
+<a id="L299"></a>            .gzip, .deflate =&gt; std.compress.flate.max_window_len,
+<a id="L300"></a>            .compress, .identity =&gt; 0,
+<a id="L301"></a>        };
+<a id="L302"></a>    }
+<a id="L303"></a>};
+<a id="L304"></a>
+<a id="L305"></a>pub const Connection = enum {
+<a id="L306"></a>    keep_alive,
+<a id="L307"></a>    close,
+<a id="L308"></a>};
+<a id="L309"></a>
+<a id="L310"></a>pub const Header = struct {
+<a id="L311"></a>    name: []const u8,
+<a id="L312"></a>    value: []const u8,
+<a id="L313"></a>};
+<a id="L314"></a>
+<a id="L315"></a>pub const Reader = struct {
+<a id="L316"></a>    in: *std.Io.Reader,
+<a id="L317"></a>    /// This is preallocated memory that might be used by `bodyReader`. That
+<a id="L318"></a>    /// function might return a pointer to this field, or a different
+<a id="L319"></a>    /// `*std.Io.Reader`. Advisable to not access this field directly.
+<a id="L320"></a>    interface: std.Io.Reader,
+<a id="L321"></a>    /// Keeps track of whether the stream is ready to accept a new request,
+<a id="L322"></a>    /// making invalid API usage cause assertion failures rather than HTTP
+<a id="L323"></a>    /// protocol violations.
+<a id="L324"></a>    state: State,
+<a id="L325"></a>    /// HTTP trailer bytes. These are at the end of a transfer-encoding:
+<a id="L326"></a>    /// chunked message. This data is available only after calling one of the
+<a id="L327"></a>    /// "end" functions and points to data inside the buffer of `in`, and is
+<a id="L328"></a>    /// therefore invalidated on the next call to `receiveHead`, or any other
+<a id="L329"></a>    /// read from `in`.
+<a id="L330"></a>    trailers: []const u8 = &amp;.{},
+<a id="L331"></a>    body_err: ?BodyError = null,
+<a id="L332"></a>    max_head_len: usize,
+<a id="L333"></a>
+<a id="L334"></a>    pub const RemainingChunkLen = enum(u64) {
+<a id="L335"></a>        head = 0,
+<a id="L336"></a>        n = 1,
+<a id="L337"></a>        rn = 2,
+<a id="L338"></a>        _,
+<a id="L339"></a>
+<a id="L340"></a>        pub fn init(integer: u64) RemainingChunkLen {
+<a id="L341"></a>            return @enumFromInt(integer);
+<a id="L342"></a>        }
+<a id="L343"></a>
+<a id="L344"></a>        pub fn int(rcl: RemainingChunkLen) u64 {
+<a id="L345"></a>            return @intFromEnum(rcl);
+<a id="L346"></a>        }
+<a id="L347"></a>    };
+<a id="L348"></a>
+<a id="L349"></a>    pub const State = union(enum) {
+<a id="L350"></a>        /// The stream is available to be used for the first time, or reused.
+<a id="L351"></a>        ready,
+<a id="L352"></a>        received_head,
+<a id="L353"></a>        /// The stream goes until the connection is closed.
+<a id="L354"></a>        body_none,
+<a id="L355"></a>        body_remaining_content_length: u64,
+<a id="L356"></a>        body_remaining_chunk_len: RemainingChunkLen,
+<a id="L357"></a>        /// The stream would be eligible for another HTTP request, however the
+<a id="L358"></a>        /// client and server did not negotiate a persistent connection.
+<a id="L359"></a>        closing,
+<a id="L360"></a>    };
+<a id="L361"></a>
+<a id="L362"></a>    pub const BodyError = error{
+<a id="L363"></a>        HttpChunkInvalid,
+<a id="L364"></a>        HttpChunkTruncated,
+<a id="L365"></a>        HttpHeadersOversize,
+<a id="L366"></a>    };
+<a id="L367"></a>
+<a id="L368"></a>    pub const HeadError = error{
+<a id="L369"></a>        /// Too many bytes of HTTP headers.
+<a id="L370"></a>        ///
+<a id="L371"></a>        /// The HTTP specification suggests to respond with a 431 status code
+<a id="L372"></a>        /// before closing the connection.
+<a id="L373"></a>        HttpHeadersOversize,
+<a id="L374"></a>        /// Partial HTTP request was received but the connection was closed
+<a id="L375"></a>        /// before fully receiving the headers.
+<a id="L376"></a>        HttpRequestTruncated,
+<a id="L377"></a>        /// The client sent 0 bytes of headers before closing the stream. This
+<a id="L378"></a>        /// happens when a keep-alive connection is finally closed.
+<a id="L379"></a>        HttpConnectionClosing,
+<a id="L380"></a>        /// Transitive error occurred reading from `in`.
+<a id="L381"></a>        ReadFailed,
+<a id="L382"></a>    };
+<a id="L383"></a>
+<a id="L384"></a>    /// Buffers the entire head inside `in`.
+<a id="L385"></a>    ///
+<a id="L386"></a>    /// The resulting memory is invalidated by any subsequent consumption of
+<a id="L387"></a>    /// the input stream.
+<a id="L388"></a>    pub fn receiveHead(reader: *Reader) HeadError![]const u8 {
+<a id="L389"></a>        reader.trailers = &amp;.{};
+<a id="L390"></a>        const in = reader.in;
+<a id="L391"></a>        const max_head_len = reader.max_head_len;
+<a id="L392"></a>        var hp: HeadParser = .{};
+<a id="L393"></a>        var head_len: usize = 0;
+<a id="L394"></a>        while (true) {
+<a id="L395"></a>            if (head_len &gt;= max_head_len) return error.HttpHeadersOversize;
+<a id="L396"></a>            const remaining = in.buffered()[head_len..];
+<a id="L397"></a>            if (remaining.len == 0) {
+<a id="L398"></a>                in.fillMore() catch |err| switch (err) {
+<a id="L399"></a>                    error.EndOfStream =&gt; switch (head_len) {
+<a id="L400"></a>                        0 =&gt; return error.HttpConnectionClosing,
+<a id="L401"></a>                        else =&gt; return error.HttpRequestTruncated,
+<a id="L402"></a>                    },
+<a id="L403"></a>                    error.ReadFailed =&gt; return error.ReadFailed,
+<a id="L404"></a>                };
+<a id="L405"></a>                continue;
+<a id="L406"></a>            }
+<a id="L407"></a>            head_len += hp.feed(remaining);
+<a id="L408"></a>            if (hp.state == .finished) {
+<a id="L409"></a>                reader.state = .received_head;
+<a id="L410"></a>                const head_buffer = in.buffered()[0..head_len];
+<a id="L411"></a>                in.toss(head_len);
+<a id="L412"></a>                return head_buffer;
+<a id="L413"></a>            }
+<a id="L414"></a>        }
+<a id="L415"></a>    }
+<a id="L416"></a>
+<a id="L417"></a>    /// If compressed body has been negotiated this will return compressed bytes.
+<a id="L418"></a>    ///
+<a id="L419"></a>    /// Asserts only called once and after `receiveHead`.
+<a id="L420"></a>    ///
+<a id="L421"></a>    /// See also:
+<a id="L422"></a>    /// * `interfaceDecompressing`
+<a id="L423"></a>    pub fn bodyReader(
+<a id="L424"></a>        reader: *Reader,
+<a id="L425"></a>        transfer_buffer: []u8,
+<a id="L426"></a>        transfer_encoding: TransferEncoding,
+<a id="L427"></a>        content_length: ?u64,
+<a id="L428"></a>    ) *std.Io.Reader {
+<a id="L429"></a>        assert(reader.state == .received_head);
+<a id="L430"></a>        switch (transfer_encoding) {
+<a id="L431"></a>            .chunked =&gt; {
+<a id="L432"></a>                reader.state = .{ .body_remaining_chunk_len = .head };
+<a id="L433"></a>                reader.interface = .{
+<a id="L434"></a>                    .buffer = transfer_buffer,
+<a id="L435"></a>                    .seek = 0,
+<a id="L436"></a>                    .end = 0,
+<a id="L437"></a>                    .vtable = &amp;.{
+<a id="L438"></a>                        .stream = chunkedStream,
+<a id="L439"></a>                        .discard = chunkedDiscard,
+<a id="L440"></a>                    },
+<a id="L441"></a>                };
+<a id="L442"></a>                return &amp;reader.interface;
+<a id="L443"></a>            },
+<a id="L444"></a>            .none =&gt; {
+<a id="L445"></a>                if (content_length) |len| {
+<a id="L446"></a>                    reader.state = if (len == 0) .ready else .{ .body_remaining_content_length = len };
+<a id="L447"></a>                    reader.interface = .{
+<a id="L448"></a>                        .buffer = transfer_buffer,
+<a id="L449"></a>                        .seek = 0,
+<a id="L450"></a>                        .end = 0,
+<a id="L451"></a>                        .vtable = &amp;.{
+<a id="L452"></a>                            .stream = contentLengthStream,
+<a id="L453"></a>                            .discard = contentLengthDiscard,
+<a id="L454"></a>                        },
+<a id="L455"></a>                    };
+<a id="L456"></a>                    return &amp;reader.interface;
+<a id="L457"></a>                } else {
+<a id="L458"></a>                    reader.state = .body_none;
+<a id="L459"></a>                    return reader.in;
+<a id="L460"></a>                }
+<a id="L461"></a>            },
+<a id="L462"></a>        }
+<a id="L463"></a>    }
+<a id="L464"></a>
+<a id="L465"></a>    /// If compressed body has been negotiated this will return decompressed bytes.
+<a id="L466"></a>    ///
+<a id="L467"></a>    /// Asserts only called once and after `receiveHead`.
+<a id="L468"></a>    ///
+<a id="L469"></a>    /// See also:
+<a id="L470"></a>    /// * `interface`
+<a id="L471"></a>    pub fn bodyReaderDecompressing(
+<a id="L472"></a>        reader: *Reader,
+<a id="L473"></a>        transfer_buffer: []u8,
+<a id="L474"></a>        transfer_encoding: TransferEncoding,
+<a id="L475"></a>        content_length: ?u64,
+<a id="L476"></a>        content_encoding: ContentEncoding,
+<a id="L477"></a>        decompress: *Decompress,
+<a id="L478"></a>        decompress_buffer: []u8,
+<a id="L479"></a>    ) *std.Io.Reader {
+<a id="L480"></a>        if (transfer_encoding == .none and content_length == null) {
+<a id="L481"></a>            assert(reader.state == .received_head);
+<a id="L482"></a>            reader.state = .body_none;
+<a id="L483"></a>            switch (content_encoding) {
+<a id="L484"></a>                .identity =&gt; {
+<a id="L485"></a>                    return reader.in;
+<a id="L486"></a>                },
+<a id="L487"></a>                .deflate =&gt; {
+<a id="L488"></a>                    decompress.* = .{ .flate = .init(reader.in, .zlib, decompress_buffer) };
+<a id="L489"></a>                    return &amp;decompress.flate.reader;
+<a id="L490"></a>                },
+<a id="L491"></a>                .gzip =&gt; {
+<a id="L492"></a>                    decompress.* = .{ .flate = .init(reader.in, .gzip, decompress_buffer) };
+<a id="L493"></a>                    return &amp;decompress.flate.reader;
+<a id="L494"></a>                },
+<a id="L495"></a>                .zstd =&gt; {
+<a id="L496"></a>                    decompress.* = .{ .zstd = .init(reader.in, decompress_buffer, .{ .verify_checksum = false }) };
+<a id="L497"></a>                    return &amp;decompress.zstd.reader;
+<a id="L498"></a>                },
+<a id="L499"></a>                .compress =&gt; unreachable,
+<a id="L500"></a>            }
+<a id="L501"></a>        }
+<a id="L502"></a>        const transfer_reader = bodyReader(reader, transfer_buffer, transfer_encoding, content_length);
+<a id="L503"></a>        return decompress.init(transfer_reader, decompress_buffer, content_encoding);
+<a id="L504"></a>    }
+<a id="L505"></a>
+<a id="L506"></a>    fn contentLengthStream(
+<a id="L507"></a>        io_r: *std.Io.Reader,
+<a id="L508"></a>        w: *Writer,
+<a id="L509"></a>        limit: std.Io.Limit,
+<a id="L510"></a>    ) std.Io.Reader.StreamError!usize {
+<a id="L511"></a>        const reader: *Reader = @alignCast(@fieldParentPtr("interface", io_r));
+<a id="L512"></a>        if (reader.state == .ready) return error.EndOfStream;
+<a id="L513"></a>        const remaining_content_length = &amp;reader.state.body_remaining_content_length;
+<a id="L514"></a>        const remaining = remaining_content_length.*;
+<a id="L515"></a>        const n = try reader.in.stream(w, limit.min(.limited64(remaining)));
+<a id="L516"></a>        if (n == remaining) {
+<a id="L517"></a>            reader.state = .ready;
+<a id="L518"></a>        } else {
+<a id="L519"></a>            remaining_content_length.* = remaining - n;
+<a id="L520"></a>        }
+<a id="L521"></a>        return n;
+<a id="L522"></a>    }
+<a id="L523"></a>
+<a id="L524"></a>    fn contentLengthDiscard(io_r: *std.Io.Reader, limit: std.Io.Limit) std.Io.Reader.Error!usize {
+<a id="L525"></a>        const reader: *Reader = @alignCast(@fieldParentPtr("interface", io_r));
+<a id="L526"></a>        if (reader.state == .ready) return error.EndOfStream;
+<a id="L527"></a>        const remaining_content_length = &amp;reader.state.body_remaining_content_length;
+<a id="L528"></a>        const remaining = remaining_content_length.*;
+<a id="L529"></a>        const n = try reader.in.discard(limit.min(.limited64(remaining)));
+<a id="L530"></a>        if (n == remaining) {
+<a id="L531"></a>            reader.state = .ready;
+<a id="L532"></a>        } else {
+<a id="L533"></a>            remaining_content_length.* = remaining - n;
+<a id="L534"></a>        }
+<a id="L535"></a>        return n;
+<a id="L536"></a>    }
+<a id="L537"></a>
+<a id="L538"></a>    fn chunkedStream(io_r: *std.Io.Reader, w: *Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+<a id="L539"></a>        const reader: *Reader = @alignCast(@fieldParentPtr("interface", io_r));
+<a id="L540"></a>        const chunk_len_ptr = switch (reader.state) {
+<a id="L541"></a>            .ready =&gt; return error.EndOfStream,
+<a id="L542"></a>            .body_remaining_chunk_len =&gt; |*x| x,
+<a id="L543"></a>            else =&gt; unreachable,
+<a id="L544"></a>        };
+<a id="L545"></a>        return chunkedReadEndless(reader, w, limit, chunk_len_ptr) catch |err| switch (err) {
+<a id="L546"></a>            error.ReadFailed =&gt; return error.ReadFailed,
+<a id="L547"></a>            error.WriteFailed =&gt; return error.WriteFailed,
+<a id="L548"></a>            error.EndOfStream =&gt; {
+<a id="L549"></a>                reader.body_err = error.HttpChunkTruncated;
+<a id="L550"></a>                return error.ReadFailed;
+<a id="L551"></a>            },
+<a id="L552"></a>            else =&gt; |e| {
+<a id="L553"></a>                reader.body_err = e;
+<a id="L554"></a>                return error.ReadFailed;
+<a id="L555"></a>            },
+<a id="L556"></a>        };
+<a id="L557"></a>    }
+<a id="L558"></a>
+<a id="L559"></a>    fn chunkedReadEndless(
+<a id="L560"></a>        reader: *Reader,
+<a id="L561"></a>        w: *Writer,
+<a id="L562"></a>        limit: std.Io.Limit,
+<a id="L563"></a>        chunk_len_ptr: *RemainingChunkLen,
+<a id="L564"></a>    ) (BodyError || std.Io.Reader.StreamError)!usize {
+<a id="L565"></a>        const in = reader.in;
+<a id="L566"></a>        len: switch (chunk_len_ptr.*) {
+<a id="L567"></a>            .head =&gt; {
+<a id="L568"></a>                var cp: ChunkParser = .init;
+<a id="L569"></a>                while (true) {
+<a id="L570"></a>                    const i = cp.feed(in.buffered());
+<a id="L571"></a>                    switch (cp.state) {
+<a id="L572"></a>                        .invalid =&gt; return error.HttpChunkInvalid,
+<a id="L573"></a>                        .data =&gt; {
+<a id="L574"></a>                            in.toss(i);
+<a id="L575"></a>                            break;
+<a id="L576"></a>                        },
+<a id="L577"></a>                        else =&gt; {
+<a id="L578"></a>                            in.toss(i);
+<a id="L579"></a>                            try in.fillMore();
+<a id="L580"></a>                            continue;
+<a id="L581"></a>                        },
+<a id="L582"></a>                    }
+<a id="L583"></a>                }
+<a id="L584"></a>                if (cp.chunk_len == 0) return parseTrailers(reader, 0);
+<a id="L585"></a>                const n = try in.stream(w, limit.min(.limited64(cp.chunk_len)));
+<a id="L586"></a>                chunk_len_ptr.* = .init(cp.chunk_len + 2 - n);
+<a id="L587"></a>                return n;
+<a id="L588"></a>            },
+<a id="L589"></a>            .n =&gt; {
+<a id="L590"></a>                if ((try in.peekByte()) != '\n') return error.HttpChunkInvalid;
+<a id="L591"></a>                in.toss(1);
+<a id="L592"></a>                continue :len .head;
+<a id="L593"></a>            },
+<a id="L594"></a>            .rn =&gt; {
+<a id="L595"></a>                const rn = try in.peekArray(2);
+<a id="L596"></a>                if (rn[0] != '\r' or rn[1] != '\n') return error.HttpChunkInvalid;
+<a id="L597"></a>                in.toss(2);
+<a id="L598"></a>                continue :len .head;
+<a id="L599"></a>            },
+<a id="L600"></a>            else =&gt; |remaining_chunk_len| {
+<a id="L601"></a>                const n = try in.stream(w, limit.min(.limited64(@intFromEnum(remaining_chunk_len) - 2)));
+<a id="L602"></a>                chunk_len_ptr.* = .init(@intFromEnum(remaining_chunk_len) - n);
+<a id="L603"></a>                return n;
+<a id="L604"></a>            },
+<a id="L605"></a>        }
+<a id="L606"></a>    }
+<a id="L607"></a>
+<a id="L608"></a>    fn chunkedDiscard(io_r: *std.Io.Reader, limit: std.Io.Limit) std.Io.Reader.Error!usize {
+<a id="L609"></a>        const reader: *Reader = @alignCast(@fieldParentPtr("interface", io_r));
+<a id="L610"></a>        const chunk_len_ptr = switch (reader.state) {
+<a id="L611"></a>            .ready =&gt; return error.EndOfStream,
+<a id="L612"></a>            .body_remaining_chunk_len =&gt; |*x| x,
+<a id="L613"></a>            else =&gt; unreachable,
+<a id="L614"></a>        };
+<a id="L615"></a>        return chunkedDiscardEndless(reader, limit, chunk_len_ptr) catch |err| switch (err) {
+<a id="L616"></a>            error.ReadFailed =&gt; return error.ReadFailed,
+<a id="L617"></a>            error.EndOfStream =&gt; {
+<a id="L618"></a>                reader.body_err = error.HttpChunkTruncated;
+<a id="L619"></a>                return error.ReadFailed;
+<a id="L620"></a>            },
+<a id="L621"></a>            else =&gt; |e| {
+<a id="L622"></a>                reader.body_err = e;
+<a id="L623"></a>                return error.ReadFailed;
+<a id="L624"></a>            },
+<a id="L625"></a>        };
+<a id="L626"></a>    }
+<a id="L627"></a>
+<a id="L628"></a>    fn chunkedDiscardEndless(
+<a id="L629"></a>        reader: *Reader,
+<a id="L630"></a>        limit: std.Io.Limit,
+<a id="L631"></a>        chunk_len_ptr: *RemainingChunkLen,
+<a id="L632"></a>    ) (BodyError || std.Io.Reader.Error)!usize {
+<a id="L633"></a>        const in = reader.in;
+<a id="L634"></a>        len: switch (chunk_len_ptr.*) {
+<a id="L635"></a>            .head =&gt; {
+<a id="L636"></a>                var cp: ChunkParser = .init;
+<a id="L637"></a>                while (true) {
+<a id="L638"></a>                    const i = cp.feed(in.buffered());
+<a id="L639"></a>                    switch (cp.state) {
+<a id="L640"></a>                        .invalid =&gt; return error.HttpChunkInvalid,
+<a id="L641"></a>                        .data =&gt; {
+<a id="L642"></a>                            in.toss(i);
+<a id="L643"></a>                            break;
+<a id="L644"></a>                        },
+<a id="L645"></a>                        else =&gt; {
+<a id="L646"></a>                            in.toss(i);
+<a id="L647"></a>                            try in.fillMore();
+<a id="L648"></a>                            continue;
+<a id="L649"></a>                        },
+<a id="L650"></a>                    }
+<a id="L651"></a>                }
+<a id="L652"></a>                if (cp.chunk_len == 0) return parseTrailers(reader, 0);
+<a id="L653"></a>                const n = try in.discard(limit.min(.limited64(cp.chunk_len)));
+<a id="L654"></a>                chunk_len_ptr.* = .init(cp.chunk_len + 2 - n);
+<a id="L655"></a>                return n;
+<a id="L656"></a>            },
+<a id="L657"></a>            .n =&gt; {
+<a id="L658"></a>                if ((try in.peekByte()) != '\n') return error.HttpChunkInvalid;
+<a id="L659"></a>                in.toss(1);
+<a id="L660"></a>                continue :len .head;
+<a id="L661"></a>            },
+<a id="L662"></a>            .rn =&gt; {
+<a id="L663"></a>                const rn = try in.peekArray(2);
+<a id="L664"></a>                if (rn[0] != '\r' or rn[1] != '\n') return error.HttpChunkInvalid;
+<a id="L665"></a>                in.toss(2);
+<a id="L666"></a>                continue :len .head;
+<a id="L667"></a>            },
+<a id="L668"></a>            else =&gt; |remaining_chunk_len| {
+<a id="L669"></a>                const n = try in.discard(limit.min(.limited64(remaining_chunk_len.int() - 2)));
+<a id="L670"></a>                chunk_len_ptr.* = .init(remaining_chunk_len.int() - n);
+<a id="L671"></a>                return n;
+<a id="L672"></a>            },
+<a id="L673"></a>        }
+<a id="L674"></a>    }
+<a id="L675"></a>
+<a id="L676"></a>    /// Called when next bytes in the stream are trailers, or "\r\n" to indicate
+<a id="L677"></a>    /// end of chunked body.
+<a id="L678"></a>    fn parseTrailers(reader: *Reader, amt_read: usize) (BodyError || std.Io.Reader.Error)!usize {
+<a id="L679"></a>        const in = reader.in;
+<a id="L680"></a>        const rn = try in.peekArray(2);
+<a id="L681"></a>        if (rn[0] == '\r' and rn[1] == '\n') {
+<a id="L682"></a>            in.toss(2);
+<a id="L683"></a>            reader.state = .ready;
+<a id="L684"></a>            assert(reader.trailers.len == 0);
+<a id="L685"></a>            return amt_read;
+<a id="L686"></a>        }
+<a id="L687"></a>        var hp: HeadParser = .{ .state = .seen_rn };
+<a id="L688"></a>        var trailers_len: usize = 2;
+<a id="L689"></a>        while (true) {
+<a id="L690"></a>            if (in.buffer.len - trailers_len == 0) return error.HttpHeadersOversize;
+<a id="L691"></a>            const remaining = in.buffered()[trailers_len..];
+<a id="L692"></a>            if (remaining.len == 0) {
+<a id="L693"></a>                try in.fillMore();
+<a id="L694"></a>                continue;
+<a id="L695"></a>            }
+<a id="L696"></a>            trailers_len += hp.feed(remaining);
+<a id="L697"></a>            if (hp.state == .finished) {
+<a id="L698"></a>                reader.state = .ready;
+<a id="L699"></a>                reader.trailers = in.buffered()[0..trailers_len];
+<a id="L700"></a>                in.toss(trailers_len);
+<a id="L701"></a>                return amt_read;
+<a id="L702"></a>            }
+<a id="L703"></a>        }
+<a id="L704"></a>    }
+<a id="L705"></a>};
+<a id="L706"></a>
+<a id="L707"></a>pub const Decompress = union(enum) {
+<a id="L708"></a>    flate: std.compress.flate.Decompress,
+<a id="L709"></a>    zstd: std.compress.zstd.Decompress,
+<a id="L710"></a>    none: *std.Io.Reader,
+<a id="L711"></a>
+<a id="L712"></a>    pub fn init(
+<a id="L713"></a>        decompress: *Decompress,
+<a id="L714"></a>        transfer_reader: *std.Io.Reader,
+<a id="L715"></a>        buffer: []u8,
+<a id="L716"></a>        content_encoding: ContentEncoding,
+<a id="L717"></a>    ) *std.Io.Reader {
+<a id="L718"></a>        switch (content_encoding) {
+<a id="L719"></a>            .identity =&gt; {
+<a id="L720"></a>                decompress.* = .{ .none = transfer_reader };
+<a id="L721"></a>                return transfer_reader;
+<a id="L722"></a>            },
+<a id="L723"></a>            .deflate =&gt; {
+<a id="L724"></a>                decompress.* = .{ .flate = .init(transfer_reader, .zlib, buffer) };
+<a id="L725"></a>                return &amp;decompress.flate.reader;
+<a id="L726"></a>            },
+<a id="L727"></a>            .gzip =&gt; {
+<a id="L728"></a>                decompress.* = .{ .flate = .init(transfer_reader, .gzip, buffer) };
+<a id="L729"></a>                return &amp;decompress.flate.reader;
+<a id="L730"></a>            },
+<a id="L731"></a>            .zstd =&gt; {
+<a id="L732"></a>                decompress.* = .{ .zstd = .init(transfer_reader, buffer, .{ .verify_checksum = false }) };
+<a id="L733"></a>                return &amp;decompress.zstd.reader;
+<a id="L734"></a>            },
+<a id="L735"></a>            .compress =&gt; unreachable,
+<a id="L736"></a>        }
+<a id="L737"></a>    }
+<a id="L738"></a>};
+<a id="L739"></a>
+<a id="L740"></a>/// Request or response body.
+<a id="L741"></a>pub const BodyWriter = struct {
+<a id="L742"></a>    /// Until the lifetime of `BodyWriter` ends, it is illegal to modify the
+<a id="L743"></a>    /// state of this other than via methods of `BodyWriter`.
+<a id="L744"></a>    http_protocol_output: *Writer,
+<a id="L745"></a>    state: State,
+<a id="L746"></a>    writer: Writer,
+<a id="L747"></a>
+<a id="L748"></a>    pub const Error = Writer.Error;
+<a id="L749"></a>
+<a id="L750"></a>    /// How many zeroes to reserve for hex-encoded chunk length.
+<a id="L751"></a>    const chunk_len_digits = 8;
+<a id="L752"></a>    const max_chunk_len: usize = std.math.pow(u64, 16, chunk_len_digits) - 1;
+<a id="L753"></a>    const chunk_header_template = ("0" ** chunk_len_digits) ++ "\r\n";
+<a id="L754"></a>
+<a id="L755"></a>    comptime {
+<a id="L756"></a>        assert(max_chunk_len == std.math.maxInt(u32));
+<a id="L757"></a>    }
+<a id="L758"></a>
+<a id="L759"></a>    pub const State = union(enum) {
+<a id="L760"></a>        /// End of connection signals the end of the stream.
+<a id="L761"></a>        none,
+<a id="L762"></a>        /// As a debugging utility, counts down to zero as bytes are written.
+<a id="L763"></a>        content_length: u64,
+<a id="L764"></a>        /// Each chunk is wrapped in a header and trailer.
+<a id="L765"></a>        /// This length is the the number of bytes to be written before the
+<a id="L766"></a>        /// next header. This includes +2 for the `\r\n` trailer and is zero
+<a id="L767"></a>        /// for the beginning of the stream.
+<a id="L768"></a>        chunk_len: usize,
+<a id="L769"></a>        /// Cleanly finished stream; connection can be reused.
+<a id="L770"></a>        end,
+<a id="L771"></a>
+<a id="L772"></a>        pub const init_chunked: State = .{ .chunk_len = 0 };
+<a id="L773"></a>    };
+<a id="L774"></a>
+<a id="L775"></a>    pub fn isEliding(w: *const BodyWriter) bool {
+<a id="L776"></a>        return w.writer.vtable.drain == elidingDrain;
+<a id="L777"></a>    }
+<a id="L778"></a>
+<a id="L779"></a>    /// Sends all buffered data across `BodyWriter.http_protocol_output`.
+<a id="L780"></a>    pub fn flush(w: *BodyWriter) Error!void {
+<a id="L781"></a>        const out = w.http_protocol_output;
+<a id="L782"></a>        switch (w.state) {
+<a id="L783"></a>            .end, .none, .content_length, .chunk_len =&gt; return out.flush(),
+<a id="L784"></a>        }
+<a id="L785"></a>    }
+<a id="L786"></a>
+<a id="L787"></a>    /// When using content-length, asserts that the amount of data sent matches
+<a id="L788"></a>    /// the value sent in the header, then flushes `http_protocol_output`.
+<a id="L789"></a>    ///
+<a id="L790"></a>    /// When using transfer-encoding: chunked, writes the end-of-stream message
+<a id="L791"></a>    /// with empty trailers, then flushes the stream to the system. Asserts any
+<a id="L792"></a>    /// started chunk has been completely finished.
+<a id="L793"></a>    ///
+<a id="L794"></a>    /// Respects the value of `isEliding` to omit all data after the headers.
+<a id="L795"></a>    ///
+<a id="L796"></a>    /// See also:
+<a id="L797"></a>    /// * `endUnflushed`
+<a id="L798"></a>    /// * `endChunked`
+<a id="L799"></a>    pub fn end(w: *BodyWriter) Error!void {
+<a id="L800"></a>        try endUnflushed(w);
+<a id="L801"></a>        try w.http_protocol_output.flush();
+<a id="L802"></a>    }
+<a id="L803"></a>
+<a id="L804"></a>    /// When using content-length, asserts that the amount of data sent matches
+<a id="L805"></a>    /// the value sent in the header.
+<a id="L806"></a>    ///
+<a id="L807"></a>    /// Otherwise, transfer-encoding: chunked is being used, and it writes the
+<a id="L808"></a>    /// end-of-stream message with empty trailers.
+<a id="L809"></a>    ///
+<a id="L810"></a>    /// Respects the value of `isEliding` to omit all data after the headers.
+<a id="L811"></a>    ///
+<a id="L812"></a>    /// Does not flush `http_protocol_output`, but does flush `writer`.
+<a id="L813"></a>    ///
+<a id="L814"></a>    /// See also:
+<a id="L815"></a>    /// * `end`
+<a id="L816"></a>    /// * `endChunked`
+<a id="L817"></a>    pub fn endUnflushed(w: *BodyWriter) Error!void {
+<a id="L818"></a>        try w.writer.flush();
+<a id="L819"></a>        switch (w.state) {
+<a id="L820"></a>            .end =&gt; unreachable,
+<a id="L821"></a>            .content_length =&gt; |len| {
+<a id="L822"></a>                assert(len == 0); // Trips when end() called before all bytes written.
+<a id="L823"></a>                w.state = .end;
+<a id="L824"></a>            },
+<a id="L825"></a>            .none =&gt; {},
+<a id="L826"></a>            .chunk_len =&gt; return endChunkedUnflushed(w, .{}),
+<a id="L827"></a>        }
+<a id="L828"></a>    }
+<a id="L829"></a>
+<a id="L830"></a>    pub const EndChunkedOptions = struct {
+<a id="L831"></a>        trailers: []const Header = &amp;.{},
+<a id="L832"></a>    };
+<a id="L833"></a>
+<a id="L834"></a>    /// Writes the end-of-stream message and any optional trailers, flushing
+<a id="L835"></a>    /// the underlying stream.
+<a id="L836"></a>    ///
+<a id="L837"></a>    /// Asserts that the BodyWriter is using transfer-encoding: chunked.
+<a id="L838"></a>    ///
+<a id="L839"></a>    /// Respects the value of `isEliding` to omit all data after the headers.
+<a id="L840"></a>    ///
+<a id="L841"></a>    /// See also:
+<a id="L842"></a>    /// * `endChunkedUnflushed`
+<a id="L843"></a>    /// * `end`
+<a id="L844"></a>    pub fn endChunked(w: *BodyWriter, options: EndChunkedOptions) Error!void {
+<a id="L845"></a>        try endChunkedUnflushed(w, options);
+<a id="L846"></a>        try w.http_protocol_output.flush();
+<a id="L847"></a>    }
+<a id="L848"></a>
+<a id="L849"></a>    /// Writes the end-of-stream message and any optional trailers.
+<a id="L850"></a>    ///
+<a id="L851"></a>    /// Does not flush.
+<a id="L852"></a>    ///
+<a id="L853"></a>    /// Asserts that the BodyWriter is using transfer-encoding: chunked.
+<a id="L854"></a>    ///
+<a id="L855"></a>    /// Respects the value of `isEliding` to omit all data after the headers.
+<a id="L856"></a>    ///
+<a id="L857"></a>    /// See also:
+<a id="L858"></a>    /// * `endChunked`
+<a id="L859"></a>    /// * `endUnflushed`
+<a id="L860"></a>    /// * `end`
+<a id="L861"></a>    pub fn endChunkedUnflushed(w: *BodyWriter, options: EndChunkedOptions) Error!void {
+<a id="L862"></a>        if (w.isEliding()) {
+<a id="L863"></a>            w.state = .end;
+<a id="L864"></a>            return;
+<a id="L865"></a>        }
+<a id="L866"></a>        const bw = w.http_protocol_output;
+<a id="L867"></a>        switch (w.state.chunk_len) {
+<a id="L868"></a>            0 =&gt; {},
+<a id="L869"></a>            1 =&gt; unreachable, // Wrote more data than specified in chunk header.
+<a id="L870"></a>            2 =&gt; try bw.writeAll("\r\n"),
+<a id="L871"></a>            else =&gt; unreachable, // An earlier write call indicated more data would follow.
+<a id="L872"></a>        }
+<a id="L873"></a>        try bw.writeAll("0\r\n");
+<a id="L874"></a>        for (options.trailers) |trailer| {
+<a id="L875"></a>            try bw.writeAll(trailer.name);
+<a id="L876"></a>            try bw.writeAll(": ");
+<a id="L877"></a>            try bw.writeAll(trailer.value);
+<a id="L878"></a>            try bw.writeAll("\r\n");
+<a id="L879"></a>        }
+<a id="L880"></a>        try bw.writeAll("\r\n");
+<a id="L881"></a>        w.state = .end;
+<a id="L882"></a>    }
+<a id="L883"></a>
+<a id="L884"></a>    pub fn contentLengthDrain(w: *Writer, data: []const []const u8, splat: usize) Error!usize {
+<a id="L885"></a>        const bw: *BodyWriter = @alignCast(@fieldParentPtr("writer", w));
+<a id="L886"></a>        assert(!bw.isEliding());
+<a id="L887"></a>        const out = bw.http_protocol_output;
+<a id="L888"></a>        const n = try out.writeSplatHeader(w.buffered(), data, splat);
+<a id="L889"></a>        bw.state.content_length -= n;
+<a id="L890"></a>        return w.consume(n);
+<a id="L891"></a>    }
+<a id="L892"></a>
+<a id="L893"></a>    pub fn noneDrain(w: *Writer, data: []const []const u8, splat: usize) Error!usize {
+<a id="L894"></a>        const bw: *BodyWriter = @alignCast(@fieldParentPtr("writer", w));
+<a id="L895"></a>        assert(!bw.isEliding());
+<a id="L896"></a>        const out = bw.http_protocol_output;
+<a id="L897"></a>        const n = try out.writeSplatHeader(w.buffered(), data, splat);
+<a id="L898"></a>        return w.consume(n);
+<a id="L899"></a>    }
+<a id="L900"></a>
+<a id="L901"></a>    pub fn elidingDrain(w: *Writer, data: []const []const u8, splat: usize) Error!usize {
+<a id="L902"></a>        const bw: *BodyWriter = @alignCast(@fieldParentPtr("writer", w));
+<a id="L903"></a>        const slice = data[0 .. data.len - 1];
+<a id="L904"></a>        const pattern = data[slice.len];
+<a id="L905"></a>        var written: usize = pattern.len * splat;
+<a id="L906"></a>        for (slice) |bytes| written += bytes.len;
+<a id="L907"></a>        switch (bw.state) {
+<a id="L908"></a>            .content_length =&gt; |*len| len.* -= written + w.end,
+<a id="L909"></a>            else =&gt; {},
+<a id="L910"></a>        }
+<a id="L911"></a>        w.end = 0;
+<a id="L912"></a>        return written;
+<a id="L913"></a>    }
+<a id="L914"></a>
+<a id="L915"></a>    pub fn elidingSendFile(w: *Writer, file_reader: *File.Reader, limit: std.Io.Limit) Writer.FileError!usize {
+<a id="L916"></a>        const bw: *BodyWriter = @alignCast(@fieldParentPtr("writer", w));
+<a id="L917"></a>        if (File.Handle == void) return error.Unimplemented;
+<a id="L918"></a>        if (builtin.zig_backend == .stage2_aarch64) return error.Unimplemented;
+<a id="L919"></a>        switch (bw.state) {
+<a id="L920"></a>            .content_length =&gt; |*len| len.* -= w.end,
+<a id="L921"></a>            else =&gt; {},
+<a id="L922"></a>        }
+<a id="L923"></a>        w.end = 0;
+<a id="L924"></a>        if (limit == .nothing) return 0;
+<a id="L925"></a>        if (file_reader.getSize()) |size| {
+<a id="L926"></a>            const n = limit.minInt64(size - file_reader.pos);
+<a id="L927"></a>            if (n == 0) return error.EndOfStream;
+<a id="L928"></a>            file_reader.seekBy(@intCast(n)) catch return error.Unimplemented;
+<a id="L929"></a>            switch (bw.state) {
+<a id="L930"></a>                .content_length =&gt; |*len| len.* -= n,
+<a id="L931"></a>                else =&gt; {},
+<a id="L932"></a>            }
+<a id="L933"></a>            return n;
+<a id="L934"></a>        } else |_| {
+<a id="L935"></a>            // Error is observable on `file_reader` instance, and it is better to
+<a id="L936"></a>            // treat the file as a pipe.
+<a id="L937"></a>            return error.Unimplemented;
+<a id="L938"></a>        }
+<a id="L939"></a>    }
+<a id="L940"></a>
+<a id="L941"></a>    /// Returns `null` if size cannot be computed without making any syscalls.
+<a id="L942"></a>    pub fn noneSendFile(w: *Writer, file_reader: *File.Reader, limit: std.Io.Limit) Writer.FileError!usize {
+<a id="L943"></a>        const bw: *BodyWriter = @alignCast(@fieldParentPtr("writer", w));
+<a id="L944"></a>        assert(!bw.isEliding());
+<a id="L945"></a>        const out = bw.http_protocol_output;
+<a id="L946"></a>        const n = try out.sendFileHeader(w.buffered(), file_reader, limit);
+<a id="L947"></a>        return w.consume(n);
+<a id="L948"></a>    }
+<a id="L949"></a>
+<a id="L950"></a>    pub fn contentLengthSendFile(w: *Writer, file_reader: *File.Reader, limit: std.Io.Limit) Writer.FileError!usize {
+<a id="L951"></a>        const bw: *BodyWriter = @alignCast(@fieldParentPtr("writer", w));
+<a id="L952"></a>        assert(!bw.isEliding());
+<a id="L953"></a>        const out = bw.http_protocol_output;
+<a id="L954"></a>        const n = try out.sendFileHeader(w.buffered(), file_reader, limit);
+<a id="L955"></a>        bw.state.content_length -= n;
+<a id="L956"></a>        return w.consume(n);
+<a id="L957"></a>    }
+<a id="L958"></a>
+<a id="L959"></a>    pub fn chunkedSendFile(w: *Writer, file_reader: *File.Reader, limit: std.Io.Limit) Writer.FileError!usize {
+<a id="L960"></a>        const bw: *BodyWriter = @alignCast(@fieldParentPtr("writer", w));
+<a id="L961"></a>        assert(!bw.isEliding());
+<a id="L962"></a>        const data_len = Writer.countSendFileLowerBound(w.end, file_reader, limit) orelse {
+<a id="L963"></a>            // If the file size is unknown, we cannot lower to a `sendFile` since we would
+<a id="L964"></a>            // have to flush the chunk header before knowing the chunk length.
+<a id="L965"></a>            return error.Unimplemented;
+<a id="L966"></a>        };
+<a id="L967"></a>        if (data_len == 0) return error.EndOfStream;
+<a id="L968"></a>        const out = bw.http_protocol_output;
+<a id="L969"></a>        l: switch (bw.state.chunk_len) {
+<a id="L970"></a>            0 =&gt; {
+<a id="L971"></a>                const header_buf = try out.writableArray(chunk_header_template.len);
+<a id="L972"></a>                @memcpy(header_buf, chunk_header_template);
+<a id="L973"></a>                writeHex(header_buf[0..chunk_len_digits], data_len);
+<a id="L974"></a>                bw.state.chunk_len = data_len + 2;
+<a id="L975"></a>                continue :l bw.state.chunk_len;
+<a id="L976"></a>            },
+<a id="L977"></a>            1 =&gt; unreachable, // Wrote more data than specified in chunk header.
+<a id="L978"></a>            2 =&gt; {
+<a id="L979"></a>                try out.writeAll("\r\n");
+<a id="L980"></a>                bw.state.chunk_len = 0;
+<a id="L981"></a>                continue :l 0;
+<a id="L982"></a>            },
+<a id="L983"></a>            else =&gt; {
+<a id="L984"></a>                const chunk_limit: std.Io.Limit = .limited(bw.state.chunk_len - 2);
+<a id="L985"></a>                const n = if (chunk_limit.subtract(w.buffered().len)) |sendfile_limit|
+<a id="L986"></a>                    try out.sendFileHeader(w.buffered(), file_reader, sendfile_limit.min(limit))
+<a id="L987"></a>                else
+<a id="L988"></a>                    try out.write(chunk_limit.slice(w.buffered()));
+<a id="L989"></a>                bw.state.chunk_len -= n;
+<a id="L990"></a>                return w.consume(n);
+<a id="L991"></a>            },
+<a id="L992"></a>        }
+<a id="L993"></a>    }
+<a id="L994"></a>
+<a id="L995"></a>    pub fn chunkedDrain(w: *Writer, data: []const []const u8, splat: usize) Error!usize {
+<a id="L996"></a>        const bw: *BodyWriter = @alignCast(@fieldParentPtr("writer", w));
+<a id="L997"></a>        assert(!bw.isEliding());
+<a id="L998"></a>        const out = bw.http_protocol_output;
+<a id="L999"></a>        const data_len = w.end + Writer.countSplat(data, splat);
+<a id="L1000"></a>        l: switch (bw.state.chunk_len) {
+<a id="L1001"></a>            0 =&gt; {
+<a id="L1002"></a>                const header_buf = try out.writableArray(chunk_header_template.len);
+<a id="L1003"></a>                @memcpy(header_buf, chunk_header_template);
+<a id="L1004"></a>                writeHex(header_buf[0..chunk_len_digits], data_len);
+<a id="L1005"></a>                bw.state.chunk_len = data_len + 2;
+<a id="L1006"></a>                continue :l bw.state.chunk_len;
+<a id="L1007"></a>            },
+<a id="L1008"></a>            1 =&gt; unreachable, // Wrote more data than specified in chunk header.
+<a id="L1009"></a>            2 =&gt; {
+<a id="L1010"></a>                try out.writeAll("\r\n");
+<a id="L1011"></a>                bw.state.chunk_len = 0;
+<a id="L1012"></a>                continue :l 0;
+<a id="L1013"></a>            },
+<a id="L1014"></a>            else =&gt; {
+<a id="L1015"></a>                const n = try out.writeSplatHeaderLimit(w.buffered(), data, splat, .limited(bw.state.chunk_len - 2));
+<a id="L1016"></a>                bw.state.chunk_len -= n;
+<a id="L1017"></a>                return w.consume(n);
+<a id="L1018"></a>            },
+<a id="L1019"></a>        }
+<a id="L1020"></a>    }
+<a id="L1021"></a>
+<a id="L1022"></a>    /// Writes an integer as base 16 to `buf`, right-aligned, assuming the
+<a id="L1023"></a>    /// buffer has already been filled with zeroes.
+<a id="L1024"></a>    fn writeHex(buf: []u8, x: usize) void {
+<a id="L1025"></a>        assert(std.mem.allEqual(u8, buf, '0'));
+<a id="L1026"></a>        const base = 16;
+<a id="L1027"></a>        var index: usize = buf.len;
+<a id="L1028"></a>        var a = x;
+<a id="L1029"></a>        while (a &gt; 0) {
+<a id="L1030"></a>            const digit = a % base;
+<a id="L1031"></a>            index -= 1;
+<a id="L1032"></a>            buf[index] = std.fmt.digitToChar(@intCast(digit), .lower);
+<a id="L1033"></a>            a /= base;
+<a id="L1034"></a>        }
+<a id="L1035"></a>    }
+<a id="L1036"></a>};
+<a id="L1037"></a>
+<a id="L1038"></a>test {
+<a id="L1039"></a>    _ = Server;
+<a id="L1040"></a>    _ = Status;
+<a id="L1041"></a>    _ = Method;
+<a id="L1042"></a>    _ = ChunkParser;
+<a id="L1043"></a>    _ = HeadParser;
+<a id="L1044"></a>
+<a id="L1045"></a>    if (builtin.os.tag != .wasi) {
+<a id="L1046"></a>        _ = Client;
+<a id="L1047"></a>        _ = @import("http/test.zig");
+<a id="L1048"></a>    }
+<a id="L1049"></a>}
+</pre>
 </body>
 </html>

@@ -2,603 +2,606 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Source: zig-0.16.0-std/debug/MachOFile.zig</title>
+    <title>Source: debug/MachOFile.zig</title>
     <style>
         body { background: #1e1e1e; color: #d4d4d4; font-family: monospace; padding: 20px; }
         pre { white-space: pre-wrap; word-wrap: break-word; }
         .header { border-bottom: 1px solid #444; padding-bottom: 10px; margin-bottom: 20px; }
         a { color: #569cd6; }
+        a[id] { color: inherit; text-decoration: none; }
+        :target { background: #3a3a00; }
     </style>
 </head>
 <body>
     <div class="header">
-        <a href="/">Index</a> | <strong>File: zig-0.16.0-std/debug/MachOFile.zig</strong>
+        <a href="/">Index</a> | <strong>File: debug/MachOFile.zig</strong>
     </div>
-    <pre>mapped_memory: []align(std.heap.page_size_min) const u8,
-symbols: []const Symbol,
-strings: []const u8,
-text_vmaddr: u64,
-
-/// Key is index into `strings` of the file path.
-ofiles: std.AutoArrayHashMapUnmanaged(u32, Error!OFile),
-
-pub const Error = error{
-    InvalidMachO,
-    InvalidDwarf,
-    MissingDebugInfo,
-    UnsupportedDebugInfo,
-    ReadFailed,
-    OutOfMemory,
-};
-
-pub fn deinit(mf: *MachOFile, gpa: Allocator) void {
-    for (mf.ofiles.values()) |*maybe_of| {
-        const of = &amp;(maybe_of.* catch continue);
-        posix.munmap(of.mapped_memory);
-        of.dwarf.deinit(gpa);
-        of.symbols_by_name.deinit(gpa);
-    }
-    mf.ofiles.deinit(gpa);
-    gpa.free(mf.symbols);
-    posix.munmap(mf.mapped_memory);
-}
-
-pub fn load(gpa: Allocator, io: Io, path: []const u8, arch: std.Target.Cpu.Arch) Error!MachOFile {
-    switch (arch) {
-        .x86_64, .aarch64 =&gt; {},
-        else =&gt; unreachable,
-    }
-
-    const all_mapped_memory = try mapDebugInfoFile(io, path);
-    errdefer posix.munmap(all_mapped_memory);
-
-    // In most cases, the file we just mapped is a Mach-O binary. However, it could be a "universal
-    // binary": a simple file format which contains Mach-O binaries for multiple targets. For
-    // instance, `/usr/lib/dyld` is currently distributed as a universal binary containing images
-    // for both ARM64 macOS and x86_64 macOS.
-    if (all_mapped_memory.len &lt; 4) return error.InvalidMachO;
-    const magic = std.mem.readInt(u32, all_mapped_memory.ptr[0..4], .little);
-
-    // The contents of a Mach-O file, which may or may not be the whole of `all_mapped_memory`.
-    const mapped_macho = switch (magic) {
-        macho.MH_MAGIC_64 =&gt; all_mapped_memory,
-
-        macho.FAT_CIGAM =&gt; mapped_macho: {
-            // This is the universal binary format (aka a "fat binary").
-            var fat_r: Io.Reader = .fixed(all_mapped_memory);
-            const hdr = fat_r.takeStruct(macho.fat_header, .big) catch |err| switch (err) {
-                error.ReadFailed =&gt; unreachable,
-                error.EndOfStream =&gt; return error.InvalidMachO,
-            };
-            const want_cpu_type = switch (arch) {
-                .x86_64 =&gt; macho.CPU_TYPE_X86_64,
-                .aarch64 =&gt; macho.CPU_TYPE_ARM64,
-                else =&gt; unreachable,
-            };
-            for (0..hdr.nfat_arch) |_| {
-                const fat_arch = fat_r.takeStruct(macho.fat_arch, .big) catch |err| switch (err) {
-                    error.ReadFailed =&gt; unreachable,
-                    error.EndOfStream =&gt; return error.InvalidMachO,
-                };
-                if (fat_arch.cputype != want_cpu_type) continue;
-                if (fat_arch.offset + fat_arch.size &gt; all_mapped_memory.len) return error.InvalidMachO;
-                break :mapped_macho all_mapped_memory[fat_arch.offset..][0..fat_arch.size];
-            }
-            // `arch` was not present in the fat binary.
-            return error.MissingDebugInfo;
-        },
-
-        // Even on modern 64-bit targets, this format doesn't seem to be too extensively used. It
-        // will be fairly easy to add support here if necessary; it's very similar to above.
-        macho.FAT_CIGAM_64 =&gt; return error.UnsupportedDebugInfo,
-
-        else =&gt; return error.InvalidMachO,
-    };
-
-    var r: Io.Reader = .fixed(mapped_macho);
-    const hdr = r.takeStruct(macho.mach_header_64, .little) catch |err| switch (err) {
-        error.ReadFailed =&gt; unreachable,
-        error.EndOfStream =&gt; return error.InvalidMachO,
-    };
-
-    if (hdr.magic != macho.MH_MAGIC_64)
-        return error.InvalidMachO;
-
-    const symtab: macho.symtab_command, const text_vmaddr: u64 = lcs: {
-        var it: macho.LoadCommandIterator = try .init(&amp;hdr, mapped_macho[@sizeOf(macho.mach_header_64)..]);
-        var symtab: ?macho.symtab_command = null;
-        var text_vmaddr: ?u64 = null;
-        while (try it.next()) |cmd| switch (cmd.hdr.cmd) {
-            .SYMTAB =&gt; symtab = cmd.cast(macho.symtab_command) orelse return error.InvalidMachO,
-            .SEGMENT_64 =&gt; if (cmd.cast(macho.segment_command_64)) |seg_cmd| {
-                if (!mem.eql(u8, seg_cmd.segName(), "__TEXT")) continue;
-                text_vmaddr = seg_cmd.vmaddr;
-            },
-            else =&gt; {},
-        };
-        break :lcs .{
-            symtab orelse return error.MissingDebugInfo,
-            text_vmaddr orelse return error.MissingDebugInfo,
-        };
-    };
-
-    const strings = mapped_macho[symtab.stroff..][0 .. symtab.strsize - 1];
-
-    var symbols: std.ArrayList(Symbol) = try .initCapacity(gpa, symtab.nsyms);
-    defer symbols.deinit(gpa);
-
-    // This map is temporary; it is used only to detect duplicates here. This is
-    // necessary because we prefer to use STAB ("symbolic debugging table") symbols,
-    // but they might not be present, so we track normal symbols too.
-    // Indices match 1-1 with those of `symbols`.
-    var symbol_names: std.StringArrayHashMapUnmanaged(void) = .empty;
-    defer symbol_names.deinit(gpa);
-    try symbol_names.ensureUnusedCapacity(gpa, symtab.nsyms);
-
-    var ofile: u32 = undefined;
-    var last_sym: Symbol = undefined;
-    var state: enum {
-        init,
-        oso_open,
-        oso_close,
-        bnsym,
-        fun_strx,
-        fun_size,
-        ensym,
-    } = .init;
-
-    var sym_r: Io.Reader = .fixed(mapped_macho[symtab.symoff..]);
-    for (0..symtab.nsyms) |_| {
-        const sym = sym_r.takeStruct(macho.nlist_64, .little) catch |err| switch (err) {
-            error.ReadFailed =&gt; unreachable,
-            error.EndOfStream =&gt; return error.InvalidMachO,
-        };
-        if (sym.n_type.bits.is_stab == 0) {
-            if (sym.n_strx == 0) continue;
-            switch (sym.n_type.bits.type) {
-                .undf, .pbud, .indr, .abs, _ =&gt; continue,
-                .sect =&gt; {
-                    const name = std.mem.sliceTo(strings[sym.n_strx..], 0);
-                    const gop = symbol_names.getOrPutAssumeCapacity(name);
-                    if (!gop.found_existing) {
-                        assert(gop.index == symbols.items.len);
-                        symbols.appendAssumeCapacity(.{
-                            .strx = sym.n_strx,
-                            .addr = sym.n_value,
-                            .ofile = Symbol.unknown_ofile,
-                        });
-                    }
-                },
-            }
-            continue;
-        }
-
-        // TODO handle globals N_GSYM, and statics N_STSYM
-        //
-        // NOTE: ld64.lld and Apple's ld differ in STABS layout.
-        // Apple's ld emit N_BNSYM and N_ENSYM to mark the start and end of
-        // functions, while ld64.lld doesn't.
-        switch (sym.n_type.stab) {
-            .oso =&gt; switch (state) {
-                .init, .oso_close =&gt; {
-                    state = .oso_open;
-                    ofile = sym.n_strx;
-                },
-                else =&gt; return error.InvalidMachO,
-            },
-            .bnsym =&gt; switch (state) {
-                .oso_open, .ensym =&gt; {
-                    state = .bnsym;
-                    last_sym = .{
-                        .strx = 0,
-                        .addr = sym.n_value,
-                        .ofile = ofile,
-                    };
-                },
-                else =&gt; return error.InvalidMachO,
-            },
-            .fun =&gt; switch (state) {
-                .oso_open =&gt; {
-                    state = .fun_strx;
-                    last_sym = .{
-                        .strx = sym.n_strx,
-                        .addr = sym.n_value,
-                        .ofile = ofile,
-                    };
-                },
-                .bnsym =&gt; {
-                    state = .fun_strx;
-                    last_sym.strx = sym.n_strx;
-                },
-                .fun_strx =&gt; {
-                    state = .fun_size;
-                },
-                .fun_size =&gt; {
-                    if (last_sym.strx != 0) {
-                        appendStabSymbol(&amp;symbols, &amp;symbol_names, strings, last_sym);
-                    }
-                    last_sym = .{
-                        .strx = sym.n_strx,
-                        .addr = sym.n_value,
-                        .ofile = ofile,
-                    };
-                    state = .fun_strx;
-                },
-                else =&gt; return error.InvalidMachO,
-            },
-            .ensym =&gt; switch (state) {
-                .fun_size =&gt; {
-                    state = .ensym;
-                    if (last_sym.strx != 0) {
-                        appendStabSymbol(&amp;symbols, &amp;symbol_names, strings, last_sym);
-                    }
-                },
-                else =&gt; return error.InvalidMachO,
-            },
-            .so =&gt; switch (state) {
-                .init, .oso_close =&gt; {},
-                .oso_open, .ensym =&gt; {
-                    state = .oso_close;
-                },
-                .fun_size =&gt; {
-                    state = .oso_close;
-                    if (last_sym.strx != 0) {
-                        appendStabSymbol(&amp;symbols, &amp;symbol_names, strings, last_sym);
-                    }
-                },
-                else =&gt; return error.InvalidMachO,
-            },
-            else =&gt; {},
-        }
-    }
-
-    switch (state) {
-        .init =&gt; {
-            // Missing STAB symtab entries is still okay, unless there were also no normal symbols.
-            if (symbols.items.len == 0) return error.MissingDebugInfo;
-        },
-        .oso_close =&gt; {},
-        else =&gt; return error.InvalidMachO, // corrupted STAB entries in symtab
-    }
-
-    const symbols_slice = try symbols.toOwnedSlice(gpa);
-    errdefer gpa.free(symbols_slice);
-
-    // Even though lld emits symbols in ascending order, this debug code
-    // should work for programs linked in any valid way.
-    // This sort is so that we can binary search later.
-    mem.sort(Symbol, symbols_slice, {}, Symbol.addressLessThan);
-
-    return .{
-        .mapped_memory = all_mapped_memory,
-        .symbols = symbols_slice,
-        .strings = strings,
-        .ofiles = .empty,
-        .text_vmaddr = text_vmaddr,
-    };
-}
-pub fn getDwarfForAddress(mf: *MachOFile, gpa: Allocator, io: Io, vaddr: u64) !struct { *Dwarf, u64 } {
-    const symbol = Symbol.find(mf.symbols, vaddr) orelse return error.MissingDebugInfo;
-
-    if (symbol.ofile == Symbol.unknown_ofile) return error.MissingDebugInfo;
-
-    // offset of `address` from start of `symbol`
-    const address_symbol_offset = vaddr - symbol.addr;
-
-    // Take the symbol name from the N_FUN STAB entry, we're going to
-    // use it if we fail to find the DWARF infos
-    const stab_symbol = mem.sliceTo(mf.strings[symbol.strx..], 0);
-
-    const gop = try mf.ofiles.getOrPut(gpa, symbol.ofile);
-    if (!gop.found_existing) {
-        const name = mem.sliceTo(mf.strings[symbol.ofile..], 0);
-        gop.value_ptr.* = loadOFile(gpa, io, name);
-    }
-    const of = &amp;(gop.value_ptr.* catch |err| return err);
-
-    const symbol_index = of.symbols_by_name.getKeyAdapted(
-        @as([]const u8, stab_symbol),
-        @as(OFile.SymbolAdapter, .{ .strtab = of.strtab, .symtab_raw = of.symtab_raw }),
-    ) orelse return error.MissingDebugInfo;
-
-    const symbol_ofile_vaddr = vaddr: {
-        var sym = of.symtab_raw[symbol_index];
-        if (builtin.cpu.arch.endian() != .little) std.mem.byteSwapAllFields(macho.nlist_64, &amp;sym);
-        break :vaddr sym.n_value;
-    };
-
-    return .{ &amp;of.dwarf, symbol_ofile_vaddr + address_symbol_offset };
-}
-pub fn lookupSymbolName(mf: *MachOFile, vaddr: u64) error{MissingDebugInfo}![]const u8 {
-    const symbol = Symbol.find(mf.symbols, vaddr) orelse return error.MissingDebugInfo;
-    return mem.sliceTo(mf.strings[symbol.strx..], 0);
-}
-
-const OFile = struct {
-    mapped_memory: []align(std.heap.page_size_min) const u8,
-    dwarf: Dwarf,
-    strtab: []const u8,
-    symtab_raw: []align(1) const macho.nlist_64,
-    /// All named symbols in `symtab_raw`. Stored `u32` key is the index into `symtab_raw`. Accessed
-    /// through `SymbolAdapter`, so that the symbol name is used as the logical key.
-    symbols_by_name: std.ArrayHashMapUnmanaged(u32, void, void, true),
-
-    const SymbolAdapter = struct {
-        strtab: []const u8,
-        symtab_raw: []align(1) const macho.nlist_64,
-        pub fn hash(ctx: SymbolAdapter, sym_name: []const u8) u32 {
-            _ = ctx;
-            return @truncate(std.hash.Wyhash.hash(0, sym_name));
-        }
-        pub fn eql(ctx: SymbolAdapter, a_sym_name: []const u8, b_sym_index: u32, b_index: usize) bool {
-            _ = b_index;
-            var b_sym = ctx.symtab_raw[b_sym_index];
-            if (builtin.cpu.arch.endian() != .little) std.mem.byteSwapAllFields(macho.nlist_64, &amp;b_sym);
-            const b_sym_name = std.mem.sliceTo(ctx.strtab[b_sym.n_strx..], 0);
-            return mem.eql(u8, a_sym_name, b_sym_name);
-        }
-    };
-};
-
-const Symbol = struct {
-    strx: u32,
-    addr: u64,
-    /// Value may be `unknown_ofile`.
-    ofile: u32,
-    const unknown_ofile = std.math.maxInt(u32);
-    fn addressLessThan(context: void, lhs: Symbol, rhs: Symbol) bool {
-        _ = context;
-        return lhs.addr &lt; rhs.addr;
-    }
-    /// Assumes that `symbols` is sorted in order of ascending `addr`.
-    fn find(symbols: []const Symbol, address: usize) ?*const Symbol {
-        if (symbols.len == 0) return null; // no potential match
-        if (address &lt; symbols[0].addr) return null; // address is before the lowest-address symbol
-        var left: usize = 0;
-        var len: usize = symbols.len;
-        while (len &gt; 1) {
-            const mid = left + len / 2;
-            if (address &lt; symbols[mid].addr) {
-                len /= 2;
-            } else {
-                left = mid;
-                len -= len / 2;
-            }
-        }
-        return &amp;symbols[left];
-    }
-
-    test find {
-        const symbols: []const Symbol = &amp;.{
-            .{ .addr = 100, .strx = undefined, .ofile = undefined },
-            .{ .addr = 200, .strx = undefined, .ofile = undefined },
-            .{ .addr = 300, .strx = undefined, .ofile = undefined },
-        };
-
-        try testing.expectEqual(null, find(symbols, 0));
-        try testing.expectEqual(null, find(symbols, 99));
-        try testing.expectEqual(&amp;symbols[0], find(symbols, 100).?);
-        try testing.expectEqual(&amp;symbols[0], find(symbols, 150).?);
-        try testing.expectEqual(&amp;symbols[0], find(symbols, 199).?);
-
-        try testing.expectEqual(&amp;symbols[1], find(symbols, 200).?);
-        try testing.expectEqual(&amp;symbols[1], find(symbols, 250).?);
-        try testing.expectEqual(&amp;symbols[1], find(symbols, 299).?);
-
-        try testing.expectEqual(&amp;symbols[2], find(symbols, 300).?);
-        try testing.expectEqual(&amp;symbols[2], find(symbols, 301).?);
-        try testing.expectEqual(&amp;symbols[2], find(symbols, 5000).?);
-    }
-};
-test {
-    _ = Symbol;
-}
-
-fn appendStabSymbol(
-    symbols: *std.ArrayList(Symbol),
-    symbol_names: *std.StringArrayHashMapUnmanaged(void),
-    strings: []const u8,
-    last_sym: Symbol,
-) void {
-    const name = std.mem.sliceTo(strings[last_sym.strx..], 0);
-    const gop = symbol_names.getOrPutAssumeCapacity(name);
-    if (!gop.found_existing) {
-        assert(gop.index == symbols.items.len);
-        symbols.appendAssumeCapacity(last_sym);
-    } else {
-        symbols.items[gop.index] = last_sym;
-    }
-}
-
-fn loadOFile(gpa: Allocator, io: Io, o_file_name: []const u8) !OFile {
-    const all_mapped_memory, const mapped_ofile = map: {
-        const open_paren = paren: {
-            if (std.mem.endsWith(u8, o_file_name, ")")) {
-                if (std.mem.findScalarLast(u8, o_file_name, '(')) |i| {
-                    break :paren i;
-                }
-            }
-            // Not an archive, just a normal path to a .o file
-            const m = try mapDebugInfoFile(io, o_file_name);
-            break :map .{ m, m };
-        };
-
-        // We have the form 'path/to/archive.a(entry.o)'. Map the archive and find the object file in question.
-
-        const archive_path = o_file_name[0..open_paren];
-        const target_name_in_archive = o_file_name[open_paren + 1 .. o_file_name.len - 1];
-        const mapped_archive = try mapDebugInfoFile(io, archive_path);
-        errdefer posix.munmap(mapped_archive);
-
-        var ar_reader: Io.Reader = .fixed(mapped_archive);
-        const ar_magic = ar_reader.take(8) catch return error.InvalidMachO;
-        if (!std.mem.eql(u8, ar_magic, "!&lt;arch&gt;\n")) return error.InvalidMachO;
-        while (true) {
-            if (ar_reader.seek == ar_reader.buffer.len) return error.MissingDebugInfo;
-
-            const raw_name = ar_reader.takeArray(16) catch return error.InvalidMachO;
-            ar_reader.discardAll(12 + 6 + 6 + 8) catch return error.InvalidMachO;
-            const raw_size = ar_reader.takeArray(10) catch return error.InvalidMachO;
-            const file_magic = ar_reader.takeArray(2) catch return error.InvalidMachO;
-            if (!std.mem.eql(u8, file_magic, "`\n")) return error.InvalidMachO;
-
-            const size = std.fmt.parseInt(u32, mem.sliceTo(raw_size, ' '), 10) catch return error.InvalidMachO;
-            const raw_data = ar_reader.take(size) catch return error.InvalidMachO;
-
-            const entry_name: []const u8, const entry_contents: []const u8 = entry: {
-                if (!std.mem.startsWith(u8, raw_name, "#1/")) {
-                    break :entry .{ mem.sliceTo(raw_name, '/'), raw_data };
-                }
-                const len = std.fmt.parseInt(u32, mem.sliceTo(raw_name[3..], ' '), 10) catch return error.InvalidMachO;
-                if (len &gt; size) return error.InvalidMachO;
-                break :entry .{ mem.sliceTo(raw_data[0..len], 0), raw_data[len..] };
-            };
-
-            if (std.mem.eql(u8, entry_name, target_name_in_archive)) {
-                break :map .{ mapped_archive, entry_contents };
-            }
-        }
-    };
-    errdefer posix.munmap(all_mapped_memory);
-
-    var r: Io.Reader = .fixed(mapped_ofile);
-    const hdr = r.takeStruct(macho.mach_header_64, .little) catch |err| switch (err) {
-        error.ReadFailed =&gt; unreachable,
-        error.EndOfStream =&gt; return error.InvalidMachO,
-    };
-    if (hdr.magic != std.macho.MH_MAGIC_64) return error.InvalidMachO;
-
-    const seg_cmd: macho.LoadCommandIterator.LoadCommand, const symtab_cmd: macho.symtab_command = cmds: {
-        var seg_cmd: ?macho.LoadCommandIterator.LoadCommand = null;
-        var symtab_cmd: ?macho.symtab_command = null;
-        var it: macho.LoadCommandIterator = try .init(&amp;hdr, mapped_ofile[@sizeOf(macho.mach_header_64)..]);
-        while (try it.next()) |lc| switch (lc.hdr.cmd) {
-            .SEGMENT_64 =&gt; seg_cmd = lc,
-            .SYMTAB =&gt; symtab_cmd = lc.cast(macho.symtab_command) orelse return error.InvalidMachO,
-            else =&gt; {},
-        };
-        break :cmds .{
-            seg_cmd orelse return error.MissingDebugInfo,
-            symtab_cmd orelse return error.MissingDebugInfo,
-        };
-    };
-
-    if (mapped_ofile.len &lt; symtab_cmd.stroff + symtab_cmd.strsize) return error.InvalidMachO;
-    if (mapped_ofile[symtab_cmd.stroff + symtab_cmd.strsize - 1] != 0) return error.InvalidMachO;
-    const strtab = mapped_ofile[symtab_cmd.stroff..][0 .. symtab_cmd.strsize - 1];
-
-    const n_sym_bytes = symtab_cmd.nsyms * @sizeOf(macho.nlist_64);
-    if (mapped_ofile.len &lt; symtab_cmd.symoff + n_sym_bytes) return error.InvalidMachO;
-    const symtab_raw: []align(1) const macho.nlist_64 = @ptrCast(mapped_ofile[symtab_cmd.symoff..][0..n_sym_bytes]);
-
-    // TODO handle tentative (common) symbols
-    var symbols_by_name: std.ArrayHashMapUnmanaged(u32, void, void, true) = .empty;
-    defer symbols_by_name.deinit(gpa);
-    try symbols_by_name.ensureUnusedCapacity(gpa, @intCast(symtab_raw.len));
-    for (symtab_raw, 0..) |sym_raw, sym_index| {
-        var sym = sym_raw;
-        if (builtin.cpu.arch.endian() != .little) std.mem.byteSwapAllFields(macho.nlist_64, &amp;sym);
-        if (sym.n_strx == 0) continue;
-        switch (sym.n_type.bits.type) {
-            .undf =&gt; continue, // includes tentative symbols
-            .abs =&gt; continue,
-            else =&gt; {},
-        }
-        const sym_name = mem.sliceTo(strtab[sym.n_strx..], 0);
-        const gop = symbols_by_name.getOrPutAssumeCapacityAdapted(
-            @as([]const u8, sym_name),
-            @as(OFile.SymbolAdapter, .{ .strtab = strtab, .symtab_raw = symtab_raw }),
-        );
-        if (gop.found_existing) return error.InvalidMachO;
-        gop.key_ptr.* = @intCast(sym_index);
-    }
-
-    var sections: Dwarf.SectionArray = @splat(null);
-    for (seg_cmd.getSections()) |sect_raw| {
-        var sect = sect_raw;
-        if (builtin.cpu.arch.endian() != .little) std.mem.byteSwapAllFields(macho.section_64, &amp;sect);
-
-        if (!std.mem.eql(u8, "__DWARF", sect.segName())) continue;
-
-        const section_index: usize = inline for (@typeInfo(Dwarf.Section.Id).@"enum".fields, 0..) |section, i| {
-            if (mem.eql(u8, "__" ++ section.name, sect.sectName())) break i;
-        } else continue;
-
-        if (mapped_ofile.len &lt; sect.offset + sect.size) return error.InvalidMachO;
-        const section_bytes = mapped_ofile[sect.offset..][0..sect.size];
-        sections[section_index] = .{
-            .data = section_bytes,
-            .owned = false,
-        };
-    }
-
-    if (sections[@intFromEnum(Dwarf.Section.Id.debug_info)] == null or
-        sections[@intFromEnum(Dwarf.Section.Id.debug_abbrev)] == null or
-        sections[@intFromEnum(Dwarf.Section.Id.debug_str)] == null or
-        sections[@intFromEnum(Dwarf.Section.Id.debug_line)] == null)
-    {
-        return error.MissingDebugInfo;
-    }
-
-    var dwarf: Dwarf = .{ .sections = sections };
-    errdefer dwarf.deinit(gpa);
-    dwarf.open(gpa, .little) catch |err| switch (err) {
-        error.InvalidDebugInfo,
-        error.EndOfStream,
-        error.Overflow,
-        error.StreamTooLong,
-        =&gt; return error.InvalidDwarf,
-
-        error.MissingDebugInfo,
-        error.ReadFailed,
-        error.OutOfMemory,
-        =&gt; |e| return e,
-    };
-
-    return .{
-        .mapped_memory = all_mapped_memory,
-        .dwarf = dwarf,
-        .strtab = strtab,
-        .symtab_raw = symtab_raw,
-        .symbols_by_name = symbols_by_name.move(),
-    };
-}
-
-/// Uses `mmap` to map the file at `path` into memory.
-fn mapDebugInfoFile(io: Io, path: []const u8) ![]align(std.heap.page_size_min) const u8 {
-    const file = Io.Dir.cwd().openFile(io, path, .{}) catch |err| switch (err) {
-        error.FileNotFound =&gt; return error.MissingDebugInfo,
-        else =&gt; return error.ReadFailed,
-    };
-    defer file.close(io);
-
-    const file_len = std.math.cast(
-        usize,
-        file.length(io) catch return error.ReadFailed,
-    ) orelse return error.ReadFailed;
-
-    return posix.mmap(
-        null,
-        file_len,
-        .{ .READ = true },
-        .{ .TYPE = .SHARED },
-        file.handle,
-        0,
-    ) catch return error.ReadFailed;
-}
-
-const std = @import("std");
-const Allocator = std.mem.Allocator;
-const Dwarf = std.debug.Dwarf;
-const Io = std.Io;
-const assert = std.debug.assert;
-const posix = std.posix;
-const macho = std.macho;
-const mem = std.mem;
-const testing = std.testing;
-
-const builtin = @import("builtin");
-
-const MachOFile = @This();</pre>
+    <pre><a id="L1"></a>mapped_memory: []align(std.heap.page_size_min) const u8,
+<a id="L2"></a>symbols: []const Symbol,
+<a id="L3"></a>strings: []const u8,
+<a id="L4"></a>text_vmaddr: u64,
+<a id="L5"></a>
+<a id="L6"></a>/// Key is index into `strings` of the file path.
+<a id="L7"></a>ofiles: std.AutoArrayHashMapUnmanaged(u32, Error!OFile),
+<a id="L8"></a>
+<a id="L9"></a>pub const Error = error{
+<a id="L10"></a>    InvalidMachO,
+<a id="L11"></a>    InvalidDwarf,
+<a id="L12"></a>    MissingDebugInfo,
+<a id="L13"></a>    UnsupportedDebugInfo,
+<a id="L14"></a>    ReadFailed,
+<a id="L15"></a>    OutOfMemory,
+<a id="L16"></a>};
+<a id="L17"></a>
+<a id="L18"></a>pub fn deinit(mf: *MachOFile, gpa: Allocator) void {
+<a id="L19"></a>    for (mf.ofiles.values()) |*maybe_of| {
+<a id="L20"></a>        const of = &amp;(maybe_of.* catch continue);
+<a id="L21"></a>        posix.munmap(of.mapped_memory);
+<a id="L22"></a>        of.dwarf.deinit(gpa);
+<a id="L23"></a>        of.symbols_by_name.deinit(gpa);
+<a id="L24"></a>    }
+<a id="L25"></a>    mf.ofiles.deinit(gpa);
+<a id="L26"></a>    gpa.free(mf.symbols);
+<a id="L27"></a>    posix.munmap(mf.mapped_memory);
+<a id="L28"></a>}
+<a id="L29"></a>
+<a id="L30"></a>pub fn load(gpa: Allocator, io: Io, path: []const u8, arch: std.Target.Cpu.Arch) Error!MachOFile {
+<a id="L31"></a>    switch (arch) {
+<a id="L32"></a>        .x86_64, .aarch64 =&gt; {},
+<a id="L33"></a>        else =&gt; unreachable,
+<a id="L34"></a>    }
+<a id="L35"></a>
+<a id="L36"></a>    const all_mapped_memory = try mapDebugInfoFile(io, path);
+<a id="L37"></a>    errdefer posix.munmap(all_mapped_memory);
+<a id="L38"></a>
+<a id="L39"></a>    // In most cases, the file we just mapped is a Mach-O binary. However, it could be a "universal
+<a id="L40"></a>    // binary": a simple file format which contains Mach-O binaries for multiple targets. For
+<a id="L41"></a>    // instance, `/usr/lib/dyld` is currently distributed as a universal binary containing images
+<a id="L42"></a>    // for both ARM64 macOS and x86_64 macOS.
+<a id="L43"></a>    if (all_mapped_memory.len &lt; 4) return error.InvalidMachO;
+<a id="L44"></a>    const magic = std.mem.readInt(u32, all_mapped_memory.ptr[0..4], .little);
+<a id="L45"></a>
+<a id="L46"></a>    // The contents of a Mach-O file, which may or may not be the whole of `all_mapped_memory`.
+<a id="L47"></a>    const mapped_macho = switch (magic) {
+<a id="L48"></a>        macho.MH_MAGIC_64 =&gt; all_mapped_memory,
+<a id="L49"></a>
+<a id="L50"></a>        macho.FAT_CIGAM =&gt; mapped_macho: {
+<a id="L51"></a>            // This is the universal binary format (aka a "fat binary").
+<a id="L52"></a>            var fat_r: Io.Reader = .fixed(all_mapped_memory);
+<a id="L53"></a>            const hdr = fat_r.takeStruct(macho.fat_header, .big) catch |err| switch (err) {
+<a id="L54"></a>                error.ReadFailed =&gt; unreachable,
+<a id="L55"></a>                error.EndOfStream =&gt; return error.InvalidMachO,
+<a id="L56"></a>            };
+<a id="L57"></a>            const want_cpu_type = switch (arch) {
+<a id="L58"></a>                .x86_64 =&gt; macho.CPU_TYPE_X86_64,
+<a id="L59"></a>                .aarch64 =&gt; macho.CPU_TYPE_ARM64,
+<a id="L60"></a>                else =&gt; unreachable,
+<a id="L61"></a>            };
+<a id="L62"></a>            for (0..hdr.nfat_arch) |_| {
+<a id="L63"></a>                const fat_arch = fat_r.takeStruct(macho.fat_arch, .big) catch |err| switch (err) {
+<a id="L64"></a>                    error.ReadFailed =&gt; unreachable,
+<a id="L65"></a>                    error.EndOfStream =&gt; return error.InvalidMachO,
+<a id="L66"></a>                };
+<a id="L67"></a>                if (fat_arch.cputype != want_cpu_type) continue;
+<a id="L68"></a>                if (fat_arch.offset + fat_arch.size &gt; all_mapped_memory.len) return error.InvalidMachO;
+<a id="L69"></a>                break :mapped_macho all_mapped_memory[fat_arch.offset..][0..fat_arch.size];
+<a id="L70"></a>            }
+<a id="L71"></a>            // `arch` was not present in the fat binary.
+<a id="L72"></a>            return error.MissingDebugInfo;
+<a id="L73"></a>        },
+<a id="L74"></a>
+<a id="L75"></a>        // Even on modern 64-bit targets, this format doesn't seem to be too extensively used. It
+<a id="L76"></a>        // will be fairly easy to add support here if necessary; it's very similar to above.
+<a id="L77"></a>        macho.FAT_CIGAM_64 =&gt; return error.UnsupportedDebugInfo,
+<a id="L78"></a>
+<a id="L79"></a>        else =&gt; return error.InvalidMachO,
+<a id="L80"></a>    };
+<a id="L81"></a>
+<a id="L82"></a>    var r: Io.Reader = .fixed(mapped_macho);
+<a id="L83"></a>    const hdr = r.takeStruct(macho.mach_header_64, .little) catch |err| switch (err) {
+<a id="L84"></a>        error.ReadFailed =&gt; unreachable,
+<a id="L85"></a>        error.EndOfStream =&gt; return error.InvalidMachO,
+<a id="L86"></a>    };
+<a id="L87"></a>
+<a id="L88"></a>    if (hdr.magic != macho.MH_MAGIC_64)
+<a id="L89"></a>        return error.InvalidMachO;
+<a id="L90"></a>
+<a id="L91"></a>    const symtab: macho.symtab_command, const text_vmaddr: u64 = lcs: {
+<a id="L92"></a>        var it: macho.LoadCommandIterator = try .init(&amp;hdr, mapped_macho[@sizeOf(macho.mach_header_64)..]);
+<a id="L93"></a>        var symtab: ?macho.symtab_command = null;
+<a id="L94"></a>        var text_vmaddr: ?u64 = null;
+<a id="L95"></a>        while (try it.next()) |cmd| switch (cmd.hdr.cmd) {
+<a id="L96"></a>            .SYMTAB =&gt; symtab = cmd.cast(macho.symtab_command) orelse return error.InvalidMachO,
+<a id="L97"></a>            .SEGMENT_64 =&gt; if (cmd.cast(macho.segment_command_64)) |seg_cmd| {
+<a id="L98"></a>                if (!mem.eql(u8, seg_cmd.segName(), "__TEXT")) continue;
+<a id="L99"></a>                text_vmaddr = seg_cmd.vmaddr;
+<a id="L100"></a>            },
+<a id="L101"></a>            else =&gt; {},
+<a id="L102"></a>        };
+<a id="L103"></a>        break :lcs .{
+<a id="L104"></a>            symtab orelse return error.MissingDebugInfo,
+<a id="L105"></a>            text_vmaddr orelse return error.MissingDebugInfo,
+<a id="L106"></a>        };
+<a id="L107"></a>    };
+<a id="L108"></a>
+<a id="L109"></a>    const strings = mapped_macho[symtab.stroff..][0 .. symtab.strsize - 1];
+<a id="L110"></a>
+<a id="L111"></a>    var symbols: std.ArrayList(Symbol) = try .initCapacity(gpa, symtab.nsyms);
+<a id="L112"></a>    defer symbols.deinit(gpa);
+<a id="L113"></a>
+<a id="L114"></a>    // This map is temporary; it is used only to detect duplicates here. This is
+<a id="L115"></a>    // necessary because we prefer to use STAB ("symbolic debugging table") symbols,
+<a id="L116"></a>    // but they might not be present, so we track normal symbols too.
+<a id="L117"></a>    // Indices match 1-1 with those of `symbols`.
+<a id="L118"></a>    var symbol_names: std.StringArrayHashMapUnmanaged(void) = .empty;
+<a id="L119"></a>    defer symbol_names.deinit(gpa);
+<a id="L120"></a>    try symbol_names.ensureUnusedCapacity(gpa, symtab.nsyms);
+<a id="L121"></a>
+<a id="L122"></a>    var ofile: u32 = undefined;
+<a id="L123"></a>    var last_sym: Symbol = undefined;
+<a id="L124"></a>    var state: enum {
+<a id="L125"></a>        init,
+<a id="L126"></a>        oso_open,
+<a id="L127"></a>        oso_close,
+<a id="L128"></a>        bnsym,
+<a id="L129"></a>        fun_strx,
+<a id="L130"></a>        fun_size,
+<a id="L131"></a>        ensym,
+<a id="L132"></a>    } = .init;
+<a id="L133"></a>
+<a id="L134"></a>    var sym_r: Io.Reader = .fixed(mapped_macho[symtab.symoff..]);
+<a id="L135"></a>    for (0..symtab.nsyms) |_| {
+<a id="L136"></a>        const sym = sym_r.takeStruct(macho.nlist_64, .little) catch |err| switch (err) {
+<a id="L137"></a>            error.ReadFailed =&gt; unreachable,
+<a id="L138"></a>            error.EndOfStream =&gt; return error.InvalidMachO,
+<a id="L139"></a>        };
+<a id="L140"></a>        if (sym.n_type.bits.is_stab == 0) {
+<a id="L141"></a>            if (sym.n_strx == 0) continue;
+<a id="L142"></a>            switch (sym.n_type.bits.type) {
+<a id="L143"></a>                .undf, .pbud, .indr, .abs, _ =&gt; continue,
+<a id="L144"></a>                .sect =&gt; {
+<a id="L145"></a>                    const name = std.mem.sliceTo(strings[sym.n_strx..], 0);
+<a id="L146"></a>                    const gop = symbol_names.getOrPutAssumeCapacity(name);
+<a id="L147"></a>                    if (!gop.found_existing) {
+<a id="L148"></a>                        assert(gop.index == symbols.items.len);
+<a id="L149"></a>                        symbols.appendAssumeCapacity(.{
+<a id="L150"></a>                            .strx = sym.n_strx,
+<a id="L151"></a>                            .addr = sym.n_value,
+<a id="L152"></a>                            .ofile = Symbol.unknown_ofile,
+<a id="L153"></a>                        });
+<a id="L154"></a>                    }
+<a id="L155"></a>                },
+<a id="L156"></a>            }
+<a id="L157"></a>            continue;
+<a id="L158"></a>        }
+<a id="L159"></a>
+<a id="L160"></a>        // TODO handle globals N_GSYM, and statics N_STSYM
+<a id="L161"></a>        //
+<a id="L162"></a>        // NOTE: ld64.lld and Apple's ld differ in STABS layout.
+<a id="L163"></a>        // Apple's ld emit N_BNSYM and N_ENSYM to mark the start and end of
+<a id="L164"></a>        // functions, while ld64.lld doesn't.
+<a id="L165"></a>        switch (sym.n_type.stab) {
+<a id="L166"></a>            .oso =&gt; switch (state) {
+<a id="L167"></a>                .init, .oso_close =&gt; {
+<a id="L168"></a>                    state = .oso_open;
+<a id="L169"></a>                    ofile = sym.n_strx;
+<a id="L170"></a>                },
+<a id="L171"></a>                else =&gt; return error.InvalidMachO,
+<a id="L172"></a>            },
+<a id="L173"></a>            .bnsym =&gt; switch (state) {
+<a id="L174"></a>                .oso_open, .ensym =&gt; {
+<a id="L175"></a>                    state = .bnsym;
+<a id="L176"></a>                    last_sym = .{
+<a id="L177"></a>                        .strx = 0,
+<a id="L178"></a>                        .addr = sym.n_value,
+<a id="L179"></a>                        .ofile = ofile,
+<a id="L180"></a>                    };
+<a id="L181"></a>                },
+<a id="L182"></a>                else =&gt; return error.InvalidMachO,
+<a id="L183"></a>            },
+<a id="L184"></a>            .fun =&gt; switch (state) {
+<a id="L185"></a>                .oso_open =&gt; {
+<a id="L186"></a>                    state = .fun_strx;
+<a id="L187"></a>                    last_sym = .{
+<a id="L188"></a>                        .strx = sym.n_strx,
+<a id="L189"></a>                        .addr = sym.n_value,
+<a id="L190"></a>                        .ofile = ofile,
+<a id="L191"></a>                    };
+<a id="L192"></a>                },
+<a id="L193"></a>                .bnsym =&gt; {
+<a id="L194"></a>                    state = .fun_strx;
+<a id="L195"></a>                    last_sym.strx = sym.n_strx;
+<a id="L196"></a>                },
+<a id="L197"></a>                .fun_strx =&gt; {
+<a id="L198"></a>                    state = .fun_size;
+<a id="L199"></a>                },
+<a id="L200"></a>                .fun_size =&gt; {
+<a id="L201"></a>                    if (last_sym.strx != 0) {
+<a id="L202"></a>                        appendStabSymbol(&amp;symbols, &amp;symbol_names, strings, last_sym);
+<a id="L203"></a>                    }
+<a id="L204"></a>                    last_sym = .{
+<a id="L205"></a>                        .strx = sym.n_strx,
+<a id="L206"></a>                        .addr = sym.n_value,
+<a id="L207"></a>                        .ofile = ofile,
+<a id="L208"></a>                    };
+<a id="L209"></a>                    state = .fun_strx;
+<a id="L210"></a>                },
+<a id="L211"></a>                else =&gt; return error.InvalidMachO,
+<a id="L212"></a>            },
+<a id="L213"></a>            .ensym =&gt; switch (state) {
+<a id="L214"></a>                .fun_size =&gt; {
+<a id="L215"></a>                    state = .ensym;
+<a id="L216"></a>                    if (last_sym.strx != 0) {
+<a id="L217"></a>                        appendStabSymbol(&amp;symbols, &amp;symbol_names, strings, last_sym);
+<a id="L218"></a>                    }
+<a id="L219"></a>                },
+<a id="L220"></a>                else =&gt; return error.InvalidMachO,
+<a id="L221"></a>            },
+<a id="L222"></a>            .so =&gt; switch (state) {
+<a id="L223"></a>                .init, .oso_close =&gt; {},
+<a id="L224"></a>                .oso_open, .ensym =&gt; {
+<a id="L225"></a>                    state = .oso_close;
+<a id="L226"></a>                },
+<a id="L227"></a>                .fun_size =&gt; {
+<a id="L228"></a>                    state = .oso_close;
+<a id="L229"></a>                    if (last_sym.strx != 0) {
+<a id="L230"></a>                        appendStabSymbol(&amp;symbols, &amp;symbol_names, strings, last_sym);
+<a id="L231"></a>                    }
+<a id="L232"></a>                },
+<a id="L233"></a>                else =&gt; return error.InvalidMachO,
+<a id="L234"></a>            },
+<a id="L235"></a>            else =&gt; {},
+<a id="L236"></a>        }
+<a id="L237"></a>    }
+<a id="L238"></a>
+<a id="L239"></a>    switch (state) {
+<a id="L240"></a>        .init =&gt; {
+<a id="L241"></a>            // Missing STAB symtab entries is still okay, unless there were also no normal symbols.
+<a id="L242"></a>            if (symbols.items.len == 0) return error.MissingDebugInfo;
+<a id="L243"></a>        },
+<a id="L244"></a>        .oso_close =&gt; {},
+<a id="L245"></a>        else =&gt; return error.InvalidMachO, // corrupted STAB entries in symtab
+<a id="L246"></a>    }
+<a id="L247"></a>
+<a id="L248"></a>    const symbols_slice = try symbols.toOwnedSlice(gpa);
+<a id="L249"></a>    errdefer gpa.free(symbols_slice);
+<a id="L250"></a>
+<a id="L251"></a>    // Even though lld emits symbols in ascending order, this debug code
+<a id="L252"></a>    // should work for programs linked in any valid way.
+<a id="L253"></a>    // This sort is so that we can binary search later.
+<a id="L254"></a>    mem.sort(Symbol, symbols_slice, {}, Symbol.addressLessThan);
+<a id="L255"></a>
+<a id="L256"></a>    return .{
+<a id="L257"></a>        .mapped_memory = all_mapped_memory,
+<a id="L258"></a>        .symbols = symbols_slice,
+<a id="L259"></a>        .strings = strings,
+<a id="L260"></a>        .ofiles = .empty,
+<a id="L261"></a>        .text_vmaddr = text_vmaddr,
+<a id="L262"></a>    };
+<a id="L263"></a>}
+<a id="L264"></a>pub fn getDwarfForAddress(mf: *MachOFile, gpa: Allocator, io: Io, vaddr: u64) !struct { *Dwarf, u64 } {
+<a id="L265"></a>    const symbol = Symbol.find(mf.symbols, vaddr) orelse return error.MissingDebugInfo;
+<a id="L266"></a>
+<a id="L267"></a>    if (symbol.ofile == Symbol.unknown_ofile) return error.MissingDebugInfo;
+<a id="L268"></a>
+<a id="L269"></a>    // offset of `address` from start of `symbol`
+<a id="L270"></a>    const address_symbol_offset = vaddr - symbol.addr;
+<a id="L271"></a>
+<a id="L272"></a>    // Take the symbol name from the N_FUN STAB entry, we're going to
+<a id="L273"></a>    // use it if we fail to find the DWARF infos
+<a id="L274"></a>    const stab_symbol = mem.sliceTo(mf.strings[symbol.strx..], 0);
+<a id="L275"></a>
+<a id="L276"></a>    const gop = try mf.ofiles.getOrPut(gpa, symbol.ofile);
+<a id="L277"></a>    if (!gop.found_existing) {
+<a id="L278"></a>        const name = mem.sliceTo(mf.strings[symbol.ofile..], 0);
+<a id="L279"></a>        gop.value_ptr.* = loadOFile(gpa, io, name);
+<a id="L280"></a>    }
+<a id="L281"></a>    const of = &amp;(gop.value_ptr.* catch |err| return err);
+<a id="L282"></a>
+<a id="L283"></a>    const symbol_index = of.symbols_by_name.getKeyAdapted(
+<a id="L284"></a>        @as([]const u8, stab_symbol),
+<a id="L285"></a>        @as(OFile.SymbolAdapter, .{ .strtab = of.strtab, .symtab_raw = of.symtab_raw }),
+<a id="L286"></a>    ) orelse return error.MissingDebugInfo;
+<a id="L287"></a>
+<a id="L288"></a>    const symbol_ofile_vaddr = vaddr: {
+<a id="L289"></a>        var sym = of.symtab_raw[symbol_index];
+<a id="L290"></a>        if (builtin.cpu.arch.endian() != .little) std.mem.byteSwapAllFields(macho.nlist_64, &amp;sym);
+<a id="L291"></a>        break :vaddr sym.n_value;
+<a id="L292"></a>    };
+<a id="L293"></a>
+<a id="L294"></a>    return .{ &amp;of.dwarf, symbol_ofile_vaddr + address_symbol_offset };
+<a id="L295"></a>}
+<a id="L296"></a>pub fn lookupSymbolName(mf: *MachOFile, vaddr: u64) error{MissingDebugInfo}![]const u8 {
+<a id="L297"></a>    const symbol = Symbol.find(mf.symbols, vaddr) orelse return error.MissingDebugInfo;
+<a id="L298"></a>    return mem.sliceTo(mf.strings[symbol.strx..], 0);
+<a id="L299"></a>}
+<a id="L300"></a>
+<a id="L301"></a>const OFile = struct {
+<a id="L302"></a>    mapped_memory: []align(std.heap.page_size_min) const u8,
+<a id="L303"></a>    dwarf: Dwarf,
+<a id="L304"></a>    strtab: []const u8,
+<a id="L305"></a>    symtab_raw: []align(1) const macho.nlist_64,
+<a id="L306"></a>    /// All named symbols in `symtab_raw`. Stored `u32` key is the index into `symtab_raw`. Accessed
+<a id="L307"></a>    /// through `SymbolAdapter`, so that the symbol name is used as the logical key.
+<a id="L308"></a>    symbols_by_name: std.ArrayHashMapUnmanaged(u32, void, void, true),
+<a id="L309"></a>
+<a id="L310"></a>    const SymbolAdapter = struct {
+<a id="L311"></a>        strtab: []const u8,
+<a id="L312"></a>        symtab_raw: []align(1) const macho.nlist_64,
+<a id="L313"></a>        pub fn hash(ctx: SymbolAdapter, sym_name: []const u8) u32 {
+<a id="L314"></a>            _ = ctx;
+<a id="L315"></a>            return @truncate(std.hash.Wyhash.hash(0, sym_name));
+<a id="L316"></a>        }
+<a id="L317"></a>        pub fn eql(ctx: SymbolAdapter, a_sym_name: []const u8, b_sym_index: u32, b_index: usize) bool {
+<a id="L318"></a>            _ = b_index;
+<a id="L319"></a>            var b_sym = ctx.symtab_raw[b_sym_index];
+<a id="L320"></a>            if (builtin.cpu.arch.endian() != .little) std.mem.byteSwapAllFields(macho.nlist_64, &amp;b_sym);
+<a id="L321"></a>            const b_sym_name = std.mem.sliceTo(ctx.strtab[b_sym.n_strx..], 0);
+<a id="L322"></a>            return mem.eql(u8, a_sym_name, b_sym_name);
+<a id="L323"></a>        }
+<a id="L324"></a>    };
+<a id="L325"></a>};
+<a id="L326"></a>
+<a id="L327"></a>const Symbol = struct {
+<a id="L328"></a>    strx: u32,
+<a id="L329"></a>    addr: u64,
+<a id="L330"></a>    /// Value may be `unknown_ofile`.
+<a id="L331"></a>    ofile: u32,
+<a id="L332"></a>    const unknown_ofile = std.math.maxInt(u32);
+<a id="L333"></a>    fn addressLessThan(context: void, lhs: Symbol, rhs: Symbol) bool {
+<a id="L334"></a>        _ = context;
+<a id="L335"></a>        return lhs.addr &lt; rhs.addr;
+<a id="L336"></a>    }
+<a id="L337"></a>    /// Assumes that `symbols` is sorted in order of ascending `addr`.
+<a id="L338"></a>    fn find(symbols: []const Symbol, address: usize) ?*const Symbol {
+<a id="L339"></a>        if (symbols.len == 0) return null; // no potential match
+<a id="L340"></a>        if (address &lt; symbols[0].addr) return null; // address is before the lowest-address symbol
+<a id="L341"></a>        var left: usize = 0;
+<a id="L342"></a>        var len: usize = symbols.len;
+<a id="L343"></a>        while (len &gt; 1) {
+<a id="L344"></a>            const mid = left + len / 2;
+<a id="L345"></a>            if (address &lt; symbols[mid].addr) {
+<a id="L346"></a>                len /= 2;
+<a id="L347"></a>            } else {
+<a id="L348"></a>                left = mid;
+<a id="L349"></a>                len -= len / 2;
+<a id="L350"></a>            }
+<a id="L351"></a>        }
+<a id="L352"></a>        return &amp;symbols[left];
+<a id="L353"></a>    }
+<a id="L354"></a>
+<a id="L355"></a>    test find {
+<a id="L356"></a>        const symbols: []const Symbol = &amp;.{
+<a id="L357"></a>            .{ .addr = 100, .strx = undefined, .ofile = undefined },
+<a id="L358"></a>            .{ .addr = 200, .strx = undefined, .ofile = undefined },
+<a id="L359"></a>            .{ .addr = 300, .strx = undefined, .ofile = undefined },
+<a id="L360"></a>        };
+<a id="L361"></a>
+<a id="L362"></a>        try testing.expectEqual(null, find(symbols, 0));
+<a id="L363"></a>        try testing.expectEqual(null, find(symbols, 99));
+<a id="L364"></a>        try testing.expectEqual(&amp;symbols[0], find(symbols, 100).?);
+<a id="L365"></a>        try testing.expectEqual(&amp;symbols[0], find(symbols, 150).?);
+<a id="L366"></a>        try testing.expectEqual(&amp;symbols[0], find(symbols, 199).?);
+<a id="L367"></a>
+<a id="L368"></a>        try testing.expectEqual(&amp;symbols[1], find(symbols, 200).?);
+<a id="L369"></a>        try testing.expectEqual(&amp;symbols[1], find(symbols, 250).?);
+<a id="L370"></a>        try testing.expectEqual(&amp;symbols[1], find(symbols, 299).?);
+<a id="L371"></a>
+<a id="L372"></a>        try testing.expectEqual(&amp;symbols[2], find(symbols, 300).?);
+<a id="L373"></a>        try testing.expectEqual(&amp;symbols[2], find(symbols, 301).?);
+<a id="L374"></a>        try testing.expectEqual(&amp;symbols[2], find(symbols, 5000).?);
+<a id="L375"></a>    }
+<a id="L376"></a>};
+<a id="L377"></a>test {
+<a id="L378"></a>    _ = Symbol;
+<a id="L379"></a>}
+<a id="L380"></a>
+<a id="L381"></a>fn appendStabSymbol(
+<a id="L382"></a>    symbols: *std.ArrayList(Symbol),
+<a id="L383"></a>    symbol_names: *std.StringArrayHashMapUnmanaged(void),
+<a id="L384"></a>    strings: []const u8,
+<a id="L385"></a>    last_sym: Symbol,
+<a id="L386"></a>) void {
+<a id="L387"></a>    const name = std.mem.sliceTo(strings[last_sym.strx..], 0);
+<a id="L388"></a>    const gop = symbol_names.getOrPutAssumeCapacity(name);
+<a id="L389"></a>    if (!gop.found_existing) {
+<a id="L390"></a>        assert(gop.index == symbols.items.len);
+<a id="L391"></a>        symbols.appendAssumeCapacity(last_sym);
+<a id="L392"></a>    } else {
+<a id="L393"></a>        symbols.items[gop.index] = last_sym;
+<a id="L394"></a>    }
+<a id="L395"></a>}
+<a id="L396"></a>
+<a id="L397"></a>fn loadOFile(gpa: Allocator, io: Io, o_file_name: []const u8) !OFile {
+<a id="L398"></a>    const all_mapped_memory, const mapped_ofile = map: {
+<a id="L399"></a>        const open_paren = paren: {
+<a id="L400"></a>            if (std.mem.endsWith(u8, o_file_name, ")")) {
+<a id="L401"></a>                if (std.mem.findScalarLast(u8, o_file_name, '(')) |i| {
+<a id="L402"></a>                    break :paren i;
+<a id="L403"></a>                }
+<a id="L404"></a>            }
+<a id="L405"></a>            // Not an archive, just a normal path to a .o file
+<a id="L406"></a>            const m = try mapDebugInfoFile(io, o_file_name);
+<a id="L407"></a>            break :map .{ m, m };
+<a id="L408"></a>        };
+<a id="L409"></a>
+<a id="L410"></a>        // We have the form 'path/to/archive.a(entry.o)'. Map the archive and find the object file in question.
+<a id="L411"></a>
+<a id="L412"></a>        const archive_path = o_file_name[0..open_paren];
+<a id="L413"></a>        const target_name_in_archive = o_file_name[open_paren + 1 .. o_file_name.len - 1];
+<a id="L414"></a>        const mapped_archive = try mapDebugInfoFile(io, archive_path);
+<a id="L415"></a>        errdefer posix.munmap(mapped_archive);
+<a id="L416"></a>
+<a id="L417"></a>        var ar_reader: Io.Reader = .fixed(mapped_archive);
+<a id="L418"></a>        const ar_magic = ar_reader.take(8) catch return error.InvalidMachO;
+<a id="L419"></a>        if (!std.mem.eql(u8, ar_magic, "!&lt;arch&gt;\n")) return error.InvalidMachO;
+<a id="L420"></a>        while (true) {
+<a id="L421"></a>            if (ar_reader.seek == ar_reader.buffer.len) return error.MissingDebugInfo;
+<a id="L422"></a>
+<a id="L423"></a>            const raw_name = ar_reader.takeArray(16) catch return error.InvalidMachO;
+<a id="L424"></a>            ar_reader.discardAll(12 + 6 + 6 + 8) catch return error.InvalidMachO;
+<a id="L425"></a>            const raw_size = ar_reader.takeArray(10) catch return error.InvalidMachO;
+<a id="L426"></a>            const file_magic = ar_reader.takeArray(2) catch return error.InvalidMachO;
+<a id="L427"></a>            if (!std.mem.eql(u8, file_magic, "`\n")) return error.InvalidMachO;
+<a id="L428"></a>
+<a id="L429"></a>            const size = std.fmt.parseInt(u32, mem.sliceTo(raw_size, ' '), 10) catch return error.InvalidMachO;
+<a id="L430"></a>            const raw_data = ar_reader.take(size) catch return error.InvalidMachO;
+<a id="L431"></a>
+<a id="L432"></a>            const entry_name: []const u8, const entry_contents: []const u8 = entry: {
+<a id="L433"></a>                if (!std.mem.startsWith(u8, raw_name, "#1/")) {
+<a id="L434"></a>                    break :entry .{ mem.sliceTo(raw_name, '/'), raw_data };
+<a id="L435"></a>                }
+<a id="L436"></a>                const len = std.fmt.parseInt(u32, mem.sliceTo(raw_name[3..], ' '), 10) catch return error.InvalidMachO;
+<a id="L437"></a>                if (len &gt; size) return error.InvalidMachO;
+<a id="L438"></a>                break :entry .{ mem.sliceTo(raw_data[0..len], 0), raw_data[len..] };
+<a id="L439"></a>            };
+<a id="L440"></a>
+<a id="L441"></a>            if (std.mem.eql(u8, entry_name, target_name_in_archive)) {
+<a id="L442"></a>                break :map .{ mapped_archive, entry_contents };
+<a id="L443"></a>            }
+<a id="L444"></a>        }
+<a id="L445"></a>    };
+<a id="L446"></a>    errdefer posix.munmap(all_mapped_memory);
+<a id="L447"></a>
+<a id="L448"></a>    var r: Io.Reader = .fixed(mapped_ofile);
+<a id="L449"></a>    const hdr = r.takeStruct(macho.mach_header_64, .little) catch |err| switch (err) {
+<a id="L450"></a>        error.ReadFailed =&gt; unreachable,
+<a id="L451"></a>        error.EndOfStream =&gt; return error.InvalidMachO,
+<a id="L452"></a>    };
+<a id="L453"></a>    if (hdr.magic != std.macho.MH_MAGIC_64) return error.InvalidMachO;
+<a id="L454"></a>
+<a id="L455"></a>    const seg_cmd: macho.LoadCommandIterator.LoadCommand, const symtab_cmd: macho.symtab_command = cmds: {
+<a id="L456"></a>        var seg_cmd: ?macho.LoadCommandIterator.LoadCommand = null;
+<a id="L457"></a>        var symtab_cmd: ?macho.symtab_command = null;
+<a id="L458"></a>        var it: macho.LoadCommandIterator = try .init(&amp;hdr, mapped_ofile[@sizeOf(macho.mach_header_64)..]);
+<a id="L459"></a>        while (try it.next()) |lc| switch (lc.hdr.cmd) {
+<a id="L460"></a>            .SEGMENT_64 =&gt; seg_cmd = lc,
+<a id="L461"></a>            .SYMTAB =&gt; symtab_cmd = lc.cast(macho.symtab_command) orelse return error.InvalidMachO,
+<a id="L462"></a>            else =&gt; {},
+<a id="L463"></a>        };
+<a id="L464"></a>        break :cmds .{
+<a id="L465"></a>            seg_cmd orelse return error.MissingDebugInfo,
+<a id="L466"></a>            symtab_cmd orelse return error.MissingDebugInfo,
+<a id="L467"></a>        };
+<a id="L468"></a>    };
+<a id="L469"></a>
+<a id="L470"></a>    if (mapped_ofile.len &lt; symtab_cmd.stroff + symtab_cmd.strsize) return error.InvalidMachO;
+<a id="L471"></a>    if (mapped_ofile[symtab_cmd.stroff + symtab_cmd.strsize - 1] != 0) return error.InvalidMachO;
+<a id="L472"></a>    const strtab = mapped_ofile[symtab_cmd.stroff..][0 .. symtab_cmd.strsize - 1];
+<a id="L473"></a>
+<a id="L474"></a>    const n_sym_bytes = symtab_cmd.nsyms * @sizeOf(macho.nlist_64);
+<a id="L475"></a>    if (mapped_ofile.len &lt; symtab_cmd.symoff + n_sym_bytes) return error.InvalidMachO;
+<a id="L476"></a>    const symtab_raw: []align(1) const macho.nlist_64 = @ptrCast(mapped_ofile[symtab_cmd.symoff..][0..n_sym_bytes]);
+<a id="L477"></a>
+<a id="L478"></a>    // TODO handle tentative (common) symbols
+<a id="L479"></a>    var symbols_by_name: std.ArrayHashMapUnmanaged(u32, void, void, true) = .empty;
+<a id="L480"></a>    defer symbols_by_name.deinit(gpa);
+<a id="L481"></a>    try symbols_by_name.ensureUnusedCapacity(gpa, @intCast(symtab_raw.len));
+<a id="L482"></a>    for (symtab_raw, 0..) |sym_raw, sym_index| {
+<a id="L483"></a>        var sym = sym_raw;
+<a id="L484"></a>        if (builtin.cpu.arch.endian() != .little) std.mem.byteSwapAllFields(macho.nlist_64, &amp;sym);
+<a id="L485"></a>        if (sym.n_strx == 0) continue;
+<a id="L486"></a>        switch (sym.n_type.bits.type) {
+<a id="L487"></a>            .undf =&gt; continue, // includes tentative symbols
+<a id="L488"></a>            .abs =&gt; continue,
+<a id="L489"></a>            else =&gt; {},
+<a id="L490"></a>        }
+<a id="L491"></a>        const sym_name = mem.sliceTo(strtab[sym.n_strx..], 0);
+<a id="L492"></a>        const gop = symbols_by_name.getOrPutAssumeCapacityAdapted(
+<a id="L493"></a>            @as([]const u8, sym_name),
+<a id="L494"></a>            @as(OFile.SymbolAdapter, .{ .strtab = strtab, .symtab_raw = symtab_raw }),
+<a id="L495"></a>        );
+<a id="L496"></a>        if (gop.found_existing) return error.InvalidMachO;
+<a id="L497"></a>        gop.key_ptr.* = @intCast(sym_index);
+<a id="L498"></a>    }
+<a id="L499"></a>
+<a id="L500"></a>    var sections: Dwarf.SectionArray = @splat(null);
+<a id="L501"></a>    for (seg_cmd.getSections()) |sect_raw| {
+<a id="L502"></a>        var sect = sect_raw;
+<a id="L503"></a>        if (builtin.cpu.arch.endian() != .little) std.mem.byteSwapAllFields(macho.section_64, &amp;sect);
+<a id="L504"></a>
+<a id="L505"></a>        if (!std.mem.eql(u8, "__DWARF", sect.segName())) continue;
+<a id="L506"></a>
+<a id="L507"></a>        const section_index: usize = inline for (@typeInfo(Dwarf.Section.Id).@"enum".fields, 0..) |section, i| {
+<a id="L508"></a>            if (mem.eql(u8, "__" ++ section.name, sect.sectName())) break i;
+<a id="L509"></a>        } else continue;
+<a id="L510"></a>
+<a id="L511"></a>        if (mapped_ofile.len &lt; sect.offset + sect.size) return error.InvalidMachO;
+<a id="L512"></a>        const section_bytes = mapped_ofile[sect.offset..][0..sect.size];
+<a id="L513"></a>        sections[section_index] = .{
+<a id="L514"></a>            .data = section_bytes,
+<a id="L515"></a>            .owned = false,
+<a id="L516"></a>        };
+<a id="L517"></a>    }
+<a id="L518"></a>
+<a id="L519"></a>    if (sections[@intFromEnum(Dwarf.Section.Id.debug_info)] == null or
+<a id="L520"></a>        sections[@intFromEnum(Dwarf.Section.Id.debug_abbrev)] == null or
+<a id="L521"></a>        sections[@intFromEnum(Dwarf.Section.Id.debug_str)] == null or
+<a id="L522"></a>        sections[@intFromEnum(Dwarf.Section.Id.debug_line)] == null)
+<a id="L523"></a>    {
+<a id="L524"></a>        return error.MissingDebugInfo;
+<a id="L525"></a>    }
+<a id="L526"></a>
+<a id="L527"></a>    var dwarf: Dwarf = .{ .sections = sections };
+<a id="L528"></a>    errdefer dwarf.deinit(gpa);
+<a id="L529"></a>    dwarf.open(gpa, .little) catch |err| switch (err) {
+<a id="L530"></a>        error.InvalidDebugInfo,
+<a id="L531"></a>        error.EndOfStream,
+<a id="L532"></a>        error.Overflow,
+<a id="L533"></a>        error.StreamTooLong,
+<a id="L534"></a>        =&gt; return error.InvalidDwarf,
+<a id="L535"></a>
+<a id="L536"></a>        error.MissingDebugInfo,
+<a id="L537"></a>        error.ReadFailed,
+<a id="L538"></a>        error.OutOfMemory,
+<a id="L539"></a>        =&gt; |e| return e,
+<a id="L540"></a>    };
+<a id="L541"></a>
+<a id="L542"></a>    return .{
+<a id="L543"></a>        .mapped_memory = all_mapped_memory,
+<a id="L544"></a>        .dwarf = dwarf,
+<a id="L545"></a>        .strtab = strtab,
+<a id="L546"></a>        .symtab_raw = symtab_raw,
+<a id="L547"></a>        .symbols_by_name = symbols_by_name.move(),
+<a id="L548"></a>    };
+<a id="L549"></a>}
+<a id="L550"></a>
+<a id="L551"></a>/// Uses `mmap` to map the file at `path` into memory.
+<a id="L552"></a>fn mapDebugInfoFile(io: Io, path: []const u8) ![]align(std.heap.page_size_min) const u8 {
+<a id="L553"></a>    const file = Io.Dir.cwd().openFile(io, path, .{}) catch |err| switch (err) {
+<a id="L554"></a>        error.FileNotFound =&gt; return error.MissingDebugInfo,
+<a id="L555"></a>        else =&gt; return error.ReadFailed,
+<a id="L556"></a>    };
+<a id="L557"></a>    defer file.close(io);
+<a id="L558"></a>
+<a id="L559"></a>    const file_len = std.math.cast(
+<a id="L560"></a>        usize,
+<a id="L561"></a>        file.length(io) catch return error.ReadFailed,
+<a id="L562"></a>    ) orelse return error.ReadFailed;
+<a id="L563"></a>
+<a id="L564"></a>    return posix.mmap(
+<a id="L565"></a>        null,
+<a id="L566"></a>        file_len,
+<a id="L567"></a>        .{ .READ = true },
+<a id="L568"></a>        .{ .TYPE = .SHARED },
+<a id="L569"></a>        file.handle,
+<a id="L570"></a>        0,
+<a id="L571"></a>    ) catch return error.ReadFailed;
+<a id="L572"></a>}
+<a id="L573"></a>
+<a id="L574"></a>const std = @import("std");
+<a id="L575"></a>const Allocator = std.mem.Allocator;
+<a id="L576"></a>const Dwarf = std.debug.Dwarf;
+<a id="L577"></a>const Io = std.Io;
+<a id="L578"></a>const assert = std.debug.assert;
+<a id="L579"></a>const posix = std.posix;
+<a id="L580"></a>const macho = std.macho;
+<a id="L581"></a>const mem = std.mem;
+<a id="L582"></a>const testing = std.testing;
+<a id="L583"></a>
+<a id="L584"></a>const builtin = @import("builtin");
+<a id="L585"></a>
+<a id="L586"></a>const MachOFile = @This();
+</pre>
 </body>
 </html>

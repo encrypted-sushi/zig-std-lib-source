@@ -2,567 +2,570 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Source: zig-0.16.0-std/debug/ElfFile.zig</title>
+    <title>Source: debug/ElfFile.zig</title>
     <style>
         body { background: #1e1e1e; color: #d4d4d4; font-family: monospace; padding: 20px; }
         pre { white-space: pre-wrap; word-wrap: break-word; }
         .header { border-bottom: 1px solid #444; padding-bottom: 10px; margin-bottom: 20px; }
         a { color: #569cd6; }
+        a[id] { color: inherit; text-decoration: none; }
+        :target { background: #3a3a00; }
     </style>
 </head>
 <body>
     <div class="header">
-        <a href="/">Index</a> | <strong>File: zig-0.16.0-std/debug/ElfFile.zig</strong>
+        <a href="/">Index</a> | <strong>File: debug/ElfFile.zig</strong>
     </div>
-    <pre>//! A helper type for loading an ELF file and collecting its DWARF debug information, unwind
-//! information, and symbol table.
-const ElfFile = @This();
-
-const std = @import("std");
-const Io = std.Io;
-const Endian = std.builtin.Endian;
-const Dwarf = std.debug.Dwarf;
-const Allocator = std.mem.Allocator;
-const elf = std.elf;
-
-is_64: bool,
-endian: Endian,
-
-/// This is `null` iff any of the required DWARF sections were missing. `ElfFile.load` does *not*
-/// call `Dwarf.open`, `Dwarf.scanAllFunctions`, etc; that is the caller's responsibility.
-dwarf: ?Dwarf,
-
-/// If non-`null`, describes the `.eh_frame` section, which can be used with `Dwarf.Unwind`.
-eh_frame: ?UnwindSection,
-/// If non-`null`, describes the `.debug_frame` section, which can be used with `Dwarf.Unwind`.
-debug_frame: ?UnwindSection,
-
-/// If non-`null`, this is the contents of the `.strtab` section.
-strtab: ?[]const u8,
-/// If non-`null`, describes the `.symtab` section.
-symtab: ?SymtabSection,
-
-/// Binary search table lazily populated by `searchSymtab`.
-symbol_search_table: ?[]usize,
-
-/// The memory-mapped ELF file, which is referenced by `dwarf`. This field is here only so that
-/// this memory can be unmapped by `ElfFile.deinit`.
-mapped_file: []align(std.heap.page_size_min) const u8,
-/// Sometimes, debug info is stored separately to the main ELF file. In that case, `mapped_file`
-/// is the mapped ELF binary, and `mapped_debug_file` is the mapped debug info file. Both must
-/// be unmapped by `ElfFile.deinit`.
-mapped_debug_file: ?[]align(std.heap.page_size_min) const u8,
-
-arena: std.heap.ArenaAllocator.State,
-
-pub const UnwindSection = struct {
-    vaddr: u64,
-    bytes: []const u8,
-};
-pub const SymtabSection = struct {
-    entry_size: u64,
-    bytes: []const u8,
-};
-
-pub const DebugInfoSearchPaths = struct {
-    /// The location of a debuginfod client directory, which acts as a search path for build IDs. If
-    /// given, we can load from this directory opportunistically, but make no effort to populate it.
-    /// To avoid allocation when building the search paths, this is given as two components which
-    /// will be concatenated.
-    debuginfod_client: ?[2][]const u8,
-    /// All "global debug directories" on the system. These are used as search paths for both debug
-    /// links and build IDs. On typical systems this is just "/usr/lib/debug".
-    global_debug: []const []const u8,
-    /// The path to the dirname of the ELF file, which acts as a search path for debug links.
-    exe_dir: ?[]const u8,
-
-    pub const none: DebugInfoSearchPaths = .{
-        .debuginfod_client = null,
-        .global_debug = &amp;.{},
-        .exe_dir = null,
-    };
-
-    pub fn native(exe_path: []const u8) DebugInfoSearchPaths {
-        if (std.Options.elf_debug_info_search_paths) |f| return f(exe_path);
-        if (std.Options.debug_threaded_io) |t| return .{
-            .debuginfod_client = p: {
-                if (t.environString("DEBUGINFOD_CACHE_PATH")) |p| {
-                    break :p .{ p, "" };
-                }
-                if (t.environString("XDG_CACHE_HOME")) |cache_path| {
-                    break :p .{ cache_path, "/debuginfod_client" };
-                }
-                if (t.environString("HOME")) |home_path| {
-                    break :p .{ home_path, "/.cache/debuginfod_client" };
-                }
-                break :p null;
-            },
-            .global_debug = &amp;.{
-                "/usr/lib/debug",
-            },
-            .exe_dir = std.fs.path.dirname(exe_path) orelse ".",
-        };
-        @compileError("std.Options.elf_debug_info_search_paths must be provided");
-    }
-};
-
-pub fn deinit(ef: *ElfFile, gpa: Allocator) void {
-    if (ef.dwarf) |*dwarf| dwarf.deinit(gpa);
-    if (ef.symbol_search_table) |t| gpa.free(t);
-    var arena = ef.arena.promote(gpa);
-    arena.deinit();
-
-    std.posix.munmap(ef.mapped_file);
-    if (ef.mapped_debug_file) |m| std.posix.munmap(m);
-
-    ef.* = undefined;
-}
-
-pub const LoadError = error{
-    OutOfMemory,
-    Overflow,
-    TruncatedElfFile,
-    InvalidCompressedSection,
-    InvalidElfMagic,
-    InvalidElfVersion,
-    InvalidElfClass,
-    InvalidElfEndian,
-    // The remaining errors all occur when attemping to stat or mmap a file.
-    SystemResources,
-    MemoryMappingNotSupported,
-    AccessDenied,
-    LockedMemoryLimitExceeded,
-    ProcessFdQuotaExceeded,
-    SystemFdQuotaExceeded,
-    Streaming,
-    Canceled,
-    Unexpected,
-};
-
-pub fn load(
-    gpa: Allocator,
-    io: Io,
-    elf_file: Io.File,
-    opt_build_id: ?[]const u8,
-    di_search_paths: *const DebugInfoSearchPaths,
-) LoadError!ElfFile {
-    var arena_instance: std.heap.ArenaAllocator = .init(gpa);
-    errdefer arena_instance.deinit();
-    const arena = arena_instance.allocator();
-
-    var result = loadInner(arena, io, elf_file, null) catch |err| switch (err) {
-        error.CrcMismatch =&gt; unreachable, // we passed crc as null
-        else =&gt; |e| return e,
-    };
-    errdefer std.posix.munmap(result.mapped_mem);
-
-    // `loadInner` did most of the work, but we might need to load an external debug info file
-
-    const di_mapped_mem: ?[]align(std.heap.page_size_min) const u8 = load_di: {
-        if (result.sections.get(.debug_info) != null and
-            result.sections.get(.debug_abbrev) != null and
-            result.sections.get(.debug_str) != null and
-            result.sections.get(.debug_line) != null)
-        {
-            // The info is already loaded from this file alone!
-            break :load_di null;
-        }
-
-        // We're missing some debug info---let's try and load it from a separate file.
-
-        build_id: {
-            const build_id = opt_build_id orelse break :build_id;
-            if (build_id.len &lt; 3) break :build_id;
-
-            for (di_search_paths.global_debug) |global_debug| {
-                if (try loadSeparateDebugFile(arena, io, &amp;result, null, "{s}/.build-id/{x}/{x}.debug", .{
-                    global_debug,
-                    build_id[0..1],
-                    build_id[1..],
-                })) |mapped| break :load_di mapped;
-            }
-
-            if (di_search_paths.debuginfod_client) |components| {
-                if (try loadSeparateDebugFile(arena, io, &amp;result, null, "{s}{s}/{x}/debuginfo", .{
-                    components[0],
-                    components[1],
-                    build_id,
-                })) |mapped| break :load_di mapped;
-            }
-        }
-
-        debug_link: {
-            const section = result.sections.get(.gnu_debuglink) orelse break :debug_link;
-            const debug_filename = std.mem.sliceTo(section.bytes, 0);
-            const crc_offset = std.mem.alignForward(usize, debug_filename.len + 1, 4);
-            if (section.bytes.len &lt; crc_offset + 4) break :debug_link;
-            const debug_crc = std.mem.readInt(u32, section.bytes[crc_offset..][0..4], result.endian);
-
-            const exe_dir = di_search_paths.exe_dir orelse break :debug_link;
-
-            if (try loadSeparateDebugFile(arena, io, &amp;result, debug_crc, "{s}/{s}", .{
-                exe_dir,
-                debug_filename,
-            })) |mapped| break :load_di mapped;
-            if (try loadSeparateDebugFile(arena, io, &amp;result, debug_crc, "{s}/.debug/{s}", .{
-                exe_dir,
-                debug_filename,
-            })) |mapped| break :load_di mapped;
-            for (di_search_paths.global_debug) |global_debug| {
-                // This looks like a bug; it isn't. They really do embed the absolute path to the
-                // exe's dirname, *under* the global debug path.
-                if (try loadSeparateDebugFile(arena, io, &amp;result, debug_crc, "{s}/{s}/{s}", .{
-                    global_debug,
-                    exe_dir,
-                    debug_filename,
-                })) |mapped| break :load_di mapped;
-            }
-        }
-
-        break :load_di null;
-    };
-    errdefer comptime unreachable;
-
-    return .{
-        .is_64 = result.is_64,
-        .endian = result.endian,
-        .dwarf = dwarf: {
-            if (result.sections.get(.debug_info) == null or
-                result.sections.get(.debug_abbrev) == null or
-                result.sections.get(.debug_str) == null or
-                result.sections.get(.debug_line) == null)
-            {
-                break :dwarf null; // debug info not present
-            }
-            var sections: Dwarf.SectionArray = @splat(null);
-            inline for (@typeInfo(Dwarf.Section.Id).@"enum".fields) |f| {
-                if (result.sections.get(@field(Section.Id, f.name))) |s| {
-                    sections[f.value] = .{ .data = s.bytes, .owned = false };
-                }
-            }
-            break :dwarf .{ .sections = sections };
-        },
-        .eh_frame = if (result.sections.get(.eh_frame)) |s| .{
-            .vaddr = s.header.sh_addr,
-            .bytes = s.bytes,
-        } else null,
-        .debug_frame = if (result.sections.get(.debug_frame)) |s| .{
-            .vaddr = s.header.sh_addr,
-            .bytes = s.bytes,
-        } else null,
-        .strtab = if (result.sections.get(.strtab)) |s| s.bytes else null,
-        .symtab = if (result.sections.get(.symtab)) |s| .{
-            .entry_size = s.header.sh_entsize,
-            .bytes = s.bytes,
-        } else null,
-        .symbol_search_table = null,
-        .mapped_file = result.mapped_mem,
-        .mapped_debug_file = di_mapped_mem,
-        .arena = arena_instance.state,
-    };
-}
-
-pub fn searchSymtab(ef: *ElfFile, gpa: Allocator, vaddr: u64) error{
-    NoSymtab,
-    NoStrtab,
-    BadSymtab,
-    OutOfMemory,
-}!std.debug.Symbol {
-    const symtab = ef.symtab orelse return error.NoSymtab;
-    const strtab = ef.strtab orelse return error.NoStrtab;
-
-    if (symtab.bytes.len % symtab.entry_size != 0) return error.BadSymtab;
-
-    const swap_endian = ef.endian != @import("builtin").cpu.arch.endian();
-
-    switch (ef.is_64) {
-        inline true, false =&gt; |is_64| {
-            const Sym = if (is_64) elf.Elf64_Sym else elf.Elf32_Sym;
-            if (symtab.entry_size != @sizeOf(Sym)) return error.BadSymtab;
-            const symbols: []align(1) const Sym = @ptrCast(symtab.bytes);
-            if (ef.symbol_search_table == null) {
-                ef.symbol_search_table = try buildSymbolSearchTable(gpa, ef.endian, Sym, symbols);
-            }
-            const search_table = ef.symbol_search_table.?;
-            const SearchContext = struct {
-                swap_endian: bool,
-                target: u64,
-                symbols: []align(1) const Sym,
-                fn predicate(ctx: @This(), sym_index: usize) bool {
-                    // We need to return `true` for the first N items, then `false` for the rest --
-                    // the index we'll get out is the first `false` one. So, we'll return `true` iff
-                    // the target address is after the *end* of this symbol. This synchronizes with
-                    // the logic in `buildSymbolSearchTable` which sorts by *end* address.
-                    var sym = ctx.symbols[sym_index];
-                    if (ctx.swap_endian) std.mem.byteSwapAllFields(Sym, &amp;sym);
-                    const sym_end = sym.st_value + sym.st_size;
-                    return ctx.target &gt;= sym_end;
-                }
-            };
-            const sym_index_index = std.sort.partitionPoint(usize, search_table, @as(SearchContext, .{
-                .swap_endian = swap_endian,
-                .target = vaddr,
-                .symbols = symbols,
-            }), SearchContext.predicate);
-            if (sym_index_index == search_table.len) return .unknown;
-            var sym = symbols[search_table[sym_index_index]];
-            if (swap_endian) std.mem.byteSwapAllFields(Sym, &amp;sym);
-            if (vaddr &lt; sym.st_value or vaddr &gt;= sym.st_value + sym.st_size) return .unknown;
-            return .{
-                .name = std.mem.sliceTo(strtab[sym.st_name..], 0),
-                .compile_unit_name = null,
-                .source_location = null,
-            };
-        },
-    }
-}
-
-fn buildSymbolSearchTable(gpa: Allocator, endian: Endian, comptime Sym: type, symbols: []align(1) const Sym) error{
-    OutOfMemory,
-    BadSymtab,
-}![]usize {
-    var result: std.ArrayList(usize) = .empty;
-    defer result.deinit(gpa);
-
-    const swap_endian = endian != @import("builtin").cpu.arch.endian();
-
-    for (symbols, 0..) |sym_orig, sym_index| {
-        var sym = sym_orig;
-        if (swap_endian) std.mem.byteSwapAllFields(Sym, &amp;sym);
-        if (sym.st_name == 0) continue;
-        if (sym.st_shndx == elf.SHN_UNDEF) continue;
-        try result.append(gpa, sym_index);
-    }
-
-    const SortContext = struct {
-        swap_endian: bool,
-        symbols: []align(1) const Sym,
-        fn lessThan(ctx: @This(), lhs_sym_index: usize, rhs_sym_index: usize) bool {
-            // We sort by *end* address, not start address. This matches up with logic in `searchSymtab`.
-            var lhs_sym = ctx.symbols[lhs_sym_index];
-            var rhs_sym = ctx.symbols[rhs_sym_index];
-            if (ctx.swap_endian) {
-                std.mem.byteSwapAllFields(Sym, &amp;lhs_sym);
-                std.mem.byteSwapAllFields(Sym, &amp;rhs_sym);
-            }
-            const lhs_val = lhs_sym.st_value + lhs_sym.st_size;
-            const rhs_val = rhs_sym.st_value + rhs_sym.st_size;
-            return lhs_val &lt; rhs_val;
-        }
-    };
-    std.mem.sort(usize, result.items, @as(SortContext, .{
-        .swap_endian = swap_endian,
-        .symbols = symbols,
-    }), SortContext.lessThan);
-
-    return result.toOwnedSlice(gpa);
-}
-
-/// Only used locally, during `load`.
-const Section = struct {
-    header: elf.Elf64_Shdr,
-    bytes: []const u8,
-    const Id = enum {
-        // DWARF sections: see `Dwarf.Section.Id`.
-        debug_info,
-        debug_abbrev,
-        debug_str,
-        debug_str_offsets,
-        debug_line,
-        debug_line_str,
-        debug_ranges,
-        debug_loclists,
-        debug_rnglists,
-        debug_addr,
-        debug_names,
-        // Then anything else we're interested in.
-        gnu_debuglink,
-        eh_frame,
-        debug_frame,
-        symtab,
-        strtab,
-    };
-    const Array = std.enums.EnumArray(Section.Id, ?Section);
-};
-
-fn loadSeparateDebugFile(
-    arena: Allocator,
-    io: Io,
-    main_loaded: *LoadInnerResult,
-    opt_crc: ?u32,
-    comptime fmt: []const u8,
-    args: anytype,
-) Allocator.Error!?[]align(std.heap.page_size_min) const u8 {
-    const path = try std.fmt.allocPrint(arena, fmt, args);
-    const elf_file = Io.Dir.cwd().openFile(io, path, .{}) catch return null;
-    defer elf_file.close(io);
-
-    const result = loadInner(arena, io, elf_file, opt_crc) catch |err| switch (err) {
-        error.OutOfMemory =&gt; |e| return e,
-        error.CrcMismatch =&gt; return null,
-        else =&gt; return null,
-    };
-    errdefer comptime unreachable;
-
-    const have_debug_sections = inline for (@as([]const []const u8, &amp;.{
-        "debug_info",
-        "debug_abbrev",
-        "debug_str",
-        "debug_line",
-    })) |name| {
-        const s = @field(Section.Id, name);
-        if (main_loaded.sections.get(s) == null and result.sections.get(s) == null) {
-            break false;
-        }
-    } else true;
-
-    if (result.is_64 != main_loaded.is_64 or
-        result.endian != main_loaded.endian or
-        !have_debug_sections)
-    {
-        std.posix.munmap(result.mapped_mem);
-        return null;
-    }
-
-    inline for (@typeInfo(Dwarf.Section.Id).@"enum".fields) |f| {
-        const id = @field(Section.Id, f.name);
-        if (main_loaded.sections.get(id) == null) {
-            main_loaded.sections.set(id, result.sections.get(id));
-        }
-    }
-
-    return result.mapped_mem;
-}
-
-const LoadInnerResult = struct {
-    is_64: bool,
-    endian: Endian,
-    sections: Section.Array,
-    mapped_mem: []align(std.heap.page_size_min) const u8,
-};
-fn loadInner(
-    arena: Allocator,
-    io: Io,
-    elf_file: Io.File,
-    opt_crc: ?u32,
-) (LoadError || error{ CrcMismatch, Streaming, Canceled })!LoadInnerResult {
-    const mapped_mem: []align(std.heap.page_size_min) const u8 = mapped: {
-        const file_len = std.math.cast(
-            usize,
-            elf_file.length(io) catch |err| switch (err) {
-                error.PermissionDenied =&gt; unreachable, // not asking for PROT_EXEC
-                else =&gt; |e| return e,
-            },
-        ) orelse return error.Overflow;
-
-        break :mapped std.posix.mmap(
-            null,
-            file_len,
-            .{ .READ = true },
-            .{ .TYPE = .SHARED },
-            elf_file.handle,
-            0,
-        ) catch |err| switch (err) {
-            error.MappingAlreadyExists =&gt; unreachable, // not using FIXED_NOREPLACE
-            error.PermissionDenied =&gt; unreachable, // not asking for PROT_EXEC
-            else =&gt; |e| return e,
-        };
-    };
-
-    if (opt_crc) |crc| {
-        if (std.hash.crc.Crc32.hash(mapped_mem) != crc) {
-            return error.CrcMismatch;
-        }
-    }
-    errdefer std.posix.munmap(mapped_mem);
-
-    var fr: std.Io.Reader = .fixed(mapped_mem);
-
-    const header = elf.Header.read(&amp;fr) catch |err| switch (err) {
-        error.ReadFailed =&gt; unreachable,
-        error.EndOfStream =&gt; return error.TruncatedElfFile,
-
-        error.InvalidElfMagic,
-        error.InvalidElfVersion,
-        error.InvalidElfClass,
-        error.InvalidElfEndian,
-        =&gt; |e| return e,
-    };
-    const endian = header.endian;
-
-    const shstrtab_shdr_off = try std.math.add(
-        u64,
-        header.shoff,
-        try std.math.mul(u64, header.shstrndx, header.shentsize),
-    );
-    fr.seek = std.math.cast(usize, shstrtab_shdr_off) orelse return error.Overflow;
-    const shstrtab: []const u8 = if (header.is_64) shstrtab: {
-        const shdr = fr.takeStruct(elf.Elf64_Shdr, endian) catch return error.TruncatedElfFile;
-        if (shdr.sh_offset + shdr.sh_size &gt; mapped_mem.len) return error.TruncatedElfFile;
-        break :shstrtab mapped_mem[@intCast(shdr.sh_offset)..][0..@intCast(shdr.sh_size)];
-    } else shstrtab: {
-        const shdr = fr.takeStruct(elf.Elf32_Shdr, endian) catch return error.TruncatedElfFile;
-        if (shdr.sh_offset + shdr.sh_size &gt; mapped_mem.len) return error.TruncatedElfFile;
-        break :shstrtab mapped_mem[@intCast(shdr.sh_offset)..][0..@intCast(shdr.sh_size)];
-    };
-
-    var sections: Section.Array = .initFill(null);
-
-    var it = header.iterateSectionHeadersBuffer(mapped_mem);
-    while (it.next() catch return error.TruncatedElfFile) |shdr| {
-        if (shdr.sh_type == elf.SHT_NULL or shdr.sh_type == elf.SHT_NOBITS) continue;
-        if (shdr.sh_name &gt; shstrtab.len) return error.TruncatedElfFile;
-        const name = std.mem.sliceTo(shstrtab[@intCast(shdr.sh_name)..], 0);
-
-        const section_id: Section.Id = inline for (@typeInfo(Section.Id).@"enum".fields) |s| {
-            if (std.mem.eql(u8, "." ++ s.name, name)) {
-                break @enumFromInt(s.value);
-            }
-        } else continue;
-
-        if (sections.get(section_id) != null) continue;
-
-        if (shdr.sh_offset + shdr.sh_size &gt; mapped_mem.len) return error.TruncatedElfFile;
-        const raw_section_bytes = mapped_mem[@intCast(shdr.sh_offset)..][0..@intCast(shdr.sh_size)];
-        const section_bytes: []const u8 = bytes: {
-            if ((shdr.sh_flags &amp; elf.SHF_COMPRESSED) == 0) break :bytes raw_section_bytes;
-
-            var section_reader: std.Io.Reader = .fixed(raw_section_bytes);
-            const ch_type: elf.COMPRESS, const ch_size: u64 = if (header.is_64) ch: {
-                const chdr = section_reader.takeStruct(elf.Elf64_Chdr, endian) catch return error.InvalidCompressedSection;
-                break :ch .{ chdr.ch_type, chdr.ch_size };
-            } else ch: {
-                const chdr = section_reader.takeStruct(elf.Elf32_Chdr, endian) catch return error.InvalidCompressedSection;
-                break :ch .{ chdr.ch_type, chdr.ch_size };
-            };
-            if (ch_type != .ZLIB) {
-                // The compression algorithm is unsupported, but don't make that a hard error; the
-                // file might still be valid, and we might still be okay without this section.
-                continue;
-            }
-
-            const buf = try arena.alloc(u8, std.math.cast(usize, ch_size) orelse return error.Overflow);
-            var fw: std.Io.Writer = .fixed(buf);
-            var decompress: std.compress.flate.Decompress = .init(&amp;section_reader, .zlib, &amp;.{});
-            const n = decompress.reader.streamRemaining(&amp;fw) catch |err| switch (err) {
-                // If a write failed, then `buf` filled up, so `ch_size` was incorrect
-                error.WriteFailed =&gt; return error.InvalidCompressedSection,
-                // If a read failed, flate expected the section to have more data
-                error.ReadFailed =&gt; return error.InvalidCompressedSection,
-            };
-            // It's also an error if the data is shorter than expected.
-            if (n != buf.len) return error.InvalidCompressedSection;
-            break :bytes buf;
-        };
-        sections.set(section_id, .{ .header = shdr, .bytes = section_bytes });
-    }
-
-    return .{
-        .is_64 = header.is_64,
-        .endian = endian,
-        .sections = sections,
-        .mapped_mem = mapped_mem,
-    };
-}</pre>
+    <pre><a id="L1"></a>//! A helper type for loading an ELF file and collecting its DWARF debug information, unwind
+<a id="L2"></a>//! information, and symbol table.
+<a id="L3"></a>const ElfFile = @This();
+<a id="L4"></a>
+<a id="L5"></a>const std = @import("std");
+<a id="L6"></a>const Io = std.Io;
+<a id="L7"></a>const Endian = std.builtin.Endian;
+<a id="L8"></a>const Dwarf = std.debug.Dwarf;
+<a id="L9"></a>const Allocator = std.mem.Allocator;
+<a id="L10"></a>const elf = std.elf;
+<a id="L11"></a>
+<a id="L12"></a>is_64: bool,
+<a id="L13"></a>endian: Endian,
+<a id="L14"></a>
+<a id="L15"></a>/// This is `null` iff any of the required DWARF sections were missing. `ElfFile.load` does *not*
+<a id="L16"></a>/// call `Dwarf.open`, `Dwarf.scanAllFunctions`, etc; that is the caller's responsibility.
+<a id="L17"></a>dwarf: ?Dwarf,
+<a id="L18"></a>
+<a id="L19"></a>/// If non-`null`, describes the `.eh_frame` section, which can be used with `Dwarf.Unwind`.
+<a id="L20"></a>eh_frame: ?UnwindSection,
+<a id="L21"></a>/// If non-`null`, describes the `.debug_frame` section, which can be used with `Dwarf.Unwind`.
+<a id="L22"></a>debug_frame: ?UnwindSection,
+<a id="L23"></a>
+<a id="L24"></a>/// If non-`null`, this is the contents of the `.strtab` section.
+<a id="L25"></a>strtab: ?[]const u8,
+<a id="L26"></a>/// If non-`null`, describes the `.symtab` section.
+<a id="L27"></a>symtab: ?SymtabSection,
+<a id="L28"></a>
+<a id="L29"></a>/// Binary search table lazily populated by `searchSymtab`.
+<a id="L30"></a>symbol_search_table: ?[]usize,
+<a id="L31"></a>
+<a id="L32"></a>/// The memory-mapped ELF file, which is referenced by `dwarf`. This field is here only so that
+<a id="L33"></a>/// this memory can be unmapped by `ElfFile.deinit`.
+<a id="L34"></a>mapped_file: []align(std.heap.page_size_min) const u8,
+<a id="L35"></a>/// Sometimes, debug info is stored separately to the main ELF file. In that case, `mapped_file`
+<a id="L36"></a>/// is the mapped ELF binary, and `mapped_debug_file` is the mapped debug info file. Both must
+<a id="L37"></a>/// be unmapped by `ElfFile.deinit`.
+<a id="L38"></a>mapped_debug_file: ?[]align(std.heap.page_size_min) const u8,
+<a id="L39"></a>
+<a id="L40"></a>arena: std.heap.ArenaAllocator.State,
+<a id="L41"></a>
+<a id="L42"></a>pub const UnwindSection = struct {
+<a id="L43"></a>    vaddr: u64,
+<a id="L44"></a>    bytes: []const u8,
+<a id="L45"></a>};
+<a id="L46"></a>pub const SymtabSection = struct {
+<a id="L47"></a>    entry_size: u64,
+<a id="L48"></a>    bytes: []const u8,
+<a id="L49"></a>};
+<a id="L50"></a>
+<a id="L51"></a>pub const DebugInfoSearchPaths = struct {
+<a id="L52"></a>    /// The location of a debuginfod client directory, which acts as a search path for build IDs. If
+<a id="L53"></a>    /// given, we can load from this directory opportunistically, but make no effort to populate it.
+<a id="L54"></a>    /// To avoid allocation when building the search paths, this is given as two components which
+<a id="L55"></a>    /// will be concatenated.
+<a id="L56"></a>    debuginfod_client: ?[2][]const u8,
+<a id="L57"></a>    /// All "global debug directories" on the system. These are used as search paths for both debug
+<a id="L58"></a>    /// links and build IDs. On typical systems this is just "/usr/lib/debug".
+<a id="L59"></a>    global_debug: []const []const u8,
+<a id="L60"></a>    /// The path to the dirname of the ELF file, which acts as a search path for debug links.
+<a id="L61"></a>    exe_dir: ?[]const u8,
+<a id="L62"></a>
+<a id="L63"></a>    pub const none: DebugInfoSearchPaths = .{
+<a id="L64"></a>        .debuginfod_client = null,
+<a id="L65"></a>        .global_debug = &amp;.{},
+<a id="L66"></a>        .exe_dir = null,
+<a id="L67"></a>    };
+<a id="L68"></a>
+<a id="L69"></a>    pub fn native(exe_path: []const u8) DebugInfoSearchPaths {
+<a id="L70"></a>        if (std.Options.elf_debug_info_search_paths) |f| return f(exe_path);
+<a id="L71"></a>        if (std.Options.debug_threaded_io) |t| return .{
+<a id="L72"></a>            .debuginfod_client = p: {
+<a id="L73"></a>                if (t.environString("DEBUGINFOD_CACHE_PATH")) |p| {
+<a id="L74"></a>                    break :p .{ p, "" };
+<a id="L75"></a>                }
+<a id="L76"></a>                if (t.environString("XDG_CACHE_HOME")) |cache_path| {
+<a id="L77"></a>                    break :p .{ cache_path, "/debuginfod_client" };
+<a id="L78"></a>                }
+<a id="L79"></a>                if (t.environString("HOME")) |home_path| {
+<a id="L80"></a>                    break :p .{ home_path, "/.cache/debuginfod_client" };
+<a id="L81"></a>                }
+<a id="L82"></a>                break :p null;
+<a id="L83"></a>            },
+<a id="L84"></a>            .global_debug = &amp;.{
+<a id="L85"></a>                "/usr/lib/debug",
+<a id="L86"></a>            },
+<a id="L87"></a>            .exe_dir = std.fs.path.dirname(exe_path) orelse ".",
+<a id="L88"></a>        };
+<a id="L89"></a>        @compileError("std.Options.elf_debug_info_search_paths must be provided");
+<a id="L90"></a>    }
+<a id="L91"></a>};
+<a id="L92"></a>
+<a id="L93"></a>pub fn deinit(ef: *ElfFile, gpa: Allocator) void {
+<a id="L94"></a>    if (ef.dwarf) |*dwarf| dwarf.deinit(gpa);
+<a id="L95"></a>    if (ef.symbol_search_table) |t| gpa.free(t);
+<a id="L96"></a>    var arena = ef.arena.promote(gpa);
+<a id="L97"></a>    arena.deinit();
+<a id="L98"></a>
+<a id="L99"></a>    std.posix.munmap(ef.mapped_file);
+<a id="L100"></a>    if (ef.mapped_debug_file) |m| std.posix.munmap(m);
+<a id="L101"></a>
+<a id="L102"></a>    ef.* = undefined;
+<a id="L103"></a>}
+<a id="L104"></a>
+<a id="L105"></a>pub const LoadError = error{
+<a id="L106"></a>    OutOfMemory,
+<a id="L107"></a>    Overflow,
+<a id="L108"></a>    TruncatedElfFile,
+<a id="L109"></a>    InvalidCompressedSection,
+<a id="L110"></a>    InvalidElfMagic,
+<a id="L111"></a>    InvalidElfVersion,
+<a id="L112"></a>    InvalidElfClass,
+<a id="L113"></a>    InvalidElfEndian,
+<a id="L114"></a>    // The remaining errors all occur when attemping to stat or mmap a file.
+<a id="L115"></a>    SystemResources,
+<a id="L116"></a>    MemoryMappingNotSupported,
+<a id="L117"></a>    AccessDenied,
+<a id="L118"></a>    LockedMemoryLimitExceeded,
+<a id="L119"></a>    ProcessFdQuotaExceeded,
+<a id="L120"></a>    SystemFdQuotaExceeded,
+<a id="L121"></a>    Streaming,
+<a id="L122"></a>    Canceled,
+<a id="L123"></a>    Unexpected,
+<a id="L124"></a>};
+<a id="L125"></a>
+<a id="L126"></a>pub fn load(
+<a id="L127"></a>    gpa: Allocator,
+<a id="L128"></a>    io: Io,
+<a id="L129"></a>    elf_file: Io.File,
+<a id="L130"></a>    opt_build_id: ?[]const u8,
+<a id="L131"></a>    di_search_paths: *const DebugInfoSearchPaths,
+<a id="L132"></a>) LoadError!ElfFile {
+<a id="L133"></a>    var arena_instance: std.heap.ArenaAllocator = .init(gpa);
+<a id="L134"></a>    errdefer arena_instance.deinit();
+<a id="L135"></a>    const arena = arena_instance.allocator();
+<a id="L136"></a>
+<a id="L137"></a>    var result = loadInner(arena, io, elf_file, null) catch |err| switch (err) {
+<a id="L138"></a>        error.CrcMismatch =&gt; unreachable, // we passed crc as null
+<a id="L139"></a>        else =&gt; |e| return e,
+<a id="L140"></a>    };
+<a id="L141"></a>    errdefer std.posix.munmap(result.mapped_mem);
+<a id="L142"></a>
+<a id="L143"></a>    // `loadInner` did most of the work, but we might need to load an external debug info file
+<a id="L144"></a>
+<a id="L145"></a>    const di_mapped_mem: ?[]align(std.heap.page_size_min) const u8 = load_di: {
+<a id="L146"></a>        if (result.sections.get(.debug_info) != null and
+<a id="L147"></a>            result.sections.get(.debug_abbrev) != null and
+<a id="L148"></a>            result.sections.get(.debug_str) != null and
+<a id="L149"></a>            result.sections.get(.debug_line) != null)
+<a id="L150"></a>        {
+<a id="L151"></a>            // The info is already loaded from this file alone!
+<a id="L152"></a>            break :load_di null;
+<a id="L153"></a>        }
+<a id="L154"></a>
+<a id="L155"></a>        // We're missing some debug info---let's try and load it from a separate file.
+<a id="L156"></a>
+<a id="L157"></a>        build_id: {
+<a id="L158"></a>            const build_id = opt_build_id orelse break :build_id;
+<a id="L159"></a>            if (build_id.len &lt; 3) break :build_id;
+<a id="L160"></a>
+<a id="L161"></a>            for (di_search_paths.global_debug) |global_debug| {
+<a id="L162"></a>                if (try loadSeparateDebugFile(arena, io, &amp;result, null, "{s}/.build-id/{x}/{x}.debug", .{
+<a id="L163"></a>                    global_debug,
+<a id="L164"></a>                    build_id[0..1],
+<a id="L165"></a>                    build_id[1..],
+<a id="L166"></a>                })) |mapped| break :load_di mapped;
+<a id="L167"></a>            }
+<a id="L168"></a>
+<a id="L169"></a>            if (di_search_paths.debuginfod_client) |components| {
+<a id="L170"></a>                if (try loadSeparateDebugFile(arena, io, &amp;result, null, "{s}{s}/{x}/debuginfo", .{
+<a id="L171"></a>                    components[0],
+<a id="L172"></a>                    components[1],
+<a id="L173"></a>                    build_id,
+<a id="L174"></a>                })) |mapped| break :load_di mapped;
+<a id="L175"></a>            }
+<a id="L176"></a>        }
+<a id="L177"></a>
+<a id="L178"></a>        debug_link: {
+<a id="L179"></a>            const section = result.sections.get(.gnu_debuglink) orelse break :debug_link;
+<a id="L180"></a>            const debug_filename = std.mem.sliceTo(section.bytes, 0);
+<a id="L181"></a>            const crc_offset = std.mem.alignForward(usize, debug_filename.len + 1, 4);
+<a id="L182"></a>            if (section.bytes.len &lt; crc_offset + 4) break :debug_link;
+<a id="L183"></a>            const debug_crc = std.mem.readInt(u32, section.bytes[crc_offset..][0..4], result.endian);
+<a id="L184"></a>
+<a id="L185"></a>            const exe_dir = di_search_paths.exe_dir orelse break :debug_link;
+<a id="L186"></a>
+<a id="L187"></a>            if (try loadSeparateDebugFile(arena, io, &amp;result, debug_crc, "{s}/{s}", .{
+<a id="L188"></a>                exe_dir,
+<a id="L189"></a>                debug_filename,
+<a id="L190"></a>            })) |mapped| break :load_di mapped;
+<a id="L191"></a>            if (try loadSeparateDebugFile(arena, io, &amp;result, debug_crc, "{s}/.debug/{s}", .{
+<a id="L192"></a>                exe_dir,
+<a id="L193"></a>                debug_filename,
+<a id="L194"></a>            })) |mapped| break :load_di mapped;
+<a id="L195"></a>            for (di_search_paths.global_debug) |global_debug| {
+<a id="L196"></a>                // This looks like a bug; it isn't. They really do embed the absolute path to the
+<a id="L197"></a>                // exe's dirname, *under* the global debug path.
+<a id="L198"></a>                if (try loadSeparateDebugFile(arena, io, &amp;result, debug_crc, "{s}/{s}/{s}", .{
+<a id="L199"></a>                    global_debug,
+<a id="L200"></a>                    exe_dir,
+<a id="L201"></a>                    debug_filename,
+<a id="L202"></a>                })) |mapped| break :load_di mapped;
+<a id="L203"></a>            }
+<a id="L204"></a>        }
+<a id="L205"></a>
+<a id="L206"></a>        break :load_di null;
+<a id="L207"></a>    };
+<a id="L208"></a>    errdefer comptime unreachable;
+<a id="L209"></a>
+<a id="L210"></a>    return .{
+<a id="L211"></a>        .is_64 = result.is_64,
+<a id="L212"></a>        .endian = result.endian,
+<a id="L213"></a>        .dwarf = dwarf: {
+<a id="L214"></a>            if (result.sections.get(.debug_info) == null or
+<a id="L215"></a>                result.sections.get(.debug_abbrev) == null or
+<a id="L216"></a>                result.sections.get(.debug_str) == null or
+<a id="L217"></a>                result.sections.get(.debug_line) == null)
+<a id="L218"></a>            {
+<a id="L219"></a>                break :dwarf null; // debug info not present
+<a id="L220"></a>            }
+<a id="L221"></a>            var sections: Dwarf.SectionArray = @splat(null);
+<a id="L222"></a>            inline for (@typeInfo(Dwarf.Section.Id).@"enum".fields) |f| {
+<a id="L223"></a>                if (result.sections.get(@field(Section.Id, f.name))) |s| {
+<a id="L224"></a>                    sections[f.value] = .{ .data = s.bytes, .owned = false };
+<a id="L225"></a>                }
+<a id="L226"></a>            }
+<a id="L227"></a>            break :dwarf .{ .sections = sections };
+<a id="L228"></a>        },
+<a id="L229"></a>        .eh_frame = if (result.sections.get(.eh_frame)) |s| .{
+<a id="L230"></a>            .vaddr = s.header.sh_addr,
+<a id="L231"></a>            .bytes = s.bytes,
+<a id="L232"></a>        } else null,
+<a id="L233"></a>        .debug_frame = if (result.sections.get(.debug_frame)) |s| .{
+<a id="L234"></a>            .vaddr = s.header.sh_addr,
+<a id="L235"></a>            .bytes = s.bytes,
+<a id="L236"></a>        } else null,
+<a id="L237"></a>        .strtab = if (result.sections.get(.strtab)) |s| s.bytes else null,
+<a id="L238"></a>        .symtab = if (result.sections.get(.symtab)) |s| .{
+<a id="L239"></a>            .entry_size = s.header.sh_entsize,
+<a id="L240"></a>            .bytes = s.bytes,
+<a id="L241"></a>        } else null,
+<a id="L242"></a>        .symbol_search_table = null,
+<a id="L243"></a>        .mapped_file = result.mapped_mem,
+<a id="L244"></a>        .mapped_debug_file = di_mapped_mem,
+<a id="L245"></a>        .arena = arena_instance.state,
+<a id="L246"></a>    };
+<a id="L247"></a>}
+<a id="L248"></a>
+<a id="L249"></a>pub fn searchSymtab(ef: *ElfFile, gpa: Allocator, vaddr: u64) error{
+<a id="L250"></a>    NoSymtab,
+<a id="L251"></a>    NoStrtab,
+<a id="L252"></a>    BadSymtab,
+<a id="L253"></a>    OutOfMemory,
+<a id="L254"></a>}!std.debug.Symbol {
+<a id="L255"></a>    const symtab = ef.symtab orelse return error.NoSymtab;
+<a id="L256"></a>    const strtab = ef.strtab orelse return error.NoStrtab;
+<a id="L257"></a>
+<a id="L258"></a>    if (symtab.bytes.len % symtab.entry_size != 0) return error.BadSymtab;
+<a id="L259"></a>
+<a id="L260"></a>    const swap_endian = ef.endian != @import("builtin").cpu.arch.endian();
+<a id="L261"></a>
+<a id="L262"></a>    switch (ef.is_64) {
+<a id="L263"></a>        inline true, false =&gt; |is_64| {
+<a id="L264"></a>            const Sym = if (is_64) elf.Elf64_Sym else elf.Elf32_Sym;
+<a id="L265"></a>            if (symtab.entry_size != @sizeOf(Sym)) return error.BadSymtab;
+<a id="L266"></a>            const symbols: []align(1) const Sym = @ptrCast(symtab.bytes);
+<a id="L267"></a>            if (ef.symbol_search_table == null) {
+<a id="L268"></a>                ef.symbol_search_table = try buildSymbolSearchTable(gpa, ef.endian, Sym, symbols);
+<a id="L269"></a>            }
+<a id="L270"></a>            const search_table = ef.symbol_search_table.?;
+<a id="L271"></a>            const SearchContext = struct {
+<a id="L272"></a>                swap_endian: bool,
+<a id="L273"></a>                target: u64,
+<a id="L274"></a>                symbols: []align(1) const Sym,
+<a id="L275"></a>                fn predicate(ctx: @This(), sym_index: usize) bool {
+<a id="L276"></a>                    // We need to return `true` for the first N items, then `false` for the rest --
+<a id="L277"></a>                    // the index we'll get out is the first `false` one. So, we'll return `true` iff
+<a id="L278"></a>                    // the target address is after the *end* of this symbol. This synchronizes with
+<a id="L279"></a>                    // the logic in `buildSymbolSearchTable` which sorts by *end* address.
+<a id="L280"></a>                    var sym = ctx.symbols[sym_index];
+<a id="L281"></a>                    if (ctx.swap_endian) std.mem.byteSwapAllFields(Sym, &amp;sym);
+<a id="L282"></a>                    const sym_end = sym.st_value + sym.st_size;
+<a id="L283"></a>                    return ctx.target &gt;= sym_end;
+<a id="L284"></a>                }
+<a id="L285"></a>            };
+<a id="L286"></a>            const sym_index_index = std.sort.partitionPoint(usize, search_table, @as(SearchContext, .{
+<a id="L287"></a>                .swap_endian = swap_endian,
+<a id="L288"></a>                .target = vaddr,
+<a id="L289"></a>                .symbols = symbols,
+<a id="L290"></a>            }), SearchContext.predicate);
+<a id="L291"></a>            if (sym_index_index == search_table.len) return .unknown;
+<a id="L292"></a>            var sym = symbols[search_table[sym_index_index]];
+<a id="L293"></a>            if (swap_endian) std.mem.byteSwapAllFields(Sym, &amp;sym);
+<a id="L294"></a>            if (vaddr &lt; sym.st_value or vaddr &gt;= sym.st_value + sym.st_size) return .unknown;
+<a id="L295"></a>            return .{
+<a id="L296"></a>                .name = std.mem.sliceTo(strtab[sym.st_name..], 0),
+<a id="L297"></a>                .compile_unit_name = null,
+<a id="L298"></a>                .source_location = null,
+<a id="L299"></a>            };
+<a id="L300"></a>        },
+<a id="L301"></a>    }
+<a id="L302"></a>}
+<a id="L303"></a>
+<a id="L304"></a>fn buildSymbolSearchTable(gpa: Allocator, endian: Endian, comptime Sym: type, symbols: []align(1) const Sym) error{
+<a id="L305"></a>    OutOfMemory,
+<a id="L306"></a>    BadSymtab,
+<a id="L307"></a>}![]usize {
+<a id="L308"></a>    var result: std.ArrayList(usize) = .empty;
+<a id="L309"></a>    defer result.deinit(gpa);
+<a id="L310"></a>
+<a id="L311"></a>    const swap_endian = endian != @import("builtin").cpu.arch.endian();
+<a id="L312"></a>
+<a id="L313"></a>    for (symbols, 0..) |sym_orig, sym_index| {
+<a id="L314"></a>        var sym = sym_orig;
+<a id="L315"></a>        if (swap_endian) std.mem.byteSwapAllFields(Sym, &amp;sym);
+<a id="L316"></a>        if (sym.st_name == 0) continue;
+<a id="L317"></a>        if (sym.st_shndx == elf.SHN_UNDEF) continue;
+<a id="L318"></a>        try result.append(gpa, sym_index);
+<a id="L319"></a>    }
+<a id="L320"></a>
+<a id="L321"></a>    const SortContext = struct {
+<a id="L322"></a>        swap_endian: bool,
+<a id="L323"></a>        symbols: []align(1) const Sym,
+<a id="L324"></a>        fn lessThan(ctx: @This(), lhs_sym_index: usize, rhs_sym_index: usize) bool {
+<a id="L325"></a>            // We sort by *end* address, not start address. This matches up with logic in `searchSymtab`.
+<a id="L326"></a>            var lhs_sym = ctx.symbols[lhs_sym_index];
+<a id="L327"></a>            var rhs_sym = ctx.symbols[rhs_sym_index];
+<a id="L328"></a>            if (ctx.swap_endian) {
+<a id="L329"></a>                std.mem.byteSwapAllFields(Sym, &amp;lhs_sym);
+<a id="L330"></a>                std.mem.byteSwapAllFields(Sym, &amp;rhs_sym);
+<a id="L331"></a>            }
+<a id="L332"></a>            const lhs_val = lhs_sym.st_value + lhs_sym.st_size;
+<a id="L333"></a>            const rhs_val = rhs_sym.st_value + rhs_sym.st_size;
+<a id="L334"></a>            return lhs_val &lt; rhs_val;
+<a id="L335"></a>        }
+<a id="L336"></a>    };
+<a id="L337"></a>    std.mem.sort(usize, result.items, @as(SortContext, .{
+<a id="L338"></a>        .swap_endian = swap_endian,
+<a id="L339"></a>        .symbols = symbols,
+<a id="L340"></a>    }), SortContext.lessThan);
+<a id="L341"></a>
+<a id="L342"></a>    return result.toOwnedSlice(gpa);
+<a id="L343"></a>}
+<a id="L344"></a>
+<a id="L345"></a>/// Only used locally, during `load`.
+<a id="L346"></a>const Section = struct {
+<a id="L347"></a>    header: elf.Elf64_Shdr,
+<a id="L348"></a>    bytes: []const u8,
+<a id="L349"></a>    const Id = enum {
+<a id="L350"></a>        // DWARF sections: see `Dwarf.Section.Id`.
+<a id="L351"></a>        debug_info,
+<a id="L352"></a>        debug_abbrev,
+<a id="L353"></a>        debug_str,
+<a id="L354"></a>        debug_str_offsets,
+<a id="L355"></a>        debug_line,
+<a id="L356"></a>        debug_line_str,
+<a id="L357"></a>        debug_ranges,
+<a id="L358"></a>        debug_loclists,
+<a id="L359"></a>        debug_rnglists,
+<a id="L360"></a>        debug_addr,
+<a id="L361"></a>        debug_names,
+<a id="L362"></a>        // Then anything else we're interested in.
+<a id="L363"></a>        gnu_debuglink,
+<a id="L364"></a>        eh_frame,
+<a id="L365"></a>        debug_frame,
+<a id="L366"></a>        symtab,
+<a id="L367"></a>        strtab,
+<a id="L368"></a>    };
+<a id="L369"></a>    const Array = std.enums.EnumArray(Section.Id, ?Section);
+<a id="L370"></a>};
+<a id="L371"></a>
+<a id="L372"></a>fn loadSeparateDebugFile(
+<a id="L373"></a>    arena: Allocator,
+<a id="L374"></a>    io: Io,
+<a id="L375"></a>    main_loaded: *LoadInnerResult,
+<a id="L376"></a>    opt_crc: ?u32,
+<a id="L377"></a>    comptime fmt: []const u8,
+<a id="L378"></a>    args: anytype,
+<a id="L379"></a>) Allocator.Error!?[]align(std.heap.page_size_min) const u8 {
+<a id="L380"></a>    const path = try std.fmt.allocPrint(arena, fmt, args);
+<a id="L381"></a>    const elf_file = Io.Dir.cwd().openFile(io, path, .{}) catch return null;
+<a id="L382"></a>    defer elf_file.close(io);
+<a id="L383"></a>
+<a id="L384"></a>    const result = loadInner(arena, io, elf_file, opt_crc) catch |err| switch (err) {
+<a id="L385"></a>        error.OutOfMemory =&gt; |e| return e,
+<a id="L386"></a>        error.CrcMismatch =&gt; return null,
+<a id="L387"></a>        else =&gt; return null,
+<a id="L388"></a>    };
+<a id="L389"></a>    errdefer comptime unreachable;
+<a id="L390"></a>
+<a id="L391"></a>    const have_debug_sections = inline for (@as([]const []const u8, &amp;.{
+<a id="L392"></a>        "debug_info",
+<a id="L393"></a>        "debug_abbrev",
+<a id="L394"></a>        "debug_str",
+<a id="L395"></a>        "debug_line",
+<a id="L396"></a>    })) |name| {
+<a id="L397"></a>        const s = @field(Section.Id, name);
+<a id="L398"></a>        if (main_loaded.sections.get(s) == null and result.sections.get(s) == null) {
+<a id="L399"></a>            break false;
+<a id="L400"></a>        }
+<a id="L401"></a>    } else true;
+<a id="L402"></a>
+<a id="L403"></a>    if (result.is_64 != main_loaded.is_64 or
+<a id="L404"></a>        result.endian != main_loaded.endian or
+<a id="L405"></a>        !have_debug_sections)
+<a id="L406"></a>    {
+<a id="L407"></a>        std.posix.munmap(result.mapped_mem);
+<a id="L408"></a>        return null;
+<a id="L409"></a>    }
+<a id="L410"></a>
+<a id="L411"></a>    inline for (@typeInfo(Dwarf.Section.Id).@"enum".fields) |f| {
+<a id="L412"></a>        const id = @field(Section.Id, f.name);
+<a id="L413"></a>        if (main_loaded.sections.get(id) == null) {
+<a id="L414"></a>            main_loaded.sections.set(id, result.sections.get(id));
+<a id="L415"></a>        }
+<a id="L416"></a>    }
+<a id="L417"></a>
+<a id="L418"></a>    return result.mapped_mem;
+<a id="L419"></a>}
+<a id="L420"></a>
+<a id="L421"></a>const LoadInnerResult = struct {
+<a id="L422"></a>    is_64: bool,
+<a id="L423"></a>    endian: Endian,
+<a id="L424"></a>    sections: Section.Array,
+<a id="L425"></a>    mapped_mem: []align(std.heap.page_size_min) const u8,
+<a id="L426"></a>};
+<a id="L427"></a>fn loadInner(
+<a id="L428"></a>    arena: Allocator,
+<a id="L429"></a>    io: Io,
+<a id="L430"></a>    elf_file: Io.File,
+<a id="L431"></a>    opt_crc: ?u32,
+<a id="L432"></a>) (LoadError || error{ CrcMismatch, Streaming, Canceled })!LoadInnerResult {
+<a id="L433"></a>    const mapped_mem: []align(std.heap.page_size_min) const u8 = mapped: {
+<a id="L434"></a>        const file_len = std.math.cast(
+<a id="L435"></a>            usize,
+<a id="L436"></a>            elf_file.length(io) catch |err| switch (err) {
+<a id="L437"></a>                error.PermissionDenied =&gt; unreachable, // not asking for PROT_EXEC
+<a id="L438"></a>                else =&gt; |e| return e,
+<a id="L439"></a>            },
+<a id="L440"></a>        ) orelse return error.Overflow;
+<a id="L441"></a>
+<a id="L442"></a>        break :mapped std.posix.mmap(
+<a id="L443"></a>            null,
+<a id="L444"></a>            file_len,
+<a id="L445"></a>            .{ .READ = true },
+<a id="L446"></a>            .{ .TYPE = .SHARED },
+<a id="L447"></a>            elf_file.handle,
+<a id="L448"></a>            0,
+<a id="L449"></a>        ) catch |err| switch (err) {
+<a id="L450"></a>            error.MappingAlreadyExists =&gt; unreachable, // not using FIXED_NOREPLACE
+<a id="L451"></a>            error.PermissionDenied =&gt; unreachable, // not asking for PROT_EXEC
+<a id="L452"></a>            else =&gt; |e| return e,
+<a id="L453"></a>        };
+<a id="L454"></a>    };
+<a id="L455"></a>
+<a id="L456"></a>    if (opt_crc) |crc| {
+<a id="L457"></a>        if (std.hash.crc.Crc32.hash(mapped_mem) != crc) {
+<a id="L458"></a>            return error.CrcMismatch;
+<a id="L459"></a>        }
+<a id="L460"></a>    }
+<a id="L461"></a>    errdefer std.posix.munmap(mapped_mem);
+<a id="L462"></a>
+<a id="L463"></a>    var fr: std.Io.Reader = .fixed(mapped_mem);
+<a id="L464"></a>
+<a id="L465"></a>    const header = elf.Header.read(&amp;fr) catch |err| switch (err) {
+<a id="L466"></a>        error.ReadFailed =&gt; unreachable,
+<a id="L467"></a>        error.EndOfStream =&gt; return error.TruncatedElfFile,
+<a id="L468"></a>
+<a id="L469"></a>        error.InvalidElfMagic,
+<a id="L470"></a>        error.InvalidElfVersion,
+<a id="L471"></a>        error.InvalidElfClass,
+<a id="L472"></a>        error.InvalidElfEndian,
+<a id="L473"></a>        =&gt; |e| return e,
+<a id="L474"></a>    };
+<a id="L475"></a>    const endian = header.endian;
+<a id="L476"></a>
+<a id="L477"></a>    const shstrtab_shdr_off = try std.math.add(
+<a id="L478"></a>        u64,
+<a id="L479"></a>        header.shoff,
+<a id="L480"></a>        try std.math.mul(u64, header.shstrndx, header.shentsize),
+<a id="L481"></a>    );
+<a id="L482"></a>    fr.seek = std.math.cast(usize, shstrtab_shdr_off) orelse return error.Overflow;
+<a id="L483"></a>    const shstrtab: []const u8 = if (header.is_64) shstrtab: {
+<a id="L484"></a>        const shdr = fr.takeStruct(elf.Elf64_Shdr, endian) catch return error.TruncatedElfFile;
+<a id="L485"></a>        if (shdr.sh_offset + shdr.sh_size &gt; mapped_mem.len) return error.TruncatedElfFile;
+<a id="L486"></a>        break :shstrtab mapped_mem[@intCast(shdr.sh_offset)..][0..@intCast(shdr.sh_size)];
+<a id="L487"></a>    } else shstrtab: {
+<a id="L488"></a>        const shdr = fr.takeStruct(elf.Elf32_Shdr, endian) catch return error.TruncatedElfFile;
+<a id="L489"></a>        if (shdr.sh_offset + shdr.sh_size &gt; mapped_mem.len) return error.TruncatedElfFile;
+<a id="L490"></a>        break :shstrtab mapped_mem[@intCast(shdr.sh_offset)..][0..@intCast(shdr.sh_size)];
+<a id="L491"></a>    };
+<a id="L492"></a>
+<a id="L493"></a>    var sections: Section.Array = .initFill(null);
+<a id="L494"></a>
+<a id="L495"></a>    var it = header.iterateSectionHeadersBuffer(mapped_mem);
+<a id="L496"></a>    while (it.next() catch return error.TruncatedElfFile) |shdr| {
+<a id="L497"></a>        if (shdr.sh_type == elf.SHT_NULL or shdr.sh_type == elf.SHT_NOBITS) continue;
+<a id="L498"></a>        if (shdr.sh_name &gt; shstrtab.len) return error.TruncatedElfFile;
+<a id="L499"></a>        const name = std.mem.sliceTo(shstrtab[@intCast(shdr.sh_name)..], 0);
+<a id="L500"></a>
+<a id="L501"></a>        const section_id: Section.Id = inline for (@typeInfo(Section.Id).@"enum".fields) |s| {
+<a id="L502"></a>            if (std.mem.eql(u8, "." ++ s.name, name)) {
+<a id="L503"></a>                break @enumFromInt(s.value);
+<a id="L504"></a>            }
+<a id="L505"></a>        } else continue;
+<a id="L506"></a>
+<a id="L507"></a>        if (sections.get(section_id) != null) continue;
+<a id="L508"></a>
+<a id="L509"></a>        if (shdr.sh_offset + shdr.sh_size &gt; mapped_mem.len) return error.TruncatedElfFile;
+<a id="L510"></a>        const raw_section_bytes = mapped_mem[@intCast(shdr.sh_offset)..][0..@intCast(shdr.sh_size)];
+<a id="L511"></a>        const section_bytes: []const u8 = bytes: {
+<a id="L512"></a>            if ((shdr.sh_flags &amp; elf.SHF_COMPRESSED) == 0) break :bytes raw_section_bytes;
+<a id="L513"></a>
+<a id="L514"></a>            var section_reader: std.Io.Reader = .fixed(raw_section_bytes);
+<a id="L515"></a>            const ch_type: elf.COMPRESS, const ch_size: u64 = if (header.is_64) ch: {
+<a id="L516"></a>                const chdr = section_reader.takeStruct(elf.Elf64_Chdr, endian) catch return error.InvalidCompressedSection;
+<a id="L517"></a>                break :ch .{ chdr.ch_type, chdr.ch_size };
+<a id="L518"></a>            } else ch: {
+<a id="L519"></a>                const chdr = section_reader.takeStruct(elf.Elf32_Chdr, endian) catch return error.InvalidCompressedSection;
+<a id="L520"></a>                break :ch .{ chdr.ch_type, chdr.ch_size };
+<a id="L521"></a>            };
+<a id="L522"></a>            if (ch_type != .ZLIB) {
+<a id="L523"></a>                // The compression algorithm is unsupported, but don't make that a hard error; the
+<a id="L524"></a>                // file might still be valid, and we might still be okay without this section.
+<a id="L525"></a>                continue;
+<a id="L526"></a>            }
+<a id="L527"></a>
+<a id="L528"></a>            const buf = try arena.alloc(u8, std.math.cast(usize, ch_size) orelse return error.Overflow);
+<a id="L529"></a>            var fw: std.Io.Writer = .fixed(buf);
+<a id="L530"></a>            var decompress: std.compress.flate.Decompress = .init(&amp;section_reader, .zlib, &amp;.{});
+<a id="L531"></a>            const n = decompress.reader.streamRemaining(&amp;fw) catch |err| switch (err) {
+<a id="L532"></a>                // If a write failed, then `buf` filled up, so `ch_size` was incorrect
+<a id="L533"></a>                error.WriteFailed =&gt; return error.InvalidCompressedSection,
+<a id="L534"></a>                // If a read failed, flate expected the section to have more data
+<a id="L535"></a>                error.ReadFailed =&gt; return error.InvalidCompressedSection,
+<a id="L536"></a>            };
+<a id="L537"></a>            // It's also an error if the data is shorter than expected.
+<a id="L538"></a>            if (n != buf.len) return error.InvalidCompressedSection;
+<a id="L539"></a>            break :bytes buf;
+<a id="L540"></a>        };
+<a id="L541"></a>        sections.set(section_id, .{ .header = shdr, .bytes = section_bytes });
+<a id="L542"></a>    }
+<a id="L543"></a>
+<a id="L544"></a>    return .{
+<a id="L545"></a>        .is_64 = header.is_64,
+<a id="L546"></a>        .endian = endian,
+<a id="L547"></a>        .sections = sections,
+<a id="L548"></a>        .mapped_mem = mapped_mem,
+<a id="L549"></a>    };
+<a id="L550"></a>}
+</pre>
 </body>
 </html>

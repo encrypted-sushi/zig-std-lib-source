@@ -2,183 +2,186 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Source: zig-0.16.0-std/crypto/codecs/asn1/der/Encoder.zig</title>
+    <title>Source: crypto/codecs/asn1/der/Encoder.zig</title>
     <style>
         body { background: #1e1e1e; color: #d4d4d4; font-family: monospace; padding: 20px; }
         pre { white-space: pre-wrap; word-wrap: break-word; }
         .header { border-bottom: 1px solid #444; padding-bottom: 10px; margin-bottom: 20px; }
         a { color: #569cd6; }
+        a[id] { color: inherit; text-decoration: none; }
+        :target { background: #3a3a00; }
     </style>
 </head>
 <body>
     <div class="header">
-        <a href="/">Index</a> | <strong>File: zig-0.16.0-std/crypto/codecs/asn1/der/Encoder.zig</strong>
+        <a href="/">Index</a> | <strong>File: crypto/codecs/asn1/der/Encoder.zig</strong>
     </div>
-    <pre>//! A buffered DER encoder.
-//!
-//! Prefers calling container's `fn encodeDer(self: @This(), encoder: *der.Encoder)`.
-//! That function should encode values, lengths, then tags.
-buffer: ArrayListReverse,
-/// The field tag set by a parent container.
-/// This is needed because we might visit an implicitly tagged container with a `fn encodeDer`.
-field_tag: ?FieldTag = null,
-
-pub fn init(allocator: std.mem.Allocator) Encoder {
-    return Encoder{ .buffer = ArrayListReverse.init(allocator) };
-}
-
-pub fn deinit(self: *Encoder) void {
-    self.buffer.deinit();
-}
-
-/// Encode any value.
-pub fn any(self: *Encoder, val: anytype) !void {
-    const T = @TypeOf(val);
-    try self.anyTag(Tag.fromZig(T), val);
-}
-
-fn anyTag(self: *Encoder, tag_: Tag, val: anytype) !void {
-    const T = @TypeOf(val);
-    if (std.meta.hasFn(T, "encodeDer")) return try val.encodeDer(self);
-    const start = self.buffer.data.len;
-    const merged_tag = self.mergedTag(tag_);
-
-    switch (@typeInfo(T)) {
-        .@"struct" =&gt; |info| {
-            inline for (0..info.fields.len) |i| {
-                const f = info.fields[info.fields.len - i - 1];
-                const field_val = @field(val, f.name);
-                const field_tag = FieldTag.fromContainer(T, f.name);
-
-                // &gt; The encoding of a set value or sequence value shall not include an encoding for any
-                // &gt; component value which is equal to its default value.
-                const is_default = if (f.is_comptime) false else if (f.default_value_ptr) |v| brk: {
-                    const default_val: *const f.type = @ptrCast(@alignCast(v));
-                    break :brk std.mem.eql(u8, std.mem.asBytes(default_val), std.mem.asBytes(&amp;field_val));
-                } else false;
-
-                if (!is_default) {
-                    const start2 = self.buffer.data.len;
-                    self.field_tag = field_tag;
-                    // will merge with self.field_tag.
-                    // may mutate self.field_tag.
-                    try self.anyTag(Tag.fromZig(f.type), field_val);
-                    if (field_tag) |ft| {
-                        if (ft.explicit) {
-                            try self.length(self.buffer.data.len - start2);
-                            try self.tag(ft.toTag());
-                            self.field_tag = null;
-                        }
-                    }
-                }
-            }
-        },
-        .bool =&gt; try self.buffer.prependSlice(&amp;[_]u8{if (val) 0xff else 0}),
-        .int =&gt; try self.int(T, val),
-        .@"enum" =&gt; |e| {
-            if (@hasDecl(T, "oids")) {
-                return self.any(T.oids.enumToOid(val));
-            } else {
-                try self.int(e.tag_type, @intFromEnum(val));
-            }
-        },
-        .optional =&gt; if (val) |v| return try self.anyTag(tag_, v),
-        .null =&gt; {},
-        else =&gt; @compileError("cannot encode type " ++ @typeName(T)),
-    }
-
-    try self.length(self.buffer.data.len - start);
-    try self.tag(merged_tag);
-}
-
-/// Encode a tag.
-pub fn tag(self: *Encoder, tag_: Tag) !void {
-    const t = self.mergedTag(tag_);
-    try t.encode(self.writer());
-}
-
-fn mergedTag(self: *Encoder, tag_: Tag) Tag {
-    var res = tag_;
-    if (self.field_tag) |ft| {
-        if (!ft.explicit) {
-            res.number = @enumFromInt(ft.number);
-            res.class = ft.class;
-        }
-    }
-    return res;
-}
-
-/// Encode a length.
-pub fn length(self: *Encoder, len: usize) !void {
-    const writer_ = self.writer();
-    if (len &lt; 128) {
-        try writer_.writeInt(u8, @intCast(len), .big);
-        return;
-    }
-    inline for ([_]type{ u8, u16, u32 }) |T| {
-        if (len &lt; std.math.maxInt(T)) {
-            try writer_.writeInt(T, @intCast(len), .big);
-            try writer_.writeInt(u8, @sizeOf(T) | 0x80, .big);
-            return;
-        }
-    }
-    return error.InvalidLength;
-}
-
-/// Encode a tag and length-prefixed bytes.
-pub fn tagBytes(self: *Encoder, tag_: Tag, bytes: []const u8) !void {
-    try self.buffer.prependSlice(bytes);
-    try self.length(bytes.len);
-    try self.tag(tag_);
-}
-
-/// Warning: This writer writes backwards. `fn print` will NOT work as expected.
-pub fn writer(self: *Encoder) ArrayListReverse.Writer {
-    return self.buffer.writer();
-}
-
-fn int(self: *Encoder, comptime T: type, value: T) !void {
-    const big = std.mem.nativeTo(T, value, .big);
-    const big_bytes = std.mem.asBytes(&amp;big);
-
-    const bits_needed = @bitSizeOf(T) - @clz(value);
-    const needs_padding: u1 = if (value == 0)
-        1
-    else if (bits_needed &gt; 8) brk: {
-        const RightShift = std.meta.Int(.unsigned, @bitSizeOf(@TypeOf(bits_needed)) - 1);
-        const right_shift: RightShift = @intCast(bits_needed - 9);
-        break :brk if (value &gt;&gt; right_shift == 0x1ff) 1 else 0;
-    } else 0;
-    const bytes_needed = try std.math.divCeil(usize, bits_needed, 8) + needs_padding;
-
-    const writer_ = self.writer();
-    for (0..bytes_needed - needs_padding) |i| try writer_.writeByte(big_bytes[big_bytes.len - i - 1]);
-    if (needs_padding == 1) try writer_.writeByte(0);
-}
-
-test int {
-    const allocator = std.testing.allocator;
-    var encoder = Encoder.init(allocator);
-    defer encoder.deinit();
-
-    try encoder.int(u8, 0);
-    try std.testing.expectEqualSlices(u8, &amp;[_]u8{0}, encoder.buffer.data);
-
-    encoder.buffer.clearAndFree();
-    try encoder.int(u16, 0x00ff);
-    try std.testing.expectEqualSlices(u8, &amp;[_]u8{0xff}, encoder.buffer.data);
-
-    encoder.buffer.clearAndFree();
-    try encoder.int(u32, 0xffff);
-    try std.testing.expectEqualSlices(u8, &amp;[_]u8{ 0, 0xff, 0xff }, encoder.buffer.data);
-}
-
-const std = @import("std");
-const Oid = @import("../Oid.zig");
-const asn1 = @import("../../asn1.zig");
-const ArrayListReverse = @import("./ArrayListReverse.zig");
-const Tag = asn1.Tag;
-const FieldTag = asn1.FieldTag;
-const Encoder = @This();</pre>
+    <pre><a id="L1"></a>//! A buffered DER encoder.
+<a id="L2"></a>//!
+<a id="L3"></a>//! Prefers calling container's `fn encodeDer(self: @This(), encoder: *der.Encoder)`.
+<a id="L4"></a>//! That function should encode values, lengths, then tags.
+<a id="L5"></a>buffer: ArrayListReverse,
+<a id="L6"></a>/// The field tag set by a parent container.
+<a id="L7"></a>/// This is needed because we might visit an implicitly tagged container with a `fn encodeDer`.
+<a id="L8"></a>field_tag: ?FieldTag = null,
+<a id="L9"></a>
+<a id="L10"></a>pub fn init(allocator: std.mem.Allocator) Encoder {
+<a id="L11"></a>    return Encoder{ .buffer = ArrayListReverse.init(allocator) };
+<a id="L12"></a>}
+<a id="L13"></a>
+<a id="L14"></a>pub fn deinit(self: *Encoder) void {
+<a id="L15"></a>    self.buffer.deinit();
+<a id="L16"></a>}
+<a id="L17"></a>
+<a id="L18"></a>/// Encode any value.
+<a id="L19"></a>pub fn any(self: *Encoder, val: anytype) !void {
+<a id="L20"></a>    const T = @TypeOf(val);
+<a id="L21"></a>    try self.anyTag(Tag.fromZig(T), val);
+<a id="L22"></a>}
+<a id="L23"></a>
+<a id="L24"></a>fn anyTag(self: *Encoder, tag_: Tag, val: anytype) !void {
+<a id="L25"></a>    const T = @TypeOf(val);
+<a id="L26"></a>    if (std.meta.hasFn(T, "encodeDer")) return try val.encodeDer(self);
+<a id="L27"></a>    const start = self.buffer.data.len;
+<a id="L28"></a>    const merged_tag = self.mergedTag(tag_);
+<a id="L29"></a>
+<a id="L30"></a>    switch (@typeInfo(T)) {
+<a id="L31"></a>        .@"struct" =&gt; |info| {
+<a id="L32"></a>            inline for (0..info.fields.len) |i| {
+<a id="L33"></a>                const f = info.fields[info.fields.len - i - 1];
+<a id="L34"></a>                const field_val = @field(val, f.name);
+<a id="L35"></a>                const field_tag = FieldTag.fromContainer(T, f.name);
+<a id="L36"></a>
+<a id="L37"></a>                // &gt; The encoding of a set value or sequence value shall not include an encoding for any
+<a id="L38"></a>                // &gt; component value which is equal to its default value.
+<a id="L39"></a>                const is_default = if (f.is_comptime) false else if (f.default_value_ptr) |v| brk: {
+<a id="L40"></a>                    const default_val: *const f.type = @ptrCast(@alignCast(v));
+<a id="L41"></a>                    break :brk std.mem.eql(u8, std.mem.asBytes(default_val), std.mem.asBytes(&amp;field_val));
+<a id="L42"></a>                } else false;
+<a id="L43"></a>
+<a id="L44"></a>                if (!is_default) {
+<a id="L45"></a>                    const start2 = self.buffer.data.len;
+<a id="L46"></a>                    self.field_tag = field_tag;
+<a id="L47"></a>                    // will merge with self.field_tag.
+<a id="L48"></a>                    // may mutate self.field_tag.
+<a id="L49"></a>                    try self.anyTag(Tag.fromZig(f.type), field_val);
+<a id="L50"></a>                    if (field_tag) |ft| {
+<a id="L51"></a>                        if (ft.explicit) {
+<a id="L52"></a>                            try self.length(self.buffer.data.len - start2);
+<a id="L53"></a>                            try self.tag(ft.toTag());
+<a id="L54"></a>                            self.field_tag = null;
+<a id="L55"></a>                        }
+<a id="L56"></a>                    }
+<a id="L57"></a>                }
+<a id="L58"></a>            }
+<a id="L59"></a>        },
+<a id="L60"></a>        .bool =&gt; try self.buffer.prependSlice(&amp;[_]u8{if (val) 0xff else 0}),
+<a id="L61"></a>        .int =&gt; try self.int(T, val),
+<a id="L62"></a>        .@"enum" =&gt; |e| {
+<a id="L63"></a>            if (@hasDecl(T, "oids")) {
+<a id="L64"></a>                return self.any(T.oids.enumToOid(val));
+<a id="L65"></a>            } else {
+<a id="L66"></a>                try self.int(e.tag_type, @intFromEnum(val));
+<a id="L67"></a>            }
+<a id="L68"></a>        },
+<a id="L69"></a>        .optional =&gt; if (val) |v| return try self.anyTag(tag_, v),
+<a id="L70"></a>        .null =&gt; {},
+<a id="L71"></a>        else =&gt; @compileError("cannot encode type " ++ @typeName(T)),
+<a id="L72"></a>    }
+<a id="L73"></a>
+<a id="L74"></a>    try self.length(self.buffer.data.len - start);
+<a id="L75"></a>    try self.tag(merged_tag);
+<a id="L76"></a>}
+<a id="L77"></a>
+<a id="L78"></a>/// Encode a tag.
+<a id="L79"></a>pub fn tag(self: *Encoder, tag_: Tag) !void {
+<a id="L80"></a>    const t = self.mergedTag(tag_);
+<a id="L81"></a>    try t.encode(self.writer());
+<a id="L82"></a>}
+<a id="L83"></a>
+<a id="L84"></a>fn mergedTag(self: *Encoder, tag_: Tag) Tag {
+<a id="L85"></a>    var res = tag_;
+<a id="L86"></a>    if (self.field_tag) |ft| {
+<a id="L87"></a>        if (!ft.explicit) {
+<a id="L88"></a>            res.number = @enumFromInt(ft.number);
+<a id="L89"></a>            res.class = ft.class;
+<a id="L90"></a>        }
+<a id="L91"></a>    }
+<a id="L92"></a>    return res;
+<a id="L93"></a>}
+<a id="L94"></a>
+<a id="L95"></a>/// Encode a length.
+<a id="L96"></a>pub fn length(self: *Encoder, len: usize) !void {
+<a id="L97"></a>    const writer_ = self.writer();
+<a id="L98"></a>    if (len &lt; 128) {
+<a id="L99"></a>        try writer_.writeInt(u8, @intCast(len), .big);
+<a id="L100"></a>        return;
+<a id="L101"></a>    }
+<a id="L102"></a>    inline for ([_]type{ u8, u16, u32 }) |T| {
+<a id="L103"></a>        if (len &lt; std.math.maxInt(T)) {
+<a id="L104"></a>            try writer_.writeInt(T, @intCast(len), .big);
+<a id="L105"></a>            try writer_.writeInt(u8, @sizeOf(T) | 0x80, .big);
+<a id="L106"></a>            return;
+<a id="L107"></a>        }
+<a id="L108"></a>    }
+<a id="L109"></a>    return error.InvalidLength;
+<a id="L110"></a>}
+<a id="L111"></a>
+<a id="L112"></a>/// Encode a tag and length-prefixed bytes.
+<a id="L113"></a>pub fn tagBytes(self: *Encoder, tag_: Tag, bytes: []const u8) !void {
+<a id="L114"></a>    try self.buffer.prependSlice(bytes);
+<a id="L115"></a>    try self.length(bytes.len);
+<a id="L116"></a>    try self.tag(tag_);
+<a id="L117"></a>}
+<a id="L118"></a>
+<a id="L119"></a>/// Warning: This writer writes backwards. `fn print` will NOT work as expected.
+<a id="L120"></a>pub fn writer(self: *Encoder) ArrayListReverse.Writer {
+<a id="L121"></a>    return self.buffer.writer();
+<a id="L122"></a>}
+<a id="L123"></a>
+<a id="L124"></a>fn int(self: *Encoder, comptime T: type, value: T) !void {
+<a id="L125"></a>    const big = std.mem.nativeTo(T, value, .big);
+<a id="L126"></a>    const big_bytes = std.mem.asBytes(&amp;big);
+<a id="L127"></a>
+<a id="L128"></a>    const bits_needed = @bitSizeOf(T) - @clz(value);
+<a id="L129"></a>    const needs_padding: u1 = if (value == 0)
+<a id="L130"></a>        1
+<a id="L131"></a>    else if (bits_needed &gt; 8) brk: {
+<a id="L132"></a>        const RightShift = std.meta.Int(.unsigned, @bitSizeOf(@TypeOf(bits_needed)) - 1);
+<a id="L133"></a>        const right_shift: RightShift = @intCast(bits_needed - 9);
+<a id="L134"></a>        break :brk if (value &gt;&gt; right_shift == 0x1ff) 1 else 0;
+<a id="L135"></a>    } else 0;
+<a id="L136"></a>    const bytes_needed = try std.math.divCeil(usize, bits_needed, 8) + needs_padding;
+<a id="L137"></a>
+<a id="L138"></a>    const writer_ = self.writer();
+<a id="L139"></a>    for (0..bytes_needed - needs_padding) |i| try writer_.writeByte(big_bytes[big_bytes.len - i - 1]);
+<a id="L140"></a>    if (needs_padding == 1) try writer_.writeByte(0);
+<a id="L141"></a>}
+<a id="L142"></a>
+<a id="L143"></a>test int {
+<a id="L144"></a>    const allocator = std.testing.allocator;
+<a id="L145"></a>    var encoder = Encoder.init(allocator);
+<a id="L146"></a>    defer encoder.deinit();
+<a id="L147"></a>
+<a id="L148"></a>    try encoder.int(u8, 0);
+<a id="L149"></a>    try std.testing.expectEqualSlices(u8, &amp;[_]u8{0}, encoder.buffer.data);
+<a id="L150"></a>
+<a id="L151"></a>    encoder.buffer.clearAndFree();
+<a id="L152"></a>    try encoder.int(u16, 0x00ff);
+<a id="L153"></a>    try std.testing.expectEqualSlices(u8, &amp;[_]u8{0xff}, encoder.buffer.data);
+<a id="L154"></a>
+<a id="L155"></a>    encoder.buffer.clearAndFree();
+<a id="L156"></a>    try encoder.int(u32, 0xffff);
+<a id="L157"></a>    try std.testing.expectEqualSlices(u8, &amp;[_]u8{ 0, 0xff, 0xff }, encoder.buffer.data);
+<a id="L158"></a>}
+<a id="L159"></a>
+<a id="L160"></a>const std = @import("std");
+<a id="L161"></a>const Oid = @import("../Oid.zig");
+<a id="L162"></a>const asn1 = @import("../../asn1.zig");
+<a id="L163"></a>const ArrayListReverse = @import("./ArrayListReverse.zig");
+<a id="L164"></a>const Tag = asn1.Tag;
+<a id="L165"></a>const FieldTag = asn1.FieldTag;
+<a id="L166"></a>const Encoder = @This();
+</pre>
 </body>
 </html>

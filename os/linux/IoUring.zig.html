@@ -2,1945 +2,1948 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Source: zig-0.16.0-std/os/linux/IoUring.zig</title>
+    <title>Source: os/linux/IoUring.zig</title>
     <style>
         body { background: #1e1e1e; color: #d4d4d4; font-family: monospace; padding: 20px; }
         pre { white-space: pre-wrap; word-wrap: break-word; }
         .header { border-bottom: 1px solid #444; padding-bottom: 10px; margin-bottom: 20px; }
         a { color: #569cd6; }
+        a[id] { color: inherit; text-decoration: none; }
+        :target { background: #3a3a00; }
     </style>
 </head>
 <body>
     <div class="header">
-        <a href="/">Index</a> | <strong>File: zig-0.16.0-std/os/linux/IoUring.zig</strong>
+        <a href="/">Index</a> | <strong>File: os/linux/IoUring.zig</strong>
     </div>
-    <pre>const IoUring = @This();
-
-const builtin = @import("builtin");
-const is_linux = builtin.os.tag == .linux;
-
-const std = @import("../../std.zig");
-const Io = std.Io;
-const Allocator = std.mem.Allocator;
-const assert = std.debug.assert;
-const posix = std.posix;
-const linux = std.os.linux;
-const testing = std.testing;
-const page_size_min = std.heap.page_size_min;
-const createSocketTestHarness = @import("IoUring/test.zig").createSocketTestHarness;
-
-fd: linux.fd_t = -1,
-sq: SubmissionQueue,
-cq: CompletionQueue,
-flags: u32,
-features: u32,
-
-/// A friendly way to setup an io_uring, with default linux.io_uring_params.
-/// `entries` must be a power of two between 1 and 32768, although the kernel will make the final
-/// call on how many entries the submission and completion queues will ultimately have,
-/// see https://github.com/torvalds/linux/blob/v5.8/fs/io_uring.c#L8027-L8050.
-/// Matches the interface of io_uring_queue_init() in liburing.
-pub fn init(entries: u16, flags: u32) !IoUring {
-    var params = std.mem.zeroInit(linux.io_uring_params, .{
-        .flags = flags,
-        .sq_thread_idle = 1000,
-    });
-    return try IoUring.init_params(entries, &amp;params);
-}
-
-/// A powerful way to setup an io_uring, if you want to tweak linux.io_uring_params such as submission
-/// queue thread cpu affinity or thread idle timeout (the kernel and our default is 1 second).
-/// `params` is passed by reference because the kernel needs to modify the parameters.
-/// Matches the interface of io_uring_queue_init_params() in liburing.
-pub fn init_params(entries: u16, p: *linux.io_uring_params) !IoUring {
-    if (entries == 0) return error.EntriesZero;
-    if (!std.math.isPowerOfTwo(entries)) return error.EntriesNotPowerOfTwo;
-
-    assert(p.sq_entries == 0);
-    assert(p.cq_entries == 0 or p.flags &amp; linux.IORING_SETUP_CQSIZE != 0);
-    assert(p.features == 0);
-    assert(p.wq_fd == 0 or p.flags &amp; linux.IORING_SETUP_ATTACH_WQ != 0);
-    assert(p.resv[0] == 0);
-    assert(p.resv[1] == 0);
-    assert(p.resv[2] == 0);
-
-    const res = linux.io_uring_setup(entries, p);
-    switch (linux.errno(res)) {
-        .SUCCESS =&gt; {},
-        .FAULT =&gt; return error.ParamsOutsideAccessibleAddressSpace,
-        // The resv array contains non-zero data, p.flags contains an unsupported flag,
-        // entries out of bounds, IORING_SETUP_SQ_AFF was specified without IORING_SETUP_SQPOLL,
-        // or IORING_SETUP_CQSIZE was specified but linux.io_uring_params.cq_entries was invalid:
-        .INVAL =&gt; return error.ArgumentsInvalid,
-        .MFILE =&gt; return error.ProcessFdQuotaExceeded,
-        .NFILE =&gt; return error.SystemFdQuotaExceeded,
-        .NOMEM =&gt; return error.SystemResources,
-        // IORING_SETUP_SQPOLL was specified but effective user ID lacks sufficient privileges,
-        // or a container seccomp policy prohibits io_uring syscalls:
-        .PERM =&gt; return error.PermissionDenied,
-        .NOSYS =&gt; return error.SystemOutdated,
-        else =&gt; |errno| return posix.unexpectedErrno(errno),
-    }
-    const fd = @as(linux.fd_t, @intCast(res));
-    assert(fd &gt;= 0);
-    errdefer _ = linux.close(fd);
-
-    // Kernel versions 5.4 and up use only one mmap() for the submission and completion queues.
-    // This is not an optional feature for us... if the kernel does it, we have to do it.
-    // The thinking on this by the kernel developers was that both the submission and the
-    // completion queue rings have sizes just over a power of two, but the submission queue ring
-    // is significantly smaller with u32 slots. By bundling both in a single mmap, the kernel
-    // gets the submission queue ring for free.
-    // See https://patchwork.kernel.org/patch/11115257 for the kernel patch.
-    // We do not support the double mmap() done before 5.4, because we want to keep the
-    // init/deinit mmap paths simple and because io_uring has had many bug fixes even since 5.4.
-    if ((p.features &amp; linux.IORING_FEAT_SINGLE_MMAP) == 0) {
-        return error.SystemOutdated;
-    }
-
-    // Check that the kernel has actually set params and that "impossible is nothing".
-    assert(p.sq_entries != 0);
-    assert(p.cq_entries != 0);
-    assert(p.cq_entries &gt;= p.sq_entries);
-
-    // From here on, we only need to read from params, so pass `p` by value as immutable.
-    // The completion queue shares the mmap with the submission queue, so pass `sq` there too.
-    var sq = try SubmissionQueue.init(fd, p.*);
-    errdefer sq.deinit();
-    var cq = try CompletionQueue.init(fd, p.*, sq);
-    errdefer cq.deinit();
-
-    // Check that our starting state is as we expect.
-    assert(sq.head.* == 0);
-    assert(sq.tail.* == 0);
-    assert(sq.mask == p.sq_entries - 1);
-    // Allow flags.* to be non-zero, since the kernel may set IORING_SQ_NEED_WAKEUP at any time.
-    assert(sq.dropped.* == 0);
-    assert(sq.array.len == p.sq_entries);
-    assert(sq.sqes.len == p.sq_entries);
-    assert(sq.sqe_head == 0);
-    assert(sq.sqe_tail == 0);
-
-    assert(cq.head.* == 0);
-    assert(cq.tail.* == 0);
-    assert(cq.mask == p.cq_entries - 1);
-    assert(cq.overflow.* == 0);
-    assert(cq.cqes.len == p.cq_entries);
-
-    return IoUring{
-        .fd = fd,
-        .sq = sq,
-        .cq = cq,
-        .flags = p.flags,
-        .features = p.features,
-    };
-}
-
-pub fn deinit(self: *IoUring) void {
-    assert(self.fd &gt;= 0);
-    // The mmaps depend on the fd, so the order of these calls is important:
-    self.cq.deinit();
-    self.sq.deinit();
-    _ = linux.close(self.fd);
-    self.fd = -1;
-}
-
-/// Returns a pointer to a vacant SQE, or an error if the submission queue is full.
-/// We follow the implementation (and atomics) of liburing's `io_uring_get_sqe()` exactly.
-/// However, instead of a null we return an error to force safe handling.
-/// Any situation where the submission queue is full tends more towards a control flow error,
-/// and the null return in liburing is more a C idiom than anything else, for lack of a better
-/// alternative. In Zig, we have first-class error handling... so let's use it.
-/// Matches the implementation of io_uring_get_sqe() in liburing.
-pub fn get_sqe(self: *IoUring) !*linux.io_uring_sqe {
-    const head = @atomicLoad(u32, self.sq.head, .acquire);
-    // Remember that these head and tail offsets wrap around every four billion operations.
-    // We must therefore use wrapping addition and subtraction to avoid a runtime crash.
-    const next = self.sq.sqe_tail +% 1;
-    if (next -% head &gt; self.sq.sqes.len) return error.SubmissionQueueFull;
-    const sqe = &amp;self.sq.sqes[self.sq.sqe_tail &amp; self.sq.mask];
-    self.sq.sqe_tail = next;
-    return sqe;
-}
-
-/// Submits the SQEs acquired via get_sqe() to the kernel. You can call this once after you have
-/// called get_sqe() multiple times to setup multiple I/O requests.
-/// Returns the number of SQEs submitted, if not used alongside IORING_SETUP_SQPOLL.
-/// If the io_uring instance is uses IORING_SETUP_SQPOLL, the value returned on success is not
-/// guaranteed to match the amount of actually submitted sqes during this call. A value higher
-/// or lower, including 0, may be returned.
-/// Matches the implementation of io_uring_submit() in liburing.
-pub fn submit(self: *IoUring) !u32 {
-    return self.submit_and_wait(0);
-}
-
-/// Like submit(), but allows waiting for events as well.
-/// Returns the number of SQEs submitted.
-/// Matches the implementation of io_uring_submit_and_wait() in liburing.
-pub fn submit_and_wait(self: *IoUring, wait_nr: u32) !u32 {
-    const submitted = self.flush_sq();
-    var flags: u32 = 0;
-    if (self.sq_ring_needs_enter(&amp;flags) or wait_nr &gt; 0) {
-        if (wait_nr &gt; 0 or (self.flags &amp; linux.IORING_SETUP_IOPOLL) != 0) {
-            flags |= linux.IORING_ENTER_GETEVENTS;
-        }
-        return try self.enter(submitted, wait_nr, flags);
-    }
-    return submitted;
-}
-
-/// Tell the kernel we have submitted SQEs and/or want to wait for CQEs.
-/// Returns the number of SQEs submitted.
-pub fn enter(self: *IoUring, to_submit: u32, min_complete: u32, flags: u32) !u32 {
-    assert(self.fd &gt;= 0);
-    const res = linux.io_uring_enter(self.fd, to_submit, min_complete, flags, null);
-    switch (linux.errno(res)) {
-        .SUCCESS =&gt; {},
-        // The kernel was unable to allocate memory or ran out of resources for the request.
-        // The application should wait for some completions and try again:
-        .AGAIN =&gt; return error.SystemResources,
-        // The SQE `fd` is invalid, or IOSQE_FIXED_FILE was set but no files were registered:
-        .BADF =&gt; return error.FileDescriptorInvalid,
-        // The file descriptor is valid, but the ring is not in the right state.
-        // See io_uring_register(2) for how to enable the ring.
-        .BADFD =&gt; return error.FileDescriptorInBadState,
-        // The application attempted to overcommit the number of requests it can have pending.
-        // The application should wait for some completions and try again:
-        .BUSY =&gt; return error.CompletionQueueOvercommitted,
-        // The SQE is invalid, or valid but the ring was setup with IORING_SETUP_IOPOLL:
-        .INVAL =&gt; return error.SubmissionQueueEntryInvalid,
-        // The buffer is outside the process' accessible address space, or IORING_OP_READ_FIXED
-        // or IORING_OP_WRITE_FIXED was specified but no buffers were registered, or the range
-        // described by `addr` and `len` is not within the buffer registered at `buf_index`:
-        .FAULT =&gt; return error.BufferInvalid,
-        .NXIO =&gt; return error.RingShuttingDown,
-        // The kernel believes our `self.fd` does not refer to an io_uring instance,
-        // or the opcode is valid but not supported by this kernel (more likely):
-        .OPNOTSUPP =&gt; return error.OpcodeNotSupported,
-        // The thread submitting the work is invalid. This may occur if IORING_ENTER_GETEVENTS
-        // and IORING_SETUP_DEFER_TASKRUN is set, but the submitting thread is not the thread
-        // that initially created or enabled the io_uring associated with fd.
-        .EXIST =&gt; return error.InvalidThread,
-        // The operation was interrupted by a delivery of a signal before it could complete.
-        // This can happen while waiting for events with IORING_ENTER_GETEVENTS:
-        .INTR =&gt; return error.SignalInterrupt,
-        else =&gt; |errno| return posix.unexpectedErrno(errno),
-    }
-    return @as(u32, @intCast(res));
-}
-
-/// Sync internal state with kernel ring state on the SQ side.
-/// Returns the number of all pending events in the SQ ring, for the shared ring.
-/// This return value includes previously flushed SQEs, as per liburing.
-/// The rationale is to suggest that an io_uring_enter() call is needed rather than not.
-/// Matches the implementation of __io_uring_flush_sq() in liburing.
-pub fn flush_sq(self: *IoUring) u32 {
-    if (self.sq.sqe_head != self.sq.sqe_tail) {
-        // Fill in SQEs that we have queued up, adding them to the kernel ring.
-        const to_submit = self.sq.sqe_tail -% self.sq.sqe_head;
-        var tail = self.sq.tail.*;
-        var i: usize = 0;
-        while (i &lt; to_submit) : (i += 1) {
-            self.sq.array[tail &amp; self.sq.mask] = self.sq.sqe_head &amp; self.sq.mask;
-            tail +%= 1;
-            self.sq.sqe_head +%= 1;
-        }
-        // Ensure that the kernel can actually see the SQE updates when it sees the tail update.
-        @atomicStore(u32, self.sq.tail, tail, .release);
-    }
-    return self.sq_ready();
-}
-
-/// Returns true if we are not using an SQ thread (thus nobody submits but us),
-/// or if IORING_SQ_NEED_WAKEUP is set and the SQ thread must be explicitly awakened.
-/// For the latter case, we set the SQ thread wakeup flag.
-/// Matches the implementation of sq_ring_needs_enter() in liburing.
-pub fn sq_ring_needs_enter(self: *IoUring, flags: *u32) bool {
-    assert(flags.* == 0);
-    if ((self.flags &amp; linux.IORING_SETUP_SQPOLL) == 0) return true;
-    if ((@atomicLoad(u32, self.sq.flags, .unordered) &amp; linux.IORING_SQ_NEED_WAKEUP) != 0) {
-        flags.* |= linux.IORING_ENTER_SQ_WAKEUP;
-        return true;
-    }
-    return false;
-}
-
-/// Returns the number of flushed and unflushed SQEs pending in the submission queue.
-/// In other words, this is the number of SQEs in the submission queue, i.e. its length.
-/// These are SQEs that the kernel is yet to consume.
-/// Matches the implementation of io_uring_sq_ready in liburing.
-pub fn sq_ready(self: *IoUring) u32 {
-    // Always use the shared ring state (i.e. head and not sqe_head) to avoid going out of sync,
-    // see https://github.com/axboe/liburing/issues/92.
-    return self.sq.sqe_tail -% @atomicLoad(u32, self.sq.head, .acquire);
-}
-
-/// Returns the number of CQEs in the completion queue, i.e. its length.
-/// These are CQEs that the application is yet to consume.
-/// Matches the implementation of io_uring_cq_ready in liburing.
-pub fn cq_ready(self: *IoUring) u32 {
-    return @atomicLoad(u32, self.cq.tail, .acquire) -% self.cq.head.*;
-}
-
-/// Copies as many CQEs as are ready, and that can fit into the destination `cqes` slice.
-/// If none are available, enters into the kernel to wait for at most `wait_nr` CQEs.
-/// Returns the number of CQEs copied, advancing the CQ ring.
-/// Provides all the wait/peek methods found in liburing, but with batching and a single method.
-/// The rationale for copying CQEs rather than copying pointers is that pointers are 8 bytes
-/// whereas CQEs are not much more at only 16 bytes, and this provides a safer faster interface.
-/// Safer, because you no longer need to call cqe_seen(), avoiding idempotency bugs.
-/// Faster, because we can now amortize the atomic store release to `cq.head` across the batch.
-/// See https://github.com/axboe/liburing/issues/103#issuecomment-686665007.
-/// Matches the implementation of io_uring_peek_batch_cqe() in liburing, but supports waiting.
-pub fn copy_cqes(self: *IoUring, cqes: []linux.io_uring_cqe, wait_nr: u32) !u32 {
-    const count = self.copy_cqes_ready(cqes);
-    if (count &gt; 0) return count;
-    if (self.cq_ring_needs_flush() or wait_nr &gt; 0) {
-        _ = try self.enter(0, wait_nr, linux.IORING_ENTER_GETEVENTS);
-        return self.copy_cqes_ready(cqes);
-    }
-    return 0;
-}
-
-fn copy_cqes_ready(self: *IoUring, cqes: []linux.io_uring_cqe) u32 {
-    const ready = self.cq_ready();
-    const count = @min(cqes.len, ready);
-    const head = self.cq.head.* &amp; self.cq.mask;
-
-    // before wrapping
-    const n = @min(self.cq.cqes.len - head, count);
-    @memcpy(cqes[0..n], self.cq.cqes[head..][0..n]);
-
-    if (count &gt; n) {
-        // wrap self.cq.cqes
-        const w = count - n;
-        @memcpy(cqes[n..][0..w], self.cq.cqes[0..w]);
-    }
-
-    self.cq_advance(count);
-    return count;
-}
-
-/// Returns a copy of an I/O completion, waiting for it if necessary, and advancing the CQ ring.
-/// A convenience method for `copy_cqes()` for when you don't need to batch or peek.
-pub fn copy_cqe(ring: *IoUring) !linux.io_uring_cqe {
-    var cqes: [1]linux.io_uring_cqe = undefined;
-    while (true) {
-        const count = try ring.copy_cqes(&amp;cqes, 1);
-        if (count &gt; 0) return cqes[0];
-    }
-}
-
-/// Matches the implementation of cq_ring_needs_flush() in liburing.
-pub fn cq_ring_needs_flush(self: *IoUring) bool {
-    return (@atomicLoad(u32, self.sq.flags, .unordered) &amp; linux.IORING_SQ_CQ_OVERFLOW) != 0;
-}
-
-/// For advanced use cases only that implement custom completion queue methods.
-/// If you use copy_cqes() or copy_cqe() you must not call cqe_seen() or cq_advance().
-/// Must be called exactly once after a zero-copy CQE has been processed by your application.
-/// Not idempotent, calling more than once will result in other CQEs being lost.
-/// Matches the implementation of cqe_seen() in liburing.
-pub fn cqe_seen(self: *IoUring, cqe: *linux.io_uring_cqe) void {
-    _ = cqe;
-    self.cq_advance(1);
-}
-
-/// For advanced use cases only that implement custom completion queue methods.
-/// Matches the implementation of cq_advance() in liburing.
-pub fn cq_advance(self: *IoUring, count: u32) void {
-    if (count &gt; 0) {
-        // Ensure the kernel only sees the new head value after the CQEs have been read.
-        @atomicStore(u32, self.cq.head, self.cq.head.* +% count, .release);
-    }
-}
-
-/// Queues (but does not submit) an SQE to perform an `fsync(2)`.
-/// Returns a pointer to the SQE so that you can further modify the SQE for advanced use cases.
-/// For example, for `fdatasync()` you can set `IORING_FSYNC_DATASYNC` in the SQE's `rw_flags`.
-/// N.B. While SQEs are initiated in the order in which they appear in the submission queue,
-/// operations execute in parallel and completions are unordered. Therefore, an application that
-/// submits a write followed by an fsync in the submission queue cannot expect the fsync to
-/// apply to the write, since the fsync may complete before the write is issued to the disk.
-/// You should preferably use `link_with_next_sqe()` on a write's SQE to link it with an fsync,
-/// or else insert a full write barrier using `drain_previous_sqes()` when queueing an fsync.
-pub fn fsync(self: *IoUring, user_data: u64, fd: linux.fd_t, flags: u32) !*linux.io_uring_sqe {
-    const sqe = try self.get_sqe();
-    sqe.prep_fsync(fd, flags);
-    sqe.user_data = user_data;
-    return sqe;
-}
-
-/// Queues (but does not submit) an SQE to perform a no-op.
-/// Returns a pointer to the SQE so that you can further modify the SQE for advanced use cases.
-/// A no-op is more useful than may appear at first glance.
-/// For example, you could call `drain_previous_sqes()` on the returned SQE, to use the no-op to
-/// know when the ring is idle before acting on a kill signal.
-pub fn nop(self: *IoUring, user_data: u64) !*linux.io_uring_sqe {
-    const sqe = try self.get_sqe();
-    sqe.prep_nop();
-    sqe.user_data = user_data;
-    return sqe;
-}
-
-/// Used to select how the read should be handled.
-pub const ReadBuffer = union(enum) {
-    /// io_uring will read directly into this buffer
-    buffer: []u8,
-
-    /// io_uring will read directly into these buffers using readv.
-    iovecs: []const posix.iovec,
-
-    /// io_uring will select a buffer that has previously been provided with `provide_buffers`.
-    /// The buffer group reference by `group_id` must contain at least one buffer for the read to work.
-    /// `len` controls the number of bytes to read into the selected buffer.
-    buffer_selection: struct {
-        group_id: u16,
-        len: usize,
-    },
-};
-
-/// Queues (but does not submit) an SQE to perform a `read(2)` or `preadv(2)` depending on the buffer type.
-/// * Reading into a `ReadBuffer.buffer` uses `read(2)`
-/// * Reading into a `ReadBuffer.iovecs` uses `preadv(2)`
-///   If you want to do a `preadv2(2)` then set `rw_flags` on the returned SQE. See https://man7.org/linux/man-pages/man2/preadv2.2.html
-///
-/// Returns a pointer to the SQE.
-pub fn read(
-    self: *IoUring,
-    user_data: u64,
-    fd: linux.fd_t,
-    buffer: ReadBuffer,
-    offset: u64,
-) !*linux.io_uring_sqe {
-    const sqe = try self.get_sqe();
-    switch (buffer) {
-        .buffer =&gt; |slice| sqe.prep_read(fd, slice, offset),
-        .iovecs =&gt; |vecs| sqe.prep_readv(fd, vecs, offset),
-        .buffer_selection =&gt; |selection| {
-            sqe.prep_rw(.READ, fd, 0, selection.len, offset);
-            sqe.flags |= linux.IOSQE_BUFFER_SELECT;
-            sqe.buf_index = selection.group_id;
-        },
-    }
-    sqe.user_data = user_data;
-    return sqe;
-}
-
-/// Queues (but does not submit) an SQE to perform a `write(2)`.
-/// Returns a pointer to the SQE.
-pub fn write(
-    self: *IoUring,
-    user_data: u64,
-    fd: linux.fd_t,
-    buffer: []const u8,
-    offset: u64,
-) !*linux.io_uring_sqe {
-    const sqe = try self.get_sqe();
-    sqe.prep_write(fd, buffer, offset);
-    sqe.user_data = user_data;
-    return sqe;
-}
-
-/// Queues (but does not submit) an SQE to perform a `splice(2)`
-/// Either `fd_in` or `fd_out` must be a pipe.
-/// If `fd_in` refers to a pipe, `off_in` is ignored and must be set to std.math.maxInt(u64).
-/// If `fd_in` does not refer to a pipe and `off_in` is maxInt(u64), then `len` are read
-/// from `fd_in` starting from the file offset, which is incremented by the number of bytes read.
-/// If `fd_in` does not refer to a pipe and `off_in` is not maxInt(u64), then the starting offset of `fd_in` will be `off_in`.
-/// This splice operation can be used to implement sendfile by splicing to an intermediate pipe first,
-/// then splice to the final destination. In fact, the implementation of sendfile in kernel uses splice internally.
-///
-/// NOTE that even if fd_in or fd_out refers to a pipe, the splice operation can still fail with EINVAL if one of the
-/// fd doesn't explicitly support splice peration, e.g. reading from terminal is unsupported from kernel 5.7 to 5.11.
-/// See https://github.com/axboe/liburing/issues/291
-///
-/// Returns a pointer to the SQE so that you can further modify the SQE for advanced use cases.
-pub fn splice(self: *IoUring, user_data: u64, fd_in: linux.fd_t, off_in: u64, fd_out: linux.fd_t, off_out: u64, len: usize) !*linux.io_uring_sqe {
-    const sqe = try self.get_sqe();
-    sqe.prep_splice(fd_in, off_in, fd_out, off_out, len);
-    sqe.user_data = user_data;
-    return sqe;
-}
-
-/// Queues (but does not submit) an SQE to perform a IORING_OP_READ_FIXED.
-/// The `buffer` provided must be registered with the kernel by calling `register_buffers` first.
-/// The `buffer_index` must be the same as its index in the array provided to `register_buffers`.
-///
-/// Returns a pointer to the SQE so that you can further modify the SQE for advanced use cases.
-pub fn read_fixed(
-    self: *IoUring,
-    user_data: u64,
-    fd: linux.fd_t,
-    buffer: *posix.iovec,
-    offset: u64,
-    buffer_index: u16,
-) !*linux.io_uring_sqe {
-    const sqe = try self.get_sqe();
-    sqe.prep_read_fixed(fd, buffer, offset, buffer_index);
-    sqe.user_data = user_data;
-    return sqe;
-}
-
-/// Queues (but does not submit) an SQE to perform a `pwritev()`.
-/// Returns a pointer to the SQE so that you can further modify the SQE for advanced use cases.
-/// For example, if you want to do a `pwritev2()` then set `rw_flags` on the returned SQE.
-/// See https://linux.die.net/man/2/pwritev.
-pub fn writev(
-    self: *IoUring,
-    user_data: u64,
-    fd: linux.fd_t,
-    iovecs: []const posix.iovec_const,
-    offset: u64,
-) !*linux.io_uring_sqe {
-    const sqe = try self.get_sqe();
-    sqe.prep_writev(fd, iovecs, offset);
-    sqe.user_data = user_data;
-    return sqe;
-}
-
-/// Queues (but does not submit) an SQE to perform a IORING_OP_WRITE_FIXED.
-/// The `buffer` provided must be registered with the kernel by calling `register_buffers` first.
-/// The `buffer_index` must be the same as its index in the array provided to `register_buffers`.
-///
-/// Returns a pointer to the SQE so that you can further modify the SQE for advanced use cases.
-pub fn write_fixed(
-    self: *IoUring,
-    user_data: u64,
-    fd: linux.fd_t,
-    buffer: *posix.iovec,
-    offset: u64,
-    buffer_index: u16,
-) !*linux.io_uring_sqe {
-    const sqe = try self.get_sqe();
-    sqe.prep_write_fixed(fd, buffer, offset, buffer_index);
-    sqe.user_data = user_data;
-    return sqe;
-}
-
-/// Queues (but does not submit) an SQE to perform an `accept4(2)` on a socket.
-/// Returns a pointer to the SQE.
-/// Available since 5.5
-pub fn accept(
-    self: *IoUring,
-    user_data: u64,
-    fd: linux.fd_t,
-    addr: ?*posix.sockaddr,
-    addrlen: ?*posix.socklen_t,
-    flags: u32,
-) !*linux.io_uring_sqe {
-    const sqe = try self.get_sqe();
-    sqe.prep_accept(fd, addr, addrlen, flags);
-    sqe.user_data = user_data;
-    return sqe;
-}
-
-/// Queues an multishot accept on a socket.
-///
-/// Multishot variant allows an application to issue a single accept request,
-/// which will repeatedly trigger a CQE when a connection request comes in.
-/// While IORING_CQE_F_MORE flag is set in CQE flags accept will generate
-/// further CQEs.
-///
-/// Available since 5.19
-pub fn accept_multishot(
-    self: *IoUring,
-    user_data: u64,
-    fd: linux.fd_t,
-    addr: ?*posix.sockaddr,
-    addrlen: ?*posix.socklen_t,
-    flags: u32,
-) !*linux.io_uring_sqe {
-    const sqe = try self.get_sqe();
-    sqe.prep_multishot_accept(fd, addr, addrlen, flags);
-    sqe.user_data = user_data;
-    return sqe;
-}
-
-/// Queues an accept using direct (registered) file descriptors.
-///
-/// To use an accept direct variant, the application must first have registered
-/// a file table (with register_files). An unused table index will be
-/// dynamically chosen and returned in the CQE res field.
-///
-/// After creation, they can be used by setting IOSQE_FIXED_FILE in the SQE
-/// flags member, and setting the SQE fd field to the direct descriptor value
-/// rather than the regular file descriptor.
-///
-/// Available since 5.19
-pub fn accept_direct(
-    self: *IoUring,
-    user_data: u64,
-    fd: linux.fd_t,
-    addr: ?*posix.sockaddr,
-    addrlen: ?*posix.socklen_t,
-    flags: u32,
-) !*linux.io_uring_sqe {
-    const sqe = try self.get_sqe();
-    sqe.prep_accept_direct(fd, addr, addrlen, flags, linux.IORING_FILE_INDEX_ALLOC);
-    sqe.user_data = user_data;
-    return sqe;
-}
-
-/// Queues an multishot accept using direct (registered) file descriptors.
-/// Available since 5.19
-pub fn accept_multishot_direct(
-    self: *IoUring,
-    user_data: u64,
-    fd: linux.fd_t,
-    addr: ?*posix.sockaddr,
-    addrlen: ?*posix.socklen_t,
-    flags: u32,
-) !*linux.io_uring_sqe {
-    const sqe = try self.get_sqe();
-    sqe.prep_multishot_accept_direct(fd, addr, addrlen, flags);
-    sqe.user_data = user_data;
-    return sqe;
-}
-
-/// Queue (but does not submit) an SQE to perform a `connect(2)` on a socket.
-/// Returns a pointer to the SQE.
-pub fn connect(
-    self: *IoUring,
-    user_data: u64,
-    fd: linux.fd_t,
-    addr: *const posix.sockaddr,
-    addrlen: posix.socklen_t,
-) !*linux.io_uring_sqe {
-    const sqe = try self.get_sqe();
-    sqe.prep_connect(fd, addr, addrlen);
-    sqe.user_data = user_data;
-    return sqe;
-}
-
-/// Queues (but does not submit) an SQE to perform a `epoll_ctl(2)`.
-/// Returns a pointer to the SQE.
-pub fn epoll_ctl(
-    self: *IoUring,
-    user_data: u64,
-    epfd: linux.fd_t,
-    fd: linux.fd_t,
-    op: u32,
-    ev: ?*linux.epoll_event,
-) !*linux.io_uring_sqe {
-    const sqe = try self.get_sqe();
-    sqe.prep_epoll_ctl(epfd, fd, op, ev);
-    sqe.user_data = user_data;
-    return sqe;
-}
-
-/// Used to select how the recv call should be handled.
-pub const RecvBuffer = union(enum) {
-    /// io_uring will recv directly into this buffer
-    buffer: []u8,
-
-    /// io_uring will select a buffer that has previously been provided with `provide_buffers`.
-    /// The buffer group referenced by `group_id` must contain at least one buffer for the recv call to work.
-    /// `len` controls the number of bytes to read into the selected buffer.
-    buffer_selection: struct {
-        group_id: u16,
-        len: usize,
-    },
-};
-
-/// Queues (but does not submit) an SQE to perform a `recv(2)`.
-/// Returns a pointer to the SQE.
-/// Available since 5.6
-pub fn recv(
-    self: *IoUring,
-    user_data: u64,
-    fd: linux.fd_t,
-    buffer: RecvBuffer,
-    flags: u32,
-) !*linux.io_uring_sqe {
-    const sqe = try self.get_sqe();
-    switch (buffer) {
-        .buffer =&gt; |slice| sqe.prep_recv(fd, slice, flags),
-        .buffer_selection =&gt; |selection| {
-            sqe.prep_rw(.RECV, fd, 0, selection.len, 0);
-            sqe.rw_flags = flags;
-            sqe.flags |= linux.IOSQE_BUFFER_SELECT;
-            sqe.buf_index = selection.group_id;
-        },
-    }
-    sqe.user_data = user_data;
-    return sqe;
-}
-
-/// Queues (but does not submit) an SQE to perform a `send(2)`.
-/// Returns a pointer to the SQE.
-/// Available since 5.6
-pub fn send(
-    self: *IoUring,
-    user_data: u64,
-    fd: linux.fd_t,
-    buffer: []const u8,
-    flags: u32,
-) !*linux.io_uring_sqe {
-    const sqe = try self.get_sqe();
-    sqe.prep_send(fd, buffer, flags);
-    sqe.user_data = user_data;
-    return sqe;
-}
-
-/// Queues (but does not submit) an SQE to perform an async zerocopy `send(2)`.
-///
-/// This operation will most likely produce two CQEs. The flags field of the
-/// first cqe may likely contain IORING_CQE_F_MORE, which means that there will
-/// be a second cqe with the user_data field set to the same value. The user
-/// must not modify the data buffer until the notification is posted. The first
-/// cqe follows the usual rules and so its res field will contain the number of
-/// bytes sent or a negative error code. The notification's res field will be
-/// set to zero and the flags field will contain IORING_CQE_F_NOTIF. The two
-/// step model is needed because the kernel may hold on to buffers for a long
-/// time, e.g. waiting for a TCP ACK. Notifications responsible for controlling
-/// the lifetime of the buffers. Even errored requests may generate a
-/// notification.
-///
-/// Available since 6.0
-pub fn send_zc(
-    self: *IoUring,
-    user_data: u64,
-    fd: linux.fd_t,
-    buffer: []const u8,
-    send_flags: u32,
-    zc_flags: u16,
-) !*linux.io_uring_sqe {
-    const sqe = try self.get_sqe();
-    sqe.prep_send_zc(fd, buffer, send_flags, zc_flags);
-    sqe.user_data = user_data;
-    return sqe;
-}
-
-/// Queues (but does not submit) an SQE to perform an async zerocopy `send(2)`.
-/// Returns a pointer to the SQE.
-/// Available since 6.0
-pub fn send_zc_fixed(
-    self: *IoUring,
-    user_data: u64,
-    fd: linux.fd_t,
-    buffer: []const u8,
-    send_flags: u32,
-    zc_flags: u16,
-    buf_index: u16,
-) !*linux.io_uring_sqe {
-    const sqe = try self.get_sqe();
-    sqe.prep_send_zc_fixed(fd, buffer, send_flags, zc_flags, buf_index);
-    sqe.user_data = user_data;
-    return sqe;
-}
-
-/// Queues (but does not submit) an SQE to perform a `recvmsg(2)`.
-/// Returns a pointer to the SQE.
-/// Available since 5.3
-pub fn recvmsg(
-    self: *IoUring,
-    user_data: u64,
-    fd: linux.fd_t,
-    msg: *linux.msghdr,
-    flags: u32,
-) !*linux.io_uring_sqe {
-    const sqe = try self.get_sqe();
-    sqe.prep_recvmsg(fd, msg, flags);
-    sqe.user_data = user_data;
-    return sqe;
-}
-
-/// Queues (but does not submit) an SQE to perform a `sendmsg(2)`.
-/// Returns a pointer to the SQE.
-/// Available since 5.3
-pub fn sendmsg(
-    self: *IoUring,
-    user_data: u64,
-    fd: linux.fd_t,
-    msg: *const linux.msghdr_const,
-    flags: u32,
-) !*linux.io_uring_sqe {
-    const sqe = try self.get_sqe();
-    sqe.prep_sendmsg(fd, msg, flags);
-    sqe.user_data = user_data;
-    return sqe;
-}
-
-/// Queues (but does not submit) an SQE to perform an async zerocopy `sendmsg(2)`.
-/// Returns a pointer to the SQE.
-/// Available since 6.1
-pub fn sendmsg_zc(
-    self: *IoUring,
-    user_data: u64,
-    fd: linux.fd_t,
-    msg: *const linux.msghdr_const,
-    flags: u32,
-) !*linux.io_uring_sqe {
-    const sqe = try self.get_sqe();
-    sqe.prep_sendmsg_zc(fd, msg, flags);
-    sqe.user_data = user_data;
-    return sqe;
-}
-
-/// Queues (but does not submit) an SQE to perform an `openat(2)`.
-/// Returns a pointer to the SQE.
-/// Available since 5.6.
-pub fn openat(
-    self: *IoUring,
-    user_data: u64,
-    fd: linux.fd_t,
-    path: [*:0]const u8,
-    flags: linux.O,
-    mode: posix.mode_t,
-) !*linux.io_uring_sqe {
-    const sqe = try self.get_sqe();
-    sqe.prep_openat(fd, path, flags, mode);
-    sqe.user_data = user_data;
-    return sqe;
-}
-
-/// Queues an openat using direct (registered) file descriptors.
-///
-/// To use an accept direct variant, the application must first have registered
-/// a file table (with register_files). An unused table index will be
-/// dynamically chosen and returned in the CQE res field.
-///
-/// After creation, they can be used by setting IOSQE_FIXED_FILE in the SQE
-/// flags member, and setting the SQE fd field to the direct descriptor value
-/// rather than the regular file descriptor.
-///
-/// Available since 5.15
-pub fn openat_direct(
-    self: *IoUring,
-    user_data: u64,
-    fd: linux.fd_t,
-    path: [*:0]const u8,
-    flags: linux.O,
-    mode: posix.mode_t,
-    file_index: u32,
-) !*linux.io_uring_sqe {
-    const sqe = try self.get_sqe();
-    sqe.prep_openat_direct(fd, path, flags, mode, file_index);
-    sqe.user_data = user_data;
-    return sqe;
-}
-
-/// Queues (but does not submit) an SQE to perform a `close(2)`.
-/// Returns a pointer to the SQE.
-/// Available since 5.6.
-pub fn close(self: *IoUring, user_data: u64, fd: linux.fd_t) !*linux.io_uring_sqe {
-    const sqe = try self.get_sqe();
-    sqe.prep_close(fd);
-    sqe.user_data = user_data;
-    return sqe;
-}
-
-/// Queues close of registered file descriptor.
-/// Available since 5.15
-pub fn close_direct(self: *IoUring, user_data: u64, file_index: u32) !*linux.io_uring_sqe {
-    const sqe = try self.get_sqe();
-    sqe.prep_close_direct(file_index);
-    sqe.user_data = user_data;
-    return sqe;
-}
-
-/// Queues (but does not submit) an SQE to register a timeout operation.
-/// Returns a pointer to the SQE.
-///
-/// The timeout will complete when either the timeout expires, or after the specified number of
-/// events complete (if `count` is greater than `0`).
-///
-/// `flags` may be `0` for a relative timeout, or `IORING_TIMEOUT_ABS` for an absolute timeout.
-///
-/// The completion event result will be `-ETIME` if the timeout completed through expiration,
-/// `0` if the timeout completed after the specified number of events, or `-ECANCELED` if the
-/// timeout was removed before it expired.
-///
-/// io_uring timeouts use the `CLOCK.MONOTONIC` clock source.
-pub fn timeout(
-    self: *IoUring,
-    user_data: u64,
-    ts: *const linux.kernel_timespec,
-    count: u32,
-    flags: u32,
-) !*linux.io_uring_sqe {
-    const sqe = try self.get_sqe();
-    sqe.prep_timeout(ts, count, flags);
-    sqe.user_data = user_data;
-    return sqe;
-}
-
-/// Queues (but does not submit) an SQE to remove an existing timeout operation.
-/// Returns a pointer to the SQE.
-///
-/// The timeout is identified by its `user_data`.
-///
-/// The completion event result will be `0` if the timeout was found and canceled successfully,
-/// `-EBUSY` if the timeout was found but expiration was already in progress, or
-/// `-ENOENT` if the timeout was not found.
-pub fn timeout_remove(
-    self: *IoUring,
-    user_data: u64,
-    timeout_user_data: u64,
-    flags: u32,
-) !*linux.io_uring_sqe {
-    const sqe = try self.get_sqe();
-    sqe.prep_timeout_remove(timeout_user_data, flags);
-    sqe.user_data = user_data;
-    return sqe;
-}
-
-/// Queues (but does not submit) an SQE to add a link timeout operation.
-/// Returns a pointer to the SQE.
-///
-/// You need to set linux.IOSQE_IO_LINK to flags of the target operation
-/// and then call this method right after the target operation.
-/// See https://lwn.net/Articles/803932/ for detail.
-///
-/// If the dependent request finishes before the linked timeout, the timeout
-/// is canceled. If the timeout finishes before the dependent request, the
-/// dependent request will be canceled.
-///
-/// The completion event result of the link_timeout will be
-/// `-ETIME` if the timeout finishes before the dependent request
-/// (in this case, the completion event result of the dependent request will
-/// be `-ECANCELED`), or
-/// `-EALREADY` if the dependent request finishes before the linked timeout.
-pub fn link_timeout(
-    self: *IoUring,
-    user_data: u64,
-    ts: *const linux.kernel_timespec,
-    flags: u32,
-) !*linux.io_uring_sqe {
-    const sqe = try self.get_sqe();
-    sqe.prep_link_timeout(ts, flags);
-    sqe.user_data = user_data;
-    return sqe;
-}
-
-/// Queues (but does not submit) an SQE to perform a `poll(2)`.
-/// Returns a pointer to the SQE.
-pub fn poll_add(
-    self: *IoUring,
-    user_data: u64,
-    fd: linux.fd_t,
-    poll_mask: u32,
-) !*linux.io_uring_sqe {
-    const sqe = try self.get_sqe();
-    sqe.prep_poll_add(fd, poll_mask);
-    sqe.user_data = user_data;
-    return sqe;
-}
-
-/// Queues (but does not submit) an SQE to remove an existing poll operation.
-/// Returns a pointer to the SQE.
-pub fn poll_remove(
-    self: *IoUring,
-    user_data: u64,
-    target_user_data: u64,
-) !*linux.io_uring_sqe {
-    const sqe = try self.get_sqe();
-    sqe.prep_poll_remove(target_user_data);
-    sqe.user_data = user_data;
-    return sqe;
-}
-
-/// Queues (but does not submit) an SQE to update the user data of an existing poll
-/// operation. Returns a pointer to the SQE.
-pub fn poll_update(
-    self: *IoUring,
-    user_data: u64,
-    old_user_data: u64,
-    new_user_data: u64,
-    poll_mask: u32,
-    flags: u32,
-) !*linux.io_uring_sqe {
-    const sqe = try self.get_sqe();
-    sqe.prep_poll_update(old_user_data, new_user_data, poll_mask, flags);
-    sqe.user_data = user_data;
-    return sqe;
-}
-
-/// Queues (but does not submit) an SQE to perform an `fallocate(2)`.
-/// Returns a pointer to the SQE.
-pub fn fallocate(
-    self: *IoUring,
-    user_data: u64,
-    fd: linux.fd_t,
-    mode: i32,
-    offset: u64,
-    len: u64,
-) !*linux.io_uring_sqe {
-    const sqe = try self.get_sqe();
-    sqe.prep_fallocate(fd, mode, offset, len);
-    sqe.user_data = user_data;
-    return sqe;
-}
-
-/// Queues (but does not submit) an SQE to perform an `statx(2)`.
-/// Returns a pointer to the SQE.
-pub fn statx(
-    self: *IoUring,
-    user_data: u64,
-    fd: linux.fd_t,
-    path: [:0]const u8,
-    flags: u32,
-    mask: linux.STATX,
-    buf: *linux.Statx,
-) !*linux.io_uring_sqe {
-    const sqe = try self.get_sqe();
-    sqe.prep_statx(fd, path, flags, mask, buf);
-    sqe.user_data = user_data;
-    return sqe;
-}
-
-/// Queues (but does not submit) an SQE to remove an existing operation.
-/// Returns a pointer to the SQE.
-///
-/// The operation is identified by its `user_data`.
-///
-/// The completion event result will be `0` if the operation was found and canceled successfully,
-/// `-EALREADY` if the operation was found but was already in progress, or
-/// `-ENOENT` if the operation was not found.
-pub fn cancel(
-    self: *IoUring,
-    user_data: u64,
-    cancel_user_data: u64,
-    flags: u32,
-) !*linux.io_uring_sqe {
-    const sqe = try self.get_sqe();
-    sqe.prep_cancel(cancel_user_data, flags);
-    sqe.user_data = user_data;
-    return sqe;
-}
-
-/// Queues (but does not submit) an SQE to perform a `shutdown(2)`.
-/// Returns a pointer to the SQE.
-///
-/// The operation is identified by its `user_data`.
-pub fn shutdown(
-    self: *IoUring,
-    user_data: u64,
-    sockfd: posix.socket_t,
-    how: u32,
-) !*linux.io_uring_sqe {
-    const sqe = try self.get_sqe();
-    sqe.prep_shutdown(sockfd, how);
-    sqe.user_data = user_data;
-    return sqe;
-}
-
-/// Queues (but does not submit) an SQE to perform a `renameat2(2)`.
-/// Returns a pointer to the SQE.
-pub fn renameat(
-    self: *IoUring,
-    user_data: u64,
-    old_dir_fd: linux.fd_t,
-    old_path: [*:0]const u8,
-    new_dir_fd: linux.fd_t,
-    new_path: [*:0]const u8,
-    flags: u32,
-) !*linux.io_uring_sqe {
-    const sqe = try self.get_sqe();
-    sqe.prep_renameat(old_dir_fd, old_path, new_dir_fd, new_path, flags);
-    sqe.user_data = user_data;
-    return sqe;
-}
-
-/// Queues (but does not submit) an SQE to perform a `unlinkat(2)`.
-/// Returns a pointer to the SQE.
-pub fn unlinkat(
-    self: *IoUring,
-    user_data: u64,
-    dir_fd: linux.fd_t,
-    path: [*:0]const u8,
-    flags: u32,
-) !*linux.io_uring_sqe {
-    const sqe = try self.get_sqe();
-    sqe.prep_unlinkat(dir_fd, path, flags);
-    sqe.user_data = user_data;
-    return sqe;
-}
-
-/// Queues (but does not submit) an SQE to perform a `mkdirat(2)`.
-/// Returns a pointer to the SQE.
-pub fn mkdirat(
-    self: *IoUring,
-    user_data: u64,
-    dir_fd: linux.fd_t,
-    path: [*:0]const u8,
-    mode: posix.mode_t,
-) !*linux.io_uring_sqe {
-    const sqe = try self.get_sqe();
-    sqe.prep_mkdirat(dir_fd, path, mode);
-    sqe.user_data = user_data;
-    return sqe;
-}
-
-/// Queues (but does not submit) an SQE to perform a `symlinkat(2)`.
-/// Returns a pointer to the SQE.
-pub fn symlinkat(
-    self: *IoUring,
-    user_data: u64,
-    target: [*:0]const u8,
-    new_dir_fd: linux.fd_t,
-    link_path: [*:0]const u8,
-) !*linux.io_uring_sqe {
-    const sqe = try self.get_sqe();
-    sqe.prep_symlinkat(target, new_dir_fd, link_path);
-    sqe.user_data = user_data;
-    return sqe;
-}
-
-/// Queues (but does not submit) an SQE to perform a `linkat(2)`.
-/// Returns a pointer to the SQE.
-pub fn linkat(
-    self: *IoUring,
-    user_data: u64,
-    old_dir_fd: linux.fd_t,
-    old_path: [*:0]const u8,
-    new_dir_fd: linux.fd_t,
-    new_path: [*:0]const u8,
-    flags: u32,
-) !*linux.io_uring_sqe {
-    const sqe = try self.get_sqe();
-    sqe.prep_linkat(old_dir_fd, old_path, new_dir_fd, new_path, flags);
-    sqe.user_data = user_data;
-    return sqe;
-}
-
-/// Queues (but does not submit) an SQE to provide a group of buffers used for commands that read/receive data.
-/// Returns a pointer to the SQE.
-///
-/// Provided buffers can be used in `read`, `recv` or `recvmsg` commands via .buffer_selection.
-///
-/// The kernel expects a contiguous block of memory of size (buffers_count * buffer_size).
-pub fn provide_buffers(
-    self: *IoUring,
-    user_data: u64,
-    buffers: [*]u8,
-    buffer_size: usize,
-    buffers_count: usize,
-    group_id: usize,
-    buffer_id: usize,
-) !*linux.io_uring_sqe {
-    const sqe = try self.get_sqe();
-    sqe.prep_provide_buffers(buffers, buffer_size, buffers_count, group_id, buffer_id);
-    sqe.user_data = user_data;
-    return sqe;
-}
-
-/// Queues (but does not submit) an SQE to remove a group of provided buffers.
-/// Returns a pointer to the SQE.
-pub fn remove_buffers(
-    self: *IoUring,
-    user_data: u64,
-    buffers_count: usize,
-    group_id: usize,
-) !*linux.io_uring_sqe {
-    const sqe = try self.get_sqe();
-    sqe.prep_remove_buffers(buffers_count, group_id);
-    sqe.user_data = user_data;
-    return sqe;
-}
-
-/// Queues (but does not submit) an SQE to perform a `waitid(2)`.
-/// Returns a pointer to the SQE.
-pub fn waitid(
-    self: *IoUring,
-    user_data: u64,
-    id_type: linux.P,
-    id: i32,
-    infop: *linux.siginfo_t,
-    options: u32,
-    flags: u32,
-) !*linux.io_uring_sqe {
-    const sqe = try self.get_sqe();
-    sqe.prep_waitid(id_type, id, infop, options, flags);
-    sqe.user_data = user_data;
-    return sqe;
-}
-
-/// Registers an array of file descriptors.
-/// Every time a file descriptor is put in an SQE and submitted to the kernel, the kernel must
-/// retrieve a reference to the file, and once I/O has completed the file reference must be
-/// dropped. The atomic nature of this file reference can be a slowdown for high IOPS workloads.
-/// This slowdown can be avoided by pre-registering file descriptors.
-/// To refer to a registered file descriptor, IOSQE_FIXED_FILE must be set in the SQE's flags,
-/// and the SQE's fd must be set to the index of the file descriptor in the registered array.
-/// Registering file descriptors will wait for the ring to idle.
-/// Files are automatically unregistered by the kernel when the ring is torn down.
-/// An application need unregister only if it wants to register a new array of file descriptors.
-pub fn register_files(self: *IoUring, fds: []const linux.fd_t) !void {
-    assert(self.fd &gt;= 0);
-    const res = linux.io_uring_register(
-        self.fd,
-        .REGISTER_FILES,
-        @as(*const anyopaque, @ptrCast(fds.ptr)),
-        @as(u32, @intCast(fds.len)),
-    );
-    try handle_registration_result(res);
-}
-
-/// Updates registered file descriptors.
-///
-/// Updates are applied starting at the provided offset in the original file descriptors slice.
-/// There are three kind of updates:
-/// * turning a sparse entry (where the fd is -1) into a real one
-/// * removing an existing entry (set the fd to -1)
-/// * replacing an existing entry with a new fd
-/// Adding new file descriptors must be done with `register_files`.
-pub fn register_files_update(self: *IoUring, offset: u32, fds: []const linux.fd_t) !void {
-    assert(self.fd &gt;= 0);
-
-    const FilesUpdate = extern struct {
-        offset: u32,
-        resv: u32,
-        fds: u64 align(8),
-    };
-    var update = FilesUpdate{
-        .offset = offset,
-        .resv = @as(u32, 0),
-        .fds = @as(u64, @intFromPtr(fds.ptr)),
-    };
-
-    const res = linux.io_uring_register(
-        self.fd,
-        .REGISTER_FILES_UPDATE,
-        @as(*const anyopaque, @ptrCast(&amp;update)),
-        @as(u32, @intCast(fds.len)),
-    );
-    try handle_registration_result(res);
-}
-
-/// Registers an empty (-1) file table of `nr_files` number of file descriptors.
-pub fn register_files_sparse(self: *IoUring, nr_files: u32) !void {
-    assert(self.fd &gt;= 0);
-
-    const reg = &amp;linux.io_uring_rsrc_register{
-        .nr = nr_files,
-        .flags = linux.IORING_RSRC_REGISTER_SPARSE,
-        .resv2 = 0,
-        .data = 0,
-        .tags = 0,
-    };
-
-    const res = linux.io_uring_register(
-        self.fd,
-        .REGISTER_FILES2,
-        @ptrCast(reg),
-        @as(u32, @sizeOf(linux.io_uring_rsrc_register)),
-    );
-
-    return handle_registration_result(res);
-}
-
-// Registers range for fixed file allocations.
-// Available since 6.0
-pub fn register_file_alloc_range(self: *IoUring, offset: u32, len: u32) !void {
-    assert(self.fd &gt;= 0);
-
-    const range = &amp;linux.io_uring_file_index_range{
-        .off = offset,
-        .len = len,
-        .resv = 0,
-    };
-
-    const res = linux.io_uring_register(
-        self.fd,
-        .REGISTER_FILE_ALLOC_RANGE,
-        @ptrCast(range),
-        @as(u32, @sizeOf(linux.io_uring_file_index_range)),
-    );
-
-    return handle_registration_result(res);
-}
-
-/// Registers the file descriptor for an eventfd that will be notified of completion events on
-///  an io_uring instance.
-/// Only a single a eventfd can be registered at any given point in time.
-pub fn register_eventfd(self: *IoUring, fd: linux.fd_t) !void {
-    assert(self.fd &gt;= 0);
-    const res = linux.io_uring_register(
-        self.fd,
-        .REGISTER_EVENTFD,
-        @as(*const anyopaque, @ptrCast(&amp;fd)),
-        1,
-    );
-    try handle_registration_result(res);
-}
-
-/// Registers the file descriptor for an eventfd that will be notified of completion events on
-/// an io_uring instance. Notifications are only posted for events that complete in an async manner.
-/// This means that events that complete inline while being submitted do not trigger a notification event.
-/// Only a single eventfd can be registered at any given point in time.
-pub fn register_eventfd_async(self: *IoUring, fd: linux.fd_t) !void {
-    assert(self.fd &gt;= 0);
-    const res = linux.io_uring_register(
-        self.fd,
-        .REGISTER_EVENTFD_ASYNC,
-        @as(*const anyopaque, @ptrCast(&amp;fd)),
-        1,
-    );
-    try handle_registration_result(res);
-}
-
-/// Unregister the registered eventfd file descriptor.
-pub fn unregister_eventfd(self: *IoUring) !void {
-    assert(self.fd &gt;= 0);
-    const res = linux.io_uring_register(
-        self.fd,
-        .UNREGISTER_EVENTFD,
-        null,
-        0,
-    );
-    try handle_registration_result(res);
-}
-
-pub fn register_napi(self: *IoUring, napi: *linux.io_uring_napi) !void {
-    assert(self.fd &gt;= 0);
-    const res = linux.io_uring_register(self.fd, .REGISTER_NAPI, napi, 1);
-    try handle_registration_result(res);
-}
-
-pub fn unregister_napi(self: *IoUring, napi: *linux.io_uring_napi) !void {
-    assert(self.fd &gt;= 0);
-    const res = linux.io_uring_register(self.fd, .UNREGISTER_NAPI, napi, 1);
-    try handle_registration_result(res);
-}
-
-/// Registers an array of buffers for use with `read_fixed` and `write_fixed`.
-pub fn register_buffers(self: *IoUring, buffers: []const posix.iovec) !void {
-    assert(self.fd &gt;= 0);
-    const res = linux.io_uring_register(
-        self.fd,
-        .REGISTER_BUFFERS,
-        buffers.ptr,
-        @as(u32, @intCast(buffers.len)),
-    );
-    try handle_registration_result(res);
-}
-
-/// Unregister the registered buffers.
-pub fn unregister_buffers(self: *IoUring) !void {
-    assert(self.fd &gt;= 0);
-    const res = linux.io_uring_register(self.fd, .UNREGISTER_BUFFERS, null, 0);
-    switch (linux.errno(res)) {
-        .SUCCESS =&gt; {},
-        .NXIO =&gt; return error.BuffersNotRegistered,
-        else =&gt; |errno| return posix.unexpectedErrno(errno),
-    }
-}
-
-/// Returns a io_uring_probe which is used to probe the capabilities of the
-/// io_uring subsystem of the running kernel. The io_uring_probe contains the
-/// list of supported operations.
-pub fn get_probe(self: *IoUring) !linux.io_uring_probe {
-    var probe = std.mem.zeroInit(linux.io_uring_probe, .{});
-    const res = linux.io_uring_register(self.fd, .REGISTER_PROBE, &amp;probe, probe.ops.len);
-    try handle_register_buf_ring_result(res);
-    return probe;
-}
-
-fn handle_registration_result(res: usize) !void {
-    switch (linux.errno(res)) {
-        .SUCCESS =&gt; {},
-        // One or more fds in the array are invalid, or the kernel does not support sparse sets:
-        .BADF =&gt; return error.FileDescriptorInvalid,
-        .BUSY =&gt; return error.FilesAlreadyRegistered,
-        .INVAL =&gt; return error.FilesEmpty,
-        // Adding `nr_args` file references would exceed the maximum allowed number of files the
-        // user is allowed to have according to the per-user RLIMIT_NOFILE resource limit and
-        // the CAP_SYS_RESOURCE capability is not set, or `nr_args` exceeds the maximum allowed
-        // for a fixed file set (older kernels have a limit of 1024 files vs 64K files):
-        .MFILE =&gt; return error.UserFdQuotaExceeded,
-        // Insufficient kernel resources, or the caller had a non-zero RLIMIT_MEMLOCK soft
-        // resource limit but tried to lock more memory than the limit permitted (not enforced
-        // when the process is privileged with CAP_IPC_LOCK):
-        .NOMEM =&gt; return error.SystemResources,
-        // Attempt to register files on a ring already registering files or being torn down:
-        .NXIO =&gt; return error.RingShuttingDownOrAlreadyRegisteringFiles,
-        else =&gt; |errno| return posix.unexpectedErrno(errno),
-    }
-}
-
-/// Unregisters all registered file descriptors previously associated with the ring.
-pub fn unregister_files(self: *IoUring) !void {
-    assert(self.fd &gt;= 0);
-    const res = linux.io_uring_register(self.fd, .UNREGISTER_FILES, null, 0);
-    switch (linux.errno(res)) {
-        .SUCCESS =&gt; {},
-        .NXIO =&gt; return error.FilesNotRegistered,
-        else =&gt; |errno| return posix.unexpectedErrno(errno),
-    }
-}
-
-/// Prepares a socket creation request.
-/// New socket fd will be returned in completion result.
-/// Available since 5.19
-pub fn socket(
-    self: *IoUring,
-    user_data: u64,
-    domain: u32,
-    socket_type: u32,
-    protocol: u32,
-    flags: u32,
-) !*linux.io_uring_sqe {
-    const sqe = try self.get_sqe();
-    sqe.prep_socket(domain, socket_type, protocol, flags);
-    sqe.user_data = user_data;
-    return sqe;
-}
-
-/// Prepares a socket creation request for registered file at index `file_index`.
-/// Available since 5.19
-pub fn socket_direct(
-    self: *IoUring,
-    user_data: u64,
-    domain: u32,
-    socket_type: u32,
-    protocol: u32,
-    flags: u32,
-    file_index: u32,
-) !*linux.io_uring_sqe {
-    const sqe = try self.get_sqe();
-    sqe.prep_socket_direct(domain, socket_type, protocol, flags, file_index);
-    sqe.user_data = user_data;
-    return sqe;
-}
-
-/// Prepares a socket creation request for registered file, index chosen by kernel (file index alloc).
-/// File index will be returned in CQE res field.
-/// Available since 5.19
-pub fn socket_direct_alloc(
-    self: *IoUring,
-    user_data: u64,
-    domain: u32,
-    socket_type: u32,
-    protocol: u32,
-    flags: u32,
-) !*linux.io_uring_sqe {
-    const sqe = try self.get_sqe();
-    sqe.prep_socket_direct_alloc(domain, socket_type, protocol, flags);
-    sqe.user_data = user_data;
-    return sqe;
-}
-
-/// Queues (but does not submit) an SQE to perform an `bind(2)` on a socket.
-/// Returns a pointer to the SQE.
-/// Available since 6.11
-pub fn bind(
-    self: *IoUring,
-    user_data: u64,
-    fd: linux.fd_t,
-    addr: *const posix.sockaddr,
-    addrlen: posix.socklen_t,
-    flags: u32,
-) !*linux.io_uring_sqe {
-    const sqe = try self.get_sqe();
-    sqe.prep_bind(fd, addr, addrlen, flags);
-    sqe.user_data = user_data;
-    return sqe;
-}
-
-/// Queues (but does not submit) an SQE to perform an `listen(2)` on a socket.
-/// Returns a pointer to the SQE.
-/// Available since 6.11
-pub fn listen(
-    self: *IoUring,
-    user_data: u64,
-    fd: linux.fd_t,
-    backlog: usize,
-    flags: u32,
-) !*linux.io_uring_sqe {
-    const sqe = try self.get_sqe();
-    sqe.prep_listen(fd, backlog, flags);
-    sqe.user_data = user_data;
-    return sqe;
-}
-
-/// Prepares an cmd request for a socket.
-/// See: https://man7.org/linux/man-pages/man3/io_uring_prep_cmd.3.html
-/// Available since 6.7.
-pub fn cmd_sock(
-    self: *IoUring,
-    user_data: u64,
-    cmd_op: linux.IO_URING_SOCKET_OP,
-    fd: linux.fd_t,
-    level: u32, // linux.SOL
-    optname: u32, // linux.SO
-    optval: u64, // pointer to the option value
-    optlen: u32, // size of the option value
-) !*linux.io_uring_sqe {
-    const sqe = try self.get_sqe();
-    sqe.prep_cmd_sock(cmd_op, fd, level, optname, optval, optlen);
-    sqe.user_data = user_data;
-    return sqe;
-}
-
-/// Prepares set socket option for the optname argument, at the protocol
-/// level specified by the level argument.
-/// Available since 6.7.n
-pub fn setsockopt(
-    self: *IoUring,
-    user_data: u64,
-    fd: linux.fd_t,
-    level: u32, // linux.SOL
-    optname: u32, // linux.SO
-    opt: []const u8,
-) !*linux.io_uring_sqe {
-    return try self.cmd_sock(
-        user_data,
-        .SETSOCKOPT,
-        fd,
-        level,
-        optname,
-        @intFromPtr(opt.ptr),
-        @intCast(opt.len),
-    );
-}
-
-/// Prepares get socket option to retrieve the value for the option specified by
-/// the option_name argument for the socket specified by the fd argument.
-/// Available since 6.7.
-pub fn getsockopt(
-    self: *IoUring,
-    user_data: u64,
-    fd: linux.fd_t,
-    level: u32, // linux.SOL
-    optname: u32, // linux.SO
-    opt: []u8,
-) !*linux.io_uring_sqe {
-    return try self.cmd_sock(
-        user_data,
-        .GETSOCKOPT,
-        fd,
-        level,
-        optname,
-        @intFromPtr(opt.ptr),
-        @intCast(opt.len),
-    );
-}
-
-pub const SubmissionQueue = struct {
-    head: *u32,
-    tail: *u32,
-    mask: u32,
-    flags: *u32,
-    dropped: *u32,
-    array: []u32,
-    sqes: []linux.io_uring_sqe,
-    mmap: []align(page_size_min) u8,
-    mmap_sqes: []align(page_size_min) u8,
-
-    // We use `sqe_head` and `sqe_tail` in the same way as liburing:
-    // We increment `sqe_tail` (but not `tail`) for each call to `get_sqe()`.
-    // We then set `tail` to `sqe_tail` once, only when these events are actually submitted.
-    // This allows us to amortize the cost of the @atomicStore to `tail` across multiple SQEs.
-    sqe_head: u32 = 0,
-    sqe_tail: u32 = 0,
-
-    pub fn init(fd: linux.fd_t, p: linux.io_uring_params) !SubmissionQueue {
-        assert(fd &gt;= 0);
-        assert((p.features &amp; linux.IORING_FEAT_SINGLE_MMAP) != 0);
-        const size = @max(
-            p.sq_off.array + p.sq_entries * @sizeOf(u32),
-            p.cq_off.cqes + p.cq_entries * @sizeOf(linux.io_uring_cqe),
-        );
-        const mmap = try posix.mmap(
-            null,
-            size,
-            .{ .READ = true, .WRITE = true },
-            .{ .TYPE = .SHARED, .POPULATE = true },
-            fd,
-            linux.IORING_OFF_SQ_RING,
-        );
-        errdefer posix.munmap(mmap);
-        assert(mmap.len == size);
-
-        // The motivation for the `sqes` and `array` indirection is to make it possible for the
-        // application to preallocate static linux.io_uring_sqe entries and then replay them when needed.
-        const size_sqes = p.sq_entries * @sizeOf(linux.io_uring_sqe);
-        const mmap_sqes = try posix.mmap(
-            null,
-            size_sqes,
-            .{ .READ = true, .WRITE = true },
-            .{ .TYPE = .SHARED, .POPULATE = true },
-            fd,
-            linux.IORING_OFF_SQES,
-        );
-        errdefer posix.munmap(mmap_sqes);
-        assert(mmap_sqes.len == size_sqes);
-
-        const array: [*]u32 = @ptrCast(@alignCast(&amp;mmap[p.sq_off.array]));
-        const sqes: [*]linux.io_uring_sqe = @ptrCast(@alignCast(&amp;mmap_sqes[0]));
-        // We expect the kernel copies p.sq_entries to the u32 pointed to by p.sq_off.ring_entries,
-        // see https://github.com/torvalds/linux/blob/v5.8/fs/io_uring.c#L7843-L7844.
-        assert(p.sq_entries == @as(*u32, @ptrCast(@alignCast(&amp;mmap[p.sq_off.ring_entries]))).*);
-        return SubmissionQueue{
-            .head = @ptrCast(@alignCast(&amp;mmap[p.sq_off.head])),
-            .tail = @ptrCast(@alignCast(&amp;mmap[p.sq_off.tail])),
-            .mask = @as(*u32, @ptrCast(@alignCast(&amp;mmap[p.sq_off.ring_mask]))).*,
-            .flags = @ptrCast(@alignCast(&amp;mmap[p.sq_off.flags])),
-            .dropped = @ptrCast(@alignCast(&amp;mmap[p.sq_off.dropped])),
-            .array = array[0..p.sq_entries],
-            .sqes = sqes[0..p.sq_entries],
-            .mmap = mmap,
-            .mmap_sqes = mmap_sqes,
-        };
-    }
-
-    pub fn deinit(self: *SubmissionQueue) void {
-        posix.munmap(self.mmap_sqes);
-        posix.munmap(self.mmap);
-    }
-};
-
-pub const CompletionQueue = struct {
-    head: *u32,
-    tail: *u32,
-    mask: u32,
-    overflow: *u32,
-    cqes: []linux.io_uring_cqe,
-
-    pub fn init(fd: linux.fd_t, p: linux.io_uring_params, sq: SubmissionQueue) !CompletionQueue {
-        assert(fd &gt;= 0);
-        assert((p.features &amp; linux.IORING_FEAT_SINGLE_MMAP) != 0);
-        const mmap = sq.mmap;
-        const cqes: [*]linux.io_uring_cqe = @ptrCast(@alignCast(&amp;mmap[p.cq_off.cqes]));
-        assert(p.cq_entries == @as(*u32, @ptrCast(@alignCast(&amp;mmap[p.cq_off.ring_entries]))).*);
-        return CompletionQueue{
-            .head = @ptrCast(@alignCast(&amp;mmap[p.cq_off.head])),
-            .tail = @ptrCast(@alignCast(&amp;mmap[p.cq_off.tail])),
-            .mask = @as(*u32, @ptrCast(@alignCast(&amp;mmap[p.cq_off.ring_mask]))).*,
-            .overflow = @ptrCast(@alignCast(&amp;mmap[p.cq_off.overflow])),
-            .cqes = cqes[0..p.cq_entries],
-        };
-    }
-
-    pub fn deinit(self: *CompletionQueue) void {
-        _ = self;
-        // A no-op since we now share the mmap with the submission queue.
-        // Here for symmetry with the submission queue, and for any future feature support.
-    }
-};
-
-/// Group of application provided buffers. Uses newer type, called ring mapped
-/// buffers, supported since kernel 5.19. Buffers are identified by a buffer
-/// group ID, and within that group, a buffer ID. IO_Uring can have multiple
-/// buffer groups, each with unique group ID.
-///
-/// In `init` application provides contiguous block of memory `buffers` for
-/// `buffers_count` buffers of size `buffers_size`. Application can then submit
-/// `recv` operation without providing buffer upfront. Once the operation is
-/// ready to receive data, a buffer is picked automatically and the resulting
-/// CQE will contain the buffer ID in `cqe.buffer_id()`. Use `get` method to get
-/// buffer for buffer ID identified by CQE. Once the application has processed
-/// the buffer, it may hand ownership back to the kernel, by calling `put`
-/// allowing the cycle to repeat.
-///
-/// Depending on the rate of arrival of data, it is possible that a given buffer
-/// group will run out of buffers before those in CQEs can be put back to the
-/// kernel. If this happens, a `cqe.err()` will have ENOBUFS as the error value.
-///
-pub const BufferGroup = struct {
-    /// Parent ring for which this group is registered.
-    ring: *IoUring,
-    /// Pointer to the memory shared by the kernel.
-    /// `buffers_count` of `io_uring_buf` structures are shared by the kernel.
-    /// First `io_uring_buf` is overlaid by `io_uring_buf_ring` struct.
-    br: *align(page_size_min) linux.io_uring_buf_ring,
-    /// Contiguous block of memory of size (buffers_count * buffer_size).
-    buffers: []u8,
-    /// Size of each buffer in buffers.
-    buffer_size: u32,
-    /// Number of buffers in `buffers`, number of `io_uring_buf structures` in br.
-    buffers_count: u16,
-    /// Head of unconsumed part of each buffer, if incremental consumption is enabled
-    heads: []u32,
-    /// ID of this group, must be unique in ring.
-    group_id: u16,
-
-    pub fn init(
-        ring: *IoUring,
-        allocator: Allocator,
-        group_id: u16,
-        buffer_size: u32,
-        buffers_count: u16,
-    ) !BufferGroup {
-        const buffers = try allocator.alloc(u8, buffer_size * buffers_count);
-        errdefer allocator.free(buffers);
-        const heads = try allocator.alloc(u32, buffers_count);
-        errdefer allocator.free(heads);
-
-        const br = try setup_buf_ring(ring.fd, buffers_count, group_id, .{ .inc = true });
-        buf_ring_init(br);
-
-        const mask = buf_ring_mask(buffers_count);
-        var i: u16 = 0;
-        while (i &lt; buffers_count) : (i += 1) {
-            const pos = buffer_size * i;
-            const buf = buffers[pos .. pos + buffer_size];
-            heads[i] = 0;
-            buf_ring_add(br, buf, i, mask, i);
-        }
-        buf_ring_advance(br, buffers_count);
-
-        return BufferGroup{
-            .ring = ring,
-            .group_id = group_id,
-            .br = br,
-            .buffers = buffers,
-            .heads = heads,
-            .buffer_size = buffer_size,
-            .buffers_count = buffers_count,
-        };
-    }
-
-    pub fn deinit(self: *BufferGroup, allocator: Allocator) void {
-        free_buf_ring(self.ring.fd, self.br, self.buffers_count, self.group_id);
-        allocator.free(self.buffers);
-        allocator.free(self.heads);
-    }
-
-    // Prepare recv operation which will select buffer from this group.
-    pub fn recv(self: *BufferGroup, user_data: u64, fd: linux.fd_t, flags: u32) !*linux.io_uring_sqe {
-        var sqe = try self.ring.get_sqe();
-        sqe.prep_rw(.RECV, fd, 0, 0, 0);
-        sqe.rw_flags = flags;
-        sqe.flags |= linux.IOSQE_BUFFER_SELECT;
-        sqe.buf_index = self.group_id;
-        sqe.user_data = user_data;
-        return sqe;
-    }
-
-    // Prepare multishot recv operation which will select buffer from this group.
-    pub fn recv_multishot(self: *BufferGroup, user_data: u64, fd: linux.fd_t, flags: u32) !*linux.io_uring_sqe {
-        var sqe = try self.recv(user_data, fd, flags);
-        sqe.ioprio |= linux.IORING_RECV_MULTISHOT;
-        return sqe;
-    }
-
-    // Get buffer by id.
-    pub fn get_by_id(self: *BufferGroup, buffer_id: u16) []u8 {
-        const pos = self.buffer_size * buffer_id;
-        return self.buffers[pos .. pos + self.buffer_size][self.heads[buffer_id]..];
-    }
-
-    // Get buffer by CQE.
-    pub fn get(self: *BufferGroup, cqe: linux.io_uring_cqe) ![]u8 {
-        const buffer_id = try cqe.buffer_id();
-        const used_len = @as(usize, @intCast(cqe.res));
-        return self.get_by_id(buffer_id)[0..used_len];
-    }
-
-    // Release buffer from CQE to the kernel.
-    pub fn put(self: *BufferGroup, cqe: linux.io_uring_cqe) !void {
-        const buffer_id = try cqe.buffer_id();
-        if (cqe.flags &amp; linux.IORING_CQE_F_BUF_MORE == linux.IORING_CQE_F_BUF_MORE) {
-            // Incremental consumption active, kernel will write to the this buffer again
-            const used_len = @as(u32, @intCast(cqe.res));
-            // Track what part of the buffer is used
-            self.heads[buffer_id] += used_len;
-            return;
-        }
-        self.heads[buffer_id] = 0;
-
-        // Release buffer to the kernel.    const mask = buf_ring_mask(self.buffers_count);
-        const mask = buf_ring_mask(self.buffers_count);
-        buf_ring_add(self.br, self.get_by_id(buffer_id), buffer_id, mask, 0);
-        buf_ring_advance(self.br, 1);
-    }
-};
-
-/// Registers a shared buffer ring to be used with provided buffers.
-/// `entries` number of `io_uring_buf` structures is mem mapped and shared by kernel.
-/// `fd` is IO_Uring.fd for which the provided buffer ring is being registered.
-/// `entries` is the number of entries requested in the buffer ring, must be power of 2.
-/// `group_id` is the chosen buffer group ID, unique in IO_Uring.
-pub fn setup_buf_ring(
-    fd: linux.fd_t,
-    entries: u16,
-    group_id: u16,
-    flags: linux.io_uring_buf_reg.Flags,
-) !*align(page_size_min) linux.io_uring_buf_ring {
-    if (entries == 0 or entries &gt; 1 &lt;&lt; 15) return error.EntriesNotInRange;
-    if (!std.math.isPowerOfTwo(entries)) return error.EntriesNotPowerOfTwo;
-
-    const mmap_size = @as(usize, entries) * @sizeOf(linux.io_uring_buf);
-    const mmap = try posix.mmap(
-        null,
-        mmap_size,
-        .{ .READ = true, .WRITE = true },
-        .{ .TYPE = .PRIVATE, .ANONYMOUS = true },
-        -1,
-        0,
-    );
-    errdefer posix.munmap(mmap);
-    assert(mmap.len == mmap_size);
-
-    const br: *align(page_size_min) linux.io_uring_buf_ring = @ptrCast(mmap.ptr);
-    try register_buf_ring(fd, @intFromPtr(br), entries, group_id, flags);
-    return br;
-}
-
-fn register_buf_ring(
-    fd: linux.fd_t,
-    addr: u64,
-    entries: u32,
-    group_id: u16,
-    flags: linux.io_uring_buf_reg.Flags,
-) !void {
-    var reg = std.mem.zeroInit(linux.io_uring_buf_reg, .{
-        .ring_addr = addr,
-        .ring_entries = entries,
-        .bgid = group_id,
-        .flags = flags,
-    });
-    var res = linux.io_uring_register(fd, .REGISTER_PBUF_RING, @as(*const anyopaque, @ptrCast(&amp;reg)), 1);
-    if (linux.errno(res) == .INVAL and reg.flags.inc) {
-        // Retry without incremental buffer consumption.
-        // It is available since kernel 6.12. returns INVAL on older.
-        reg.flags.inc = false;
-        res = linux.io_uring_register(fd, .REGISTER_PBUF_RING, @as(*const anyopaque, @ptrCast(&amp;reg)), 1);
-    }
-    try handle_register_buf_ring_result(res);
-}
-
-fn unregister_buf_ring(fd: linux.fd_t, group_id: u16) !void {
-    var reg = std.mem.zeroInit(linux.io_uring_buf_reg, .{
-        .bgid = group_id,
-    });
-    const res = linux.io_uring_register(
-        fd,
-        .UNREGISTER_PBUF_RING,
-        @as(*const anyopaque, @ptrCast(&amp;reg)),
-        1,
-    );
-    try handle_register_buf_ring_result(res);
-}
-
-fn handle_register_buf_ring_result(res: usize) !void {
-    switch (linux.errno(res)) {
-        .SUCCESS =&gt; {},
-        .INVAL =&gt; return error.ArgumentsInvalid,
-        else =&gt; |errno| return posix.unexpectedErrno(errno),
-    }
-}
-
-// Unregisters a previously registered shared buffer ring, returned from io_uring_setup_buf_ring.
-pub fn free_buf_ring(fd: linux.fd_t, br: *align(page_size_min) linux.io_uring_buf_ring, entries: u32, group_id: u16) void {
-    unregister_buf_ring(fd, group_id) catch {};
-    var mmap: []align(page_size_min) u8 = undefined;
-    mmap.ptr = @ptrCast(br);
-    mmap.len = entries * @sizeOf(linux.io_uring_buf);
-    posix.munmap(mmap);
-}
-
-/// Initialises `br` so that it is ready to be used.
-pub fn buf_ring_init(br: *linux.io_uring_buf_ring) void {
-    br.tail = 0;
-}
-
-/// Calculates the appropriate size mask for a buffer ring.
-/// `entries` is the ring entries as specified in io_uring_register_buf_ring.
-pub fn buf_ring_mask(entries: u16) u16 {
-    return entries - 1;
-}
-
-/// Assigns `buffer` with the `br` buffer ring.
-/// `buffer_id` is identifier which will be returned in the CQE.
-/// `buffer_offset` is the offset to insert at from the current tail.
-/// If just one buffer is provided before the ring tail is committed with advance then offset should be 0.
-/// If buffers are provided in a loop before being committed, the offset must be incremented by one for each buffer added.
-pub fn buf_ring_add(
-    br: *linux.io_uring_buf_ring,
-    buffer: []u8,
-    buffer_id: u16,
-    mask: u16,
-    buffer_offset: u16,
-) void {
-    const bufs: [*]linux.io_uring_buf = @ptrCast(br);
-    const buf: *linux.io_uring_buf = &amp;bufs[(br.tail +% buffer_offset) &amp; mask];
-
-    buf.addr = @intFromPtr(buffer.ptr);
-    buf.len = @intCast(buffer.len);
-    buf.bid = buffer_id;
-}
-
-/// Make `count` new buffers visible to the kernel. Called after
-/// `io_uring_buf_ring_add` has been called `count` times to fill in new buffers.
-pub fn buf_ring_advance(br: *linux.io_uring_buf_ring, count: u16) void {
-    const tail: u16 = br.tail +% count;
-    @atomicStore(u16, &amp;br.tail, tail, .release);
-}
-
-test BufferGroup {
-    if (!is_linux) return error.SkipZigTest;
-
-    const io = testing.io;
-    _ = io;
-
-    // Init IoUring
-    var ring = IoUring.init(16, 0) catch |err| switch (err) {
-        error.SystemOutdated =&gt; return error.SkipZigTest,
-        error.PermissionDenied =&gt; return error.SkipZigTest,
-        else =&gt; return err,
-    };
-    defer ring.deinit();
-
-    // Init buffer group for ring
-    const group_id: u16 = 1; // buffers group id
-    const buffers_count: u16 = 1; // number of buffers in buffer group
-    const buffer_size: usize = 128; // size of each buffer in group
-    var buf_grp = BufferGroup.init(
-        &amp;ring,
-        testing.allocator,
-        group_id,
-        buffer_size,
-        buffers_count,
-    ) catch |err| switch (err) {
-        // kernel older than 5.19
-        error.ArgumentsInvalid =&gt; return error.SkipZigTest,
-        else =&gt; return err,
-    };
-    defer buf_grp.deinit(testing.allocator);
-
-    // Create client/server fds
-    const fds = try createSocketTestHarness(&amp;ring);
-    defer fds.close();
-    const data = [_]u8{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0xa, 0xb, 0xc, 0xd, 0xe };
-
-    // Client sends data
-    {
-        _ = try ring.send(1, fds.client, data[0..], 0);
-        const submitted = try ring.submit();
-        try testing.expectEqual(1, submitted);
-        const cqe_send = try ring.copy_cqe();
-        if (cqe_send.err() == .INVAL) return error.SkipZigTest;
-        try testing.expectEqual(linux.io_uring_cqe{ .user_data = 1, .res = data.len, .flags = 0 }, cqe_send);
-    }
-
-    // Server uses buffer group receive
-    {
-        // Submit recv operation, buffer will be chosen from buffer group
-        _ = try buf_grp.recv(2, fds.server, 0);
-        const submitted = try ring.submit();
-        try testing.expectEqual(1, submitted);
-
-        // ... when we have completion for recv operation
-        const cqe = try ring.copy_cqe();
-        try testing.expectEqual(2, cqe.user_data); // matches submitted user_data
-        try testing.expect(cqe.res &gt;= 0); // success
-        try testing.expectEqual(posix.E.SUCCESS, cqe.err());
-        try testing.expectEqual(data.len, @as(usize, @intCast(cqe.res))); // cqe.res holds received data len
-
-        // Get buffer from pool
-        const buf = try buf_grp.get(cqe);
-        try testing.expectEqualSlices(u8, &amp;data, buf);
-        // Release buffer to the kernel when application is done with it
-        try buf_grp.put(cqe);
-    }
-}
-
-test {
-    if (is_linux) _ = @import("IoUring/test.zig");
-}</pre>
+    <pre><a id="L1"></a>const IoUring = @This();
+<a id="L2"></a>
+<a id="L3"></a>const builtin = @import("builtin");
+<a id="L4"></a>const is_linux = builtin.os.tag == .linux;
+<a id="L5"></a>
+<a id="L6"></a>const std = @import("../../std.zig");
+<a id="L7"></a>const Io = std.Io;
+<a id="L8"></a>const Allocator = std.mem.Allocator;
+<a id="L9"></a>const assert = std.debug.assert;
+<a id="L10"></a>const posix = std.posix;
+<a id="L11"></a>const linux = std.os.linux;
+<a id="L12"></a>const testing = std.testing;
+<a id="L13"></a>const page_size_min = std.heap.page_size_min;
+<a id="L14"></a>const createSocketTestHarness = @import("IoUring/test.zig").createSocketTestHarness;
+<a id="L15"></a>
+<a id="L16"></a>fd: linux.fd_t = -1,
+<a id="L17"></a>sq: SubmissionQueue,
+<a id="L18"></a>cq: CompletionQueue,
+<a id="L19"></a>flags: u32,
+<a id="L20"></a>features: u32,
+<a id="L21"></a>
+<a id="L22"></a>/// A friendly way to setup an io_uring, with default linux.io_uring_params.
+<a id="L23"></a>/// `entries` must be a power of two between 1 and 32768, although the kernel will make the final
+<a id="L24"></a>/// call on how many entries the submission and completion queues will ultimately have,
+<a id="L25"></a>/// see https://github.com/torvalds/linux/blob/v5.8/fs/io_uring.c#L8027-L8050.
+<a id="L26"></a>/// Matches the interface of io_uring_queue_init() in liburing.
+<a id="L27"></a>pub fn init(entries: u16, flags: u32) !IoUring {
+<a id="L28"></a>    var params = std.mem.zeroInit(linux.io_uring_params, .{
+<a id="L29"></a>        .flags = flags,
+<a id="L30"></a>        .sq_thread_idle = 1000,
+<a id="L31"></a>    });
+<a id="L32"></a>    return try IoUring.init_params(entries, &amp;params);
+<a id="L33"></a>}
+<a id="L34"></a>
+<a id="L35"></a>/// A powerful way to setup an io_uring, if you want to tweak linux.io_uring_params such as submission
+<a id="L36"></a>/// queue thread cpu affinity or thread idle timeout (the kernel and our default is 1 second).
+<a id="L37"></a>/// `params` is passed by reference because the kernel needs to modify the parameters.
+<a id="L38"></a>/// Matches the interface of io_uring_queue_init_params() in liburing.
+<a id="L39"></a>pub fn init_params(entries: u16, p: *linux.io_uring_params) !IoUring {
+<a id="L40"></a>    if (entries == 0) return error.EntriesZero;
+<a id="L41"></a>    if (!std.math.isPowerOfTwo(entries)) return error.EntriesNotPowerOfTwo;
+<a id="L42"></a>
+<a id="L43"></a>    assert(p.sq_entries == 0);
+<a id="L44"></a>    assert(p.cq_entries == 0 or p.flags &amp; linux.IORING_SETUP_CQSIZE != 0);
+<a id="L45"></a>    assert(p.features == 0);
+<a id="L46"></a>    assert(p.wq_fd == 0 or p.flags &amp; linux.IORING_SETUP_ATTACH_WQ != 0);
+<a id="L47"></a>    assert(p.resv[0] == 0);
+<a id="L48"></a>    assert(p.resv[1] == 0);
+<a id="L49"></a>    assert(p.resv[2] == 0);
+<a id="L50"></a>
+<a id="L51"></a>    const res = linux.io_uring_setup(entries, p);
+<a id="L52"></a>    switch (linux.errno(res)) {
+<a id="L53"></a>        .SUCCESS =&gt; {},
+<a id="L54"></a>        .FAULT =&gt; return error.ParamsOutsideAccessibleAddressSpace,
+<a id="L55"></a>        // The resv array contains non-zero data, p.flags contains an unsupported flag,
+<a id="L56"></a>        // entries out of bounds, IORING_SETUP_SQ_AFF was specified without IORING_SETUP_SQPOLL,
+<a id="L57"></a>        // or IORING_SETUP_CQSIZE was specified but linux.io_uring_params.cq_entries was invalid:
+<a id="L58"></a>        .INVAL =&gt; return error.ArgumentsInvalid,
+<a id="L59"></a>        .MFILE =&gt; return error.ProcessFdQuotaExceeded,
+<a id="L60"></a>        .NFILE =&gt; return error.SystemFdQuotaExceeded,
+<a id="L61"></a>        .NOMEM =&gt; return error.SystemResources,
+<a id="L62"></a>        // IORING_SETUP_SQPOLL was specified but effective user ID lacks sufficient privileges,
+<a id="L63"></a>        // or a container seccomp policy prohibits io_uring syscalls:
+<a id="L64"></a>        .PERM =&gt; return error.PermissionDenied,
+<a id="L65"></a>        .NOSYS =&gt; return error.SystemOutdated,
+<a id="L66"></a>        else =&gt; |errno| return posix.unexpectedErrno(errno),
+<a id="L67"></a>    }
+<a id="L68"></a>    const fd = @as(linux.fd_t, @intCast(res));
+<a id="L69"></a>    assert(fd &gt;= 0);
+<a id="L70"></a>    errdefer _ = linux.close(fd);
+<a id="L71"></a>
+<a id="L72"></a>    // Kernel versions 5.4 and up use only one mmap() for the submission and completion queues.
+<a id="L73"></a>    // This is not an optional feature for us... if the kernel does it, we have to do it.
+<a id="L74"></a>    // The thinking on this by the kernel developers was that both the submission and the
+<a id="L75"></a>    // completion queue rings have sizes just over a power of two, but the submission queue ring
+<a id="L76"></a>    // is significantly smaller with u32 slots. By bundling both in a single mmap, the kernel
+<a id="L77"></a>    // gets the submission queue ring for free.
+<a id="L78"></a>    // See https://patchwork.kernel.org/patch/11115257 for the kernel patch.
+<a id="L79"></a>    // We do not support the double mmap() done before 5.4, because we want to keep the
+<a id="L80"></a>    // init/deinit mmap paths simple and because io_uring has had many bug fixes even since 5.4.
+<a id="L81"></a>    if ((p.features &amp; linux.IORING_FEAT_SINGLE_MMAP) == 0) {
+<a id="L82"></a>        return error.SystemOutdated;
+<a id="L83"></a>    }
+<a id="L84"></a>
+<a id="L85"></a>    // Check that the kernel has actually set params and that "impossible is nothing".
+<a id="L86"></a>    assert(p.sq_entries != 0);
+<a id="L87"></a>    assert(p.cq_entries != 0);
+<a id="L88"></a>    assert(p.cq_entries &gt;= p.sq_entries);
+<a id="L89"></a>
+<a id="L90"></a>    // From here on, we only need to read from params, so pass `p` by value as immutable.
+<a id="L91"></a>    // The completion queue shares the mmap with the submission queue, so pass `sq` there too.
+<a id="L92"></a>    var sq = try SubmissionQueue.init(fd, p.*);
+<a id="L93"></a>    errdefer sq.deinit();
+<a id="L94"></a>    var cq = try CompletionQueue.init(fd, p.*, sq);
+<a id="L95"></a>    errdefer cq.deinit();
+<a id="L96"></a>
+<a id="L97"></a>    // Check that our starting state is as we expect.
+<a id="L98"></a>    assert(sq.head.* == 0);
+<a id="L99"></a>    assert(sq.tail.* == 0);
+<a id="L100"></a>    assert(sq.mask == p.sq_entries - 1);
+<a id="L101"></a>    // Allow flags.* to be non-zero, since the kernel may set IORING_SQ_NEED_WAKEUP at any time.
+<a id="L102"></a>    assert(sq.dropped.* == 0);
+<a id="L103"></a>    assert(sq.array.len == p.sq_entries);
+<a id="L104"></a>    assert(sq.sqes.len == p.sq_entries);
+<a id="L105"></a>    assert(sq.sqe_head == 0);
+<a id="L106"></a>    assert(sq.sqe_tail == 0);
+<a id="L107"></a>
+<a id="L108"></a>    assert(cq.head.* == 0);
+<a id="L109"></a>    assert(cq.tail.* == 0);
+<a id="L110"></a>    assert(cq.mask == p.cq_entries - 1);
+<a id="L111"></a>    assert(cq.overflow.* == 0);
+<a id="L112"></a>    assert(cq.cqes.len == p.cq_entries);
+<a id="L113"></a>
+<a id="L114"></a>    return IoUring{
+<a id="L115"></a>        .fd = fd,
+<a id="L116"></a>        .sq = sq,
+<a id="L117"></a>        .cq = cq,
+<a id="L118"></a>        .flags = p.flags,
+<a id="L119"></a>        .features = p.features,
+<a id="L120"></a>    };
+<a id="L121"></a>}
+<a id="L122"></a>
+<a id="L123"></a>pub fn deinit(self: *IoUring) void {
+<a id="L124"></a>    assert(self.fd &gt;= 0);
+<a id="L125"></a>    // The mmaps depend on the fd, so the order of these calls is important:
+<a id="L126"></a>    self.cq.deinit();
+<a id="L127"></a>    self.sq.deinit();
+<a id="L128"></a>    _ = linux.close(self.fd);
+<a id="L129"></a>    self.fd = -1;
+<a id="L130"></a>}
+<a id="L131"></a>
+<a id="L132"></a>/// Returns a pointer to a vacant SQE, or an error if the submission queue is full.
+<a id="L133"></a>/// We follow the implementation (and atomics) of liburing's `io_uring_get_sqe()` exactly.
+<a id="L134"></a>/// However, instead of a null we return an error to force safe handling.
+<a id="L135"></a>/// Any situation where the submission queue is full tends more towards a control flow error,
+<a id="L136"></a>/// and the null return in liburing is more a C idiom than anything else, for lack of a better
+<a id="L137"></a>/// alternative. In Zig, we have first-class error handling... so let's use it.
+<a id="L138"></a>/// Matches the implementation of io_uring_get_sqe() in liburing.
+<a id="L139"></a>pub fn get_sqe(self: *IoUring) !*linux.io_uring_sqe {
+<a id="L140"></a>    const head = @atomicLoad(u32, self.sq.head, .acquire);
+<a id="L141"></a>    // Remember that these head and tail offsets wrap around every four billion operations.
+<a id="L142"></a>    // We must therefore use wrapping addition and subtraction to avoid a runtime crash.
+<a id="L143"></a>    const next = self.sq.sqe_tail +% 1;
+<a id="L144"></a>    if (next -% head &gt; self.sq.sqes.len) return error.SubmissionQueueFull;
+<a id="L145"></a>    const sqe = &amp;self.sq.sqes[self.sq.sqe_tail &amp; self.sq.mask];
+<a id="L146"></a>    self.sq.sqe_tail = next;
+<a id="L147"></a>    return sqe;
+<a id="L148"></a>}
+<a id="L149"></a>
+<a id="L150"></a>/// Submits the SQEs acquired via get_sqe() to the kernel. You can call this once after you have
+<a id="L151"></a>/// called get_sqe() multiple times to setup multiple I/O requests.
+<a id="L152"></a>/// Returns the number of SQEs submitted, if not used alongside IORING_SETUP_SQPOLL.
+<a id="L153"></a>/// If the io_uring instance is uses IORING_SETUP_SQPOLL, the value returned on success is not
+<a id="L154"></a>/// guaranteed to match the amount of actually submitted sqes during this call. A value higher
+<a id="L155"></a>/// or lower, including 0, may be returned.
+<a id="L156"></a>/// Matches the implementation of io_uring_submit() in liburing.
+<a id="L157"></a>pub fn submit(self: *IoUring) !u32 {
+<a id="L158"></a>    return self.submit_and_wait(0);
+<a id="L159"></a>}
+<a id="L160"></a>
+<a id="L161"></a>/// Like submit(), but allows waiting for events as well.
+<a id="L162"></a>/// Returns the number of SQEs submitted.
+<a id="L163"></a>/// Matches the implementation of io_uring_submit_and_wait() in liburing.
+<a id="L164"></a>pub fn submit_and_wait(self: *IoUring, wait_nr: u32) !u32 {
+<a id="L165"></a>    const submitted = self.flush_sq();
+<a id="L166"></a>    var flags: u32 = 0;
+<a id="L167"></a>    if (self.sq_ring_needs_enter(&amp;flags) or wait_nr &gt; 0) {
+<a id="L168"></a>        if (wait_nr &gt; 0 or (self.flags &amp; linux.IORING_SETUP_IOPOLL) != 0) {
+<a id="L169"></a>            flags |= linux.IORING_ENTER_GETEVENTS;
+<a id="L170"></a>        }
+<a id="L171"></a>        return try self.enter(submitted, wait_nr, flags);
+<a id="L172"></a>    }
+<a id="L173"></a>    return submitted;
+<a id="L174"></a>}
+<a id="L175"></a>
+<a id="L176"></a>/// Tell the kernel we have submitted SQEs and/or want to wait for CQEs.
+<a id="L177"></a>/// Returns the number of SQEs submitted.
+<a id="L178"></a>pub fn enter(self: *IoUring, to_submit: u32, min_complete: u32, flags: u32) !u32 {
+<a id="L179"></a>    assert(self.fd &gt;= 0);
+<a id="L180"></a>    const res = linux.io_uring_enter(self.fd, to_submit, min_complete, flags, null);
+<a id="L181"></a>    switch (linux.errno(res)) {
+<a id="L182"></a>        .SUCCESS =&gt; {},
+<a id="L183"></a>        // The kernel was unable to allocate memory or ran out of resources for the request.
+<a id="L184"></a>        // The application should wait for some completions and try again:
+<a id="L185"></a>        .AGAIN =&gt; return error.SystemResources,
+<a id="L186"></a>        // The SQE `fd` is invalid, or IOSQE_FIXED_FILE was set but no files were registered:
+<a id="L187"></a>        .BADF =&gt; return error.FileDescriptorInvalid,
+<a id="L188"></a>        // The file descriptor is valid, but the ring is not in the right state.
+<a id="L189"></a>        // See io_uring_register(2) for how to enable the ring.
+<a id="L190"></a>        .BADFD =&gt; return error.FileDescriptorInBadState,
+<a id="L191"></a>        // The application attempted to overcommit the number of requests it can have pending.
+<a id="L192"></a>        // The application should wait for some completions and try again:
+<a id="L193"></a>        .BUSY =&gt; return error.CompletionQueueOvercommitted,
+<a id="L194"></a>        // The SQE is invalid, or valid but the ring was setup with IORING_SETUP_IOPOLL:
+<a id="L195"></a>        .INVAL =&gt; return error.SubmissionQueueEntryInvalid,
+<a id="L196"></a>        // The buffer is outside the process' accessible address space, or IORING_OP_READ_FIXED
+<a id="L197"></a>        // or IORING_OP_WRITE_FIXED was specified but no buffers were registered, or the range
+<a id="L198"></a>        // described by `addr` and `len` is not within the buffer registered at `buf_index`:
+<a id="L199"></a>        .FAULT =&gt; return error.BufferInvalid,
+<a id="L200"></a>        .NXIO =&gt; return error.RingShuttingDown,
+<a id="L201"></a>        // The kernel believes our `self.fd` does not refer to an io_uring instance,
+<a id="L202"></a>        // or the opcode is valid but not supported by this kernel (more likely):
+<a id="L203"></a>        .OPNOTSUPP =&gt; return error.OpcodeNotSupported,
+<a id="L204"></a>        // The thread submitting the work is invalid. This may occur if IORING_ENTER_GETEVENTS
+<a id="L205"></a>        // and IORING_SETUP_DEFER_TASKRUN is set, but the submitting thread is not the thread
+<a id="L206"></a>        // that initially created or enabled the io_uring associated with fd.
+<a id="L207"></a>        .EXIST =&gt; return error.InvalidThread,
+<a id="L208"></a>        // The operation was interrupted by a delivery of a signal before it could complete.
+<a id="L209"></a>        // This can happen while waiting for events with IORING_ENTER_GETEVENTS:
+<a id="L210"></a>        .INTR =&gt; return error.SignalInterrupt,
+<a id="L211"></a>        else =&gt; |errno| return posix.unexpectedErrno(errno),
+<a id="L212"></a>    }
+<a id="L213"></a>    return @as(u32, @intCast(res));
+<a id="L214"></a>}
+<a id="L215"></a>
+<a id="L216"></a>/// Sync internal state with kernel ring state on the SQ side.
+<a id="L217"></a>/// Returns the number of all pending events in the SQ ring, for the shared ring.
+<a id="L218"></a>/// This return value includes previously flushed SQEs, as per liburing.
+<a id="L219"></a>/// The rationale is to suggest that an io_uring_enter() call is needed rather than not.
+<a id="L220"></a>/// Matches the implementation of __io_uring_flush_sq() in liburing.
+<a id="L221"></a>pub fn flush_sq(self: *IoUring) u32 {
+<a id="L222"></a>    if (self.sq.sqe_head != self.sq.sqe_tail) {
+<a id="L223"></a>        // Fill in SQEs that we have queued up, adding them to the kernel ring.
+<a id="L224"></a>        const to_submit = self.sq.sqe_tail -% self.sq.sqe_head;
+<a id="L225"></a>        var tail = self.sq.tail.*;
+<a id="L226"></a>        var i: usize = 0;
+<a id="L227"></a>        while (i &lt; to_submit) : (i += 1) {
+<a id="L228"></a>            self.sq.array[tail &amp; self.sq.mask] = self.sq.sqe_head &amp; self.sq.mask;
+<a id="L229"></a>            tail +%= 1;
+<a id="L230"></a>            self.sq.sqe_head +%= 1;
+<a id="L231"></a>        }
+<a id="L232"></a>        // Ensure that the kernel can actually see the SQE updates when it sees the tail update.
+<a id="L233"></a>        @atomicStore(u32, self.sq.tail, tail, .release);
+<a id="L234"></a>    }
+<a id="L235"></a>    return self.sq_ready();
+<a id="L236"></a>}
+<a id="L237"></a>
+<a id="L238"></a>/// Returns true if we are not using an SQ thread (thus nobody submits but us),
+<a id="L239"></a>/// or if IORING_SQ_NEED_WAKEUP is set and the SQ thread must be explicitly awakened.
+<a id="L240"></a>/// For the latter case, we set the SQ thread wakeup flag.
+<a id="L241"></a>/// Matches the implementation of sq_ring_needs_enter() in liburing.
+<a id="L242"></a>pub fn sq_ring_needs_enter(self: *IoUring, flags: *u32) bool {
+<a id="L243"></a>    assert(flags.* == 0);
+<a id="L244"></a>    if ((self.flags &amp; linux.IORING_SETUP_SQPOLL) == 0) return true;
+<a id="L245"></a>    if ((@atomicLoad(u32, self.sq.flags, .unordered) &amp; linux.IORING_SQ_NEED_WAKEUP) != 0) {
+<a id="L246"></a>        flags.* |= linux.IORING_ENTER_SQ_WAKEUP;
+<a id="L247"></a>        return true;
+<a id="L248"></a>    }
+<a id="L249"></a>    return false;
+<a id="L250"></a>}
+<a id="L251"></a>
+<a id="L252"></a>/// Returns the number of flushed and unflushed SQEs pending in the submission queue.
+<a id="L253"></a>/// In other words, this is the number of SQEs in the submission queue, i.e. its length.
+<a id="L254"></a>/// These are SQEs that the kernel is yet to consume.
+<a id="L255"></a>/// Matches the implementation of io_uring_sq_ready in liburing.
+<a id="L256"></a>pub fn sq_ready(self: *IoUring) u32 {
+<a id="L257"></a>    // Always use the shared ring state (i.e. head and not sqe_head) to avoid going out of sync,
+<a id="L258"></a>    // see https://github.com/axboe/liburing/issues/92.
+<a id="L259"></a>    return self.sq.sqe_tail -% @atomicLoad(u32, self.sq.head, .acquire);
+<a id="L260"></a>}
+<a id="L261"></a>
+<a id="L262"></a>/// Returns the number of CQEs in the completion queue, i.e. its length.
+<a id="L263"></a>/// These are CQEs that the application is yet to consume.
+<a id="L264"></a>/// Matches the implementation of io_uring_cq_ready in liburing.
+<a id="L265"></a>pub fn cq_ready(self: *IoUring) u32 {
+<a id="L266"></a>    return @atomicLoad(u32, self.cq.tail, .acquire) -% self.cq.head.*;
+<a id="L267"></a>}
+<a id="L268"></a>
+<a id="L269"></a>/// Copies as many CQEs as are ready, and that can fit into the destination `cqes` slice.
+<a id="L270"></a>/// If none are available, enters into the kernel to wait for at most `wait_nr` CQEs.
+<a id="L271"></a>/// Returns the number of CQEs copied, advancing the CQ ring.
+<a id="L272"></a>/// Provides all the wait/peek methods found in liburing, but with batching and a single method.
+<a id="L273"></a>/// The rationale for copying CQEs rather than copying pointers is that pointers are 8 bytes
+<a id="L274"></a>/// whereas CQEs are not much more at only 16 bytes, and this provides a safer faster interface.
+<a id="L275"></a>/// Safer, because you no longer need to call cqe_seen(), avoiding idempotency bugs.
+<a id="L276"></a>/// Faster, because we can now amortize the atomic store release to `cq.head` across the batch.
+<a id="L277"></a>/// See https://github.com/axboe/liburing/issues/103#issuecomment-686665007.
+<a id="L278"></a>/// Matches the implementation of io_uring_peek_batch_cqe() in liburing, but supports waiting.
+<a id="L279"></a>pub fn copy_cqes(self: *IoUring, cqes: []linux.io_uring_cqe, wait_nr: u32) !u32 {
+<a id="L280"></a>    const count = self.copy_cqes_ready(cqes);
+<a id="L281"></a>    if (count &gt; 0) return count;
+<a id="L282"></a>    if (self.cq_ring_needs_flush() or wait_nr &gt; 0) {
+<a id="L283"></a>        _ = try self.enter(0, wait_nr, linux.IORING_ENTER_GETEVENTS);
+<a id="L284"></a>        return self.copy_cqes_ready(cqes);
+<a id="L285"></a>    }
+<a id="L286"></a>    return 0;
+<a id="L287"></a>}
+<a id="L288"></a>
+<a id="L289"></a>fn copy_cqes_ready(self: *IoUring, cqes: []linux.io_uring_cqe) u32 {
+<a id="L290"></a>    const ready = self.cq_ready();
+<a id="L291"></a>    const count = @min(cqes.len, ready);
+<a id="L292"></a>    const head = self.cq.head.* &amp; self.cq.mask;
+<a id="L293"></a>
+<a id="L294"></a>    // before wrapping
+<a id="L295"></a>    const n = @min(self.cq.cqes.len - head, count);
+<a id="L296"></a>    @memcpy(cqes[0..n], self.cq.cqes[head..][0..n]);
+<a id="L297"></a>
+<a id="L298"></a>    if (count &gt; n) {
+<a id="L299"></a>        // wrap self.cq.cqes
+<a id="L300"></a>        const w = count - n;
+<a id="L301"></a>        @memcpy(cqes[n..][0..w], self.cq.cqes[0..w]);
+<a id="L302"></a>    }
+<a id="L303"></a>
+<a id="L304"></a>    self.cq_advance(count);
+<a id="L305"></a>    return count;
+<a id="L306"></a>}
+<a id="L307"></a>
+<a id="L308"></a>/// Returns a copy of an I/O completion, waiting for it if necessary, and advancing the CQ ring.
+<a id="L309"></a>/// A convenience method for `copy_cqes()` for when you don't need to batch or peek.
+<a id="L310"></a>pub fn copy_cqe(ring: *IoUring) !linux.io_uring_cqe {
+<a id="L311"></a>    var cqes: [1]linux.io_uring_cqe = undefined;
+<a id="L312"></a>    while (true) {
+<a id="L313"></a>        const count = try ring.copy_cqes(&amp;cqes, 1);
+<a id="L314"></a>        if (count &gt; 0) return cqes[0];
+<a id="L315"></a>    }
+<a id="L316"></a>}
+<a id="L317"></a>
+<a id="L318"></a>/// Matches the implementation of cq_ring_needs_flush() in liburing.
+<a id="L319"></a>pub fn cq_ring_needs_flush(self: *IoUring) bool {
+<a id="L320"></a>    return (@atomicLoad(u32, self.sq.flags, .unordered) &amp; linux.IORING_SQ_CQ_OVERFLOW) != 0;
+<a id="L321"></a>}
+<a id="L322"></a>
+<a id="L323"></a>/// For advanced use cases only that implement custom completion queue methods.
+<a id="L324"></a>/// If you use copy_cqes() or copy_cqe() you must not call cqe_seen() or cq_advance().
+<a id="L325"></a>/// Must be called exactly once after a zero-copy CQE has been processed by your application.
+<a id="L326"></a>/// Not idempotent, calling more than once will result in other CQEs being lost.
+<a id="L327"></a>/// Matches the implementation of cqe_seen() in liburing.
+<a id="L328"></a>pub fn cqe_seen(self: *IoUring, cqe: *linux.io_uring_cqe) void {
+<a id="L329"></a>    _ = cqe;
+<a id="L330"></a>    self.cq_advance(1);
+<a id="L331"></a>}
+<a id="L332"></a>
+<a id="L333"></a>/// For advanced use cases only that implement custom completion queue methods.
+<a id="L334"></a>/// Matches the implementation of cq_advance() in liburing.
+<a id="L335"></a>pub fn cq_advance(self: *IoUring, count: u32) void {
+<a id="L336"></a>    if (count &gt; 0) {
+<a id="L337"></a>        // Ensure the kernel only sees the new head value after the CQEs have been read.
+<a id="L338"></a>        @atomicStore(u32, self.cq.head, self.cq.head.* +% count, .release);
+<a id="L339"></a>    }
+<a id="L340"></a>}
+<a id="L341"></a>
+<a id="L342"></a>/// Queues (but does not submit) an SQE to perform an `fsync(2)`.
+<a id="L343"></a>/// Returns a pointer to the SQE so that you can further modify the SQE for advanced use cases.
+<a id="L344"></a>/// For example, for `fdatasync()` you can set `IORING_FSYNC_DATASYNC` in the SQE's `rw_flags`.
+<a id="L345"></a>/// N.B. While SQEs are initiated in the order in which they appear in the submission queue,
+<a id="L346"></a>/// operations execute in parallel and completions are unordered. Therefore, an application that
+<a id="L347"></a>/// submits a write followed by an fsync in the submission queue cannot expect the fsync to
+<a id="L348"></a>/// apply to the write, since the fsync may complete before the write is issued to the disk.
+<a id="L349"></a>/// You should preferably use `link_with_next_sqe()` on a write's SQE to link it with an fsync,
+<a id="L350"></a>/// or else insert a full write barrier using `drain_previous_sqes()` when queueing an fsync.
+<a id="L351"></a>pub fn fsync(self: *IoUring, user_data: u64, fd: linux.fd_t, flags: u32) !*linux.io_uring_sqe {
+<a id="L352"></a>    const sqe = try self.get_sqe();
+<a id="L353"></a>    sqe.prep_fsync(fd, flags);
+<a id="L354"></a>    sqe.user_data = user_data;
+<a id="L355"></a>    return sqe;
+<a id="L356"></a>}
+<a id="L357"></a>
+<a id="L358"></a>/// Queues (but does not submit) an SQE to perform a no-op.
+<a id="L359"></a>/// Returns a pointer to the SQE so that you can further modify the SQE for advanced use cases.
+<a id="L360"></a>/// A no-op is more useful than may appear at first glance.
+<a id="L361"></a>/// For example, you could call `drain_previous_sqes()` on the returned SQE, to use the no-op to
+<a id="L362"></a>/// know when the ring is idle before acting on a kill signal.
+<a id="L363"></a>pub fn nop(self: *IoUring, user_data: u64) !*linux.io_uring_sqe {
+<a id="L364"></a>    const sqe = try self.get_sqe();
+<a id="L365"></a>    sqe.prep_nop();
+<a id="L366"></a>    sqe.user_data = user_data;
+<a id="L367"></a>    return sqe;
+<a id="L368"></a>}
+<a id="L369"></a>
+<a id="L370"></a>/// Used to select how the read should be handled.
+<a id="L371"></a>pub const ReadBuffer = union(enum) {
+<a id="L372"></a>    /// io_uring will read directly into this buffer
+<a id="L373"></a>    buffer: []u8,
+<a id="L374"></a>
+<a id="L375"></a>    /// io_uring will read directly into these buffers using readv.
+<a id="L376"></a>    iovecs: []const posix.iovec,
+<a id="L377"></a>
+<a id="L378"></a>    /// io_uring will select a buffer that has previously been provided with `provide_buffers`.
+<a id="L379"></a>    /// The buffer group reference by `group_id` must contain at least one buffer for the read to work.
+<a id="L380"></a>    /// `len` controls the number of bytes to read into the selected buffer.
+<a id="L381"></a>    buffer_selection: struct {
+<a id="L382"></a>        group_id: u16,
+<a id="L383"></a>        len: usize,
+<a id="L384"></a>    },
+<a id="L385"></a>};
+<a id="L386"></a>
+<a id="L387"></a>/// Queues (but does not submit) an SQE to perform a `read(2)` or `preadv(2)` depending on the buffer type.
+<a id="L388"></a>/// * Reading into a `ReadBuffer.buffer` uses `read(2)`
+<a id="L389"></a>/// * Reading into a `ReadBuffer.iovecs` uses `preadv(2)`
+<a id="L390"></a>///   If you want to do a `preadv2(2)` then set `rw_flags` on the returned SQE. See https://man7.org/linux/man-pages/man2/preadv2.2.html
+<a id="L391"></a>///
+<a id="L392"></a>/// Returns a pointer to the SQE.
+<a id="L393"></a>pub fn read(
+<a id="L394"></a>    self: *IoUring,
+<a id="L395"></a>    user_data: u64,
+<a id="L396"></a>    fd: linux.fd_t,
+<a id="L397"></a>    buffer: ReadBuffer,
+<a id="L398"></a>    offset: u64,
+<a id="L399"></a>) !*linux.io_uring_sqe {
+<a id="L400"></a>    const sqe = try self.get_sqe();
+<a id="L401"></a>    switch (buffer) {
+<a id="L402"></a>        .buffer =&gt; |slice| sqe.prep_read(fd, slice, offset),
+<a id="L403"></a>        .iovecs =&gt; |vecs| sqe.prep_readv(fd, vecs, offset),
+<a id="L404"></a>        .buffer_selection =&gt; |selection| {
+<a id="L405"></a>            sqe.prep_rw(.READ, fd, 0, selection.len, offset);
+<a id="L406"></a>            sqe.flags |= linux.IOSQE_BUFFER_SELECT;
+<a id="L407"></a>            sqe.buf_index = selection.group_id;
+<a id="L408"></a>        },
+<a id="L409"></a>    }
+<a id="L410"></a>    sqe.user_data = user_data;
+<a id="L411"></a>    return sqe;
+<a id="L412"></a>}
+<a id="L413"></a>
+<a id="L414"></a>/// Queues (but does not submit) an SQE to perform a `write(2)`.
+<a id="L415"></a>/// Returns a pointer to the SQE.
+<a id="L416"></a>pub fn write(
+<a id="L417"></a>    self: *IoUring,
+<a id="L418"></a>    user_data: u64,
+<a id="L419"></a>    fd: linux.fd_t,
+<a id="L420"></a>    buffer: []const u8,
+<a id="L421"></a>    offset: u64,
+<a id="L422"></a>) !*linux.io_uring_sqe {
+<a id="L423"></a>    const sqe = try self.get_sqe();
+<a id="L424"></a>    sqe.prep_write(fd, buffer, offset);
+<a id="L425"></a>    sqe.user_data = user_data;
+<a id="L426"></a>    return sqe;
+<a id="L427"></a>}
+<a id="L428"></a>
+<a id="L429"></a>/// Queues (but does not submit) an SQE to perform a `splice(2)`
+<a id="L430"></a>/// Either `fd_in` or `fd_out` must be a pipe.
+<a id="L431"></a>/// If `fd_in` refers to a pipe, `off_in` is ignored and must be set to std.math.maxInt(u64).
+<a id="L432"></a>/// If `fd_in` does not refer to a pipe and `off_in` is maxInt(u64), then `len` are read
+<a id="L433"></a>/// from `fd_in` starting from the file offset, which is incremented by the number of bytes read.
+<a id="L434"></a>/// If `fd_in` does not refer to a pipe and `off_in` is not maxInt(u64), then the starting offset of `fd_in` will be `off_in`.
+<a id="L435"></a>/// This splice operation can be used to implement sendfile by splicing to an intermediate pipe first,
+<a id="L436"></a>/// then splice to the final destination. In fact, the implementation of sendfile in kernel uses splice internally.
+<a id="L437"></a>///
+<a id="L438"></a>/// NOTE that even if fd_in or fd_out refers to a pipe, the splice operation can still fail with EINVAL if one of the
+<a id="L439"></a>/// fd doesn't explicitly support splice peration, e.g. reading from terminal is unsupported from kernel 5.7 to 5.11.
+<a id="L440"></a>/// See https://github.com/axboe/liburing/issues/291
+<a id="L441"></a>///
+<a id="L442"></a>/// Returns a pointer to the SQE so that you can further modify the SQE for advanced use cases.
+<a id="L443"></a>pub fn splice(self: *IoUring, user_data: u64, fd_in: linux.fd_t, off_in: u64, fd_out: linux.fd_t, off_out: u64, len: usize) !*linux.io_uring_sqe {
+<a id="L444"></a>    const sqe = try self.get_sqe();
+<a id="L445"></a>    sqe.prep_splice(fd_in, off_in, fd_out, off_out, len);
+<a id="L446"></a>    sqe.user_data = user_data;
+<a id="L447"></a>    return sqe;
+<a id="L448"></a>}
+<a id="L449"></a>
+<a id="L450"></a>/// Queues (but does not submit) an SQE to perform a IORING_OP_READ_FIXED.
+<a id="L451"></a>/// The `buffer` provided must be registered with the kernel by calling `register_buffers` first.
+<a id="L452"></a>/// The `buffer_index` must be the same as its index in the array provided to `register_buffers`.
+<a id="L453"></a>///
+<a id="L454"></a>/// Returns a pointer to the SQE so that you can further modify the SQE for advanced use cases.
+<a id="L455"></a>pub fn read_fixed(
+<a id="L456"></a>    self: *IoUring,
+<a id="L457"></a>    user_data: u64,
+<a id="L458"></a>    fd: linux.fd_t,
+<a id="L459"></a>    buffer: *posix.iovec,
+<a id="L460"></a>    offset: u64,
+<a id="L461"></a>    buffer_index: u16,
+<a id="L462"></a>) !*linux.io_uring_sqe {
+<a id="L463"></a>    const sqe = try self.get_sqe();
+<a id="L464"></a>    sqe.prep_read_fixed(fd, buffer, offset, buffer_index);
+<a id="L465"></a>    sqe.user_data = user_data;
+<a id="L466"></a>    return sqe;
+<a id="L467"></a>}
+<a id="L468"></a>
+<a id="L469"></a>/// Queues (but does not submit) an SQE to perform a `pwritev()`.
+<a id="L470"></a>/// Returns a pointer to the SQE so that you can further modify the SQE for advanced use cases.
+<a id="L471"></a>/// For example, if you want to do a `pwritev2()` then set `rw_flags` on the returned SQE.
+<a id="L472"></a>/// See https://linux.die.net/man/2/pwritev.
+<a id="L473"></a>pub fn writev(
+<a id="L474"></a>    self: *IoUring,
+<a id="L475"></a>    user_data: u64,
+<a id="L476"></a>    fd: linux.fd_t,
+<a id="L477"></a>    iovecs: []const posix.iovec_const,
+<a id="L478"></a>    offset: u64,
+<a id="L479"></a>) !*linux.io_uring_sqe {
+<a id="L480"></a>    const sqe = try self.get_sqe();
+<a id="L481"></a>    sqe.prep_writev(fd, iovecs, offset);
+<a id="L482"></a>    sqe.user_data = user_data;
+<a id="L483"></a>    return sqe;
+<a id="L484"></a>}
+<a id="L485"></a>
+<a id="L486"></a>/// Queues (but does not submit) an SQE to perform a IORING_OP_WRITE_FIXED.
+<a id="L487"></a>/// The `buffer` provided must be registered with the kernel by calling `register_buffers` first.
+<a id="L488"></a>/// The `buffer_index` must be the same as its index in the array provided to `register_buffers`.
+<a id="L489"></a>///
+<a id="L490"></a>/// Returns a pointer to the SQE so that you can further modify the SQE for advanced use cases.
+<a id="L491"></a>pub fn write_fixed(
+<a id="L492"></a>    self: *IoUring,
+<a id="L493"></a>    user_data: u64,
+<a id="L494"></a>    fd: linux.fd_t,
+<a id="L495"></a>    buffer: *posix.iovec,
+<a id="L496"></a>    offset: u64,
+<a id="L497"></a>    buffer_index: u16,
+<a id="L498"></a>) !*linux.io_uring_sqe {
+<a id="L499"></a>    const sqe = try self.get_sqe();
+<a id="L500"></a>    sqe.prep_write_fixed(fd, buffer, offset, buffer_index);
+<a id="L501"></a>    sqe.user_data = user_data;
+<a id="L502"></a>    return sqe;
+<a id="L503"></a>}
+<a id="L504"></a>
+<a id="L505"></a>/// Queues (but does not submit) an SQE to perform an `accept4(2)` on a socket.
+<a id="L506"></a>/// Returns a pointer to the SQE.
+<a id="L507"></a>/// Available since 5.5
+<a id="L508"></a>pub fn accept(
+<a id="L509"></a>    self: *IoUring,
+<a id="L510"></a>    user_data: u64,
+<a id="L511"></a>    fd: linux.fd_t,
+<a id="L512"></a>    addr: ?*posix.sockaddr,
+<a id="L513"></a>    addrlen: ?*posix.socklen_t,
+<a id="L514"></a>    flags: u32,
+<a id="L515"></a>) !*linux.io_uring_sqe {
+<a id="L516"></a>    const sqe = try self.get_sqe();
+<a id="L517"></a>    sqe.prep_accept(fd, addr, addrlen, flags);
+<a id="L518"></a>    sqe.user_data = user_data;
+<a id="L519"></a>    return sqe;
+<a id="L520"></a>}
+<a id="L521"></a>
+<a id="L522"></a>/// Queues an multishot accept on a socket.
+<a id="L523"></a>///
+<a id="L524"></a>/// Multishot variant allows an application to issue a single accept request,
+<a id="L525"></a>/// which will repeatedly trigger a CQE when a connection request comes in.
+<a id="L526"></a>/// While IORING_CQE_F_MORE flag is set in CQE flags accept will generate
+<a id="L527"></a>/// further CQEs.
+<a id="L528"></a>///
+<a id="L529"></a>/// Available since 5.19
+<a id="L530"></a>pub fn accept_multishot(
+<a id="L531"></a>    self: *IoUring,
+<a id="L532"></a>    user_data: u64,
+<a id="L533"></a>    fd: linux.fd_t,
+<a id="L534"></a>    addr: ?*posix.sockaddr,
+<a id="L535"></a>    addrlen: ?*posix.socklen_t,
+<a id="L536"></a>    flags: u32,
+<a id="L537"></a>) !*linux.io_uring_sqe {
+<a id="L538"></a>    const sqe = try self.get_sqe();
+<a id="L539"></a>    sqe.prep_multishot_accept(fd, addr, addrlen, flags);
+<a id="L540"></a>    sqe.user_data = user_data;
+<a id="L541"></a>    return sqe;
+<a id="L542"></a>}
+<a id="L543"></a>
+<a id="L544"></a>/// Queues an accept using direct (registered) file descriptors.
+<a id="L545"></a>///
+<a id="L546"></a>/// To use an accept direct variant, the application must first have registered
+<a id="L547"></a>/// a file table (with register_files). An unused table index will be
+<a id="L548"></a>/// dynamically chosen and returned in the CQE res field.
+<a id="L549"></a>///
+<a id="L550"></a>/// After creation, they can be used by setting IOSQE_FIXED_FILE in the SQE
+<a id="L551"></a>/// flags member, and setting the SQE fd field to the direct descriptor value
+<a id="L552"></a>/// rather than the regular file descriptor.
+<a id="L553"></a>///
+<a id="L554"></a>/// Available since 5.19
+<a id="L555"></a>pub fn accept_direct(
+<a id="L556"></a>    self: *IoUring,
+<a id="L557"></a>    user_data: u64,
+<a id="L558"></a>    fd: linux.fd_t,
+<a id="L559"></a>    addr: ?*posix.sockaddr,
+<a id="L560"></a>    addrlen: ?*posix.socklen_t,
+<a id="L561"></a>    flags: u32,
+<a id="L562"></a>) !*linux.io_uring_sqe {
+<a id="L563"></a>    const sqe = try self.get_sqe();
+<a id="L564"></a>    sqe.prep_accept_direct(fd, addr, addrlen, flags, linux.IORING_FILE_INDEX_ALLOC);
+<a id="L565"></a>    sqe.user_data = user_data;
+<a id="L566"></a>    return sqe;
+<a id="L567"></a>}
+<a id="L568"></a>
+<a id="L569"></a>/// Queues an multishot accept using direct (registered) file descriptors.
+<a id="L570"></a>/// Available since 5.19
+<a id="L571"></a>pub fn accept_multishot_direct(
+<a id="L572"></a>    self: *IoUring,
+<a id="L573"></a>    user_data: u64,
+<a id="L574"></a>    fd: linux.fd_t,
+<a id="L575"></a>    addr: ?*posix.sockaddr,
+<a id="L576"></a>    addrlen: ?*posix.socklen_t,
+<a id="L577"></a>    flags: u32,
+<a id="L578"></a>) !*linux.io_uring_sqe {
+<a id="L579"></a>    const sqe = try self.get_sqe();
+<a id="L580"></a>    sqe.prep_multishot_accept_direct(fd, addr, addrlen, flags);
+<a id="L581"></a>    sqe.user_data = user_data;
+<a id="L582"></a>    return sqe;
+<a id="L583"></a>}
+<a id="L584"></a>
+<a id="L585"></a>/// Queue (but does not submit) an SQE to perform a `connect(2)` on a socket.
+<a id="L586"></a>/// Returns a pointer to the SQE.
+<a id="L587"></a>pub fn connect(
+<a id="L588"></a>    self: *IoUring,
+<a id="L589"></a>    user_data: u64,
+<a id="L590"></a>    fd: linux.fd_t,
+<a id="L591"></a>    addr: *const posix.sockaddr,
+<a id="L592"></a>    addrlen: posix.socklen_t,
+<a id="L593"></a>) !*linux.io_uring_sqe {
+<a id="L594"></a>    const sqe = try self.get_sqe();
+<a id="L595"></a>    sqe.prep_connect(fd, addr, addrlen);
+<a id="L596"></a>    sqe.user_data = user_data;
+<a id="L597"></a>    return sqe;
+<a id="L598"></a>}
+<a id="L599"></a>
+<a id="L600"></a>/// Queues (but does not submit) an SQE to perform a `epoll_ctl(2)`.
+<a id="L601"></a>/// Returns a pointer to the SQE.
+<a id="L602"></a>pub fn epoll_ctl(
+<a id="L603"></a>    self: *IoUring,
+<a id="L604"></a>    user_data: u64,
+<a id="L605"></a>    epfd: linux.fd_t,
+<a id="L606"></a>    fd: linux.fd_t,
+<a id="L607"></a>    op: u32,
+<a id="L608"></a>    ev: ?*linux.epoll_event,
+<a id="L609"></a>) !*linux.io_uring_sqe {
+<a id="L610"></a>    const sqe = try self.get_sqe();
+<a id="L611"></a>    sqe.prep_epoll_ctl(epfd, fd, op, ev);
+<a id="L612"></a>    sqe.user_data = user_data;
+<a id="L613"></a>    return sqe;
+<a id="L614"></a>}
+<a id="L615"></a>
+<a id="L616"></a>/// Used to select how the recv call should be handled.
+<a id="L617"></a>pub const RecvBuffer = union(enum) {
+<a id="L618"></a>    /// io_uring will recv directly into this buffer
+<a id="L619"></a>    buffer: []u8,
+<a id="L620"></a>
+<a id="L621"></a>    /// io_uring will select a buffer that has previously been provided with `provide_buffers`.
+<a id="L622"></a>    /// The buffer group referenced by `group_id` must contain at least one buffer for the recv call to work.
+<a id="L623"></a>    /// `len` controls the number of bytes to read into the selected buffer.
+<a id="L624"></a>    buffer_selection: struct {
+<a id="L625"></a>        group_id: u16,
+<a id="L626"></a>        len: usize,
+<a id="L627"></a>    },
+<a id="L628"></a>};
+<a id="L629"></a>
+<a id="L630"></a>/// Queues (but does not submit) an SQE to perform a `recv(2)`.
+<a id="L631"></a>/// Returns a pointer to the SQE.
+<a id="L632"></a>/// Available since 5.6
+<a id="L633"></a>pub fn recv(
+<a id="L634"></a>    self: *IoUring,
+<a id="L635"></a>    user_data: u64,
+<a id="L636"></a>    fd: linux.fd_t,
+<a id="L637"></a>    buffer: RecvBuffer,
+<a id="L638"></a>    flags: u32,
+<a id="L639"></a>) !*linux.io_uring_sqe {
+<a id="L640"></a>    const sqe = try self.get_sqe();
+<a id="L641"></a>    switch (buffer) {
+<a id="L642"></a>        .buffer =&gt; |slice| sqe.prep_recv(fd, slice, flags),
+<a id="L643"></a>        .buffer_selection =&gt; |selection| {
+<a id="L644"></a>            sqe.prep_rw(.RECV, fd, 0, selection.len, 0);
+<a id="L645"></a>            sqe.rw_flags = flags;
+<a id="L646"></a>            sqe.flags |= linux.IOSQE_BUFFER_SELECT;
+<a id="L647"></a>            sqe.buf_index = selection.group_id;
+<a id="L648"></a>        },
+<a id="L649"></a>    }
+<a id="L650"></a>    sqe.user_data = user_data;
+<a id="L651"></a>    return sqe;
+<a id="L652"></a>}
+<a id="L653"></a>
+<a id="L654"></a>/// Queues (but does not submit) an SQE to perform a `send(2)`.
+<a id="L655"></a>/// Returns a pointer to the SQE.
+<a id="L656"></a>/// Available since 5.6
+<a id="L657"></a>pub fn send(
+<a id="L658"></a>    self: *IoUring,
+<a id="L659"></a>    user_data: u64,
+<a id="L660"></a>    fd: linux.fd_t,
+<a id="L661"></a>    buffer: []const u8,
+<a id="L662"></a>    flags: u32,
+<a id="L663"></a>) !*linux.io_uring_sqe {
+<a id="L664"></a>    const sqe = try self.get_sqe();
+<a id="L665"></a>    sqe.prep_send(fd, buffer, flags);
+<a id="L666"></a>    sqe.user_data = user_data;
+<a id="L667"></a>    return sqe;
+<a id="L668"></a>}
+<a id="L669"></a>
+<a id="L670"></a>/// Queues (but does not submit) an SQE to perform an async zerocopy `send(2)`.
+<a id="L671"></a>///
+<a id="L672"></a>/// This operation will most likely produce two CQEs. The flags field of the
+<a id="L673"></a>/// first cqe may likely contain IORING_CQE_F_MORE, which means that there will
+<a id="L674"></a>/// be a second cqe with the user_data field set to the same value. The user
+<a id="L675"></a>/// must not modify the data buffer until the notification is posted. The first
+<a id="L676"></a>/// cqe follows the usual rules and so its res field will contain the number of
+<a id="L677"></a>/// bytes sent or a negative error code. The notification's res field will be
+<a id="L678"></a>/// set to zero and the flags field will contain IORING_CQE_F_NOTIF. The two
+<a id="L679"></a>/// step model is needed because the kernel may hold on to buffers for a long
+<a id="L680"></a>/// time, e.g. waiting for a TCP ACK. Notifications responsible for controlling
+<a id="L681"></a>/// the lifetime of the buffers. Even errored requests may generate a
+<a id="L682"></a>/// notification.
+<a id="L683"></a>///
+<a id="L684"></a>/// Available since 6.0
+<a id="L685"></a>pub fn send_zc(
+<a id="L686"></a>    self: *IoUring,
+<a id="L687"></a>    user_data: u64,
+<a id="L688"></a>    fd: linux.fd_t,
+<a id="L689"></a>    buffer: []const u8,
+<a id="L690"></a>    send_flags: u32,
+<a id="L691"></a>    zc_flags: u16,
+<a id="L692"></a>) !*linux.io_uring_sqe {
+<a id="L693"></a>    const sqe = try self.get_sqe();
+<a id="L694"></a>    sqe.prep_send_zc(fd, buffer, send_flags, zc_flags);
+<a id="L695"></a>    sqe.user_data = user_data;
+<a id="L696"></a>    return sqe;
+<a id="L697"></a>}
+<a id="L698"></a>
+<a id="L699"></a>/// Queues (but does not submit) an SQE to perform an async zerocopy `send(2)`.
+<a id="L700"></a>/// Returns a pointer to the SQE.
+<a id="L701"></a>/// Available since 6.0
+<a id="L702"></a>pub fn send_zc_fixed(
+<a id="L703"></a>    self: *IoUring,
+<a id="L704"></a>    user_data: u64,
+<a id="L705"></a>    fd: linux.fd_t,
+<a id="L706"></a>    buffer: []const u8,
+<a id="L707"></a>    send_flags: u32,
+<a id="L708"></a>    zc_flags: u16,
+<a id="L709"></a>    buf_index: u16,
+<a id="L710"></a>) !*linux.io_uring_sqe {
+<a id="L711"></a>    const sqe = try self.get_sqe();
+<a id="L712"></a>    sqe.prep_send_zc_fixed(fd, buffer, send_flags, zc_flags, buf_index);
+<a id="L713"></a>    sqe.user_data = user_data;
+<a id="L714"></a>    return sqe;
+<a id="L715"></a>}
+<a id="L716"></a>
+<a id="L717"></a>/// Queues (but does not submit) an SQE to perform a `recvmsg(2)`.
+<a id="L718"></a>/// Returns a pointer to the SQE.
+<a id="L719"></a>/// Available since 5.3
+<a id="L720"></a>pub fn recvmsg(
+<a id="L721"></a>    self: *IoUring,
+<a id="L722"></a>    user_data: u64,
+<a id="L723"></a>    fd: linux.fd_t,
+<a id="L724"></a>    msg: *linux.msghdr,
+<a id="L725"></a>    flags: u32,
+<a id="L726"></a>) !*linux.io_uring_sqe {
+<a id="L727"></a>    const sqe = try self.get_sqe();
+<a id="L728"></a>    sqe.prep_recvmsg(fd, msg, flags);
+<a id="L729"></a>    sqe.user_data = user_data;
+<a id="L730"></a>    return sqe;
+<a id="L731"></a>}
+<a id="L732"></a>
+<a id="L733"></a>/// Queues (but does not submit) an SQE to perform a `sendmsg(2)`.
+<a id="L734"></a>/// Returns a pointer to the SQE.
+<a id="L735"></a>/// Available since 5.3
+<a id="L736"></a>pub fn sendmsg(
+<a id="L737"></a>    self: *IoUring,
+<a id="L738"></a>    user_data: u64,
+<a id="L739"></a>    fd: linux.fd_t,
+<a id="L740"></a>    msg: *const linux.msghdr_const,
+<a id="L741"></a>    flags: u32,
+<a id="L742"></a>) !*linux.io_uring_sqe {
+<a id="L743"></a>    const sqe = try self.get_sqe();
+<a id="L744"></a>    sqe.prep_sendmsg(fd, msg, flags);
+<a id="L745"></a>    sqe.user_data = user_data;
+<a id="L746"></a>    return sqe;
+<a id="L747"></a>}
+<a id="L748"></a>
+<a id="L749"></a>/// Queues (but does not submit) an SQE to perform an async zerocopy `sendmsg(2)`.
+<a id="L750"></a>/// Returns a pointer to the SQE.
+<a id="L751"></a>/// Available since 6.1
+<a id="L752"></a>pub fn sendmsg_zc(
+<a id="L753"></a>    self: *IoUring,
+<a id="L754"></a>    user_data: u64,
+<a id="L755"></a>    fd: linux.fd_t,
+<a id="L756"></a>    msg: *const linux.msghdr_const,
+<a id="L757"></a>    flags: u32,
+<a id="L758"></a>) !*linux.io_uring_sqe {
+<a id="L759"></a>    const sqe = try self.get_sqe();
+<a id="L760"></a>    sqe.prep_sendmsg_zc(fd, msg, flags);
+<a id="L761"></a>    sqe.user_data = user_data;
+<a id="L762"></a>    return sqe;
+<a id="L763"></a>}
+<a id="L764"></a>
+<a id="L765"></a>/// Queues (but does not submit) an SQE to perform an `openat(2)`.
+<a id="L766"></a>/// Returns a pointer to the SQE.
+<a id="L767"></a>/// Available since 5.6.
+<a id="L768"></a>pub fn openat(
+<a id="L769"></a>    self: *IoUring,
+<a id="L770"></a>    user_data: u64,
+<a id="L771"></a>    fd: linux.fd_t,
+<a id="L772"></a>    path: [*:0]const u8,
+<a id="L773"></a>    flags: linux.O,
+<a id="L774"></a>    mode: posix.mode_t,
+<a id="L775"></a>) !*linux.io_uring_sqe {
+<a id="L776"></a>    const sqe = try self.get_sqe();
+<a id="L777"></a>    sqe.prep_openat(fd, path, flags, mode);
+<a id="L778"></a>    sqe.user_data = user_data;
+<a id="L779"></a>    return sqe;
+<a id="L780"></a>}
+<a id="L781"></a>
+<a id="L782"></a>/// Queues an openat using direct (registered) file descriptors.
+<a id="L783"></a>///
+<a id="L784"></a>/// To use an accept direct variant, the application must first have registered
+<a id="L785"></a>/// a file table (with register_files). An unused table index will be
+<a id="L786"></a>/// dynamically chosen and returned in the CQE res field.
+<a id="L787"></a>///
+<a id="L788"></a>/// After creation, they can be used by setting IOSQE_FIXED_FILE in the SQE
+<a id="L789"></a>/// flags member, and setting the SQE fd field to the direct descriptor value
+<a id="L790"></a>/// rather than the regular file descriptor.
+<a id="L791"></a>///
+<a id="L792"></a>/// Available since 5.15
+<a id="L793"></a>pub fn openat_direct(
+<a id="L794"></a>    self: *IoUring,
+<a id="L795"></a>    user_data: u64,
+<a id="L796"></a>    fd: linux.fd_t,
+<a id="L797"></a>    path: [*:0]const u8,
+<a id="L798"></a>    flags: linux.O,
+<a id="L799"></a>    mode: posix.mode_t,
+<a id="L800"></a>    file_index: u32,
+<a id="L801"></a>) !*linux.io_uring_sqe {
+<a id="L802"></a>    const sqe = try self.get_sqe();
+<a id="L803"></a>    sqe.prep_openat_direct(fd, path, flags, mode, file_index);
+<a id="L804"></a>    sqe.user_data = user_data;
+<a id="L805"></a>    return sqe;
+<a id="L806"></a>}
+<a id="L807"></a>
+<a id="L808"></a>/// Queues (but does not submit) an SQE to perform a `close(2)`.
+<a id="L809"></a>/// Returns a pointer to the SQE.
+<a id="L810"></a>/// Available since 5.6.
+<a id="L811"></a>pub fn close(self: *IoUring, user_data: u64, fd: linux.fd_t) !*linux.io_uring_sqe {
+<a id="L812"></a>    const sqe = try self.get_sqe();
+<a id="L813"></a>    sqe.prep_close(fd);
+<a id="L814"></a>    sqe.user_data = user_data;
+<a id="L815"></a>    return sqe;
+<a id="L816"></a>}
+<a id="L817"></a>
+<a id="L818"></a>/// Queues close of registered file descriptor.
+<a id="L819"></a>/// Available since 5.15
+<a id="L820"></a>pub fn close_direct(self: *IoUring, user_data: u64, file_index: u32) !*linux.io_uring_sqe {
+<a id="L821"></a>    const sqe = try self.get_sqe();
+<a id="L822"></a>    sqe.prep_close_direct(file_index);
+<a id="L823"></a>    sqe.user_data = user_data;
+<a id="L824"></a>    return sqe;
+<a id="L825"></a>}
+<a id="L826"></a>
+<a id="L827"></a>/// Queues (but does not submit) an SQE to register a timeout operation.
+<a id="L828"></a>/// Returns a pointer to the SQE.
+<a id="L829"></a>///
+<a id="L830"></a>/// The timeout will complete when either the timeout expires, or after the specified number of
+<a id="L831"></a>/// events complete (if `count` is greater than `0`).
+<a id="L832"></a>///
+<a id="L833"></a>/// `flags` may be `0` for a relative timeout, or `IORING_TIMEOUT_ABS` for an absolute timeout.
+<a id="L834"></a>///
+<a id="L835"></a>/// The completion event result will be `-ETIME` if the timeout completed through expiration,
+<a id="L836"></a>/// `0` if the timeout completed after the specified number of events, or `-ECANCELED` if the
+<a id="L837"></a>/// timeout was removed before it expired.
+<a id="L838"></a>///
+<a id="L839"></a>/// io_uring timeouts use the `CLOCK.MONOTONIC` clock source.
+<a id="L840"></a>pub fn timeout(
+<a id="L841"></a>    self: *IoUring,
+<a id="L842"></a>    user_data: u64,
+<a id="L843"></a>    ts: *const linux.kernel_timespec,
+<a id="L844"></a>    count: u32,
+<a id="L845"></a>    flags: u32,
+<a id="L846"></a>) !*linux.io_uring_sqe {
+<a id="L847"></a>    const sqe = try self.get_sqe();
+<a id="L848"></a>    sqe.prep_timeout(ts, count, flags);
+<a id="L849"></a>    sqe.user_data = user_data;
+<a id="L850"></a>    return sqe;
+<a id="L851"></a>}
+<a id="L852"></a>
+<a id="L853"></a>/// Queues (but does not submit) an SQE to remove an existing timeout operation.
+<a id="L854"></a>/// Returns a pointer to the SQE.
+<a id="L855"></a>///
+<a id="L856"></a>/// The timeout is identified by its `user_data`.
+<a id="L857"></a>///
+<a id="L858"></a>/// The completion event result will be `0` if the timeout was found and canceled successfully,
+<a id="L859"></a>/// `-EBUSY` if the timeout was found but expiration was already in progress, or
+<a id="L860"></a>/// `-ENOENT` if the timeout was not found.
+<a id="L861"></a>pub fn timeout_remove(
+<a id="L862"></a>    self: *IoUring,
+<a id="L863"></a>    user_data: u64,
+<a id="L864"></a>    timeout_user_data: u64,
+<a id="L865"></a>    flags: u32,
+<a id="L866"></a>) !*linux.io_uring_sqe {
+<a id="L867"></a>    const sqe = try self.get_sqe();
+<a id="L868"></a>    sqe.prep_timeout_remove(timeout_user_data, flags);
+<a id="L869"></a>    sqe.user_data = user_data;
+<a id="L870"></a>    return sqe;
+<a id="L871"></a>}
+<a id="L872"></a>
+<a id="L873"></a>/// Queues (but does not submit) an SQE to add a link timeout operation.
+<a id="L874"></a>/// Returns a pointer to the SQE.
+<a id="L875"></a>///
+<a id="L876"></a>/// You need to set linux.IOSQE_IO_LINK to flags of the target operation
+<a id="L877"></a>/// and then call this method right after the target operation.
+<a id="L878"></a>/// See https://lwn.net/Articles/803932/ for detail.
+<a id="L879"></a>///
+<a id="L880"></a>/// If the dependent request finishes before the linked timeout, the timeout
+<a id="L881"></a>/// is canceled. If the timeout finishes before the dependent request, the
+<a id="L882"></a>/// dependent request will be canceled.
+<a id="L883"></a>///
+<a id="L884"></a>/// The completion event result of the link_timeout will be
+<a id="L885"></a>/// `-ETIME` if the timeout finishes before the dependent request
+<a id="L886"></a>/// (in this case, the completion event result of the dependent request will
+<a id="L887"></a>/// be `-ECANCELED`), or
+<a id="L888"></a>/// `-EALREADY` if the dependent request finishes before the linked timeout.
+<a id="L889"></a>pub fn link_timeout(
+<a id="L890"></a>    self: *IoUring,
+<a id="L891"></a>    user_data: u64,
+<a id="L892"></a>    ts: *const linux.kernel_timespec,
+<a id="L893"></a>    flags: u32,
+<a id="L894"></a>) !*linux.io_uring_sqe {
+<a id="L895"></a>    const sqe = try self.get_sqe();
+<a id="L896"></a>    sqe.prep_link_timeout(ts, flags);
+<a id="L897"></a>    sqe.user_data = user_data;
+<a id="L898"></a>    return sqe;
+<a id="L899"></a>}
+<a id="L900"></a>
+<a id="L901"></a>/// Queues (but does not submit) an SQE to perform a `poll(2)`.
+<a id="L902"></a>/// Returns a pointer to the SQE.
+<a id="L903"></a>pub fn poll_add(
+<a id="L904"></a>    self: *IoUring,
+<a id="L905"></a>    user_data: u64,
+<a id="L906"></a>    fd: linux.fd_t,
+<a id="L907"></a>    poll_mask: u32,
+<a id="L908"></a>) !*linux.io_uring_sqe {
+<a id="L909"></a>    const sqe = try self.get_sqe();
+<a id="L910"></a>    sqe.prep_poll_add(fd, poll_mask);
+<a id="L911"></a>    sqe.user_data = user_data;
+<a id="L912"></a>    return sqe;
+<a id="L913"></a>}
+<a id="L914"></a>
+<a id="L915"></a>/// Queues (but does not submit) an SQE to remove an existing poll operation.
+<a id="L916"></a>/// Returns a pointer to the SQE.
+<a id="L917"></a>pub fn poll_remove(
+<a id="L918"></a>    self: *IoUring,
+<a id="L919"></a>    user_data: u64,
+<a id="L920"></a>    target_user_data: u64,
+<a id="L921"></a>) !*linux.io_uring_sqe {
+<a id="L922"></a>    const sqe = try self.get_sqe();
+<a id="L923"></a>    sqe.prep_poll_remove(target_user_data);
+<a id="L924"></a>    sqe.user_data = user_data;
+<a id="L925"></a>    return sqe;
+<a id="L926"></a>}
+<a id="L927"></a>
+<a id="L928"></a>/// Queues (but does not submit) an SQE to update the user data of an existing poll
+<a id="L929"></a>/// operation. Returns a pointer to the SQE.
+<a id="L930"></a>pub fn poll_update(
+<a id="L931"></a>    self: *IoUring,
+<a id="L932"></a>    user_data: u64,
+<a id="L933"></a>    old_user_data: u64,
+<a id="L934"></a>    new_user_data: u64,
+<a id="L935"></a>    poll_mask: u32,
+<a id="L936"></a>    flags: u32,
+<a id="L937"></a>) !*linux.io_uring_sqe {
+<a id="L938"></a>    const sqe = try self.get_sqe();
+<a id="L939"></a>    sqe.prep_poll_update(old_user_data, new_user_data, poll_mask, flags);
+<a id="L940"></a>    sqe.user_data = user_data;
+<a id="L941"></a>    return sqe;
+<a id="L942"></a>}
+<a id="L943"></a>
+<a id="L944"></a>/// Queues (but does not submit) an SQE to perform an `fallocate(2)`.
+<a id="L945"></a>/// Returns a pointer to the SQE.
+<a id="L946"></a>pub fn fallocate(
+<a id="L947"></a>    self: *IoUring,
+<a id="L948"></a>    user_data: u64,
+<a id="L949"></a>    fd: linux.fd_t,
+<a id="L950"></a>    mode: i32,
+<a id="L951"></a>    offset: u64,
+<a id="L952"></a>    len: u64,
+<a id="L953"></a>) !*linux.io_uring_sqe {
+<a id="L954"></a>    const sqe = try self.get_sqe();
+<a id="L955"></a>    sqe.prep_fallocate(fd, mode, offset, len);
+<a id="L956"></a>    sqe.user_data = user_data;
+<a id="L957"></a>    return sqe;
+<a id="L958"></a>}
+<a id="L959"></a>
+<a id="L960"></a>/// Queues (but does not submit) an SQE to perform an `statx(2)`.
+<a id="L961"></a>/// Returns a pointer to the SQE.
+<a id="L962"></a>pub fn statx(
+<a id="L963"></a>    self: *IoUring,
+<a id="L964"></a>    user_data: u64,
+<a id="L965"></a>    fd: linux.fd_t,
+<a id="L966"></a>    path: [:0]const u8,
+<a id="L967"></a>    flags: u32,
+<a id="L968"></a>    mask: linux.STATX,
+<a id="L969"></a>    buf: *linux.Statx,
+<a id="L970"></a>) !*linux.io_uring_sqe {
+<a id="L971"></a>    const sqe = try self.get_sqe();
+<a id="L972"></a>    sqe.prep_statx(fd, path, flags, mask, buf);
+<a id="L973"></a>    sqe.user_data = user_data;
+<a id="L974"></a>    return sqe;
+<a id="L975"></a>}
+<a id="L976"></a>
+<a id="L977"></a>/// Queues (but does not submit) an SQE to remove an existing operation.
+<a id="L978"></a>/// Returns a pointer to the SQE.
+<a id="L979"></a>///
+<a id="L980"></a>/// The operation is identified by its `user_data`.
+<a id="L981"></a>///
+<a id="L982"></a>/// The completion event result will be `0` if the operation was found and canceled successfully,
+<a id="L983"></a>/// `-EALREADY` if the operation was found but was already in progress, or
+<a id="L984"></a>/// `-ENOENT` if the operation was not found.
+<a id="L985"></a>pub fn cancel(
+<a id="L986"></a>    self: *IoUring,
+<a id="L987"></a>    user_data: u64,
+<a id="L988"></a>    cancel_user_data: u64,
+<a id="L989"></a>    flags: u32,
+<a id="L990"></a>) !*linux.io_uring_sqe {
+<a id="L991"></a>    const sqe = try self.get_sqe();
+<a id="L992"></a>    sqe.prep_cancel(cancel_user_data, flags);
+<a id="L993"></a>    sqe.user_data = user_data;
+<a id="L994"></a>    return sqe;
+<a id="L995"></a>}
+<a id="L996"></a>
+<a id="L997"></a>/// Queues (but does not submit) an SQE to perform a `shutdown(2)`.
+<a id="L998"></a>/// Returns a pointer to the SQE.
+<a id="L999"></a>///
+<a id="L1000"></a>/// The operation is identified by its `user_data`.
+<a id="L1001"></a>pub fn shutdown(
+<a id="L1002"></a>    self: *IoUring,
+<a id="L1003"></a>    user_data: u64,
+<a id="L1004"></a>    sockfd: posix.socket_t,
+<a id="L1005"></a>    how: u32,
+<a id="L1006"></a>) !*linux.io_uring_sqe {
+<a id="L1007"></a>    const sqe = try self.get_sqe();
+<a id="L1008"></a>    sqe.prep_shutdown(sockfd, how);
+<a id="L1009"></a>    sqe.user_data = user_data;
+<a id="L1010"></a>    return sqe;
+<a id="L1011"></a>}
+<a id="L1012"></a>
+<a id="L1013"></a>/// Queues (but does not submit) an SQE to perform a `renameat2(2)`.
+<a id="L1014"></a>/// Returns a pointer to the SQE.
+<a id="L1015"></a>pub fn renameat(
+<a id="L1016"></a>    self: *IoUring,
+<a id="L1017"></a>    user_data: u64,
+<a id="L1018"></a>    old_dir_fd: linux.fd_t,
+<a id="L1019"></a>    old_path: [*:0]const u8,
+<a id="L1020"></a>    new_dir_fd: linux.fd_t,
+<a id="L1021"></a>    new_path: [*:0]const u8,
+<a id="L1022"></a>    flags: u32,
+<a id="L1023"></a>) !*linux.io_uring_sqe {
+<a id="L1024"></a>    const sqe = try self.get_sqe();
+<a id="L1025"></a>    sqe.prep_renameat(old_dir_fd, old_path, new_dir_fd, new_path, flags);
+<a id="L1026"></a>    sqe.user_data = user_data;
+<a id="L1027"></a>    return sqe;
+<a id="L1028"></a>}
+<a id="L1029"></a>
+<a id="L1030"></a>/// Queues (but does not submit) an SQE to perform a `unlinkat(2)`.
+<a id="L1031"></a>/// Returns a pointer to the SQE.
+<a id="L1032"></a>pub fn unlinkat(
+<a id="L1033"></a>    self: *IoUring,
+<a id="L1034"></a>    user_data: u64,
+<a id="L1035"></a>    dir_fd: linux.fd_t,
+<a id="L1036"></a>    path: [*:0]const u8,
+<a id="L1037"></a>    flags: u32,
+<a id="L1038"></a>) !*linux.io_uring_sqe {
+<a id="L1039"></a>    const sqe = try self.get_sqe();
+<a id="L1040"></a>    sqe.prep_unlinkat(dir_fd, path, flags);
+<a id="L1041"></a>    sqe.user_data = user_data;
+<a id="L1042"></a>    return sqe;
+<a id="L1043"></a>}
+<a id="L1044"></a>
+<a id="L1045"></a>/// Queues (but does not submit) an SQE to perform a `mkdirat(2)`.
+<a id="L1046"></a>/// Returns a pointer to the SQE.
+<a id="L1047"></a>pub fn mkdirat(
+<a id="L1048"></a>    self: *IoUring,
+<a id="L1049"></a>    user_data: u64,
+<a id="L1050"></a>    dir_fd: linux.fd_t,
+<a id="L1051"></a>    path: [*:0]const u8,
+<a id="L1052"></a>    mode: posix.mode_t,
+<a id="L1053"></a>) !*linux.io_uring_sqe {
+<a id="L1054"></a>    const sqe = try self.get_sqe();
+<a id="L1055"></a>    sqe.prep_mkdirat(dir_fd, path, mode);
+<a id="L1056"></a>    sqe.user_data = user_data;
+<a id="L1057"></a>    return sqe;
+<a id="L1058"></a>}
+<a id="L1059"></a>
+<a id="L1060"></a>/// Queues (but does not submit) an SQE to perform a `symlinkat(2)`.
+<a id="L1061"></a>/// Returns a pointer to the SQE.
+<a id="L1062"></a>pub fn symlinkat(
+<a id="L1063"></a>    self: *IoUring,
+<a id="L1064"></a>    user_data: u64,
+<a id="L1065"></a>    target: [*:0]const u8,
+<a id="L1066"></a>    new_dir_fd: linux.fd_t,
+<a id="L1067"></a>    link_path: [*:0]const u8,
+<a id="L1068"></a>) !*linux.io_uring_sqe {
+<a id="L1069"></a>    const sqe = try self.get_sqe();
+<a id="L1070"></a>    sqe.prep_symlinkat(target, new_dir_fd, link_path);
+<a id="L1071"></a>    sqe.user_data = user_data;
+<a id="L1072"></a>    return sqe;
+<a id="L1073"></a>}
+<a id="L1074"></a>
+<a id="L1075"></a>/// Queues (but does not submit) an SQE to perform a `linkat(2)`.
+<a id="L1076"></a>/// Returns a pointer to the SQE.
+<a id="L1077"></a>pub fn linkat(
+<a id="L1078"></a>    self: *IoUring,
+<a id="L1079"></a>    user_data: u64,
+<a id="L1080"></a>    old_dir_fd: linux.fd_t,
+<a id="L1081"></a>    old_path: [*:0]const u8,
+<a id="L1082"></a>    new_dir_fd: linux.fd_t,
+<a id="L1083"></a>    new_path: [*:0]const u8,
+<a id="L1084"></a>    flags: u32,
+<a id="L1085"></a>) !*linux.io_uring_sqe {
+<a id="L1086"></a>    const sqe = try self.get_sqe();
+<a id="L1087"></a>    sqe.prep_linkat(old_dir_fd, old_path, new_dir_fd, new_path, flags);
+<a id="L1088"></a>    sqe.user_data = user_data;
+<a id="L1089"></a>    return sqe;
+<a id="L1090"></a>}
+<a id="L1091"></a>
+<a id="L1092"></a>/// Queues (but does not submit) an SQE to provide a group of buffers used for commands that read/receive data.
+<a id="L1093"></a>/// Returns a pointer to the SQE.
+<a id="L1094"></a>///
+<a id="L1095"></a>/// Provided buffers can be used in `read`, `recv` or `recvmsg` commands via .buffer_selection.
+<a id="L1096"></a>///
+<a id="L1097"></a>/// The kernel expects a contiguous block of memory of size (buffers_count * buffer_size).
+<a id="L1098"></a>pub fn provide_buffers(
+<a id="L1099"></a>    self: *IoUring,
+<a id="L1100"></a>    user_data: u64,
+<a id="L1101"></a>    buffers: [*]u8,
+<a id="L1102"></a>    buffer_size: usize,
+<a id="L1103"></a>    buffers_count: usize,
+<a id="L1104"></a>    group_id: usize,
+<a id="L1105"></a>    buffer_id: usize,
+<a id="L1106"></a>) !*linux.io_uring_sqe {
+<a id="L1107"></a>    const sqe = try self.get_sqe();
+<a id="L1108"></a>    sqe.prep_provide_buffers(buffers, buffer_size, buffers_count, group_id, buffer_id);
+<a id="L1109"></a>    sqe.user_data = user_data;
+<a id="L1110"></a>    return sqe;
+<a id="L1111"></a>}
+<a id="L1112"></a>
+<a id="L1113"></a>/// Queues (but does not submit) an SQE to remove a group of provided buffers.
+<a id="L1114"></a>/// Returns a pointer to the SQE.
+<a id="L1115"></a>pub fn remove_buffers(
+<a id="L1116"></a>    self: *IoUring,
+<a id="L1117"></a>    user_data: u64,
+<a id="L1118"></a>    buffers_count: usize,
+<a id="L1119"></a>    group_id: usize,
+<a id="L1120"></a>) !*linux.io_uring_sqe {
+<a id="L1121"></a>    const sqe = try self.get_sqe();
+<a id="L1122"></a>    sqe.prep_remove_buffers(buffers_count, group_id);
+<a id="L1123"></a>    sqe.user_data = user_data;
+<a id="L1124"></a>    return sqe;
+<a id="L1125"></a>}
+<a id="L1126"></a>
+<a id="L1127"></a>/// Queues (but does not submit) an SQE to perform a `waitid(2)`.
+<a id="L1128"></a>/// Returns a pointer to the SQE.
+<a id="L1129"></a>pub fn waitid(
+<a id="L1130"></a>    self: *IoUring,
+<a id="L1131"></a>    user_data: u64,
+<a id="L1132"></a>    id_type: linux.P,
+<a id="L1133"></a>    id: i32,
+<a id="L1134"></a>    infop: *linux.siginfo_t,
+<a id="L1135"></a>    options: u32,
+<a id="L1136"></a>    flags: u32,
+<a id="L1137"></a>) !*linux.io_uring_sqe {
+<a id="L1138"></a>    const sqe = try self.get_sqe();
+<a id="L1139"></a>    sqe.prep_waitid(id_type, id, infop, options, flags);
+<a id="L1140"></a>    sqe.user_data = user_data;
+<a id="L1141"></a>    return sqe;
+<a id="L1142"></a>}
+<a id="L1143"></a>
+<a id="L1144"></a>/// Registers an array of file descriptors.
+<a id="L1145"></a>/// Every time a file descriptor is put in an SQE and submitted to the kernel, the kernel must
+<a id="L1146"></a>/// retrieve a reference to the file, and once I/O has completed the file reference must be
+<a id="L1147"></a>/// dropped. The atomic nature of this file reference can be a slowdown for high IOPS workloads.
+<a id="L1148"></a>/// This slowdown can be avoided by pre-registering file descriptors.
+<a id="L1149"></a>/// To refer to a registered file descriptor, IOSQE_FIXED_FILE must be set in the SQE's flags,
+<a id="L1150"></a>/// and the SQE's fd must be set to the index of the file descriptor in the registered array.
+<a id="L1151"></a>/// Registering file descriptors will wait for the ring to idle.
+<a id="L1152"></a>/// Files are automatically unregistered by the kernel when the ring is torn down.
+<a id="L1153"></a>/// An application need unregister only if it wants to register a new array of file descriptors.
+<a id="L1154"></a>pub fn register_files(self: *IoUring, fds: []const linux.fd_t) !void {
+<a id="L1155"></a>    assert(self.fd &gt;= 0);
+<a id="L1156"></a>    const res = linux.io_uring_register(
+<a id="L1157"></a>        self.fd,
+<a id="L1158"></a>        .REGISTER_FILES,
+<a id="L1159"></a>        @as(*const anyopaque, @ptrCast(fds.ptr)),
+<a id="L1160"></a>        @as(u32, @intCast(fds.len)),
+<a id="L1161"></a>    );
+<a id="L1162"></a>    try handle_registration_result(res);
+<a id="L1163"></a>}
+<a id="L1164"></a>
+<a id="L1165"></a>/// Updates registered file descriptors.
+<a id="L1166"></a>///
+<a id="L1167"></a>/// Updates are applied starting at the provided offset in the original file descriptors slice.
+<a id="L1168"></a>/// There are three kind of updates:
+<a id="L1169"></a>/// * turning a sparse entry (where the fd is -1) into a real one
+<a id="L1170"></a>/// * removing an existing entry (set the fd to -1)
+<a id="L1171"></a>/// * replacing an existing entry with a new fd
+<a id="L1172"></a>/// Adding new file descriptors must be done with `register_files`.
+<a id="L1173"></a>pub fn register_files_update(self: *IoUring, offset: u32, fds: []const linux.fd_t) !void {
+<a id="L1174"></a>    assert(self.fd &gt;= 0);
+<a id="L1175"></a>
+<a id="L1176"></a>    const FilesUpdate = extern struct {
+<a id="L1177"></a>        offset: u32,
+<a id="L1178"></a>        resv: u32,
+<a id="L1179"></a>        fds: u64 align(8),
+<a id="L1180"></a>    };
+<a id="L1181"></a>    var update = FilesUpdate{
+<a id="L1182"></a>        .offset = offset,
+<a id="L1183"></a>        .resv = @as(u32, 0),
+<a id="L1184"></a>        .fds = @as(u64, @intFromPtr(fds.ptr)),
+<a id="L1185"></a>    };
+<a id="L1186"></a>
+<a id="L1187"></a>    const res = linux.io_uring_register(
+<a id="L1188"></a>        self.fd,
+<a id="L1189"></a>        .REGISTER_FILES_UPDATE,
+<a id="L1190"></a>        @as(*const anyopaque, @ptrCast(&amp;update)),
+<a id="L1191"></a>        @as(u32, @intCast(fds.len)),
+<a id="L1192"></a>    );
+<a id="L1193"></a>    try handle_registration_result(res);
+<a id="L1194"></a>}
+<a id="L1195"></a>
+<a id="L1196"></a>/// Registers an empty (-1) file table of `nr_files` number of file descriptors.
+<a id="L1197"></a>pub fn register_files_sparse(self: *IoUring, nr_files: u32) !void {
+<a id="L1198"></a>    assert(self.fd &gt;= 0);
+<a id="L1199"></a>
+<a id="L1200"></a>    const reg = &amp;linux.io_uring_rsrc_register{
+<a id="L1201"></a>        .nr = nr_files,
+<a id="L1202"></a>        .flags = linux.IORING_RSRC_REGISTER_SPARSE,
+<a id="L1203"></a>        .resv2 = 0,
+<a id="L1204"></a>        .data = 0,
+<a id="L1205"></a>        .tags = 0,
+<a id="L1206"></a>    };
+<a id="L1207"></a>
+<a id="L1208"></a>    const res = linux.io_uring_register(
+<a id="L1209"></a>        self.fd,
+<a id="L1210"></a>        .REGISTER_FILES2,
+<a id="L1211"></a>        @ptrCast(reg),
+<a id="L1212"></a>        @as(u32, @sizeOf(linux.io_uring_rsrc_register)),
+<a id="L1213"></a>    );
+<a id="L1214"></a>
+<a id="L1215"></a>    return handle_registration_result(res);
+<a id="L1216"></a>}
+<a id="L1217"></a>
+<a id="L1218"></a>// Registers range for fixed file allocations.
+<a id="L1219"></a>// Available since 6.0
+<a id="L1220"></a>pub fn register_file_alloc_range(self: *IoUring, offset: u32, len: u32) !void {
+<a id="L1221"></a>    assert(self.fd &gt;= 0);
+<a id="L1222"></a>
+<a id="L1223"></a>    const range = &amp;linux.io_uring_file_index_range{
+<a id="L1224"></a>        .off = offset,
+<a id="L1225"></a>        .len = len,
+<a id="L1226"></a>        .resv = 0,
+<a id="L1227"></a>    };
+<a id="L1228"></a>
+<a id="L1229"></a>    const res = linux.io_uring_register(
+<a id="L1230"></a>        self.fd,
+<a id="L1231"></a>        .REGISTER_FILE_ALLOC_RANGE,
+<a id="L1232"></a>        @ptrCast(range),
+<a id="L1233"></a>        @as(u32, @sizeOf(linux.io_uring_file_index_range)),
+<a id="L1234"></a>    );
+<a id="L1235"></a>
+<a id="L1236"></a>    return handle_registration_result(res);
+<a id="L1237"></a>}
+<a id="L1238"></a>
+<a id="L1239"></a>/// Registers the file descriptor for an eventfd that will be notified of completion events on
+<a id="L1240"></a>///  an io_uring instance.
+<a id="L1241"></a>/// Only a single a eventfd can be registered at any given point in time.
+<a id="L1242"></a>pub fn register_eventfd(self: *IoUring, fd: linux.fd_t) !void {
+<a id="L1243"></a>    assert(self.fd &gt;= 0);
+<a id="L1244"></a>    const res = linux.io_uring_register(
+<a id="L1245"></a>        self.fd,
+<a id="L1246"></a>        .REGISTER_EVENTFD,
+<a id="L1247"></a>        @as(*const anyopaque, @ptrCast(&amp;fd)),
+<a id="L1248"></a>        1,
+<a id="L1249"></a>    );
+<a id="L1250"></a>    try handle_registration_result(res);
+<a id="L1251"></a>}
+<a id="L1252"></a>
+<a id="L1253"></a>/// Registers the file descriptor for an eventfd that will be notified of completion events on
+<a id="L1254"></a>/// an io_uring instance. Notifications are only posted for events that complete in an async manner.
+<a id="L1255"></a>/// This means that events that complete inline while being submitted do not trigger a notification event.
+<a id="L1256"></a>/// Only a single eventfd can be registered at any given point in time.
+<a id="L1257"></a>pub fn register_eventfd_async(self: *IoUring, fd: linux.fd_t) !void {
+<a id="L1258"></a>    assert(self.fd &gt;= 0);
+<a id="L1259"></a>    const res = linux.io_uring_register(
+<a id="L1260"></a>        self.fd,
+<a id="L1261"></a>        .REGISTER_EVENTFD_ASYNC,
+<a id="L1262"></a>        @as(*const anyopaque, @ptrCast(&amp;fd)),
+<a id="L1263"></a>        1,
+<a id="L1264"></a>    );
+<a id="L1265"></a>    try handle_registration_result(res);
+<a id="L1266"></a>}
+<a id="L1267"></a>
+<a id="L1268"></a>/// Unregister the registered eventfd file descriptor.
+<a id="L1269"></a>pub fn unregister_eventfd(self: *IoUring) !void {
+<a id="L1270"></a>    assert(self.fd &gt;= 0);
+<a id="L1271"></a>    const res = linux.io_uring_register(
+<a id="L1272"></a>        self.fd,
+<a id="L1273"></a>        .UNREGISTER_EVENTFD,
+<a id="L1274"></a>        null,
+<a id="L1275"></a>        0,
+<a id="L1276"></a>    );
+<a id="L1277"></a>    try handle_registration_result(res);
+<a id="L1278"></a>}
+<a id="L1279"></a>
+<a id="L1280"></a>pub fn register_napi(self: *IoUring, napi: *linux.io_uring_napi) !void {
+<a id="L1281"></a>    assert(self.fd &gt;= 0);
+<a id="L1282"></a>    const res = linux.io_uring_register(self.fd, .REGISTER_NAPI, napi, 1);
+<a id="L1283"></a>    try handle_registration_result(res);
+<a id="L1284"></a>}
+<a id="L1285"></a>
+<a id="L1286"></a>pub fn unregister_napi(self: *IoUring, napi: *linux.io_uring_napi) !void {
+<a id="L1287"></a>    assert(self.fd &gt;= 0);
+<a id="L1288"></a>    const res = linux.io_uring_register(self.fd, .UNREGISTER_NAPI, napi, 1);
+<a id="L1289"></a>    try handle_registration_result(res);
+<a id="L1290"></a>}
+<a id="L1291"></a>
+<a id="L1292"></a>/// Registers an array of buffers for use with `read_fixed` and `write_fixed`.
+<a id="L1293"></a>pub fn register_buffers(self: *IoUring, buffers: []const posix.iovec) !void {
+<a id="L1294"></a>    assert(self.fd &gt;= 0);
+<a id="L1295"></a>    const res = linux.io_uring_register(
+<a id="L1296"></a>        self.fd,
+<a id="L1297"></a>        .REGISTER_BUFFERS,
+<a id="L1298"></a>        buffers.ptr,
+<a id="L1299"></a>        @as(u32, @intCast(buffers.len)),
+<a id="L1300"></a>    );
+<a id="L1301"></a>    try handle_registration_result(res);
+<a id="L1302"></a>}
+<a id="L1303"></a>
+<a id="L1304"></a>/// Unregister the registered buffers.
+<a id="L1305"></a>pub fn unregister_buffers(self: *IoUring) !void {
+<a id="L1306"></a>    assert(self.fd &gt;= 0);
+<a id="L1307"></a>    const res = linux.io_uring_register(self.fd, .UNREGISTER_BUFFERS, null, 0);
+<a id="L1308"></a>    switch (linux.errno(res)) {
+<a id="L1309"></a>        .SUCCESS =&gt; {},
+<a id="L1310"></a>        .NXIO =&gt; return error.BuffersNotRegistered,
+<a id="L1311"></a>        else =&gt; |errno| return posix.unexpectedErrno(errno),
+<a id="L1312"></a>    }
+<a id="L1313"></a>}
+<a id="L1314"></a>
+<a id="L1315"></a>/// Returns a io_uring_probe which is used to probe the capabilities of the
+<a id="L1316"></a>/// io_uring subsystem of the running kernel. The io_uring_probe contains the
+<a id="L1317"></a>/// list of supported operations.
+<a id="L1318"></a>pub fn get_probe(self: *IoUring) !linux.io_uring_probe {
+<a id="L1319"></a>    var probe = std.mem.zeroInit(linux.io_uring_probe, .{});
+<a id="L1320"></a>    const res = linux.io_uring_register(self.fd, .REGISTER_PROBE, &amp;probe, probe.ops.len);
+<a id="L1321"></a>    try handle_register_buf_ring_result(res);
+<a id="L1322"></a>    return probe;
+<a id="L1323"></a>}
+<a id="L1324"></a>
+<a id="L1325"></a>fn handle_registration_result(res: usize) !void {
+<a id="L1326"></a>    switch (linux.errno(res)) {
+<a id="L1327"></a>        .SUCCESS =&gt; {},
+<a id="L1328"></a>        // One or more fds in the array are invalid, or the kernel does not support sparse sets:
+<a id="L1329"></a>        .BADF =&gt; return error.FileDescriptorInvalid,
+<a id="L1330"></a>        .BUSY =&gt; return error.FilesAlreadyRegistered,
+<a id="L1331"></a>        .INVAL =&gt; return error.FilesEmpty,
+<a id="L1332"></a>        // Adding `nr_args` file references would exceed the maximum allowed number of files the
+<a id="L1333"></a>        // user is allowed to have according to the per-user RLIMIT_NOFILE resource limit and
+<a id="L1334"></a>        // the CAP_SYS_RESOURCE capability is not set, or `nr_args` exceeds the maximum allowed
+<a id="L1335"></a>        // for a fixed file set (older kernels have a limit of 1024 files vs 64K files):
+<a id="L1336"></a>        .MFILE =&gt; return error.UserFdQuotaExceeded,
+<a id="L1337"></a>        // Insufficient kernel resources, or the caller had a non-zero RLIMIT_MEMLOCK soft
+<a id="L1338"></a>        // resource limit but tried to lock more memory than the limit permitted (not enforced
+<a id="L1339"></a>        // when the process is privileged with CAP_IPC_LOCK):
+<a id="L1340"></a>        .NOMEM =&gt; return error.SystemResources,
+<a id="L1341"></a>        // Attempt to register files on a ring already registering files or being torn down:
+<a id="L1342"></a>        .NXIO =&gt; return error.RingShuttingDownOrAlreadyRegisteringFiles,
+<a id="L1343"></a>        else =&gt; |errno| return posix.unexpectedErrno(errno),
+<a id="L1344"></a>    }
+<a id="L1345"></a>}
+<a id="L1346"></a>
+<a id="L1347"></a>/// Unregisters all registered file descriptors previously associated with the ring.
+<a id="L1348"></a>pub fn unregister_files(self: *IoUring) !void {
+<a id="L1349"></a>    assert(self.fd &gt;= 0);
+<a id="L1350"></a>    const res = linux.io_uring_register(self.fd, .UNREGISTER_FILES, null, 0);
+<a id="L1351"></a>    switch (linux.errno(res)) {
+<a id="L1352"></a>        .SUCCESS =&gt; {},
+<a id="L1353"></a>        .NXIO =&gt; return error.FilesNotRegistered,
+<a id="L1354"></a>        else =&gt; |errno| return posix.unexpectedErrno(errno),
+<a id="L1355"></a>    }
+<a id="L1356"></a>}
+<a id="L1357"></a>
+<a id="L1358"></a>/// Prepares a socket creation request.
+<a id="L1359"></a>/// New socket fd will be returned in completion result.
+<a id="L1360"></a>/// Available since 5.19
+<a id="L1361"></a>pub fn socket(
+<a id="L1362"></a>    self: *IoUring,
+<a id="L1363"></a>    user_data: u64,
+<a id="L1364"></a>    domain: u32,
+<a id="L1365"></a>    socket_type: u32,
+<a id="L1366"></a>    protocol: u32,
+<a id="L1367"></a>    flags: u32,
+<a id="L1368"></a>) !*linux.io_uring_sqe {
+<a id="L1369"></a>    const sqe = try self.get_sqe();
+<a id="L1370"></a>    sqe.prep_socket(domain, socket_type, protocol, flags);
+<a id="L1371"></a>    sqe.user_data = user_data;
+<a id="L1372"></a>    return sqe;
+<a id="L1373"></a>}
+<a id="L1374"></a>
+<a id="L1375"></a>/// Prepares a socket creation request for registered file at index `file_index`.
+<a id="L1376"></a>/// Available since 5.19
+<a id="L1377"></a>pub fn socket_direct(
+<a id="L1378"></a>    self: *IoUring,
+<a id="L1379"></a>    user_data: u64,
+<a id="L1380"></a>    domain: u32,
+<a id="L1381"></a>    socket_type: u32,
+<a id="L1382"></a>    protocol: u32,
+<a id="L1383"></a>    flags: u32,
+<a id="L1384"></a>    file_index: u32,
+<a id="L1385"></a>) !*linux.io_uring_sqe {
+<a id="L1386"></a>    const sqe = try self.get_sqe();
+<a id="L1387"></a>    sqe.prep_socket_direct(domain, socket_type, protocol, flags, file_index);
+<a id="L1388"></a>    sqe.user_data = user_data;
+<a id="L1389"></a>    return sqe;
+<a id="L1390"></a>}
+<a id="L1391"></a>
+<a id="L1392"></a>/// Prepares a socket creation request for registered file, index chosen by kernel (file index alloc).
+<a id="L1393"></a>/// File index will be returned in CQE res field.
+<a id="L1394"></a>/// Available since 5.19
+<a id="L1395"></a>pub fn socket_direct_alloc(
+<a id="L1396"></a>    self: *IoUring,
+<a id="L1397"></a>    user_data: u64,
+<a id="L1398"></a>    domain: u32,
+<a id="L1399"></a>    socket_type: u32,
+<a id="L1400"></a>    protocol: u32,
+<a id="L1401"></a>    flags: u32,
+<a id="L1402"></a>) !*linux.io_uring_sqe {
+<a id="L1403"></a>    const sqe = try self.get_sqe();
+<a id="L1404"></a>    sqe.prep_socket_direct_alloc(domain, socket_type, protocol, flags);
+<a id="L1405"></a>    sqe.user_data = user_data;
+<a id="L1406"></a>    return sqe;
+<a id="L1407"></a>}
+<a id="L1408"></a>
+<a id="L1409"></a>/// Queues (but does not submit) an SQE to perform an `bind(2)` on a socket.
+<a id="L1410"></a>/// Returns a pointer to the SQE.
+<a id="L1411"></a>/// Available since 6.11
+<a id="L1412"></a>pub fn bind(
+<a id="L1413"></a>    self: *IoUring,
+<a id="L1414"></a>    user_data: u64,
+<a id="L1415"></a>    fd: linux.fd_t,
+<a id="L1416"></a>    addr: *const posix.sockaddr,
+<a id="L1417"></a>    addrlen: posix.socklen_t,
+<a id="L1418"></a>    flags: u32,
+<a id="L1419"></a>) !*linux.io_uring_sqe {
+<a id="L1420"></a>    const sqe = try self.get_sqe();
+<a id="L1421"></a>    sqe.prep_bind(fd, addr, addrlen, flags);
+<a id="L1422"></a>    sqe.user_data = user_data;
+<a id="L1423"></a>    return sqe;
+<a id="L1424"></a>}
+<a id="L1425"></a>
+<a id="L1426"></a>/// Queues (but does not submit) an SQE to perform an `listen(2)` on a socket.
+<a id="L1427"></a>/// Returns a pointer to the SQE.
+<a id="L1428"></a>/// Available since 6.11
+<a id="L1429"></a>pub fn listen(
+<a id="L1430"></a>    self: *IoUring,
+<a id="L1431"></a>    user_data: u64,
+<a id="L1432"></a>    fd: linux.fd_t,
+<a id="L1433"></a>    backlog: usize,
+<a id="L1434"></a>    flags: u32,
+<a id="L1435"></a>) !*linux.io_uring_sqe {
+<a id="L1436"></a>    const sqe = try self.get_sqe();
+<a id="L1437"></a>    sqe.prep_listen(fd, backlog, flags);
+<a id="L1438"></a>    sqe.user_data = user_data;
+<a id="L1439"></a>    return sqe;
+<a id="L1440"></a>}
+<a id="L1441"></a>
+<a id="L1442"></a>/// Prepares an cmd request for a socket.
+<a id="L1443"></a>/// See: https://man7.org/linux/man-pages/man3/io_uring_prep_cmd.3.html
+<a id="L1444"></a>/// Available since 6.7.
+<a id="L1445"></a>pub fn cmd_sock(
+<a id="L1446"></a>    self: *IoUring,
+<a id="L1447"></a>    user_data: u64,
+<a id="L1448"></a>    cmd_op: linux.IO_URING_SOCKET_OP,
+<a id="L1449"></a>    fd: linux.fd_t,
+<a id="L1450"></a>    level: u32, // linux.SOL
+<a id="L1451"></a>    optname: u32, // linux.SO
+<a id="L1452"></a>    optval: u64, // pointer to the option value
+<a id="L1453"></a>    optlen: u32, // size of the option value
+<a id="L1454"></a>) !*linux.io_uring_sqe {
+<a id="L1455"></a>    const sqe = try self.get_sqe();
+<a id="L1456"></a>    sqe.prep_cmd_sock(cmd_op, fd, level, optname, optval, optlen);
+<a id="L1457"></a>    sqe.user_data = user_data;
+<a id="L1458"></a>    return sqe;
+<a id="L1459"></a>}
+<a id="L1460"></a>
+<a id="L1461"></a>/// Prepares set socket option for the optname argument, at the protocol
+<a id="L1462"></a>/// level specified by the level argument.
+<a id="L1463"></a>/// Available since 6.7.n
+<a id="L1464"></a>pub fn setsockopt(
+<a id="L1465"></a>    self: *IoUring,
+<a id="L1466"></a>    user_data: u64,
+<a id="L1467"></a>    fd: linux.fd_t,
+<a id="L1468"></a>    level: u32, // linux.SOL
+<a id="L1469"></a>    optname: u32, // linux.SO
+<a id="L1470"></a>    opt: []const u8,
+<a id="L1471"></a>) !*linux.io_uring_sqe {
+<a id="L1472"></a>    return try self.cmd_sock(
+<a id="L1473"></a>        user_data,
+<a id="L1474"></a>        .SETSOCKOPT,
+<a id="L1475"></a>        fd,
+<a id="L1476"></a>        level,
+<a id="L1477"></a>        optname,
+<a id="L1478"></a>        @intFromPtr(opt.ptr),
+<a id="L1479"></a>        @intCast(opt.len),
+<a id="L1480"></a>    );
+<a id="L1481"></a>}
+<a id="L1482"></a>
+<a id="L1483"></a>/// Prepares get socket option to retrieve the value for the option specified by
+<a id="L1484"></a>/// the option_name argument for the socket specified by the fd argument.
+<a id="L1485"></a>/// Available since 6.7.
+<a id="L1486"></a>pub fn getsockopt(
+<a id="L1487"></a>    self: *IoUring,
+<a id="L1488"></a>    user_data: u64,
+<a id="L1489"></a>    fd: linux.fd_t,
+<a id="L1490"></a>    level: u32, // linux.SOL
+<a id="L1491"></a>    optname: u32, // linux.SO
+<a id="L1492"></a>    opt: []u8,
+<a id="L1493"></a>) !*linux.io_uring_sqe {
+<a id="L1494"></a>    return try self.cmd_sock(
+<a id="L1495"></a>        user_data,
+<a id="L1496"></a>        .GETSOCKOPT,
+<a id="L1497"></a>        fd,
+<a id="L1498"></a>        level,
+<a id="L1499"></a>        optname,
+<a id="L1500"></a>        @intFromPtr(opt.ptr),
+<a id="L1501"></a>        @intCast(opt.len),
+<a id="L1502"></a>    );
+<a id="L1503"></a>}
+<a id="L1504"></a>
+<a id="L1505"></a>pub const SubmissionQueue = struct {
+<a id="L1506"></a>    head: *u32,
+<a id="L1507"></a>    tail: *u32,
+<a id="L1508"></a>    mask: u32,
+<a id="L1509"></a>    flags: *u32,
+<a id="L1510"></a>    dropped: *u32,
+<a id="L1511"></a>    array: []u32,
+<a id="L1512"></a>    sqes: []linux.io_uring_sqe,
+<a id="L1513"></a>    mmap: []align(page_size_min) u8,
+<a id="L1514"></a>    mmap_sqes: []align(page_size_min) u8,
+<a id="L1515"></a>
+<a id="L1516"></a>    // We use `sqe_head` and `sqe_tail` in the same way as liburing:
+<a id="L1517"></a>    // We increment `sqe_tail` (but not `tail`) for each call to `get_sqe()`.
+<a id="L1518"></a>    // We then set `tail` to `sqe_tail` once, only when these events are actually submitted.
+<a id="L1519"></a>    // This allows us to amortize the cost of the @atomicStore to `tail` across multiple SQEs.
+<a id="L1520"></a>    sqe_head: u32 = 0,
+<a id="L1521"></a>    sqe_tail: u32 = 0,
+<a id="L1522"></a>
+<a id="L1523"></a>    pub fn init(fd: linux.fd_t, p: linux.io_uring_params) !SubmissionQueue {
+<a id="L1524"></a>        assert(fd &gt;= 0);
+<a id="L1525"></a>        assert((p.features &amp; linux.IORING_FEAT_SINGLE_MMAP) != 0);
+<a id="L1526"></a>        const size = @max(
+<a id="L1527"></a>            p.sq_off.array + p.sq_entries * @sizeOf(u32),
+<a id="L1528"></a>            p.cq_off.cqes + p.cq_entries * @sizeOf(linux.io_uring_cqe),
+<a id="L1529"></a>        );
+<a id="L1530"></a>        const mmap = try posix.mmap(
+<a id="L1531"></a>            null,
+<a id="L1532"></a>            size,
+<a id="L1533"></a>            .{ .READ = true, .WRITE = true },
+<a id="L1534"></a>            .{ .TYPE = .SHARED, .POPULATE = true },
+<a id="L1535"></a>            fd,
+<a id="L1536"></a>            linux.IORING_OFF_SQ_RING,
+<a id="L1537"></a>        );
+<a id="L1538"></a>        errdefer posix.munmap(mmap);
+<a id="L1539"></a>        assert(mmap.len == size);
+<a id="L1540"></a>
+<a id="L1541"></a>        // The motivation for the `sqes` and `array` indirection is to make it possible for the
+<a id="L1542"></a>        // application to preallocate static linux.io_uring_sqe entries and then replay them when needed.
+<a id="L1543"></a>        const size_sqes = p.sq_entries * @sizeOf(linux.io_uring_sqe);
+<a id="L1544"></a>        const mmap_sqes = try posix.mmap(
+<a id="L1545"></a>            null,
+<a id="L1546"></a>            size_sqes,
+<a id="L1547"></a>            .{ .READ = true, .WRITE = true },
+<a id="L1548"></a>            .{ .TYPE = .SHARED, .POPULATE = true },
+<a id="L1549"></a>            fd,
+<a id="L1550"></a>            linux.IORING_OFF_SQES,
+<a id="L1551"></a>        );
+<a id="L1552"></a>        errdefer posix.munmap(mmap_sqes);
+<a id="L1553"></a>        assert(mmap_sqes.len == size_sqes);
+<a id="L1554"></a>
+<a id="L1555"></a>        const array: [*]u32 = @ptrCast(@alignCast(&amp;mmap[p.sq_off.array]));
+<a id="L1556"></a>        const sqes: [*]linux.io_uring_sqe = @ptrCast(@alignCast(&amp;mmap_sqes[0]));
+<a id="L1557"></a>        // We expect the kernel copies p.sq_entries to the u32 pointed to by p.sq_off.ring_entries,
+<a id="L1558"></a>        // see https://github.com/torvalds/linux/blob/v5.8/fs/io_uring.c#L7843-L7844.
+<a id="L1559"></a>        assert(p.sq_entries == @as(*u32, @ptrCast(@alignCast(&amp;mmap[p.sq_off.ring_entries]))).*);
+<a id="L1560"></a>        return SubmissionQueue{
+<a id="L1561"></a>            .head = @ptrCast(@alignCast(&amp;mmap[p.sq_off.head])),
+<a id="L1562"></a>            .tail = @ptrCast(@alignCast(&amp;mmap[p.sq_off.tail])),
+<a id="L1563"></a>            .mask = @as(*u32, @ptrCast(@alignCast(&amp;mmap[p.sq_off.ring_mask]))).*,
+<a id="L1564"></a>            .flags = @ptrCast(@alignCast(&amp;mmap[p.sq_off.flags])),
+<a id="L1565"></a>            .dropped = @ptrCast(@alignCast(&amp;mmap[p.sq_off.dropped])),
+<a id="L1566"></a>            .array = array[0..p.sq_entries],
+<a id="L1567"></a>            .sqes = sqes[0..p.sq_entries],
+<a id="L1568"></a>            .mmap = mmap,
+<a id="L1569"></a>            .mmap_sqes = mmap_sqes,
+<a id="L1570"></a>        };
+<a id="L1571"></a>    }
+<a id="L1572"></a>
+<a id="L1573"></a>    pub fn deinit(self: *SubmissionQueue) void {
+<a id="L1574"></a>        posix.munmap(self.mmap_sqes);
+<a id="L1575"></a>        posix.munmap(self.mmap);
+<a id="L1576"></a>    }
+<a id="L1577"></a>};
+<a id="L1578"></a>
+<a id="L1579"></a>pub const CompletionQueue = struct {
+<a id="L1580"></a>    head: *u32,
+<a id="L1581"></a>    tail: *u32,
+<a id="L1582"></a>    mask: u32,
+<a id="L1583"></a>    overflow: *u32,
+<a id="L1584"></a>    cqes: []linux.io_uring_cqe,
+<a id="L1585"></a>
+<a id="L1586"></a>    pub fn init(fd: linux.fd_t, p: linux.io_uring_params, sq: SubmissionQueue) !CompletionQueue {
+<a id="L1587"></a>        assert(fd &gt;= 0);
+<a id="L1588"></a>        assert((p.features &amp; linux.IORING_FEAT_SINGLE_MMAP) != 0);
+<a id="L1589"></a>        const mmap = sq.mmap;
+<a id="L1590"></a>        const cqes: [*]linux.io_uring_cqe = @ptrCast(@alignCast(&amp;mmap[p.cq_off.cqes]));
+<a id="L1591"></a>        assert(p.cq_entries == @as(*u32, @ptrCast(@alignCast(&amp;mmap[p.cq_off.ring_entries]))).*);
+<a id="L1592"></a>        return CompletionQueue{
+<a id="L1593"></a>            .head = @ptrCast(@alignCast(&amp;mmap[p.cq_off.head])),
+<a id="L1594"></a>            .tail = @ptrCast(@alignCast(&amp;mmap[p.cq_off.tail])),
+<a id="L1595"></a>            .mask = @as(*u32, @ptrCast(@alignCast(&amp;mmap[p.cq_off.ring_mask]))).*,
+<a id="L1596"></a>            .overflow = @ptrCast(@alignCast(&amp;mmap[p.cq_off.overflow])),
+<a id="L1597"></a>            .cqes = cqes[0..p.cq_entries],
+<a id="L1598"></a>        };
+<a id="L1599"></a>    }
+<a id="L1600"></a>
+<a id="L1601"></a>    pub fn deinit(self: *CompletionQueue) void {
+<a id="L1602"></a>        _ = self;
+<a id="L1603"></a>        // A no-op since we now share the mmap with the submission queue.
+<a id="L1604"></a>        // Here for symmetry with the submission queue, and for any future feature support.
+<a id="L1605"></a>    }
+<a id="L1606"></a>};
+<a id="L1607"></a>
+<a id="L1608"></a>/// Group of application provided buffers. Uses newer type, called ring mapped
+<a id="L1609"></a>/// buffers, supported since kernel 5.19. Buffers are identified by a buffer
+<a id="L1610"></a>/// group ID, and within that group, a buffer ID. IO_Uring can have multiple
+<a id="L1611"></a>/// buffer groups, each with unique group ID.
+<a id="L1612"></a>///
+<a id="L1613"></a>/// In `init` application provides contiguous block of memory `buffers` for
+<a id="L1614"></a>/// `buffers_count` buffers of size `buffers_size`. Application can then submit
+<a id="L1615"></a>/// `recv` operation without providing buffer upfront. Once the operation is
+<a id="L1616"></a>/// ready to receive data, a buffer is picked automatically and the resulting
+<a id="L1617"></a>/// CQE will contain the buffer ID in `cqe.buffer_id()`. Use `get` method to get
+<a id="L1618"></a>/// buffer for buffer ID identified by CQE. Once the application has processed
+<a id="L1619"></a>/// the buffer, it may hand ownership back to the kernel, by calling `put`
+<a id="L1620"></a>/// allowing the cycle to repeat.
+<a id="L1621"></a>///
+<a id="L1622"></a>/// Depending on the rate of arrival of data, it is possible that a given buffer
+<a id="L1623"></a>/// group will run out of buffers before those in CQEs can be put back to the
+<a id="L1624"></a>/// kernel. If this happens, a `cqe.err()` will have ENOBUFS as the error value.
+<a id="L1625"></a>///
+<a id="L1626"></a>pub const BufferGroup = struct {
+<a id="L1627"></a>    /// Parent ring for which this group is registered.
+<a id="L1628"></a>    ring: *IoUring,
+<a id="L1629"></a>    /// Pointer to the memory shared by the kernel.
+<a id="L1630"></a>    /// `buffers_count` of `io_uring_buf` structures are shared by the kernel.
+<a id="L1631"></a>    /// First `io_uring_buf` is overlaid by `io_uring_buf_ring` struct.
+<a id="L1632"></a>    br: *align(page_size_min) linux.io_uring_buf_ring,
+<a id="L1633"></a>    /// Contiguous block of memory of size (buffers_count * buffer_size).
+<a id="L1634"></a>    buffers: []u8,
+<a id="L1635"></a>    /// Size of each buffer in buffers.
+<a id="L1636"></a>    buffer_size: u32,
+<a id="L1637"></a>    /// Number of buffers in `buffers`, number of `io_uring_buf structures` in br.
+<a id="L1638"></a>    buffers_count: u16,
+<a id="L1639"></a>    /// Head of unconsumed part of each buffer, if incremental consumption is enabled
+<a id="L1640"></a>    heads: []u32,
+<a id="L1641"></a>    /// ID of this group, must be unique in ring.
+<a id="L1642"></a>    group_id: u16,
+<a id="L1643"></a>
+<a id="L1644"></a>    pub fn init(
+<a id="L1645"></a>        ring: *IoUring,
+<a id="L1646"></a>        allocator: Allocator,
+<a id="L1647"></a>        group_id: u16,
+<a id="L1648"></a>        buffer_size: u32,
+<a id="L1649"></a>        buffers_count: u16,
+<a id="L1650"></a>    ) !BufferGroup {
+<a id="L1651"></a>        const buffers = try allocator.alloc(u8, buffer_size * buffers_count);
+<a id="L1652"></a>        errdefer allocator.free(buffers);
+<a id="L1653"></a>        const heads = try allocator.alloc(u32, buffers_count);
+<a id="L1654"></a>        errdefer allocator.free(heads);
+<a id="L1655"></a>
+<a id="L1656"></a>        const br = try setup_buf_ring(ring.fd, buffers_count, group_id, .{ .inc = true });
+<a id="L1657"></a>        buf_ring_init(br);
+<a id="L1658"></a>
+<a id="L1659"></a>        const mask = buf_ring_mask(buffers_count);
+<a id="L1660"></a>        var i: u16 = 0;
+<a id="L1661"></a>        while (i &lt; buffers_count) : (i += 1) {
+<a id="L1662"></a>            const pos = buffer_size * i;
+<a id="L1663"></a>            const buf = buffers[pos .. pos + buffer_size];
+<a id="L1664"></a>            heads[i] = 0;
+<a id="L1665"></a>            buf_ring_add(br, buf, i, mask, i);
+<a id="L1666"></a>        }
+<a id="L1667"></a>        buf_ring_advance(br, buffers_count);
+<a id="L1668"></a>
+<a id="L1669"></a>        return BufferGroup{
+<a id="L1670"></a>            .ring = ring,
+<a id="L1671"></a>            .group_id = group_id,
+<a id="L1672"></a>            .br = br,
+<a id="L1673"></a>            .buffers = buffers,
+<a id="L1674"></a>            .heads = heads,
+<a id="L1675"></a>            .buffer_size = buffer_size,
+<a id="L1676"></a>            .buffers_count = buffers_count,
+<a id="L1677"></a>        };
+<a id="L1678"></a>    }
+<a id="L1679"></a>
+<a id="L1680"></a>    pub fn deinit(self: *BufferGroup, allocator: Allocator) void {
+<a id="L1681"></a>        free_buf_ring(self.ring.fd, self.br, self.buffers_count, self.group_id);
+<a id="L1682"></a>        allocator.free(self.buffers);
+<a id="L1683"></a>        allocator.free(self.heads);
+<a id="L1684"></a>    }
+<a id="L1685"></a>
+<a id="L1686"></a>    // Prepare recv operation which will select buffer from this group.
+<a id="L1687"></a>    pub fn recv(self: *BufferGroup, user_data: u64, fd: linux.fd_t, flags: u32) !*linux.io_uring_sqe {
+<a id="L1688"></a>        var sqe = try self.ring.get_sqe();
+<a id="L1689"></a>        sqe.prep_rw(.RECV, fd, 0, 0, 0);
+<a id="L1690"></a>        sqe.rw_flags = flags;
+<a id="L1691"></a>        sqe.flags |= linux.IOSQE_BUFFER_SELECT;
+<a id="L1692"></a>        sqe.buf_index = self.group_id;
+<a id="L1693"></a>        sqe.user_data = user_data;
+<a id="L1694"></a>        return sqe;
+<a id="L1695"></a>    }
+<a id="L1696"></a>
+<a id="L1697"></a>    // Prepare multishot recv operation which will select buffer from this group.
+<a id="L1698"></a>    pub fn recv_multishot(self: *BufferGroup, user_data: u64, fd: linux.fd_t, flags: u32) !*linux.io_uring_sqe {
+<a id="L1699"></a>        var sqe = try self.recv(user_data, fd, flags);
+<a id="L1700"></a>        sqe.ioprio |= linux.IORING_RECV_MULTISHOT;
+<a id="L1701"></a>        return sqe;
+<a id="L1702"></a>    }
+<a id="L1703"></a>
+<a id="L1704"></a>    // Get buffer by id.
+<a id="L1705"></a>    pub fn get_by_id(self: *BufferGroup, buffer_id: u16) []u8 {
+<a id="L1706"></a>        const pos = self.buffer_size * buffer_id;
+<a id="L1707"></a>        return self.buffers[pos .. pos + self.buffer_size][self.heads[buffer_id]..];
+<a id="L1708"></a>    }
+<a id="L1709"></a>
+<a id="L1710"></a>    // Get buffer by CQE.
+<a id="L1711"></a>    pub fn get(self: *BufferGroup, cqe: linux.io_uring_cqe) ![]u8 {
+<a id="L1712"></a>        const buffer_id = try cqe.buffer_id();
+<a id="L1713"></a>        const used_len = @as(usize, @intCast(cqe.res));
+<a id="L1714"></a>        return self.get_by_id(buffer_id)[0..used_len];
+<a id="L1715"></a>    }
+<a id="L1716"></a>
+<a id="L1717"></a>    // Release buffer from CQE to the kernel.
+<a id="L1718"></a>    pub fn put(self: *BufferGroup, cqe: linux.io_uring_cqe) !void {
+<a id="L1719"></a>        const buffer_id = try cqe.buffer_id();
+<a id="L1720"></a>        if (cqe.flags &amp; linux.IORING_CQE_F_BUF_MORE == linux.IORING_CQE_F_BUF_MORE) {
+<a id="L1721"></a>            // Incremental consumption active, kernel will write to the this buffer again
+<a id="L1722"></a>            const used_len = @as(u32, @intCast(cqe.res));
+<a id="L1723"></a>            // Track what part of the buffer is used
+<a id="L1724"></a>            self.heads[buffer_id] += used_len;
+<a id="L1725"></a>            return;
+<a id="L1726"></a>        }
+<a id="L1727"></a>        self.heads[buffer_id] = 0;
+<a id="L1728"></a>
+<a id="L1729"></a>        // Release buffer to the kernel.    const mask = buf_ring_mask(self.buffers_count);
+<a id="L1730"></a>        const mask = buf_ring_mask(self.buffers_count);
+<a id="L1731"></a>        buf_ring_add(self.br, self.get_by_id(buffer_id), buffer_id, mask, 0);
+<a id="L1732"></a>        buf_ring_advance(self.br, 1);
+<a id="L1733"></a>    }
+<a id="L1734"></a>};
+<a id="L1735"></a>
+<a id="L1736"></a>/// Registers a shared buffer ring to be used with provided buffers.
+<a id="L1737"></a>/// `entries` number of `io_uring_buf` structures is mem mapped and shared by kernel.
+<a id="L1738"></a>/// `fd` is IO_Uring.fd for which the provided buffer ring is being registered.
+<a id="L1739"></a>/// `entries` is the number of entries requested in the buffer ring, must be power of 2.
+<a id="L1740"></a>/// `group_id` is the chosen buffer group ID, unique in IO_Uring.
+<a id="L1741"></a>pub fn setup_buf_ring(
+<a id="L1742"></a>    fd: linux.fd_t,
+<a id="L1743"></a>    entries: u16,
+<a id="L1744"></a>    group_id: u16,
+<a id="L1745"></a>    flags: linux.io_uring_buf_reg.Flags,
+<a id="L1746"></a>) !*align(page_size_min) linux.io_uring_buf_ring {
+<a id="L1747"></a>    if (entries == 0 or entries &gt; 1 &lt;&lt; 15) return error.EntriesNotInRange;
+<a id="L1748"></a>    if (!std.math.isPowerOfTwo(entries)) return error.EntriesNotPowerOfTwo;
+<a id="L1749"></a>
+<a id="L1750"></a>    const mmap_size = @as(usize, entries) * @sizeOf(linux.io_uring_buf);
+<a id="L1751"></a>    const mmap = try posix.mmap(
+<a id="L1752"></a>        null,
+<a id="L1753"></a>        mmap_size,
+<a id="L1754"></a>        .{ .READ = true, .WRITE = true },
+<a id="L1755"></a>        .{ .TYPE = .PRIVATE, .ANONYMOUS = true },
+<a id="L1756"></a>        -1,
+<a id="L1757"></a>        0,
+<a id="L1758"></a>    );
+<a id="L1759"></a>    errdefer posix.munmap(mmap);
+<a id="L1760"></a>    assert(mmap.len == mmap_size);
+<a id="L1761"></a>
+<a id="L1762"></a>    const br: *align(page_size_min) linux.io_uring_buf_ring = @ptrCast(mmap.ptr);
+<a id="L1763"></a>    try register_buf_ring(fd, @intFromPtr(br), entries, group_id, flags);
+<a id="L1764"></a>    return br;
+<a id="L1765"></a>}
+<a id="L1766"></a>
+<a id="L1767"></a>fn register_buf_ring(
+<a id="L1768"></a>    fd: linux.fd_t,
+<a id="L1769"></a>    addr: u64,
+<a id="L1770"></a>    entries: u32,
+<a id="L1771"></a>    group_id: u16,
+<a id="L1772"></a>    flags: linux.io_uring_buf_reg.Flags,
+<a id="L1773"></a>) !void {
+<a id="L1774"></a>    var reg = std.mem.zeroInit(linux.io_uring_buf_reg, .{
+<a id="L1775"></a>        .ring_addr = addr,
+<a id="L1776"></a>        .ring_entries = entries,
+<a id="L1777"></a>        .bgid = group_id,
+<a id="L1778"></a>        .flags = flags,
+<a id="L1779"></a>    });
+<a id="L1780"></a>    var res = linux.io_uring_register(fd, .REGISTER_PBUF_RING, @as(*const anyopaque, @ptrCast(&amp;reg)), 1);
+<a id="L1781"></a>    if (linux.errno(res) == .INVAL and reg.flags.inc) {
+<a id="L1782"></a>        // Retry without incremental buffer consumption.
+<a id="L1783"></a>        // It is available since kernel 6.12. returns INVAL on older.
+<a id="L1784"></a>        reg.flags.inc = false;
+<a id="L1785"></a>        res = linux.io_uring_register(fd, .REGISTER_PBUF_RING, @as(*const anyopaque, @ptrCast(&amp;reg)), 1);
+<a id="L1786"></a>    }
+<a id="L1787"></a>    try handle_register_buf_ring_result(res);
+<a id="L1788"></a>}
+<a id="L1789"></a>
+<a id="L1790"></a>fn unregister_buf_ring(fd: linux.fd_t, group_id: u16) !void {
+<a id="L1791"></a>    var reg = std.mem.zeroInit(linux.io_uring_buf_reg, .{
+<a id="L1792"></a>        .bgid = group_id,
+<a id="L1793"></a>    });
+<a id="L1794"></a>    const res = linux.io_uring_register(
+<a id="L1795"></a>        fd,
+<a id="L1796"></a>        .UNREGISTER_PBUF_RING,
+<a id="L1797"></a>        @as(*const anyopaque, @ptrCast(&amp;reg)),
+<a id="L1798"></a>        1,
+<a id="L1799"></a>    );
+<a id="L1800"></a>    try handle_register_buf_ring_result(res);
+<a id="L1801"></a>}
+<a id="L1802"></a>
+<a id="L1803"></a>fn handle_register_buf_ring_result(res: usize) !void {
+<a id="L1804"></a>    switch (linux.errno(res)) {
+<a id="L1805"></a>        .SUCCESS =&gt; {},
+<a id="L1806"></a>        .INVAL =&gt; return error.ArgumentsInvalid,
+<a id="L1807"></a>        else =&gt; |errno| return posix.unexpectedErrno(errno),
+<a id="L1808"></a>    }
+<a id="L1809"></a>}
+<a id="L1810"></a>
+<a id="L1811"></a>// Unregisters a previously registered shared buffer ring, returned from io_uring_setup_buf_ring.
+<a id="L1812"></a>pub fn free_buf_ring(fd: linux.fd_t, br: *align(page_size_min) linux.io_uring_buf_ring, entries: u32, group_id: u16) void {
+<a id="L1813"></a>    unregister_buf_ring(fd, group_id) catch {};
+<a id="L1814"></a>    var mmap: []align(page_size_min) u8 = undefined;
+<a id="L1815"></a>    mmap.ptr = @ptrCast(br);
+<a id="L1816"></a>    mmap.len = entries * @sizeOf(linux.io_uring_buf);
+<a id="L1817"></a>    posix.munmap(mmap);
+<a id="L1818"></a>}
+<a id="L1819"></a>
+<a id="L1820"></a>/// Initialises `br` so that it is ready to be used.
+<a id="L1821"></a>pub fn buf_ring_init(br: *linux.io_uring_buf_ring) void {
+<a id="L1822"></a>    br.tail = 0;
+<a id="L1823"></a>}
+<a id="L1824"></a>
+<a id="L1825"></a>/// Calculates the appropriate size mask for a buffer ring.
+<a id="L1826"></a>/// `entries` is the ring entries as specified in io_uring_register_buf_ring.
+<a id="L1827"></a>pub fn buf_ring_mask(entries: u16) u16 {
+<a id="L1828"></a>    return entries - 1;
+<a id="L1829"></a>}
+<a id="L1830"></a>
+<a id="L1831"></a>/// Assigns `buffer` with the `br` buffer ring.
+<a id="L1832"></a>/// `buffer_id` is identifier which will be returned in the CQE.
+<a id="L1833"></a>/// `buffer_offset` is the offset to insert at from the current tail.
+<a id="L1834"></a>/// If just one buffer is provided before the ring tail is committed with advance then offset should be 0.
+<a id="L1835"></a>/// If buffers are provided in a loop before being committed, the offset must be incremented by one for each buffer added.
+<a id="L1836"></a>pub fn buf_ring_add(
+<a id="L1837"></a>    br: *linux.io_uring_buf_ring,
+<a id="L1838"></a>    buffer: []u8,
+<a id="L1839"></a>    buffer_id: u16,
+<a id="L1840"></a>    mask: u16,
+<a id="L1841"></a>    buffer_offset: u16,
+<a id="L1842"></a>) void {
+<a id="L1843"></a>    const bufs: [*]linux.io_uring_buf = @ptrCast(br);
+<a id="L1844"></a>    const buf: *linux.io_uring_buf = &amp;bufs[(br.tail +% buffer_offset) &amp; mask];
+<a id="L1845"></a>
+<a id="L1846"></a>    buf.addr = @intFromPtr(buffer.ptr);
+<a id="L1847"></a>    buf.len = @intCast(buffer.len);
+<a id="L1848"></a>    buf.bid = buffer_id;
+<a id="L1849"></a>}
+<a id="L1850"></a>
+<a id="L1851"></a>/// Make `count` new buffers visible to the kernel. Called after
+<a id="L1852"></a>/// `io_uring_buf_ring_add` has been called `count` times to fill in new buffers.
+<a id="L1853"></a>pub fn buf_ring_advance(br: *linux.io_uring_buf_ring, count: u16) void {
+<a id="L1854"></a>    const tail: u16 = br.tail +% count;
+<a id="L1855"></a>    @atomicStore(u16, &amp;br.tail, tail, .release);
+<a id="L1856"></a>}
+<a id="L1857"></a>
+<a id="L1858"></a>test BufferGroup {
+<a id="L1859"></a>    if (!is_linux) return error.SkipZigTest;
+<a id="L1860"></a>
+<a id="L1861"></a>    const io = testing.io;
+<a id="L1862"></a>    _ = io;
+<a id="L1863"></a>
+<a id="L1864"></a>    // Init IoUring
+<a id="L1865"></a>    var ring = IoUring.init(16, 0) catch |err| switch (err) {
+<a id="L1866"></a>        error.SystemOutdated =&gt; return error.SkipZigTest,
+<a id="L1867"></a>        error.PermissionDenied =&gt; return error.SkipZigTest,
+<a id="L1868"></a>        else =&gt; return err,
+<a id="L1869"></a>    };
+<a id="L1870"></a>    defer ring.deinit();
+<a id="L1871"></a>
+<a id="L1872"></a>    // Init buffer group for ring
+<a id="L1873"></a>    const group_id: u16 = 1; // buffers group id
+<a id="L1874"></a>    const buffers_count: u16 = 1; // number of buffers in buffer group
+<a id="L1875"></a>    const buffer_size: usize = 128; // size of each buffer in group
+<a id="L1876"></a>    var buf_grp = BufferGroup.init(
+<a id="L1877"></a>        &amp;ring,
+<a id="L1878"></a>        testing.allocator,
+<a id="L1879"></a>        group_id,
+<a id="L1880"></a>        buffer_size,
+<a id="L1881"></a>        buffers_count,
+<a id="L1882"></a>    ) catch |err| switch (err) {
+<a id="L1883"></a>        // kernel older than 5.19
+<a id="L1884"></a>        error.ArgumentsInvalid =&gt; return error.SkipZigTest,
+<a id="L1885"></a>        else =&gt; return err,
+<a id="L1886"></a>    };
+<a id="L1887"></a>    defer buf_grp.deinit(testing.allocator);
+<a id="L1888"></a>
+<a id="L1889"></a>    // Create client/server fds
+<a id="L1890"></a>    const fds = try createSocketTestHarness(&amp;ring);
+<a id="L1891"></a>    defer fds.close();
+<a id="L1892"></a>    const data = [_]u8{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0xa, 0xb, 0xc, 0xd, 0xe };
+<a id="L1893"></a>
+<a id="L1894"></a>    // Client sends data
+<a id="L1895"></a>    {
+<a id="L1896"></a>        _ = try ring.send(1, fds.client, data[0..], 0);
+<a id="L1897"></a>        const submitted = try ring.submit();
+<a id="L1898"></a>        try testing.expectEqual(1, submitted);
+<a id="L1899"></a>        const cqe_send = try ring.copy_cqe();
+<a id="L1900"></a>        if (cqe_send.err() == .INVAL) return error.SkipZigTest;
+<a id="L1901"></a>        try testing.expectEqual(linux.io_uring_cqe{ .user_data = 1, .res = data.len, .flags = 0 }, cqe_send);
+<a id="L1902"></a>    }
+<a id="L1903"></a>
+<a id="L1904"></a>    // Server uses buffer group receive
+<a id="L1905"></a>    {
+<a id="L1906"></a>        // Submit recv operation, buffer will be chosen from buffer group
+<a id="L1907"></a>        _ = try buf_grp.recv(2, fds.server, 0);
+<a id="L1908"></a>        const submitted = try ring.submit();
+<a id="L1909"></a>        try testing.expectEqual(1, submitted);
+<a id="L1910"></a>
+<a id="L1911"></a>        // ... when we have completion for recv operation
+<a id="L1912"></a>        const cqe = try ring.copy_cqe();
+<a id="L1913"></a>        try testing.expectEqual(2, cqe.user_data); // matches submitted user_data
+<a id="L1914"></a>        try testing.expect(cqe.res &gt;= 0); // success
+<a id="L1915"></a>        try testing.expectEqual(posix.E.SUCCESS, cqe.err());
+<a id="L1916"></a>        try testing.expectEqual(data.len, @as(usize, @intCast(cqe.res))); // cqe.res holds received data len
+<a id="L1917"></a>
+<a id="L1918"></a>        // Get buffer from pool
+<a id="L1919"></a>        const buf = try buf_grp.get(cqe);
+<a id="L1920"></a>        try testing.expectEqualSlices(u8, &amp;data, buf);
+<a id="L1921"></a>        // Release buffer to the kernel when application is done with it
+<a id="L1922"></a>        try buf_grp.put(cqe);
+<a id="L1923"></a>    }
+<a id="L1924"></a>}
+<a id="L1925"></a>
+<a id="L1926"></a>test {
+<a id="L1927"></a>    if (is_linux) _ = @import("IoUring/test.zig");
+<a id="L1928"></a>}
+</pre>
 </body>
 </html>

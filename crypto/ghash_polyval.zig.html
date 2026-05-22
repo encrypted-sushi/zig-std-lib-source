@@ -2,501 +2,504 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Source: zig-0.16.0-std/crypto/ghash_polyval.zig</title>
+    <title>Source: crypto/ghash_polyval.zig</title>
     <style>
         body { background: #1e1e1e; color: #d4d4d4; font-family: monospace; padding: 20px; }
         pre { white-space: pre-wrap; word-wrap: break-word; }
         .header { border-bottom: 1px solid #444; padding-bottom: 10px; margin-bottom: 20px; }
         a { color: #569cd6; }
+        a[id] { color: inherit; text-decoration: none; }
+        :target { background: #3a3a00; }
     </style>
 </head>
 <body>
     <div class="header">
-        <a href="/">Index</a> | <strong>File: zig-0.16.0-std/crypto/ghash_polyval.zig</strong>
+        <a href="/">Index</a> | <strong>File: crypto/ghash_polyval.zig</strong>
     </div>
-    <pre>const std = @import("../std.zig");
-const builtin = @import("builtin");
-const assert = std.debug.assert;
-const math = std.math;
-const mem = std.mem;
-
-const Precomp = u128;
-
-/// GHASH is a universal hash function that uses multiplication by a fixed
-/// parameter within a Galois field.
-///
-/// It is not a general purpose hash function - The key must be secret, unpredictable and never reused.
-///
-/// GHASH is typically used to compute the authentication tag in the AES-GCM construction.
-pub const Ghash = Hash(.big, true);
-
-/// POLYVAL is a universal hash function that uses multiplication by a fixed
-/// parameter within a Galois field.
-///
-/// It is not a general purpose hash function - The key must be secret, unpredictable and never reused.
-///
-/// POLYVAL is typically used to compute the authentication tag in the AES-GCM-SIV construction.
-pub const Polyval = Hash(.little, false);
-
-fn Hash(comptime endian: std.builtin.Endian, comptime shift_key: bool) type {
-    return struct {
-        const Self = @This();
-
-        pub const block_length: usize = 16;
-        pub const mac_length = 16;
-        pub const key_length = 16;
-
-        const pc_count = if (builtin.mode != .ReleaseSmall) 16 else 2;
-        const agg_4_threshold = 22;
-        const agg_8_threshold = 84;
-        const agg_16_threshold = 328;
-
-        // Before the Haswell architecture, the carryless multiplication instruction was
-        // extremely slow. Even with 128-bit operands, using Karatsuba multiplication was
-        // thus faster than a schoolbook multiplication.
-        // This is no longer the case -- Modern CPUs, including ARM-based ones, have a fast
-        // carryless multiplication instruction; using 4 multiplications is now faster than
-        // 3 multiplications with extra shifts and additions.
-        const mul_algorithm = if (builtin.cpu.arch == .x86) .karatsuba else .schoolbook;
-
-        hx: [pc_count]Precomp,
-        acc: u128 = 0,
-
-        leftover: usize = 0,
-        buf: [block_length]u8 align(16) = undefined,
-
-        /// Initialize the GHASH state with a key, and a minimum number of block count.
-        pub fn initForBlockCount(key: *const [key_length]u8, block_count: usize) Self {
-            var h = mem.readInt(u128, key[0..16], endian);
-            if (shift_key) {
-                // Shift the key by 1 bit to the left &amp; reduce for GCM.
-                const carry = ((@as(u128, 0xc2) &lt;&lt; 120) | 1) &amp; (@as(u128, 0) -% (h &gt;&gt; 127));
-                h = (h &lt;&lt; 1) ^ carry;
-            }
-            var hx: [pc_count]Precomp = undefined;
-            hx[0] = h;
-            hx[1] = reduce(clsq128(hx[0])); // h^2
-
-            if (builtin.mode != .ReleaseSmall) {
-                hx[2] = reduce(clmul128(hx[1], h)); // h^3
-                hx[3] = reduce(clsq128(hx[1])); // h^4 = h^2^2
-                if (block_count &gt;= agg_8_threshold) {
-                    hx[4] = reduce(clmul128(hx[3], h)); // h^5
-                    hx[5] = reduce(clsq128(hx[2])); // h^6 = h^3^2
-                    hx[6] = reduce(clmul128(hx[5], h)); // h^7
-                    hx[7] = reduce(clsq128(hx[3])); // h^8 = h^4^2
-                }
-                if (block_count &gt;= agg_16_threshold) {
-                    var i: usize = 8;
-                    while (i &lt; 16) : (i += 2) {
-                        hx[i] = reduce(clmul128(hx[i - 1], h));
-                        hx[i + 1] = reduce(clsq128(hx[i / 2]));
-                    }
-                }
-            }
-            return Self{ .hx = hx };
-        }
-
-        /// Initialize the GHASH state with a key.
-        pub fn init(key: *const [key_length]u8) Self {
-            return Self.initForBlockCount(key, math.maxInt(usize));
-        }
-
-        const Selector = enum { lo, hi, hi_lo };
-
-        // Carryless multiplication of two 64-bit integers for x86_64.
-        fn clmulPclmul(x: u128, y: u128, comptime half: Selector) u128 {
-            switch (half) {
-                .hi =&gt; {
-                    const product = asm (
-                        \\ vpclmulqdq $0x11, %[x], %[y], %[out]
-                        : [out] "=x" (-&gt; @Vector(2, u64)),
-                        : [x] "x" (@as(@Vector(2, u64), @bitCast(x))),
-                          [y] "x" (@as(@Vector(2, u64), @bitCast(y))),
-                    );
-                    return @as(u128, @bitCast(product));
-                },
-                .lo =&gt; {
-                    const product = asm (
-                        \\ vpclmulqdq $0x00, %[x], %[y], %[out]
-                        : [out] "=x" (-&gt; @Vector(2, u64)),
-                        : [x] "x" (@as(@Vector(2, u64), @bitCast(x))),
-                          [y] "x" (@as(@Vector(2, u64), @bitCast(y))),
-                    );
-                    return @as(u128, @bitCast(product));
-                },
-                .hi_lo =&gt; {
-                    const product = asm (
-                        \\ vpclmulqdq $0x10, %[x], %[y], %[out]
-                        : [out] "=x" (-&gt; @Vector(2, u64)),
-                        : [x] "x" (@as(@Vector(2, u64), @bitCast(x))),
-                          [y] "x" (@as(@Vector(2, u64), @bitCast(y))),
-                    );
-                    return @as(u128, @bitCast(product));
-                },
-            }
-        }
-
-        // Carryless multiplication of two 64-bit integers for ARM crypto.
-        fn clmulPmull(x: u128, y: u128, comptime half: Selector) u128 {
-            switch (half) {
-                .hi =&gt; {
-                    const product = asm (
-                        \\ pmull2 %[out].1q, %[x].2d, %[y].2d
-                        : [out] "=w" (-&gt; @Vector(2, u64)),
-                        : [x] "w" (@as(@Vector(2, u64), @bitCast(x))),
-                          [y] "w" (@as(@Vector(2, u64), @bitCast(y))),
-                    );
-                    return @as(u128, @bitCast(product));
-                },
-                .lo =&gt; {
-                    const product = asm (
-                        \\ pmull %[out].1q, %[x].1d, %[y].1d
-                        : [out] "=w" (-&gt; @Vector(2, u64)),
-                        : [x] "w" (@as(@Vector(2, u64), @bitCast(x))),
-                          [y] "w" (@as(@Vector(2, u64), @bitCast(y))),
-                    );
-                    return @as(u128, @bitCast(product));
-                },
-                .hi_lo =&gt; {
-                    const product = asm (
-                        \\ pmull %[out].1q, %[x].1d, %[y].1d
-                        : [out] "=w" (-&gt; @Vector(2, u64)),
-                        : [x] "w" (@as(@Vector(2, u64), @bitCast(x &gt;&gt; 64))),
-                          [y] "w" (@as(@Vector(2, u64), @bitCast(y))),
-                    );
-                    return @as(u128, @bitCast(product));
-                },
-            }
-        }
-
-        /// clmulSoft128_64 is faster on platforms with no native 128-bit registers.
-        const clmulSoft = switch (builtin.cpu.arch) {
-            .wasm32, .wasm64 =&gt; clmulSoft128_64,
-            else =&gt; if (std.simd.suggestVectorLength(u128) != null) clmulSoft128 else clmulSoft128_64,
-        };
-
-        // Software carryless multiplication of two 64-bit integers using native 128-bit registers.
-        fn clmulSoft128(x_: u128, y_: u128, comptime half: Selector) u128 {
-            const x = @as(u64, @truncate(if (half == .hi or half == .hi_lo) x_ &gt;&gt; 64 else x_));
-            const y = @as(u64, @truncate(if (half == .hi) y_ &gt;&gt; 64 else y_));
-
-            const x0 = x &amp; 0x1111111111111110;
-            const x1 = x &amp; 0x2222222222222220;
-            const x2 = x &amp; 0x4444444444444440;
-            const x3 = x &amp; 0x8888888888888880;
-            const y0 = y &amp; 0x1111111111111111;
-            const y1 = y &amp; 0x2222222222222222;
-            const y2 = y &amp; 0x4444444444444444;
-            const y3 = y &amp; 0x8888888888888888;
-            const z0 = (x0 * @as(u128, y0)) ^ (x1 * @as(u128, y3)) ^ (x2 * @as(u128, y2)) ^ (x3 * @as(u128, y1));
-            const z1 = (x0 * @as(u128, y1)) ^ (x1 * @as(u128, y0)) ^ (x2 * @as(u128, y3)) ^ (x3 * @as(u128, y2));
-            const z2 = (x0 * @as(u128, y2)) ^ (x1 * @as(u128, y1)) ^ (x2 * @as(u128, y0)) ^ (x3 * @as(u128, y3));
-            const z3 = (x0 * @as(u128, y3)) ^ (x1 * @as(u128, y2)) ^ (x2 * @as(u128, y1)) ^ (x3 * @as(u128, y0));
-
-            const x0_mask = @as(u64, 0) -% (x &amp; 1);
-            const x1_mask = @as(u64, 0) -% ((x &gt;&gt; 1) &amp; 1);
-            const x2_mask = @as(u64, 0) -% ((x &gt;&gt; 2) &amp; 1);
-            const x3_mask = @as(u64, 0) -% ((x &gt;&gt; 3) &amp; 1);
-            const extra = (x0_mask &amp; y) ^ (@as(u128, x1_mask &amp; y) &lt;&lt; 1) ^
-                (@as(u128, x2_mask &amp; y) &lt;&lt; 2) ^ (@as(u128, x3_mask &amp; y) &lt;&lt; 3);
-
-            return (z0 &amp; 0x11111111111111111111111111111111) ^
-                (z1 &amp; 0x22222222222222222222222222222222) ^
-                (z2 &amp; 0x44444444444444444444444444444444) ^
-                (z3 &amp; 0x88888888888888888888888888888888) ^ extra;
-        }
-
-        // Software carryless multiplication of two 32-bit integers.
-        fn clmulSoft32(x: u32, y: u32) u64 {
-            const mulWide = math.mulWide;
-            const a0 = x &amp; 0x11111111;
-            const a1 = x &amp; 0x22222222;
-            const a2 = x &amp; 0x44444444;
-            const a3 = x &amp; 0x88888888;
-            const b0 = y &amp; 0x11111111;
-            const b1 = y &amp; 0x22222222;
-            const b2 = y &amp; 0x44444444;
-            const b3 = y &amp; 0x88888888;
-            const c0 = mulWide(u32, a0, b0) ^ mulWide(u32, a1, b3) ^ mulWide(u32, a2, b2) ^ mulWide(u32, a3, b1);
-            const c1 = mulWide(u32, a0, b1) ^ mulWide(u32, a1, b0) ^ mulWide(u32, a2, b3) ^ mulWide(u32, a3, b2);
-            const c2 = mulWide(u32, a0, b2) ^ mulWide(u32, a1, b1) ^ mulWide(u32, a2, b0) ^ mulWide(u32, a3, b3);
-            const c3 = mulWide(u32, a0, b3) ^ mulWide(u32, a1, b2) ^ mulWide(u32, a2, b1) ^ mulWide(u32, a3, b0);
-            return (c0 &amp; 0x1111111111111111) | (c1 &amp; 0x2222222222222222) | (c2 &amp; 0x4444444444444444) | (c3 &amp; 0x8888888888888888);
-        }
-
-        // Software carryless multiplication of two 128-bit integers using 64-bit registers.
-        fn clmulSoft128_64(x_: u128, y_: u128, comptime half: Selector) u128 {
-            const a = @as(u64, @truncate(if (half == .hi or half == .hi_lo) x_ &gt;&gt; 64 else x_));
-            const b = @as(u64, @truncate(if (half == .hi) y_ &gt;&gt; 64 else y_));
-            const a0 = @as(u32, @truncate(a));
-            const a1 = @as(u32, @truncate(a &gt;&gt; 32));
-            const b0 = @as(u32, @truncate(b));
-            const b1 = @as(u32, @truncate(b &gt;&gt; 32));
-            const lo = clmulSoft32(a0, b0);
-            const hi = clmulSoft32(a1, b1);
-            const mid = clmulSoft32(a0 ^ a1, b0 ^ b1) ^ lo ^ hi;
-            const res_lo = lo ^ (mid &lt;&lt; 32);
-            const res_hi = hi ^ (mid &gt;&gt; 32);
-            return @as(u128, res_lo) | (@as(u128, res_hi) &lt;&lt; 64);
-        }
-
-        const I256 = struct {
-            hi: u128,
-            lo: u128,
-            mid: u128,
-        };
-
-        fn xor256(x: *I256, y: I256) void {
-            x.* = I256{
-                .hi = x.hi ^ y.hi,
-                .lo = x.lo ^ y.lo,
-                .mid = x.mid ^ y.mid,
-            };
-        }
-
-        // Square a 128-bit integer in GF(2^128).
-        fn clsq128(x: u128) I256 {
-            return .{
-                .hi = clmul(x, x, .hi),
-                .lo = clmul(x, x, .lo),
-                .mid = 0,
-            };
-        }
-
-        // Multiply two 128-bit integers in GF(2^128).
-        fn clmul128(x: u128, y: u128) I256 {
-            if (mul_algorithm == .karatsuba) {
-                const x_hi = @as(u64, @truncate(x &gt;&gt; 64));
-                const y_hi = @as(u64, @truncate(y &gt;&gt; 64));
-                const r_lo = clmul(x, y, .lo);
-                const r_hi = clmul(x, y, .hi);
-                const r_mid = clmul(x ^ x_hi, y ^ y_hi, .lo) ^ r_lo ^ r_hi;
-                return .{
-                    .hi = r_hi,
-                    .lo = r_lo,
-                    .mid = r_mid,
-                };
-            } else {
-                return .{
-                    .hi = clmul(x, y, .hi),
-                    .lo = clmul(x, y, .lo),
-                    .mid = clmul(x, y, .hi_lo) ^ clmul(y, x, .hi_lo),
-                };
-            }
-        }
-
-        // Reduce a 256-bit representative of a polynomial modulo the irreducible polynomial x^128 + x^127 + x^126 + x^121 + 1.
-        // This is done using Shay Gueron's black magic demysticated here:
-        // https://blog.quarkslab.com/reversing-a-finite-field-multiplication-optimization.html
-        fn reduce(x: I256) u128 {
-            const hi = x.hi ^ (x.mid &gt;&gt; 64);
-            const lo = x.lo ^ (x.mid &lt;&lt; 64);
-            const p64 = (((1 &lt;&lt; 121) | (1 &lt;&lt; 126) | (1 &lt;&lt; 127)) &gt;&gt; 64);
-            const a = clmul(lo, p64, .lo);
-            const b = ((lo &lt;&lt; 64) | (lo &gt;&gt; 64)) ^ a;
-            const c = clmul(b, p64, .lo);
-            const d = ((b &lt;&lt; 64) | (b &gt;&gt; 64)) ^ c;
-            return d ^ hi;
-        }
-
-        const has_pclmul = builtin.cpu.has(.x86, .pclmul);
-        const has_avx = builtin.cpu.has(.x86, .avx);
-        const has_armaes = builtin.cpu.has(.aarch64, .aes);
-        // C backend doesn't currently support passing vectors to inline asm.
-        const clmul = if (builtin.cpu.arch == .x86_64 and builtin.zig_backend != .stage2_c and has_pclmul and has_avx) impl: {
-            break :impl clmulPclmul;
-        } else if (builtin.cpu.arch == .aarch64 and builtin.zig_backend != .stage2_c and has_armaes) impl: {
-            break :impl clmulPmull;
-        } else impl: {
-            break :impl clmulSoft;
-        };
-
-        // Process 16 byte blocks.
-        fn blocks(st: *Self, msg: []const u8) void {
-            assert(msg.len % 16 == 0); // GHASH blocks() expects full blocks
-            var acc = st.acc;
-
-            var i: usize = 0;
-
-            if (builtin.mode != .ReleaseSmall and msg.len &gt;= agg_16_threshold * block_length) {
-                // 16-blocks aggregated reduction
-                while (i + 256 &lt;= msg.len) : (i += 256) {
-                    var u = clmul128(acc ^ mem.readInt(u128, msg[i..][0..16], endian), st.hx[15 - 0]);
-                    comptime var j = 1;
-                    inline while (j &lt; 16) : (j += 1) {
-                        xor256(&amp;u, clmul128(mem.readInt(u128, msg[i..][j * 16 ..][0..16], endian), st.hx[15 - j]));
-                    }
-                    acc = reduce(u);
-                }
-            } else if (builtin.mode != .ReleaseSmall and msg.len &gt;= agg_8_threshold * block_length) {
-                // 8-blocks aggregated reduction
-                while (i + 128 &lt;= msg.len) : (i += 128) {
-                    var u = clmul128(acc ^ mem.readInt(u128, msg[i..][0..16], endian), st.hx[7 - 0]);
-                    comptime var j = 1;
-                    inline while (j &lt; 8) : (j += 1) {
-                        xor256(&amp;u, clmul128(mem.readInt(u128, msg[i..][j * 16 ..][0..16], endian), st.hx[7 - j]));
-                    }
-                    acc = reduce(u);
-                }
-            } else if (builtin.mode != .ReleaseSmall and msg.len &gt;= agg_4_threshold * block_length) {
-                // 4-blocks aggregated reduction
-                while (i + 64 &lt;= msg.len) : (i += 64) {
-                    var u = clmul128(acc ^ mem.readInt(u128, msg[i..][0..16], endian), st.hx[3 - 0]);
-                    comptime var j = 1;
-                    inline while (j &lt; 4) : (j += 1) {
-                        xor256(&amp;u, clmul128(mem.readInt(u128, msg[i..][j * 16 ..][0..16], endian), st.hx[3 - j]));
-                    }
-                    acc = reduce(u);
-                }
-            }
-            // 2-blocks aggregated reduction
-            while (i + 32 &lt;= msg.len) : (i += 32) {
-                var u = clmul128(acc ^ mem.readInt(u128, msg[i..][0..16], endian), st.hx[1 - 0]);
-                comptime var j = 1;
-                inline while (j &lt; 2) : (j += 1) {
-                    xor256(&amp;u, clmul128(mem.readInt(u128, msg[i..][j * 16 ..][0..16], endian), st.hx[1 - j]));
-                }
-                acc = reduce(u);
-            }
-            // remaining blocks
-            if (i &lt; msg.len) {
-                const u = clmul128(acc ^ mem.readInt(u128, msg[i..][0..16], endian), st.hx[0]);
-                acc = reduce(u);
-                i += 16;
-            }
-            assert(i == msg.len);
-            st.acc = acc;
-        }
-
-        /// Absorb a message into the GHASH state.
-        pub fn update(st: *Self, m: []const u8) void {
-            var mb = m;
-
-            if (st.leftover &gt; 0) {
-                const want = @min(block_length - st.leftover, mb.len);
-                const mc = mb[0..want];
-                for (mc, 0..) |x, i| {
-                    st.buf[st.leftover + i] = x;
-                }
-                mb = mb[want..];
-                st.leftover += want;
-                if (st.leftover &lt; block_length) {
-                    return;
-                }
-                st.blocks(&amp;st.buf);
-                st.leftover = 0;
-            }
-            if (mb.len &gt;= block_length) {
-                const want = mb.len &amp; ~(block_length - 1);
-                st.blocks(mb[0..want]);
-                mb = mb[want..];
-            }
-            if (mb.len &gt; 0) {
-                for (mb, 0..) |x, i| {
-                    st.buf[st.leftover + i] = x;
-                }
-                st.leftover += mb.len;
-            }
-        }
-
-        /// Zero-pad to align the next input to the first byte of a block
-        pub fn pad(st: *Self) void {
-            if (st.leftover == 0) {
-                return;
-            }
-            var i = st.leftover;
-            while (i &lt; block_length) : (i += 1) {
-                st.buf[i] = 0;
-            }
-            st.blocks(&amp;st.buf);
-            st.leftover = 0;
-        }
-
-        /// Compute the GHASH of the entire input.
-        pub fn final(st: *Self, out: *[mac_length]u8) void {
-            st.pad();
-            mem.writeInt(u128, out[0..16], st.acc, endian);
-
-            std.crypto.secureZero(Self, st[0..1]);
-        }
-
-        /// Compute the GHASH of a message.
-        pub fn create(out: *[mac_length]u8, msg: []const u8, key: *const [key_length]u8) void {
-            var st = Self.init(key);
-            st.update(msg);
-            st.final(out);
-        }
-    };
-}
-
-const htest = @import("test.zig");
-
-test "ghash" {
-    const key = [_]u8{0x42} ** 16;
-    const m = [_]u8{0x69} ** 256;
-
-    var st = Ghash.init(&amp;key);
-    st.update(&amp;m);
-    var out: [16]u8 = undefined;
-    st.final(&amp;out);
-    try htest.assertEqual("889295fa746e8b174bf4ec80a65dea41", &amp;out);
-
-    st = Ghash.init(&amp;key);
-    st.update(m[0..100]);
-    st.update(m[100..]);
-    st.final(&amp;out);
-    try htest.assertEqual("889295fa746e8b174bf4ec80a65dea41", &amp;out);
-}
-
-test "ghash2" {
-    var key: [16]u8 = undefined;
-    var i: usize = 0;
-    while (i &lt; key.len) : (i += 1) {
-        key[i] = @as(u8, @intCast(i * 15 + 1));
-    }
-    const tvs = [_]struct { len: usize, hash: [:0]const u8 }{
-        .{ .len = 5263, .hash = "b9395f37c131cd403a327ccf82ec016a" },
-        .{ .len = 1361, .hash = "8c24cb3664e9a36e32ddef0c8178ab33" },
-        .{ .len = 1344, .hash = "015d7243b52d62eee8be33a66a9658cc" },
-        .{ .len = 1000, .hash = "56e148799944193f351f2014ef9dec9d" },
-        .{ .len = 512, .hash = "ca4882ce40d37546185c57709d17d1ca" },
-        .{ .len = 128, .hash = "d36dc3aac16cfe21a75cd5562d598c1c" },
-        .{ .len = 111, .hash = "6e2bea99700fd19cf1694e7b56543320" },
-        .{ .len = 80, .hash = "aa28f4092a7cca155f3de279cf21aa17" },
-        .{ .len = 16, .hash = "9d7eb5ed121a52a4b0996e4ec9b98911" },
-        .{ .len = 1, .hash = "968a203e5c7a98b6d4f3112f4d6b89a7" },
-        .{ .len = 0, .hash = "00000000000000000000000000000000" },
-    };
-    inline for (tvs) |tv| {
-        var m: [tv.len]u8 = undefined;
-        i = 0;
-        while (i &lt; m.len) : (i += 1) {
-            m[i] = @as(u8, @truncate(i % 254 + 1));
-        }
-        var st = Ghash.init(&amp;key);
-        st.update(&amp;m);
-        var out: [16]u8 = undefined;
-        st.final(&amp;out);
-        try htest.assertEqual(tv.hash, &amp;out);
-    }
-}
-
-test "polyval" {
-    const key = [_]u8{0x42} ** 16;
-    const m = [_]u8{0x69} ** 256;
-
-    var st = Polyval.init(&amp;key);
-    st.update(&amp;m);
-    var out: [16]u8 = undefined;
-    st.final(&amp;out);
-    try htest.assertEqual("0713c82b170eef25c8955ddf72c85ccb", &amp;out);
-
-    st = Polyval.init(&amp;key);
-    st.update(m[0..100]);
-    st.update(m[100..]);
-    st.final(&amp;out);
-    try htest.assertEqual("0713c82b170eef25c8955ddf72c85ccb", &amp;out);
-}</pre>
+    <pre><a id="L1"></a>const std = @import("../std.zig");
+<a id="L2"></a>const builtin = @import("builtin");
+<a id="L3"></a>const assert = std.debug.assert;
+<a id="L4"></a>const math = std.math;
+<a id="L5"></a>const mem = std.mem;
+<a id="L6"></a>
+<a id="L7"></a>const Precomp = u128;
+<a id="L8"></a>
+<a id="L9"></a>/// GHASH is a universal hash function that uses multiplication by a fixed
+<a id="L10"></a>/// parameter within a Galois field.
+<a id="L11"></a>///
+<a id="L12"></a>/// It is not a general purpose hash function - The key must be secret, unpredictable and never reused.
+<a id="L13"></a>///
+<a id="L14"></a>/// GHASH is typically used to compute the authentication tag in the AES-GCM construction.
+<a id="L15"></a>pub const Ghash = Hash(.big, true);
+<a id="L16"></a>
+<a id="L17"></a>/// POLYVAL is a universal hash function that uses multiplication by a fixed
+<a id="L18"></a>/// parameter within a Galois field.
+<a id="L19"></a>///
+<a id="L20"></a>/// It is not a general purpose hash function - The key must be secret, unpredictable and never reused.
+<a id="L21"></a>///
+<a id="L22"></a>/// POLYVAL is typically used to compute the authentication tag in the AES-GCM-SIV construction.
+<a id="L23"></a>pub const Polyval = Hash(.little, false);
+<a id="L24"></a>
+<a id="L25"></a>fn Hash(comptime endian: std.builtin.Endian, comptime shift_key: bool) type {
+<a id="L26"></a>    return struct {
+<a id="L27"></a>        const Self = @This();
+<a id="L28"></a>
+<a id="L29"></a>        pub const block_length: usize = 16;
+<a id="L30"></a>        pub const mac_length = 16;
+<a id="L31"></a>        pub const key_length = 16;
+<a id="L32"></a>
+<a id="L33"></a>        const pc_count = if (builtin.mode != .ReleaseSmall) 16 else 2;
+<a id="L34"></a>        const agg_4_threshold = 22;
+<a id="L35"></a>        const agg_8_threshold = 84;
+<a id="L36"></a>        const agg_16_threshold = 328;
+<a id="L37"></a>
+<a id="L38"></a>        // Before the Haswell architecture, the carryless multiplication instruction was
+<a id="L39"></a>        // extremely slow. Even with 128-bit operands, using Karatsuba multiplication was
+<a id="L40"></a>        // thus faster than a schoolbook multiplication.
+<a id="L41"></a>        // This is no longer the case -- Modern CPUs, including ARM-based ones, have a fast
+<a id="L42"></a>        // carryless multiplication instruction; using 4 multiplications is now faster than
+<a id="L43"></a>        // 3 multiplications with extra shifts and additions.
+<a id="L44"></a>        const mul_algorithm = if (builtin.cpu.arch == .x86) .karatsuba else .schoolbook;
+<a id="L45"></a>
+<a id="L46"></a>        hx: [pc_count]Precomp,
+<a id="L47"></a>        acc: u128 = 0,
+<a id="L48"></a>
+<a id="L49"></a>        leftover: usize = 0,
+<a id="L50"></a>        buf: [block_length]u8 align(16) = undefined,
+<a id="L51"></a>
+<a id="L52"></a>        /// Initialize the GHASH state with a key, and a minimum number of block count.
+<a id="L53"></a>        pub fn initForBlockCount(key: *const [key_length]u8, block_count: usize) Self {
+<a id="L54"></a>            var h = mem.readInt(u128, key[0..16], endian);
+<a id="L55"></a>            if (shift_key) {
+<a id="L56"></a>                // Shift the key by 1 bit to the left &amp; reduce for GCM.
+<a id="L57"></a>                const carry = ((@as(u128, 0xc2) &lt;&lt; 120) | 1) &amp; (@as(u128, 0) -% (h &gt;&gt; 127));
+<a id="L58"></a>                h = (h &lt;&lt; 1) ^ carry;
+<a id="L59"></a>            }
+<a id="L60"></a>            var hx: [pc_count]Precomp = undefined;
+<a id="L61"></a>            hx[0] = h;
+<a id="L62"></a>            hx[1] = reduce(clsq128(hx[0])); // h^2
+<a id="L63"></a>
+<a id="L64"></a>            if (builtin.mode != .ReleaseSmall) {
+<a id="L65"></a>                hx[2] = reduce(clmul128(hx[1], h)); // h^3
+<a id="L66"></a>                hx[3] = reduce(clsq128(hx[1])); // h^4 = h^2^2
+<a id="L67"></a>                if (block_count &gt;= agg_8_threshold) {
+<a id="L68"></a>                    hx[4] = reduce(clmul128(hx[3], h)); // h^5
+<a id="L69"></a>                    hx[5] = reduce(clsq128(hx[2])); // h^6 = h^3^2
+<a id="L70"></a>                    hx[6] = reduce(clmul128(hx[5], h)); // h^7
+<a id="L71"></a>                    hx[7] = reduce(clsq128(hx[3])); // h^8 = h^4^2
+<a id="L72"></a>                }
+<a id="L73"></a>                if (block_count &gt;= agg_16_threshold) {
+<a id="L74"></a>                    var i: usize = 8;
+<a id="L75"></a>                    while (i &lt; 16) : (i += 2) {
+<a id="L76"></a>                        hx[i] = reduce(clmul128(hx[i - 1], h));
+<a id="L77"></a>                        hx[i + 1] = reduce(clsq128(hx[i / 2]));
+<a id="L78"></a>                    }
+<a id="L79"></a>                }
+<a id="L80"></a>            }
+<a id="L81"></a>            return Self{ .hx = hx };
+<a id="L82"></a>        }
+<a id="L83"></a>
+<a id="L84"></a>        /// Initialize the GHASH state with a key.
+<a id="L85"></a>        pub fn init(key: *const [key_length]u8) Self {
+<a id="L86"></a>            return Self.initForBlockCount(key, math.maxInt(usize));
+<a id="L87"></a>        }
+<a id="L88"></a>
+<a id="L89"></a>        const Selector = enum { lo, hi, hi_lo };
+<a id="L90"></a>
+<a id="L91"></a>        // Carryless multiplication of two 64-bit integers for x86_64.
+<a id="L92"></a>        fn clmulPclmul(x: u128, y: u128, comptime half: Selector) u128 {
+<a id="L93"></a>            switch (half) {
+<a id="L94"></a>                .hi =&gt; {
+<a id="L95"></a>                    const product = asm (
+<a id="L96"></a>                        \\ vpclmulqdq $0x11, %[x], %[y], %[out]
+<a id="L97"></a>                        : [out] "=x" (-&gt; @Vector(2, u64)),
+<a id="L98"></a>                        : [x] "x" (@as(@Vector(2, u64), @bitCast(x))),
+<a id="L99"></a>                          [y] "x" (@as(@Vector(2, u64), @bitCast(y))),
+<a id="L100"></a>                    );
+<a id="L101"></a>                    return @as(u128, @bitCast(product));
+<a id="L102"></a>                },
+<a id="L103"></a>                .lo =&gt; {
+<a id="L104"></a>                    const product = asm (
+<a id="L105"></a>                        \\ vpclmulqdq $0x00, %[x], %[y], %[out]
+<a id="L106"></a>                        : [out] "=x" (-&gt; @Vector(2, u64)),
+<a id="L107"></a>                        : [x] "x" (@as(@Vector(2, u64), @bitCast(x))),
+<a id="L108"></a>                          [y] "x" (@as(@Vector(2, u64), @bitCast(y))),
+<a id="L109"></a>                    );
+<a id="L110"></a>                    return @as(u128, @bitCast(product));
+<a id="L111"></a>                },
+<a id="L112"></a>                .hi_lo =&gt; {
+<a id="L113"></a>                    const product = asm (
+<a id="L114"></a>                        \\ vpclmulqdq $0x10, %[x], %[y], %[out]
+<a id="L115"></a>                        : [out] "=x" (-&gt; @Vector(2, u64)),
+<a id="L116"></a>                        : [x] "x" (@as(@Vector(2, u64), @bitCast(x))),
+<a id="L117"></a>                          [y] "x" (@as(@Vector(2, u64), @bitCast(y))),
+<a id="L118"></a>                    );
+<a id="L119"></a>                    return @as(u128, @bitCast(product));
+<a id="L120"></a>                },
+<a id="L121"></a>            }
+<a id="L122"></a>        }
+<a id="L123"></a>
+<a id="L124"></a>        // Carryless multiplication of two 64-bit integers for ARM crypto.
+<a id="L125"></a>        fn clmulPmull(x: u128, y: u128, comptime half: Selector) u128 {
+<a id="L126"></a>            switch (half) {
+<a id="L127"></a>                .hi =&gt; {
+<a id="L128"></a>                    const product = asm (
+<a id="L129"></a>                        \\ pmull2 %[out].1q, %[x].2d, %[y].2d
+<a id="L130"></a>                        : [out] "=w" (-&gt; @Vector(2, u64)),
+<a id="L131"></a>                        : [x] "w" (@as(@Vector(2, u64), @bitCast(x))),
+<a id="L132"></a>                          [y] "w" (@as(@Vector(2, u64), @bitCast(y))),
+<a id="L133"></a>                    );
+<a id="L134"></a>                    return @as(u128, @bitCast(product));
+<a id="L135"></a>                },
+<a id="L136"></a>                .lo =&gt; {
+<a id="L137"></a>                    const product = asm (
+<a id="L138"></a>                        \\ pmull %[out].1q, %[x].1d, %[y].1d
+<a id="L139"></a>                        : [out] "=w" (-&gt; @Vector(2, u64)),
+<a id="L140"></a>                        : [x] "w" (@as(@Vector(2, u64), @bitCast(x))),
+<a id="L141"></a>                          [y] "w" (@as(@Vector(2, u64), @bitCast(y))),
+<a id="L142"></a>                    );
+<a id="L143"></a>                    return @as(u128, @bitCast(product));
+<a id="L144"></a>                },
+<a id="L145"></a>                .hi_lo =&gt; {
+<a id="L146"></a>                    const product = asm (
+<a id="L147"></a>                        \\ pmull %[out].1q, %[x].1d, %[y].1d
+<a id="L148"></a>                        : [out] "=w" (-&gt; @Vector(2, u64)),
+<a id="L149"></a>                        : [x] "w" (@as(@Vector(2, u64), @bitCast(x &gt;&gt; 64))),
+<a id="L150"></a>                          [y] "w" (@as(@Vector(2, u64), @bitCast(y))),
+<a id="L151"></a>                    );
+<a id="L152"></a>                    return @as(u128, @bitCast(product));
+<a id="L153"></a>                },
+<a id="L154"></a>            }
+<a id="L155"></a>        }
+<a id="L156"></a>
+<a id="L157"></a>        /// clmulSoft128_64 is faster on platforms with no native 128-bit registers.
+<a id="L158"></a>        const clmulSoft = switch (builtin.cpu.arch) {
+<a id="L159"></a>            .wasm32, .wasm64 =&gt; clmulSoft128_64,
+<a id="L160"></a>            else =&gt; if (std.simd.suggestVectorLength(u128) != null) clmulSoft128 else clmulSoft128_64,
+<a id="L161"></a>        };
+<a id="L162"></a>
+<a id="L163"></a>        // Software carryless multiplication of two 64-bit integers using native 128-bit registers.
+<a id="L164"></a>        fn clmulSoft128(x_: u128, y_: u128, comptime half: Selector) u128 {
+<a id="L165"></a>            const x = @as(u64, @truncate(if (half == .hi or half == .hi_lo) x_ &gt;&gt; 64 else x_));
+<a id="L166"></a>            const y = @as(u64, @truncate(if (half == .hi) y_ &gt;&gt; 64 else y_));
+<a id="L167"></a>
+<a id="L168"></a>            const x0 = x &amp; 0x1111111111111110;
+<a id="L169"></a>            const x1 = x &amp; 0x2222222222222220;
+<a id="L170"></a>            const x2 = x &amp; 0x4444444444444440;
+<a id="L171"></a>            const x3 = x &amp; 0x8888888888888880;
+<a id="L172"></a>            const y0 = y &amp; 0x1111111111111111;
+<a id="L173"></a>            const y1 = y &amp; 0x2222222222222222;
+<a id="L174"></a>            const y2 = y &amp; 0x4444444444444444;
+<a id="L175"></a>            const y3 = y &amp; 0x8888888888888888;
+<a id="L176"></a>            const z0 = (x0 * @as(u128, y0)) ^ (x1 * @as(u128, y3)) ^ (x2 * @as(u128, y2)) ^ (x3 * @as(u128, y1));
+<a id="L177"></a>            const z1 = (x0 * @as(u128, y1)) ^ (x1 * @as(u128, y0)) ^ (x2 * @as(u128, y3)) ^ (x3 * @as(u128, y2));
+<a id="L178"></a>            const z2 = (x0 * @as(u128, y2)) ^ (x1 * @as(u128, y1)) ^ (x2 * @as(u128, y0)) ^ (x3 * @as(u128, y3));
+<a id="L179"></a>            const z3 = (x0 * @as(u128, y3)) ^ (x1 * @as(u128, y2)) ^ (x2 * @as(u128, y1)) ^ (x3 * @as(u128, y0));
+<a id="L180"></a>
+<a id="L181"></a>            const x0_mask = @as(u64, 0) -% (x &amp; 1);
+<a id="L182"></a>            const x1_mask = @as(u64, 0) -% ((x &gt;&gt; 1) &amp; 1);
+<a id="L183"></a>            const x2_mask = @as(u64, 0) -% ((x &gt;&gt; 2) &amp; 1);
+<a id="L184"></a>            const x3_mask = @as(u64, 0) -% ((x &gt;&gt; 3) &amp; 1);
+<a id="L185"></a>            const extra = (x0_mask &amp; y) ^ (@as(u128, x1_mask &amp; y) &lt;&lt; 1) ^
+<a id="L186"></a>                (@as(u128, x2_mask &amp; y) &lt;&lt; 2) ^ (@as(u128, x3_mask &amp; y) &lt;&lt; 3);
+<a id="L187"></a>
+<a id="L188"></a>            return (z0 &amp; 0x11111111111111111111111111111111) ^
+<a id="L189"></a>                (z1 &amp; 0x22222222222222222222222222222222) ^
+<a id="L190"></a>                (z2 &amp; 0x44444444444444444444444444444444) ^
+<a id="L191"></a>                (z3 &amp; 0x88888888888888888888888888888888) ^ extra;
+<a id="L192"></a>        }
+<a id="L193"></a>
+<a id="L194"></a>        // Software carryless multiplication of two 32-bit integers.
+<a id="L195"></a>        fn clmulSoft32(x: u32, y: u32) u64 {
+<a id="L196"></a>            const mulWide = math.mulWide;
+<a id="L197"></a>            const a0 = x &amp; 0x11111111;
+<a id="L198"></a>            const a1 = x &amp; 0x22222222;
+<a id="L199"></a>            const a2 = x &amp; 0x44444444;
+<a id="L200"></a>            const a3 = x &amp; 0x88888888;
+<a id="L201"></a>            const b0 = y &amp; 0x11111111;
+<a id="L202"></a>            const b1 = y &amp; 0x22222222;
+<a id="L203"></a>            const b2 = y &amp; 0x44444444;
+<a id="L204"></a>            const b3 = y &amp; 0x88888888;
+<a id="L205"></a>            const c0 = mulWide(u32, a0, b0) ^ mulWide(u32, a1, b3) ^ mulWide(u32, a2, b2) ^ mulWide(u32, a3, b1);
+<a id="L206"></a>            const c1 = mulWide(u32, a0, b1) ^ mulWide(u32, a1, b0) ^ mulWide(u32, a2, b3) ^ mulWide(u32, a3, b2);
+<a id="L207"></a>            const c2 = mulWide(u32, a0, b2) ^ mulWide(u32, a1, b1) ^ mulWide(u32, a2, b0) ^ mulWide(u32, a3, b3);
+<a id="L208"></a>            const c3 = mulWide(u32, a0, b3) ^ mulWide(u32, a1, b2) ^ mulWide(u32, a2, b1) ^ mulWide(u32, a3, b0);
+<a id="L209"></a>            return (c0 &amp; 0x1111111111111111) | (c1 &amp; 0x2222222222222222) | (c2 &amp; 0x4444444444444444) | (c3 &amp; 0x8888888888888888);
+<a id="L210"></a>        }
+<a id="L211"></a>
+<a id="L212"></a>        // Software carryless multiplication of two 128-bit integers using 64-bit registers.
+<a id="L213"></a>        fn clmulSoft128_64(x_: u128, y_: u128, comptime half: Selector) u128 {
+<a id="L214"></a>            const a = @as(u64, @truncate(if (half == .hi or half == .hi_lo) x_ &gt;&gt; 64 else x_));
+<a id="L215"></a>            const b = @as(u64, @truncate(if (half == .hi) y_ &gt;&gt; 64 else y_));
+<a id="L216"></a>            const a0 = @as(u32, @truncate(a));
+<a id="L217"></a>            const a1 = @as(u32, @truncate(a &gt;&gt; 32));
+<a id="L218"></a>            const b0 = @as(u32, @truncate(b));
+<a id="L219"></a>            const b1 = @as(u32, @truncate(b &gt;&gt; 32));
+<a id="L220"></a>            const lo = clmulSoft32(a0, b0);
+<a id="L221"></a>            const hi = clmulSoft32(a1, b1);
+<a id="L222"></a>            const mid = clmulSoft32(a0 ^ a1, b0 ^ b1) ^ lo ^ hi;
+<a id="L223"></a>            const res_lo = lo ^ (mid &lt;&lt; 32);
+<a id="L224"></a>            const res_hi = hi ^ (mid &gt;&gt; 32);
+<a id="L225"></a>            return @as(u128, res_lo) | (@as(u128, res_hi) &lt;&lt; 64);
+<a id="L226"></a>        }
+<a id="L227"></a>
+<a id="L228"></a>        const I256 = struct {
+<a id="L229"></a>            hi: u128,
+<a id="L230"></a>            lo: u128,
+<a id="L231"></a>            mid: u128,
+<a id="L232"></a>        };
+<a id="L233"></a>
+<a id="L234"></a>        fn xor256(x: *I256, y: I256) void {
+<a id="L235"></a>            x.* = I256{
+<a id="L236"></a>                .hi = x.hi ^ y.hi,
+<a id="L237"></a>                .lo = x.lo ^ y.lo,
+<a id="L238"></a>                .mid = x.mid ^ y.mid,
+<a id="L239"></a>            };
+<a id="L240"></a>        }
+<a id="L241"></a>
+<a id="L242"></a>        // Square a 128-bit integer in GF(2^128).
+<a id="L243"></a>        fn clsq128(x: u128) I256 {
+<a id="L244"></a>            return .{
+<a id="L245"></a>                .hi = clmul(x, x, .hi),
+<a id="L246"></a>                .lo = clmul(x, x, .lo),
+<a id="L247"></a>                .mid = 0,
+<a id="L248"></a>            };
+<a id="L249"></a>        }
+<a id="L250"></a>
+<a id="L251"></a>        // Multiply two 128-bit integers in GF(2^128).
+<a id="L252"></a>        fn clmul128(x: u128, y: u128) I256 {
+<a id="L253"></a>            if (mul_algorithm == .karatsuba) {
+<a id="L254"></a>                const x_hi = @as(u64, @truncate(x &gt;&gt; 64));
+<a id="L255"></a>                const y_hi = @as(u64, @truncate(y &gt;&gt; 64));
+<a id="L256"></a>                const r_lo = clmul(x, y, .lo);
+<a id="L257"></a>                const r_hi = clmul(x, y, .hi);
+<a id="L258"></a>                const r_mid = clmul(x ^ x_hi, y ^ y_hi, .lo) ^ r_lo ^ r_hi;
+<a id="L259"></a>                return .{
+<a id="L260"></a>                    .hi = r_hi,
+<a id="L261"></a>                    .lo = r_lo,
+<a id="L262"></a>                    .mid = r_mid,
+<a id="L263"></a>                };
+<a id="L264"></a>            } else {
+<a id="L265"></a>                return .{
+<a id="L266"></a>                    .hi = clmul(x, y, .hi),
+<a id="L267"></a>                    .lo = clmul(x, y, .lo),
+<a id="L268"></a>                    .mid = clmul(x, y, .hi_lo) ^ clmul(y, x, .hi_lo),
+<a id="L269"></a>                };
+<a id="L270"></a>            }
+<a id="L271"></a>        }
+<a id="L272"></a>
+<a id="L273"></a>        // Reduce a 256-bit representative of a polynomial modulo the irreducible polynomial x^128 + x^127 + x^126 + x^121 + 1.
+<a id="L274"></a>        // This is done using Shay Gueron's black magic demysticated here:
+<a id="L275"></a>        // https://blog.quarkslab.com/reversing-a-finite-field-multiplication-optimization.html
+<a id="L276"></a>        fn reduce(x: I256) u128 {
+<a id="L277"></a>            const hi = x.hi ^ (x.mid &gt;&gt; 64);
+<a id="L278"></a>            const lo = x.lo ^ (x.mid &lt;&lt; 64);
+<a id="L279"></a>            const p64 = (((1 &lt;&lt; 121) | (1 &lt;&lt; 126) | (1 &lt;&lt; 127)) &gt;&gt; 64);
+<a id="L280"></a>            const a = clmul(lo, p64, .lo);
+<a id="L281"></a>            const b = ((lo &lt;&lt; 64) | (lo &gt;&gt; 64)) ^ a;
+<a id="L282"></a>            const c = clmul(b, p64, .lo);
+<a id="L283"></a>            const d = ((b &lt;&lt; 64) | (b &gt;&gt; 64)) ^ c;
+<a id="L284"></a>            return d ^ hi;
+<a id="L285"></a>        }
+<a id="L286"></a>
+<a id="L287"></a>        const has_pclmul = builtin.cpu.has(.x86, .pclmul);
+<a id="L288"></a>        const has_avx = builtin.cpu.has(.x86, .avx);
+<a id="L289"></a>        const has_armaes = builtin.cpu.has(.aarch64, .aes);
+<a id="L290"></a>        // C backend doesn't currently support passing vectors to inline asm.
+<a id="L291"></a>        const clmul = if (builtin.cpu.arch == .x86_64 and builtin.zig_backend != .stage2_c and has_pclmul and has_avx) impl: {
+<a id="L292"></a>            break :impl clmulPclmul;
+<a id="L293"></a>        } else if (builtin.cpu.arch == .aarch64 and builtin.zig_backend != .stage2_c and has_armaes) impl: {
+<a id="L294"></a>            break :impl clmulPmull;
+<a id="L295"></a>        } else impl: {
+<a id="L296"></a>            break :impl clmulSoft;
+<a id="L297"></a>        };
+<a id="L298"></a>
+<a id="L299"></a>        // Process 16 byte blocks.
+<a id="L300"></a>        fn blocks(st: *Self, msg: []const u8) void {
+<a id="L301"></a>            assert(msg.len % 16 == 0); // GHASH blocks() expects full blocks
+<a id="L302"></a>            var acc = st.acc;
+<a id="L303"></a>
+<a id="L304"></a>            var i: usize = 0;
+<a id="L305"></a>
+<a id="L306"></a>            if (builtin.mode != .ReleaseSmall and msg.len &gt;= agg_16_threshold * block_length) {
+<a id="L307"></a>                // 16-blocks aggregated reduction
+<a id="L308"></a>                while (i + 256 &lt;= msg.len) : (i += 256) {
+<a id="L309"></a>                    var u = clmul128(acc ^ mem.readInt(u128, msg[i..][0..16], endian), st.hx[15 - 0]);
+<a id="L310"></a>                    comptime var j = 1;
+<a id="L311"></a>                    inline while (j &lt; 16) : (j += 1) {
+<a id="L312"></a>                        xor256(&amp;u, clmul128(mem.readInt(u128, msg[i..][j * 16 ..][0..16], endian), st.hx[15 - j]));
+<a id="L313"></a>                    }
+<a id="L314"></a>                    acc = reduce(u);
+<a id="L315"></a>                }
+<a id="L316"></a>            } else if (builtin.mode != .ReleaseSmall and msg.len &gt;= agg_8_threshold * block_length) {
+<a id="L317"></a>                // 8-blocks aggregated reduction
+<a id="L318"></a>                while (i + 128 &lt;= msg.len) : (i += 128) {
+<a id="L319"></a>                    var u = clmul128(acc ^ mem.readInt(u128, msg[i..][0..16], endian), st.hx[7 - 0]);
+<a id="L320"></a>                    comptime var j = 1;
+<a id="L321"></a>                    inline while (j &lt; 8) : (j += 1) {
+<a id="L322"></a>                        xor256(&amp;u, clmul128(mem.readInt(u128, msg[i..][j * 16 ..][0..16], endian), st.hx[7 - j]));
+<a id="L323"></a>                    }
+<a id="L324"></a>                    acc = reduce(u);
+<a id="L325"></a>                }
+<a id="L326"></a>            } else if (builtin.mode != .ReleaseSmall and msg.len &gt;= agg_4_threshold * block_length) {
+<a id="L327"></a>                // 4-blocks aggregated reduction
+<a id="L328"></a>                while (i + 64 &lt;= msg.len) : (i += 64) {
+<a id="L329"></a>                    var u = clmul128(acc ^ mem.readInt(u128, msg[i..][0..16], endian), st.hx[3 - 0]);
+<a id="L330"></a>                    comptime var j = 1;
+<a id="L331"></a>                    inline while (j &lt; 4) : (j += 1) {
+<a id="L332"></a>                        xor256(&amp;u, clmul128(mem.readInt(u128, msg[i..][j * 16 ..][0..16], endian), st.hx[3 - j]));
+<a id="L333"></a>                    }
+<a id="L334"></a>                    acc = reduce(u);
+<a id="L335"></a>                }
+<a id="L336"></a>            }
+<a id="L337"></a>            // 2-blocks aggregated reduction
+<a id="L338"></a>            while (i + 32 &lt;= msg.len) : (i += 32) {
+<a id="L339"></a>                var u = clmul128(acc ^ mem.readInt(u128, msg[i..][0..16], endian), st.hx[1 - 0]);
+<a id="L340"></a>                comptime var j = 1;
+<a id="L341"></a>                inline while (j &lt; 2) : (j += 1) {
+<a id="L342"></a>                    xor256(&amp;u, clmul128(mem.readInt(u128, msg[i..][j * 16 ..][0..16], endian), st.hx[1 - j]));
+<a id="L343"></a>                }
+<a id="L344"></a>                acc = reduce(u);
+<a id="L345"></a>            }
+<a id="L346"></a>            // remaining blocks
+<a id="L347"></a>            if (i &lt; msg.len) {
+<a id="L348"></a>                const u = clmul128(acc ^ mem.readInt(u128, msg[i..][0..16], endian), st.hx[0]);
+<a id="L349"></a>                acc = reduce(u);
+<a id="L350"></a>                i += 16;
+<a id="L351"></a>            }
+<a id="L352"></a>            assert(i == msg.len);
+<a id="L353"></a>            st.acc = acc;
+<a id="L354"></a>        }
+<a id="L355"></a>
+<a id="L356"></a>        /// Absorb a message into the GHASH state.
+<a id="L357"></a>        pub fn update(st: *Self, m: []const u8) void {
+<a id="L358"></a>            var mb = m;
+<a id="L359"></a>
+<a id="L360"></a>            if (st.leftover &gt; 0) {
+<a id="L361"></a>                const want = @min(block_length - st.leftover, mb.len);
+<a id="L362"></a>                const mc = mb[0..want];
+<a id="L363"></a>                for (mc, 0..) |x, i| {
+<a id="L364"></a>                    st.buf[st.leftover + i] = x;
+<a id="L365"></a>                }
+<a id="L366"></a>                mb = mb[want..];
+<a id="L367"></a>                st.leftover += want;
+<a id="L368"></a>                if (st.leftover &lt; block_length) {
+<a id="L369"></a>                    return;
+<a id="L370"></a>                }
+<a id="L371"></a>                st.blocks(&amp;st.buf);
+<a id="L372"></a>                st.leftover = 0;
+<a id="L373"></a>            }
+<a id="L374"></a>            if (mb.len &gt;= block_length) {
+<a id="L375"></a>                const want = mb.len &amp; ~(block_length - 1);
+<a id="L376"></a>                st.blocks(mb[0..want]);
+<a id="L377"></a>                mb = mb[want..];
+<a id="L378"></a>            }
+<a id="L379"></a>            if (mb.len &gt; 0) {
+<a id="L380"></a>                for (mb, 0..) |x, i| {
+<a id="L381"></a>                    st.buf[st.leftover + i] = x;
+<a id="L382"></a>                }
+<a id="L383"></a>                st.leftover += mb.len;
+<a id="L384"></a>            }
+<a id="L385"></a>        }
+<a id="L386"></a>
+<a id="L387"></a>        /// Zero-pad to align the next input to the first byte of a block
+<a id="L388"></a>        pub fn pad(st: *Self) void {
+<a id="L389"></a>            if (st.leftover == 0) {
+<a id="L390"></a>                return;
+<a id="L391"></a>            }
+<a id="L392"></a>            var i = st.leftover;
+<a id="L393"></a>            while (i &lt; block_length) : (i += 1) {
+<a id="L394"></a>                st.buf[i] = 0;
+<a id="L395"></a>            }
+<a id="L396"></a>            st.blocks(&amp;st.buf);
+<a id="L397"></a>            st.leftover = 0;
+<a id="L398"></a>        }
+<a id="L399"></a>
+<a id="L400"></a>        /// Compute the GHASH of the entire input.
+<a id="L401"></a>        pub fn final(st: *Self, out: *[mac_length]u8) void {
+<a id="L402"></a>            st.pad();
+<a id="L403"></a>            mem.writeInt(u128, out[0..16], st.acc, endian);
+<a id="L404"></a>
+<a id="L405"></a>            std.crypto.secureZero(Self, st[0..1]);
+<a id="L406"></a>        }
+<a id="L407"></a>
+<a id="L408"></a>        /// Compute the GHASH of a message.
+<a id="L409"></a>        pub fn create(out: *[mac_length]u8, msg: []const u8, key: *const [key_length]u8) void {
+<a id="L410"></a>            var st = Self.init(key);
+<a id="L411"></a>            st.update(msg);
+<a id="L412"></a>            st.final(out);
+<a id="L413"></a>        }
+<a id="L414"></a>    };
+<a id="L415"></a>}
+<a id="L416"></a>
+<a id="L417"></a>const htest = @import("test.zig");
+<a id="L418"></a>
+<a id="L419"></a>test "ghash" {
+<a id="L420"></a>    const key = [_]u8{0x42} ** 16;
+<a id="L421"></a>    const m = [_]u8{0x69} ** 256;
+<a id="L422"></a>
+<a id="L423"></a>    var st = Ghash.init(&amp;key);
+<a id="L424"></a>    st.update(&amp;m);
+<a id="L425"></a>    var out: [16]u8 = undefined;
+<a id="L426"></a>    st.final(&amp;out);
+<a id="L427"></a>    try htest.assertEqual("889295fa746e8b174bf4ec80a65dea41", &amp;out);
+<a id="L428"></a>
+<a id="L429"></a>    st = Ghash.init(&amp;key);
+<a id="L430"></a>    st.update(m[0..100]);
+<a id="L431"></a>    st.update(m[100..]);
+<a id="L432"></a>    st.final(&amp;out);
+<a id="L433"></a>    try htest.assertEqual("889295fa746e8b174bf4ec80a65dea41", &amp;out);
+<a id="L434"></a>}
+<a id="L435"></a>
+<a id="L436"></a>test "ghash2" {
+<a id="L437"></a>    var key: [16]u8 = undefined;
+<a id="L438"></a>    var i: usize = 0;
+<a id="L439"></a>    while (i &lt; key.len) : (i += 1) {
+<a id="L440"></a>        key[i] = @as(u8, @intCast(i * 15 + 1));
+<a id="L441"></a>    }
+<a id="L442"></a>    const tvs = [_]struct { len: usize, hash: [:0]const u8 }{
+<a id="L443"></a>        .{ .len = 5263, .hash = "b9395f37c131cd403a327ccf82ec016a" },
+<a id="L444"></a>        .{ .len = 1361, .hash = "8c24cb3664e9a36e32ddef0c8178ab33" },
+<a id="L445"></a>        .{ .len = 1344, .hash = "015d7243b52d62eee8be33a66a9658cc" },
+<a id="L446"></a>        .{ .len = 1000, .hash = "56e148799944193f351f2014ef9dec9d" },
+<a id="L447"></a>        .{ .len = 512, .hash = "ca4882ce40d37546185c57709d17d1ca" },
+<a id="L448"></a>        .{ .len = 128, .hash = "d36dc3aac16cfe21a75cd5562d598c1c" },
+<a id="L449"></a>        .{ .len = 111, .hash = "6e2bea99700fd19cf1694e7b56543320" },
+<a id="L450"></a>        .{ .len = 80, .hash = "aa28f4092a7cca155f3de279cf21aa17" },
+<a id="L451"></a>        .{ .len = 16, .hash = "9d7eb5ed121a52a4b0996e4ec9b98911" },
+<a id="L452"></a>        .{ .len = 1, .hash = "968a203e5c7a98b6d4f3112f4d6b89a7" },
+<a id="L453"></a>        .{ .len = 0, .hash = "00000000000000000000000000000000" },
+<a id="L454"></a>    };
+<a id="L455"></a>    inline for (tvs) |tv| {
+<a id="L456"></a>        var m: [tv.len]u8 = undefined;
+<a id="L457"></a>        i = 0;
+<a id="L458"></a>        while (i &lt; m.len) : (i += 1) {
+<a id="L459"></a>            m[i] = @as(u8, @truncate(i % 254 + 1));
+<a id="L460"></a>        }
+<a id="L461"></a>        var st = Ghash.init(&amp;key);
+<a id="L462"></a>        st.update(&amp;m);
+<a id="L463"></a>        var out: [16]u8 = undefined;
+<a id="L464"></a>        st.final(&amp;out);
+<a id="L465"></a>        try htest.assertEqual(tv.hash, &amp;out);
+<a id="L466"></a>    }
+<a id="L467"></a>}
+<a id="L468"></a>
+<a id="L469"></a>test "polyval" {
+<a id="L470"></a>    const key = [_]u8{0x42} ** 16;
+<a id="L471"></a>    const m = [_]u8{0x69} ** 256;
+<a id="L472"></a>
+<a id="L473"></a>    var st = Polyval.init(&amp;key);
+<a id="L474"></a>    st.update(&amp;m);
+<a id="L475"></a>    var out: [16]u8 = undefined;
+<a id="L476"></a>    st.final(&amp;out);
+<a id="L477"></a>    try htest.assertEqual("0713c82b170eef25c8955ddf72c85ccb", &amp;out);
+<a id="L478"></a>
+<a id="L479"></a>    st = Polyval.init(&amp;key);
+<a id="L480"></a>    st.update(m[0..100]);
+<a id="L481"></a>    st.update(m[100..]);
+<a id="L482"></a>    st.final(&amp;out);
+<a id="L483"></a>    try htest.assertEqual("0713c82b170eef25c8955ddf72c85ccb", &amp;out);
+<a id="L484"></a>}
+</pre>
 </body>
 </html>

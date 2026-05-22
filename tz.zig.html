@@ -2,270 +2,273 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Source: zig-0.16.0-std/tz.zig</title>
+    <title>Source: tz.zig</title>
     <style>
         body { background: #1e1e1e; color: #d4d4d4; font-family: monospace; padding: 20px; }
         pre { white-space: pre-wrap; word-wrap: break-word; }
         .header { border-bottom: 1px solid #444; padding-bottom: 10px; margin-bottom: 20px; }
         a { color: #569cd6; }
+        a[id] { color: inherit; text-decoration: none; }
+        :target { background: #3a3a00; }
     </style>
 </head>
 <body>
     <div class="header">
-        <a href="/">Index</a> | <strong>File: zig-0.16.0-std/tz.zig</strong>
+        <a href="/">Index</a> | <strong>File: tz.zig</strong>
     </div>
-    <pre>//! The Time Zone Information Format (TZif)
-//! https://datatracker.ietf.org/doc/html/rfc8536
-
-const builtin = @import("builtin");
-
-const std = @import("std.zig");
-const Reader = std.Io.Reader;
-const Allocator = std.mem.Allocator;
-
-pub const Transition = struct {
-    ts: i64,
-    timetype: *Timetype,
-};
-
-pub const Timetype = struct {
-    offset: i32,
-    flags: u8,
-    name_data: [6:0]u8,
-
-    pub fn name(self: *const Timetype) [:0]const u8 {
-        return std.mem.sliceTo(self.name_data[0..], 0);
-    }
-
-    pub fn isDst(self: Timetype) bool {
-        return (self.flags &amp; 0x01) &gt; 0;
-    }
-
-    pub fn standardTimeIndicator(self: Timetype) bool {
-        return (self.flags &amp; 0x02) &gt; 0;
-    }
-
-    pub fn utIndicator(self: Timetype) bool {
-        return (self.flags &amp; 0x04) &gt; 0;
-    }
-};
-
-pub const Leapsecond = struct {
-    occurrence: i48,
-    correction: i16,
-};
-
-pub const Tz = struct {
-    allocator: Allocator,
-    transitions: []const Transition,
-    timetypes: []const Timetype,
-    leapseconds: []const Leapsecond,
-    footer: ?[]const u8,
-
-    const Header = extern struct {
-        magic: [4]u8,
-        version: u8,
-        reserved: [15]u8,
-        counts: extern struct {
-            isutcnt: u32,
-            isstdcnt: u32,
-            leapcnt: u32,
-            timecnt: u32,
-            typecnt: u32,
-            charcnt: u32,
-        },
-    };
-
-    pub fn parse(allocator: Allocator, reader: *Reader) !Tz {
-        const legacy_header = try reader.takeStruct(Header, .big);
-        if (!std.mem.eql(u8, &amp;legacy_header.magic, "TZif")) return error.BadHeader;
-        if (legacy_header.version != 0 and legacy_header.version != '2' and legacy_header.version != '3')
-            return error.BadVersion;
-
-        if (legacy_header.version == 0)
-            return parseBlock(allocator, reader, legacy_header, true);
-
-        // If the format is modern, just skip over the legacy data
-        const skip_n = legacy_header.counts.timecnt * 5 +
-            legacy_header.counts.typecnt * 6 +
-            legacy_header.counts.charcnt + legacy_header.counts.leapcnt * 8 +
-            legacy_header.counts.isstdcnt + legacy_header.counts.isutcnt;
-        try reader.discardAll(skip_n);
-
-        var header = try reader.takeStruct(Header, .big);
-        if (!std.mem.eql(u8, &amp;header.magic, "TZif")) return error.BadHeader;
-        if (header.version != '2' and header.version != '3') return error.BadVersion;
-
-        return parseBlock(allocator, reader, header, false);
-    }
-
-    fn parseBlock(allocator: Allocator, reader: *Reader, header: Header, legacy: bool) !Tz {
-        if (header.counts.isstdcnt != 0 and header.counts.isstdcnt != header.counts.typecnt) return error.Malformed; // rfc8536: isstdcnt [...] MUST either be zero or equal to "typecnt"
-        if (header.counts.isutcnt != 0 and header.counts.isutcnt != header.counts.typecnt) return error.Malformed; // rfc8536: isutcnt [...] MUST either be zero or equal to "typecnt"
-        if (header.counts.typecnt == 0) return error.Malformed; // rfc8536: typecnt [...] MUST NOT be zero
-        if (header.counts.charcnt == 0) return error.Malformed; // rfc8536: charcnt [...] MUST NOT be zero
-        if (header.counts.charcnt &gt; 256 + 6) return error.Malformed; // Not explicitly banned by rfc8536 but nonsensical
-
-        var leapseconds = try allocator.alloc(Leapsecond, header.counts.leapcnt);
-        errdefer allocator.free(leapseconds);
-        var transitions = try allocator.alloc(Transition, header.counts.timecnt);
-        errdefer allocator.free(transitions);
-        var timetypes = try allocator.alloc(Timetype, header.counts.typecnt);
-        errdefer allocator.free(timetypes);
-
-        // Parse transition types
-        var i: usize = 0;
-        while (i &lt; header.counts.timecnt) : (i += 1) {
-            transitions[i].ts = if (legacy) try reader.takeInt(i32, .big) else try reader.takeInt(i64, .big);
-        }
-
-        i = 0;
-        while (i &lt; header.counts.timecnt) : (i += 1) {
-            const tt = try reader.takeByte();
-            if (tt &gt;= timetypes.len) return error.Malformed; // rfc8536: Each type index MUST be in the range [0, "typecnt" - 1]
-            transitions[i].timetype = &amp;timetypes[tt];
-        }
-
-        // Parse time types
-        i = 0;
-        while (i &lt; header.counts.typecnt) : (i += 1) {
-            const offset = try reader.takeInt(i32, .big);
-            if (offset &lt; -2147483648) return error.Malformed; // rfc8536: utoff [...] MUST NOT be -2**31
-            const dst = try reader.takeByte();
-            if (dst != 0 and dst != 1) return error.Malformed; // rfc8536: (is)dst [...] The value MUST be 0 or 1.
-            const idx = try reader.takeByte();
-            if (idx &gt; header.counts.charcnt - 1) return error.Malformed; // rfc8536: (desig)idx [...] Each index MUST be in the range [0, "charcnt" - 1]
-            timetypes[i] = .{
-                .offset = offset,
-                .flags = dst,
-                .name_data = undefined,
-            };
-
-            // Temporarily cache idx in name_data to be processed after we've read the designator names below
-            timetypes[i].name_data[0] = idx;
-        }
-
-        var designators_data: [256 + 6]u8 = undefined;
-        try reader.readSliceAll(designators_data[0..header.counts.charcnt]);
-        const designators = designators_data[0..header.counts.charcnt];
-        if (designators[designators.len - 1] != 0) return error.Malformed; // rfc8536: charcnt [...] includes the trailing NUL (0x00) octet
-
-        // Iterate through the timetypes again, setting the designator names
-        for (timetypes) |*tt| {
-            const name = std.mem.sliceTo(designators[tt.name_data[0]..], 0);
-            // We are mandating the "SHOULD" 6-character limit so we can pack the struct better, and to conform to POSIX.
-            if (name.len &gt; 6) return error.Malformed; // rfc8536: Time zone designations SHOULD consist of at least three (3) and no more than six (6) ASCII characters.
-            @memcpy(tt.name_data[0..name.len], name);
-            tt.name_data[name.len] = 0;
-        }
-
-        // Parse leap seconds
-        i = 0;
-        while (i &lt; header.counts.leapcnt) : (i += 1) {
-            const occur: i64 = if (legacy) try reader.takeInt(i32, .big) else try reader.takeInt(i64, .big);
-            if (occur &lt; 0) return error.Malformed; // rfc8536: occur [...] MUST be nonnegative
-            if (i &gt; 0 and leapseconds[i - 1].occurrence + 2419199 &gt; occur) return error.Malformed; // rfc8536: occur [...] each later value MUST be at least 2419199 greater than the previous value
-            if (occur &gt; std.math.maxInt(i48)) return error.Malformed; // Unreasonably far into the future
-
-            const corr = try reader.takeInt(i32, .big);
-            if (i == 0 and corr != -1 and corr != 1) return error.Malformed; // rfc8536: The correction value in the first leap-second record, if present, MUST be either one (1) or minus one (-1)
-            if (i &gt; 0 and leapseconds[i - 1].correction != corr + 1 and leapseconds[i - 1].correction != corr - 1) return error.Malformed; // rfc8536: The correction values in adjacent leap-second records MUST differ by exactly one (1)
-            if (corr &gt; std.math.maxInt(i16)) return error.Malformed; // Unreasonably large correction
-
-            leapseconds[i] = .{
-                .occurrence = @as(i48, @intCast(occur)),
-                .correction = @as(i16, @intCast(corr)),
-            };
-        }
-
-        // Parse standard/wall indicators
-        i = 0;
-        while (i &lt; header.counts.isstdcnt) : (i += 1) {
-            const stdtime = try reader.takeByte();
-            if (stdtime == 1) {
-                timetypes[i].flags |= 0x02;
-            }
-        }
-
-        // Parse UT/local indicators
-        i = 0;
-        while (i &lt; header.counts.isutcnt) : (i += 1) {
-            const ut = try reader.takeByte();
-            if (ut == 1) {
-                timetypes[i].flags |= 0x04;
-                if (!timetypes[i].standardTimeIndicator()) return error.Malformed; // rfc8536: standard/wall value MUST be one (1) if the UT/local value is one (1)
-            }
-        }
-
-        // Footer
-        var footer: ?[]u8 = null;
-        if (!legacy) {
-            if ((try reader.takeByte()) != '\n') return error.Malformed; // An rfc8536 footer must start with a newline
-            const footer_mem = reader.takeSentinel('\n') catch |err| switch (err) {
-                error.StreamTooLong =&gt; return error.OverlargeFooter, // Read more than 128 bytes, much larger than any reasonable POSIX TZ string
-                else =&gt; return err,
-            };
-            if (footer_mem.len != 0) {
-                footer = try allocator.dupe(u8, footer_mem);
-            }
-        }
-        errdefer if (footer) |ft| allocator.free(ft);
-
-        return .{
-            .allocator = allocator,
-            .transitions = transitions,
-            .timetypes = timetypes,
-            .leapseconds = leapseconds,
-            .footer = footer,
-        };
-    }
-
-    pub fn deinit(self: *Tz) void {
-        if (self.footer) |footer| {
-            self.allocator.free(footer);
-        }
-        self.allocator.free(self.leapseconds);
-        self.allocator.free(self.transitions);
-        self.allocator.free(self.timetypes);
-    }
-};
-
-test "slim" {
-    const data = @embedFile("tz/asia_tokyo.tzif");
-    var in_stream: Reader = .fixed(data);
-
-    var tz = try std.Tz.parse(std.testing.allocator, &amp;in_stream);
-    defer tz.deinit();
-
-    try std.testing.expectEqual(tz.transitions.len, 9);
-    try std.testing.expect(std.mem.eql(u8, tz.transitions[3].timetype.name(), "JDT"));
-    try std.testing.expectEqual(tz.transitions[5].ts, -620298000); // 1950-05-06 15:00:00 UTC
-    try std.testing.expectEqual(tz.leapseconds[13].occurrence, 567993613); // 1988-01-01 00:00:00 UTC (+23s in TAI, and +13 in the data since it doesn't store the initial 10 second offset)
-}
-
-test "fat" {
-    const data = @embedFile("tz/antarctica_davis.tzif");
-    var in_stream: Reader = .fixed(data);
-
-    var tz = try std.Tz.parse(std.testing.allocator, &amp;in_stream);
-    defer tz.deinit();
-
-    try std.testing.expectEqual(tz.transitions.len, 8);
-    try std.testing.expect(std.mem.eql(u8, tz.transitions[3].timetype.name(), "+05"));
-    try std.testing.expectEqual(tz.transitions[4].ts, 1268251224); // 2010-03-10 20:00:00 UTC
-}
-
-test "legacy" {
-    // Taken from Slackware 8.0, from 2001
-    const data = @embedFile("tz/europe_vatican.tzif");
-    var in_stream: Reader = .fixed(data);
-
-    var tz = try std.Tz.parse(std.testing.allocator, &amp;in_stream);
-    defer tz.deinit();
-
-    try std.testing.expectEqual(tz.transitions.len, 170);
-    try std.testing.expect(std.mem.eql(u8, tz.transitions[69].timetype.name(), "CET"));
-    try std.testing.expectEqual(tz.transitions[123].ts, 1414285200); // 2014-10-26 01:00:00 UTC
-}</pre>
+    <pre><a id="L1"></a>//! The Time Zone Information Format (TZif)
+<a id="L2"></a>//! https://datatracker.ietf.org/doc/html/rfc8536
+<a id="L3"></a>
+<a id="L4"></a>const builtin = @import("builtin");
+<a id="L5"></a>
+<a id="L6"></a>const std = @import("std.zig");
+<a id="L7"></a>const Reader = std.Io.Reader;
+<a id="L8"></a>const Allocator = std.mem.Allocator;
+<a id="L9"></a>
+<a id="L10"></a>pub const Transition = struct {
+<a id="L11"></a>    ts: i64,
+<a id="L12"></a>    timetype: *Timetype,
+<a id="L13"></a>};
+<a id="L14"></a>
+<a id="L15"></a>pub const Timetype = struct {
+<a id="L16"></a>    offset: i32,
+<a id="L17"></a>    flags: u8,
+<a id="L18"></a>    name_data: [6:0]u8,
+<a id="L19"></a>
+<a id="L20"></a>    pub fn name(self: *const Timetype) [:0]const u8 {
+<a id="L21"></a>        return std.mem.sliceTo(self.name_data[0..], 0);
+<a id="L22"></a>    }
+<a id="L23"></a>
+<a id="L24"></a>    pub fn isDst(self: Timetype) bool {
+<a id="L25"></a>        return (self.flags &amp; 0x01) &gt; 0;
+<a id="L26"></a>    }
+<a id="L27"></a>
+<a id="L28"></a>    pub fn standardTimeIndicator(self: Timetype) bool {
+<a id="L29"></a>        return (self.flags &amp; 0x02) &gt; 0;
+<a id="L30"></a>    }
+<a id="L31"></a>
+<a id="L32"></a>    pub fn utIndicator(self: Timetype) bool {
+<a id="L33"></a>        return (self.flags &amp; 0x04) &gt; 0;
+<a id="L34"></a>    }
+<a id="L35"></a>};
+<a id="L36"></a>
+<a id="L37"></a>pub const Leapsecond = struct {
+<a id="L38"></a>    occurrence: i48,
+<a id="L39"></a>    correction: i16,
+<a id="L40"></a>};
+<a id="L41"></a>
+<a id="L42"></a>pub const Tz = struct {
+<a id="L43"></a>    allocator: Allocator,
+<a id="L44"></a>    transitions: []const Transition,
+<a id="L45"></a>    timetypes: []const Timetype,
+<a id="L46"></a>    leapseconds: []const Leapsecond,
+<a id="L47"></a>    footer: ?[]const u8,
+<a id="L48"></a>
+<a id="L49"></a>    const Header = extern struct {
+<a id="L50"></a>        magic: [4]u8,
+<a id="L51"></a>        version: u8,
+<a id="L52"></a>        reserved: [15]u8,
+<a id="L53"></a>        counts: extern struct {
+<a id="L54"></a>            isutcnt: u32,
+<a id="L55"></a>            isstdcnt: u32,
+<a id="L56"></a>            leapcnt: u32,
+<a id="L57"></a>            timecnt: u32,
+<a id="L58"></a>            typecnt: u32,
+<a id="L59"></a>            charcnt: u32,
+<a id="L60"></a>        },
+<a id="L61"></a>    };
+<a id="L62"></a>
+<a id="L63"></a>    pub fn parse(allocator: Allocator, reader: *Reader) !Tz {
+<a id="L64"></a>        const legacy_header = try reader.takeStruct(Header, .big);
+<a id="L65"></a>        if (!std.mem.eql(u8, &amp;legacy_header.magic, "TZif")) return error.BadHeader;
+<a id="L66"></a>        if (legacy_header.version != 0 and legacy_header.version != '2' and legacy_header.version != '3')
+<a id="L67"></a>            return error.BadVersion;
+<a id="L68"></a>
+<a id="L69"></a>        if (legacy_header.version == 0)
+<a id="L70"></a>            return parseBlock(allocator, reader, legacy_header, true);
+<a id="L71"></a>
+<a id="L72"></a>        // If the format is modern, just skip over the legacy data
+<a id="L73"></a>        const skip_n = legacy_header.counts.timecnt * 5 +
+<a id="L74"></a>            legacy_header.counts.typecnt * 6 +
+<a id="L75"></a>            legacy_header.counts.charcnt + legacy_header.counts.leapcnt * 8 +
+<a id="L76"></a>            legacy_header.counts.isstdcnt + legacy_header.counts.isutcnt;
+<a id="L77"></a>        try reader.discardAll(skip_n);
+<a id="L78"></a>
+<a id="L79"></a>        var header = try reader.takeStruct(Header, .big);
+<a id="L80"></a>        if (!std.mem.eql(u8, &amp;header.magic, "TZif")) return error.BadHeader;
+<a id="L81"></a>        if (header.version != '2' and header.version != '3') return error.BadVersion;
+<a id="L82"></a>
+<a id="L83"></a>        return parseBlock(allocator, reader, header, false);
+<a id="L84"></a>    }
+<a id="L85"></a>
+<a id="L86"></a>    fn parseBlock(allocator: Allocator, reader: *Reader, header: Header, legacy: bool) !Tz {
+<a id="L87"></a>        if (header.counts.isstdcnt != 0 and header.counts.isstdcnt != header.counts.typecnt) return error.Malformed; // rfc8536: isstdcnt [...] MUST either be zero or equal to "typecnt"
+<a id="L88"></a>        if (header.counts.isutcnt != 0 and header.counts.isutcnt != header.counts.typecnt) return error.Malformed; // rfc8536: isutcnt [...] MUST either be zero or equal to "typecnt"
+<a id="L89"></a>        if (header.counts.typecnt == 0) return error.Malformed; // rfc8536: typecnt [...] MUST NOT be zero
+<a id="L90"></a>        if (header.counts.charcnt == 0) return error.Malformed; // rfc8536: charcnt [...] MUST NOT be zero
+<a id="L91"></a>        if (header.counts.charcnt &gt; 256 + 6) return error.Malformed; // Not explicitly banned by rfc8536 but nonsensical
+<a id="L92"></a>
+<a id="L93"></a>        var leapseconds = try allocator.alloc(Leapsecond, header.counts.leapcnt);
+<a id="L94"></a>        errdefer allocator.free(leapseconds);
+<a id="L95"></a>        var transitions = try allocator.alloc(Transition, header.counts.timecnt);
+<a id="L96"></a>        errdefer allocator.free(transitions);
+<a id="L97"></a>        var timetypes = try allocator.alloc(Timetype, header.counts.typecnt);
+<a id="L98"></a>        errdefer allocator.free(timetypes);
+<a id="L99"></a>
+<a id="L100"></a>        // Parse transition types
+<a id="L101"></a>        var i: usize = 0;
+<a id="L102"></a>        while (i &lt; header.counts.timecnt) : (i += 1) {
+<a id="L103"></a>            transitions[i].ts = if (legacy) try reader.takeInt(i32, .big) else try reader.takeInt(i64, .big);
+<a id="L104"></a>        }
+<a id="L105"></a>
+<a id="L106"></a>        i = 0;
+<a id="L107"></a>        while (i &lt; header.counts.timecnt) : (i += 1) {
+<a id="L108"></a>            const tt = try reader.takeByte();
+<a id="L109"></a>            if (tt &gt;= timetypes.len) return error.Malformed; // rfc8536: Each type index MUST be in the range [0, "typecnt" - 1]
+<a id="L110"></a>            transitions[i].timetype = &amp;timetypes[tt];
+<a id="L111"></a>        }
+<a id="L112"></a>
+<a id="L113"></a>        // Parse time types
+<a id="L114"></a>        i = 0;
+<a id="L115"></a>        while (i &lt; header.counts.typecnt) : (i += 1) {
+<a id="L116"></a>            const offset = try reader.takeInt(i32, .big);
+<a id="L117"></a>            if (offset &lt; -2147483648) return error.Malformed; // rfc8536: utoff [...] MUST NOT be -2**31
+<a id="L118"></a>            const dst = try reader.takeByte();
+<a id="L119"></a>            if (dst != 0 and dst != 1) return error.Malformed; // rfc8536: (is)dst [...] The value MUST be 0 or 1.
+<a id="L120"></a>            const idx = try reader.takeByte();
+<a id="L121"></a>            if (idx &gt; header.counts.charcnt - 1) return error.Malformed; // rfc8536: (desig)idx [...] Each index MUST be in the range [0, "charcnt" - 1]
+<a id="L122"></a>            timetypes[i] = .{
+<a id="L123"></a>                .offset = offset,
+<a id="L124"></a>                .flags = dst,
+<a id="L125"></a>                .name_data = undefined,
+<a id="L126"></a>            };
+<a id="L127"></a>
+<a id="L128"></a>            // Temporarily cache idx in name_data to be processed after we've read the designator names below
+<a id="L129"></a>            timetypes[i].name_data[0] = idx;
+<a id="L130"></a>        }
+<a id="L131"></a>
+<a id="L132"></a>        var designators_data: [256 + 6]u8 = undefined;
+<a id="L133"></a>        try reader.readSliceAll(designators_data[0..header.counts.charcnt]);
+<a id="L134"></a>        const designators = designators_data[0..header.counts.charcnt];
+<a id="L135"></a>        if (designators[designators.len - 1] != 0) return error.Malformed; // rfc8536: charcnt [...] includes the trailing NUL (0x00) octet
+<a id="L136"></a>
+<a id="L137"></a>        // Iterate through the timetypes again, setting the designator names
+<a id="L138"></a>        for (timetypes) |*tt| {
+<a id="L139"></a>            const name = std.mem.sliceTo(designators[tt.name_data[0]..], 0);
+<a id="L140"></a>            // We are mandating the "SHOULD" 6-character limit so we can pack the struct better, and to conform to POSIX.
+<a id="L141"></a>            if (name.len &gt; 6) return error.Malformed; // rfc8536: Time zone designations SHOULD consist of at least three (3) and no more than six (6) ASCII characters.
+<a id="L142"></a>            @memcpy(tt.name_data[0..name.len], name);
+<a id="L143"></a>            tt.name_data[name.len] = 0;
+<a id="L144"></a>        }
+<a id="L145"></a>
+<a id="L146"></a>        // Parse leap seconds
+<a id="L147"></a>        i = 0;
+<a id="L148"></a>        while (i &lt; header.counts.leapcnt) : (i += 1) {
+<a id="L149"></a>            const occur: i64 = if (legacy) try reader.takeInt(i32, .big) else try reader.takeInt(i64, .big);
+<a id="L150"></a>            if (occur &lt; 0) return error.Malformed; // rfc8536: occur [...] MUST be nonnegative
+<a id="L151"></a>            if (i &gt; 0 and leapseconds[i - 1].occurrence + 2419199 &gt; occur) return error.Malformed; // rfc8536: occur [...] each later value MUST be at least 2419199 greater than the previous value
+<a id="L152"></a>            if (occur &gt; std.math.maxInt(i48)) return error.Malformed; // Unreasonably far into the future
+<a id="L153"></a>
+<a id="L154"></a>            const corr = try reader.takeInt(i32, .big);
+<a id="L155"></a>            if (i == 0 and corr != -1 and corr != 1) return error.Malformed; // rfc8536: The correction value in the first leap-second record, if present, MUST be either one (1) or minus one (-1)
+<a id="L156"></a>            if (i &gt; 0 and leapseconds[i - 1].correction != corr + 1 and leapseconds[i - 1].correction != corr - 1) return error.Malformed; // rfc8536: The correction values in adjacent leap-second records MUST differ by exactly one (1)
+<a id="L157"></a>            if (corr &gt; std.math.maxInt(i16)) return error.Malformed; // Unreasonably large correction
+<a id="L158"></a>
+<a id="L159"></a>            leapseconds[i] = .{
+<a id="L160"></a>                .occurrence = @as(i48, @intCast(occur)),
+<a id="L161"></a>                .correction = @as(i16, @intCast(corr)),
+<a id="L162"></a>            };
+<a id="L163"></a>        }
+<a id="L164"></a>
+<a id="L165"></a>        // Parse standard/wall indicators
+<a id="L166"></a>        i = 0;
+<a id="L167"></a>        while (i &lt; header.counts.isstdcnt) : (i += 1) {
+<a id="L168"></a>            const stdtime = try reader.takeByte();
+<a id="L169"></a>            if (stdtime == 1) {
+<a id="L170"></a>                timetypes[i].flags |= 0x02;
+<a id="L171"></a>            }
+<a id="L172"></a>        }
+<a id="L173"></a>
+<a id="L174"></a>        // Parse UT/local indicators
+<a id="L175"></a>        i = 0;
+<a id="L176"></a>        while (i &lt; header.counts.isutcnt) : (i += 1) {
+<a id="L177"></a>            const ut = try reader.takeByte();
+<a id="L178"></a>            if (ut == 1) {
+<a id="L179"></a>                timetypes[i].flags |= 0x04;
+<a id="L180"></a>                if (!timetypes[i].standardTimeIndicator()) return error.Malformed; // rfc8536: standard/wall value MUST be one (1) if the UT/local value is one (1)
+<a id="L181"></a>            }
+<a id="L182"></a>        }
+<a id="L183"></a>
+<a id="L184"></a>        // Footer
+<a id="L185"></a>        var footer: ?[]u8 = null;
+<a id="L186"></a>        if (!legacy) {
+<a id="L187"></a>            if ((try reader.takeByte()) != '\n') return error.Malformed; // An rfc8536 footer must start with a newline
+<a id="L188"></a>            const footer_mem = reader.takeSentinel('\n') catch |err| switch (err) {
+<a id="L189"></a>                error.StreamTooLong =&gt; return error.OverlargeFooter, // Read more than 128 bytes, much larger than any reasonable POSIX TZ string
+<a id="L190"></a>                else =&gt; return err,
+<a id="L191"></a>            };
+<a id="L192"></a>            if (footer_mem.len != 0) {
+<a id="L193"></a>                footer = try allocator.dupe(u8, footer_mem);
+<a id="L194"></a>            }
+<a id="L195"></a>        }
+<a id="L196"></a>        errdefer if (footer) |ft| allocator.free(ft);
+<a id="L197"></a>
+<a id="L198"></a>        return .{
+<a id="L199"></a>            .allocator = allocator,
+<a id="L200"></a>            .transitions = transitions,
+<a id="L201"></a>            .timetypes = timetypes,
+<a id="L202"></a>            .leapseconds = leapseconds,
+<a id="L203"></a>            .footer = footer,
+<a id="L204"></a>        };
+<a id="L205"></a>    }
+<a id="L206"></a>
+<a id="L207"></a>    pub fn deinit(self: *Tz) void {
+<a id="L208"></a>        if (self.footer) |footer| {
+<a id="L209"></a>            self.allocator.free(footer);
+<a id="L210"></a>        }
+<a id="L211"></a>        self.allocator.free(self.leapseconds);
+<a id="L212"></a>        self.allocator.free(self.transitions);
+<a id="L213"></a>        self.allocator.free(self.timetypes);
+<a id="L214"></a>    }
+<a id="L215"></a>};
+<a id="L216"></a>
+<a id="L217"></a>test "slim" {
+<a id="L218"></a>    const data = @embedFile("tz/asia_tokyo.tzif");
+<a id="L219"></a>    var in_stream: Reader = .fixed(data);
+<a id="L220"></a>
+<a id="L221"></a>    var tz = try std.Tz.parse(std.testing.allocator, &amp;in_stream);
+<a id="L222"></a>    defer tz.deinit();
+<a id="L223"></a>
+<a id="L224"></a>    try std.testing.expectEqual(tz.transitions.len, 9);
+<a id="L225"></a>    try std.testing.expect(std.mem.eql(u8, tz.transitions[3].timetype.name(), "JDT"));
+<a id="L226"></a>    try std.testing.expectEqual(tz.transitions[5].ts, -620298000); // 1950-05-06 15:00:00 UTC
+<a id="L227"></a>    try std.testing.expectEqual(tz.leapseconds[13].occurrence, 567993613); // 1988-01-01 00:00:00 UTC (+23s in TAI, and +13 in the data since it doesn't store the initial 10 second offset)
+<a id="L228"></a>}
+<a id="L229"></a>
+<a id="L230"></a>test "fat" {
+<a id="L231"></a>    const data = @embedFile("tz/antarctica_davis.tzif");
+<a id="L232"></a>    var in_stream: Reader = .fixed(data);
+<a id="L233"></a>
+<a id="L234"></a>    var tz = try std.Tz.parse(std.testing.allocator, &amp;in_stream);
+<a id="L235"></a>    defer tz.deinit();
+<a id="L236"></a>
+<a id="L237"></a>    try std.testing.expectEqual(tz.transitions.len, 8);
+<a id="L238"></a>    try std.testing.expect(std.mem.eql(u8, tz.transitions[3].timetype.name(), "+05"));
+<a id="L239"></a>    try std.testing.expectEqual(tz.transitions[4].ts, 1268251224); // 2010-03-10 20:00:00 UTC
+<a id="L240"></a>}
+<a id="L241"></a>
+<a id="L242"></a>test "legacy" {
+<a id="L243"></a>    // Taken from Slackware 8.0, from 2001
+<a id="L244"></a>    const data = @embedFile("tz/europe_vatican.tzif");
+<a id="L245"></a>    var in_stream: Reader = .fixed(data);
+<a id="L246"></a>
+<a id="L247"></a>    var tz = try std.Tz.parse(std.testing.allocator, &amp;in_stream);
+<a id="L248"></a>    defer tz.deinit();
+<a id="L249"></a>
+<a id="L250"></a>    try std.testing.expectEqual(tz.transitions.len, 170);
+<a id="L251"></a>    try std.testing.expect(std.mem.eql(u8, tz.transitions[69].timetype.name(), "CET"));
+<a id="L252"></a>    try std.testing.expectEqual(tz.transitions[123].ts, 1414285200); // 2014-10-26 01:00:00 UTC
+<a id="L253"></a>}
+</pre>
 </body>
 </html>

@@ -2,298 +2,301 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Source: zig-0.16.0-std/zig/system/windows.zig</title>
+    <title>Source: zig/system/windows.zig</title>
     <style>
         body { background: #1e1e1e; color: #d4d4d4; font-family: monospace; padding: 20px; }
         pre { white-space: pre-wrap; word-wrap: break-word; }
         .header { border-bottom: 1px solid #444; padding-bottom: 10px; margin-bottom: 20px; }
         a { color: #569cd6; }
+        a[id] { color: inherit; text-decoration: none; }
+        :target { background: #3a3a00; }
     </style>
 </head>
 <body>
     <div class="header">
-        <a href="/">Index</a> | <strong>File: zig-0.16.0-std/zig/system/windows.zig</strong>
+        <a href="/">Index</a> | <strong>File: zig/system/windows.zig</strong>
     </div>
-    <pre>const std = @import("std");
-const builtin = @import("builtin");
-const assert = std.debug.assert;
-const mem = std.mem;
-const Target = std.Target;
-
-pub const WindowsVersion = std.Target.Os.WindowsVersion;
-pub const PF = std.os.windows.PF;
-pub const REG = std.os.windows.REG;
-pub const IsProcessorFeaturePresent = std.os.windows.IsProcessorFeaturePresent;
-
-/// Returns the highest known WindowsVersion deduced from reported runtime information.
-/// Discards information about in-between versions we don't differentiate.
-pub fn detectRuntimeVersion() WindowsVersion {
-    var version_info: std.os.windows.RTL_OSVERSIONINFOW = undefined;
-    version_info.dwOSVersionInfoSize = @sizeOf(@TypeOf(version_info));
-
-    switch (std.os.windows.ntdll.RtlGetVersion(&amp;version_info)) {
-        .SUCCESS =&gt; {},
-        else =&gt; unreachable,
-    }
-
-    // Starting from the system infos build a NTDDI-like version
-    // constant whose format is:
-    //   B0 B1 B2 B3
-    //   `---` `` ``--&gt; Sub-version (Starting from Windows 10 onwards)
-    //     \    `--&gt; Service pack (Always zero in the constants defined)
-    //      `--&gt; OS version (Major &amp; minor)
-    const os_ver: u16 = @as(u16, @intCast(version_info.dwMajorVersion &amp; 0xff)) &lt;&lt; 8 |
-        @as(u16, @intCast(version_info.dwMinorVersion &amp; 0xff));
-    const sp_ver: u8 = 0;
-    const sub_ver: u8 = if (os_ver &gt;= 0x0A00) subver: {
-        // There's no other way to obtain this info beside
-        // checking the build number against a known set of
-        // values
-        var last_idx: usize = 0;
-        for (WindowsVersion.known_win10_build_numbers, 0..) |build, i| {
-            if (version_info.dwBuildNumber &gt;= build)
-                last_idx = i;
-        }
-        break :subver @as(u8, @truncate(last_idx));
-    } else 0;
-
-    const version: u32 = @as(u32, os_ver) &lt;&lt; 16 | @as(u16, sp_ver) &lt;&lt; 8 | sub_ver;
-
-    return @as(WindowsVersion, @enumFromInt(version));
-}
-
-// Technically, a registry value can be as long as 1MB. However, MS recommends storing
-// values larger than 2048 bytes in a file rather than directly in the registry, and since we
-// are only accessing a system hive \Registry\Machine, we stick to MS guidelines.
-// https://learn.microsoft.com/en-us/windows/win32/sysinfo/registry-element-size-limits
-const max_value_len = 2048;
-
-fn getCpuInfoFromRegistry(core: usize, args: anytype) !void {
-    const ArgsType = @TypeOf(args);
-    const args_type_info = @typeInfo(ArgsType);
-
-    if (args_type_info != .@"struct") {
-        @compileError("expected tuple or struct argument, found " ++ @typeName(ArgsType));
-    }
-
-    const fields_info = args_type_info.@"struct".fields;
-
-    // Originally, I wanted to issue a single call with a more complex table structure such that we
-    // would sequentially visit each CPU#d subkey in the registry and pull the value of interest into
-    // a buffer, however, NT seems to be expecting a single buffer per each table meaning we would
-    // end up pulling only the last CPU core info, overwriting everything else.
-    // If anyone can come up with a solution to this, please do!
-    const table_size = 1 + fields_info.len;
-    var table: [table_size + 1]std.os.windows.RTL_QUERY_REGISTRY_TABLE = undefined;
-
-    const topkey = std.unicode.utf8ToUtf16LeStringLiteral("\\Registry\\Machine\\HARDWARE\\DESCRIPTION\\System\\CentralProcessor");
-
-    const max_cpu_buf = 4;
-    var next_cpu_buf: [max_cpu_buf]u8 = undefined;
-    const next_cpu = try std.fmt.bufPrint(&amp;next_cpu_buf, "{d}", .{core});
-
-    var subkey: [max_cpu_buf + 1]u16 = undefined;
-    const subkey_len = try std.unicode.utf8ToUtf16Le(&amp;subkey, next_cpu);
-    subkey[subkey_len] = 0;
-
-    table[0] = .{
-        .QueryRoutine = null,
-        .Flags = std.os.windows.RTL_QUERY_REGISTRY_SUBKEY | std.os.windows.RTL_QUERY_REGISTRY_REQUIRED,
-        .Name = subkey[0..subkey_len :0],
-        .EntryContext = null,
-        .DefaultType = .NONE,
-        .DefaultData = null,
-        .DefaultLength = 0,
-    };
-
-    var tmp_bufs: [fields_info.len][max_value_len]u8 align(@alignOf(std.os.windows.UNICODE_STRING)) = undefined;
-
-    inline for (fields_info, 0..) |field, i| {
-        const ctx: *anyopaque = blk: {
-            switch (@field(args, field.name).value_type) {
-                .SZ,
-                .EXPAND_SZ,
-                .MULTI_SZ,
-                =&gt; {
-                    comptime assert(@sizeOf(std.os.windows.UNICODE_STRING) % 2 == 0);
-                    const unicode: *std.os.windows.UNICODE_STRING = @ptrCast(&amp;tmp_bufs[i]);
-                    unicode.* = .{
-                        .Length = 0,
-                        .MaximumLength = max_value_len - @sizeOf(std.os.windows.UNICODE_STRING),
-                        .Buffer = @ptrCast(tmp_bufs[i][@sizeOf(std.os.windows.UNICODE_STRING)..]),
-                    };
-                    break :blk unicode;
-                },
-
-                .DWORD,
-                .DWORD_BIG_ENDIAN,
-                .QWORD,
-                =&gt; break :blk &amp;tmp_bufs[i],
-
-                else =&gt; unreachable,
-            }
-        };
-
-        var key_buf: [max_value_len / 2 + 1]u16 = undefined;
-        const key_len = try std.unicode.utf8ToUtf16Le(&amp;key_buf, @field(args, field.name).key);
-        key_buf[key_len] = 0;
-
-        table[i + 1] = .{
-            .QueryRoutine = null,
-            .Flags = std.os.windows.RTL_QUERY_REGISTRY_DIRECT | std.os.windows.RTL_QUERY_REGISTRY_REQUIRED,
-            .Name = key_buf[0..key_len :0],
-            .EntryContext = ctx,
-            .DefaultType = .NONE,
-            .DefaultData = null,
-            .DefaultLength = 0,
-        };
-    }
-
-    // Table sentinel
-    table[table_size] = .{
-        .QueryRoutine = null,
-        .Flags = 0,
-        .Name = null,
-        .EntryContext = null,
-        .DefaultType = .NONE,
-        .DefaultData = null,
-        .DefaultLength = 0,
-    };
-
-    const res = std.os.windows.ntdll.RtlQueryRegistryValues(
-        std.os.windows.RTL_REGISTRY_ABSOLUTE,
-        topkey,
-        &amp;table,
-        null,
-        null,
-    );
-    switch (res) {
-        .SUCCESS =&gt; {
-            inline for (fields_info, 0..) |field, i| switch (@field(args, field.name).value_type) {
-                .SZ,
-                .EXPAND_SZ,
-                .MULTI_SZ,
-                =&gt; {
-                    var buf = @field(args, field.name).value_buf;
-                    const entry: *const std.os.windows.UNICODE_STRING = @ptrCast(table[i + 1].EntryContext);
-                    const len = try std.unicode.utf16LeToUtf8(buf, entry.slice());
-                    buf[len] = 0;
-                },
-
-                .DWORD,
-                .DWORD_BIG_ENDIAN,
-                .QWORD,
-                =&gt; {
-                    const entry: [*]const u8 = @ptrCast(table[i + 1].EntryContext);
-                    switch (@field(args, field.name).value_type) {
-                        .DWORD, .DWORD_BIG_ENDIAN =&gt; {
-                            @memcpy(@field(args, field.name).value_buf[0..4], entry[0..4]);
-                        },
-                        .QWORD =&gt; {
-                            @memcpy(@field(args, field.name).value_buf[0..8], entry[0..8]);
-                        },
-                        else =&gt; unreachable,
-                    }
-                },
-
-                else =&gt; unreachable,
-            };
-        },
-        else =&gt; return error.Unexpected,
-    }
-}
-
-fn setFeature(comptime Feature: type, cpu: *Target.Cpu, feature: Feature, enabled: bool) void {
-    const idx = @as(Target.Cpu.Feature.Set.Index, @intFromEnum(feature));
-
-    if (enabled) cpu.features.addFeature(idx) else cpu.features.removeFeature(idx);
-}
-
-fn getCpuCount() usize {
-    return std.os.windows.peb().NumberOfProcessors;
-}
-
-/// If the fine-grained detection of CPU features via Win registry fails,
-/// we fallback to a generic CPU model but we override the feature set
-/// using `SharedUserData` contents.
-/// This is effectively what LLVM does for all ARM chips on Windows.
-fn genericCpuAndNativeFeatures(arch: Target.Cpu.Arch) Target.Cpu {
-    var cpu = Target.Cpu{
-        .arch = arch,
-        .model = Target.Cpu.Model.generic(arch),
-        .features = Target.Cpu.Feature.Set.empty,
-    };
-
-    switch (arch) {
-        .aarch64, .aarch64_be =&gt; {
-            const Feature = Target.aarch64.Feature;
-
-            // Override any features that are either present or absent
-            setFeature(Feature, &amp;cpu, .neon, IsProcessorFeaturePresent(PF.ARM_NEON_INSTRUCTIONS_AVAILABLE));
-            setFeature(Feature, &amp;cpu, .crc, IsProcessorFeaturePresent(PF.ARM_V8_CRC32_INSTRUCTIONS_AVAILABLE));
-            setFeature(Feature, &amp;cpu, .crypto, IsProcessorFeaturePresent(PF.ARM_V8_CRYPTO_INSTRUCTIONS_AVAILABLE));
-            setFeature(Feature, &amp;cpu, .lse, IsProcessorFeaturePresent(PF.ARM_V81_ATOMIC_INSTRUCTIONS_AVAILABLE));
-            setFeature(Feature, &amp;cpu, .dotprod, IsProcessorFeaturePresent(PF.ARM_V82_DP_INSTRUCTIONS_AVAILABLE));
-            setFeature(Feature, &amp;cpu, .jsconv, IsProcessorFeaturePresent(PF.ARM_V83_JSCVT_INSTRUCTIONS_AVAILABLE));
-        },
-        else =&gt; {},
-    }
-
-    return cpu;
-}
-
-pub fn detectNativeCpuAndFeatures() ?Target.Cpu {
-    const current_arch = builtin.cpu.arch;
-    const cpu: ?Target.Cpu = switch (current_arch) {
-        .aarch64, .aarch64_be =&gt; blk: {
-            var cores: [128]Target.Cpu = undefined;
-            const core_count = getCpuCount();
-
-            if (core_count &gt; cores.len) break :blk null;
-
-            var i: usize = 0;
-            while (i &lt; core_count) : (i += 1) {
-                // Backing datastore
-                var registers: [12]u64 = undefined;
-
-                // Registry key to system ID register mapping
-                // CP 4000 -&gt; MIDR_EL1
-                // CP 4020 -&gt; ID_AA64PFR0_EL1
-                // CP 4021 -&gt; ID_AA64PFR1_EL1
-                // CP 4028 -&gt; ID_AA64DFR0_EL1
-                // CP 4029 -&gt; ID_AA64DFR1_EL1
-                // CP 402C -&gt; ID_AA64AFR0_EL1
-                // CP 402D -&gt; ID_AA64AFR1_EL1
-                // CP 4030 -&gt; ID_AA64ISAR0_EL1
-                // CP 4031 -&gt; ID_AA64ISAR1_EL1
-                // CP 4038 -&gt; ID_AA64MMFR0_EL1
-                // CP 4039 -&gt; ID_AA64MMFR1_EL1
-                // CP 403A -&gt; ID_AA64MMFR2_EL1
-                getCpuInfoFromRegistry(i, .{
-                    .{ .key = "CP 4000", .value_type = REG.ValueType.QWORD, .value_buf = @as(*[8]u8, @ptrCast(&amp;registers[0])) },
-                    .{ .key = "CP 4020", .value_type = REG.ValueType.QWORD, .value_buf = @as(*[8]u8, @ptrCast(&amp;registers[1])) },
-                    .{ .key = "CP 4021", .value_type = REG.ValueType.QWORD, .value_buf = @as(*[8]u8, @ptrCast(&amp;registers[2])) },
-                    .{ .key = "CP 4028", .value_type = REG.ValueType.QWORD, .value_buf = @as(*[8]u8, @ptrCast(&amp;registers[3])) },
-                    .{ .key = "CP 4029", .value_type = REG.ValueType.QWORD, .value_buf = @as(*[8]u8, @ptrCast(&amp;registers[4])) },
-                    .{ .key = "CP 402C", .value_type = REG.ValueType.QWORD, .value_buf = @as(*[8]u8, @ptrCast(&amp;registers[5])) },
-                    .{ .key = "CP 402D", .value_type = REG.ValueType.QWORD, .value_buf = @as(*[8]u8, @ptrCast(&amp;registers[6])) },
-                    .{ .key = "CP 4030", .value_type = REG.ValueType.QWORD, .value_buf = @as(*[8]u8, @ptrCast(&amp;registers[7])) },
-                    .{ .key = "CP 4031", .value_type = REG.ValueType.QWORD, .value_buf = @as(*[8]u8, @ptrCast(&amp;registers[8])) },
-                    .{ .key = "CP 4038", .value_type = REG.ValueType.QWORD, .value_buf = @as(*[8]u8, @ptrCast(&amp;registers[9])) },
-                    .{ .key = "CP 4039", .value_type = REG.ValueType.QWORD, .value_buf = @as(*[8]u8, @ptrCast(&amp;registers[10])) },
-                    .{ .key = "CP 403A", .value_type = REG.ValueType.QWORD, .value_buf = @as(*[8]u8, @ptrCast(&amp;registers[11])) },
-                }) catch break :blk null;
-
-                cores[i] = @import("arm.zig").aarch64.detectNativeCpuAndFeatures(current_arch, registers) orelse
-                    break :blk null;
-            }
-
-            // Pick the first core, usually LITTLE in big.LITTLE architecture.
-            break :blk cores[0];
-        },
-        else =&gt; null,
-    };
-    return cpu orelse genericCpuAndNativeFeatures(current_arch);
-}</pre>
+    <pre><a id="L1"></a>const std = @import("std");
+<a id="L2"></a>const builtin = @import("builtin");
+<a id="L3"></a>const assert = std.debug.assert;
+<a id="L4"></a>const mem = std.mem;
+<a id="L5"></a>const Target = std.Target;
+<a id="L6"></a>
+<a id="L7"></a>pub const WindowsVersion = std.Target.Os.WindowsVersion;
+<a id="L8"></a>pub const PF = std.os.windows.PF;
+<a id="L9"></a>pub const REG = std.os.windows.REG;
+<a id="L10"></a>pub const IsProcessorFeaturePresent = std.os.windows.IsProcessorFeaturePresent;
+<a id="L11"></a>
+<a id="L12"></a>/// Returns the highest known WindowsVersion deduced from reported runtime information.
+<a id="L13"></a>/// Discards information about in-between versions we don't differentiate.
+<a id="L14"></a>pub fn detectRuntimeVersion() WindowsVersion {
+<a id="L15"></a>    var version_info: std.os.windows.RTL_OSVERSIONINFOW = undefined;
+<a id="L16"></a>    version_info.dwOSVersionInfoSize = @sizeOf(@TypeOf(version_info));
+<a id="L17"></a>
+<a id="L18"></a>    switch (std.os.windows.ntdll.RtlGetVersion(&amp;version_info)) {
+<a id="L19"></a>        .SUCCESS =&gt; {},
+<a id="L20"></a>        else =&gt; unreachable,
+<a id="L21"></a>    }
+<a id="L22"></a>
+<a id="L23"></a>    // Starting from the system infos build a NTDDI-like version
+<a id="L24"></a>    // constant whose format is:
+<a id="L25"></a>    //   B0 B1 B2 B3
+<a id="L26"></a>    //   `---` `` ``--&gt; Sub-version (Starting from Windows 10 onwards)
+<a id="L27"></a>    //     \    `--&gt; Service pack (Always zero in the constants defined)
+<a id="L28"></a>    //      `--&gt; OS version (Major &amp; minor)
+<a id="L29"></a>    const os_ver: u16 = @as(u16, @intCast(version_info.dwMajorVersion &amp; 0xff)) &lt;&lt; 8 |
+<a id="L30"></a>        @as(u16, @intCast(version_info.dwMinorVersion &amp; 0xff));
+<a id="L31"></a>    const sp_ver: u8 = 0;
+<a id="L32"></a>    const sub_ver: u8 = if (os_ver &gt;= 0x0A00) subver: {
+<a id="L33"></a>        // There's no other way to obtain this info beside
+<a id="L34"></a>        // checking the build number against a known set of
+<a id="L35"></a>        // values
+<a id="L36"></a>        var last_idx: usize = 0;
+<a id="L37"></a>        for (WindowsVersion.known_win10_build_numbers, 0..) |build, i| {
+<a id="L38"></a>            if (version_info.dwBuildNumber &gt;= build)
+<a id="L39"></a>                last_idx = i;
+<a id="L40"></a>        }
+<a id="L41"></a>        break :subver @as(u8, @truncate(last_idx));
+<a id="L42"></a>    } else 0;
+<a id="L43"></a>
+<a id="L44"></a>    const version: u32 = @as(u32, os_ver) &lt;&lt; 16 | @as(u16, sp_ver) &lt;&lt; 8 | sub_ver;
+<a id="L45"></a>
+<a id="L46"></a>    return @as(WindowsVersion, @enumFromInt(version));
+<a id="L47"></a>}
+<a id="L48"></a>
+<a id="L49"></a>// Technically, a registry value can be as long as 1MB. However, MS recommends storing
+<a id="L50"></a>// values larger than 2048 bytes in a file rather than directly in the registry, and since we
+<a id="L51"></a>// are only accessing a system hive \Registry\Machine, we stick to MS guidelines.
+<a id="L52"></a>// https://learn.microsoft.com/en-us/windows/win32/sysinfo/registry-element-size-limits
+<a id="L53"></a>const max_value_len = 2048;
+<a id="L54"></a>
+<a id="L55"></a>fn getCpuInfoFromRegistry(core: usize, args: anytype) !void {
+<a id="L56"></a>    const ArgsType = @TypeOf(args);
+<a id="L57"></a>    const args_type_info = @typeInfo(ArgsType);
+<a id="L58"></a>
+<a id="L59"></a>    if (args_type_info != .@"struct") {
+<a id="L60"></a>        @compileError("expected tuple or struct argument, found " ++ @typeName(ArgsType));
+<a id="L61"></a>    }
+<a id="L62"></a>
+<a id="L63"></a>    const fields_info = args_type_info.@"struct".fields;
+<a id="L64"></a>
+<a id="L65"></a>    // Originally, I wanted to issue a single call with a more complex table structure such that we
+<a id="L66"></a>    // would sequentially visit each CPU#d subkey in the registry and pull the value of interest into
+<a id="L67"></a>    // a buffer, however, NT seems to be expecting a single buffer per each table meaning we would
+<a id="L68"></a>    // end up pulling only the last CPU core info, overwriting everything else.
+<a id="L69"></a>    // If anyone can come up with a solution to this, please do!
+<a id="L70"></a>    const table_size = 1 + fields_info.len;
+<a id="L71"></a>    var table: [table_size + 1]std.os.windows.RTL_QUERY_REGISTRY_TABLE = undefined;
+<a id="L72"></a>
+<a id="L73"></a>    const topkey = std.unicode.utf8ToUtf16LeStringLiteral("\\Registry\\Machine\\HARDWARE\\DESCRIPTION\\System\\CentralProcessor");
+<a id="L74"></a>
+<a id="L75"></a>    const max_cpu_buf = 4;
+<a id="L76"></a>    var next_cpu_buf: [max_cpu_buf]u8 = undefined;
+<a id="L77"></a>    const next_cpu = try std.fmt.bufPrint(&amp;next_cpu_buf, "{d}", .{core});
+<a id="L78"></a>
+<a id="L79"></a>    var subkey: [max_cpu_buf + 1]u16 = undefined;
+<a id="L80"></a>    const subkey_len = try std.unicode.utf8ToUtf16Le(&amp;subkey, next_cpu);
+<a id="L81"></a>    subkey[subkey_len] = 0;
+<a id="L82"></a>
+<a id="L83"></a>    table[0] = .{
+<a id="L84"></a>        .QueryRoutine = null,
+<a id="L85"></a>        .Flags = std.os.windows.RTL_QUERY_REGISTRY_SUBKEY | std.os.windows.RTL_QUERY_REGISTRY_REQUIRED,
+<a id="L86"></a>        .Name = subkey[0..subkey_len :0],
+<a id="L87"></a>        .EntryContext = null,
+<a id="L88"></a>        .DefaultType = .NONE,
+<a id="L89"></a>        .DefaultData = null,
+<a id="L90"></a>        .DefaultLength = 0,
+<a id="L91"></a>    };
+<a id="L92"></a>
+<a id="L93"></a>    var tmp_bufs: [fields_info.len][max_value_len]u8 align(@alignOf(std.os.windows.UNICODE_STRING)) = undefined;
+<a id="L94"></a>
+<a id="L95"></a>    inline for (fields_info, 0..) |field, i| {
+<a id="L96"></a>        const ctx: *anyopaque = blk: {
+<a id="L97"></a>            switch (@field(args, field.name).value_type) {
+<a id="L98"></a>                .SZ,
+<a id="L99"></a>                .EXPAND_SZ,
+<a id="L100"></a>                .MULTI_SZ,
+<a id="L101"></a>                =&gt; {
+<a id="L102"></a>                    comptime assert(@sizeOf(std.os.windows.UNICODE_STRING) % 2 == 0);
+<a id="L103"></a>                    const unicode: *std.os.windows.UNICODE_STRING = @ptrCast(&amp;tmp_bufs[i]);
+<a id="L104"></a>                    unicode.* = .{
+<a id="L105"></a>                        .Length = 0,
+<a id="L106"></a>                        .MaximumLength = max_value_len - @sizeOf(std.os.windows.UNICODE_STRING),
+<a id="L107"></a>                        .Buffer = @ptrCast(tmp_bufs[i][@sizeOf(std.os.windows.UNICODE_STRING)..]),
+<a id="L108"></a>                    };
+<a id="L109"></a>                    break :blk unicode;
+<a id="L110"></a>                },
+<a id="L111"></a>
+<a id="L112"></a>                .DWORD,
+<a id="L113"></a>                .DWORD_BIG_ENDIAN,
+<a id="L114"></a>                .QWORD,
+<a id="L115"></a>                =&gt; break :blk &amp;tmp_bufs[i],
+<a id="L116"></a>
+<a id="L117"></a>                else =&gt; unreachable,
+<a id="L118"></a>            }
+<a id="L119"></a>        };
+<a id="L120"></a>
+<a id="L121"></a>        var key_buf: [max_value_len / 2 + 1]u16 = undefined;
+<a id="L122"></a>        const key_len = try std.unicode.utf8ToUtf16Le(&amp;key_buf, @field(args, field.name).key);
+<a id="L123"></a>        key_buf[key_len] = 0;
+<a id="L124"></a>
+<a id="L125"></a>        table[i + 1] = .{
+<a id="L126"></a>            .QueryRoutine = null,
+<a id="L127"></a>            .Flags = std.os.windows.RTL_QUERY_REGISTRY_DIRECT | std.os.windows.RTL_QUERY_REGISTRY_REQUIRED,
+<a id="L128"></a>            .Name = key_buf[0..key_len :0],
+<a id="L129"></a>            .EntryContext = ctx,
+<a id="L130"></a>            .DefaultType = .NONE,
+<a id="L131"></a>            .DefaultData = null,
+<a id="L132"></a>            .DefaultLength = 0,
+<a id="L133"></a>        };
+<a id="L134"></a>    }
+<a id="L135"></a>
+<a id="L136"></a>    // Table sentinel
+<a id="L137"></a>    table[table_size] = .{
+<a id="L138"></a>        .QueryRoutine = null,
+<a id="L139"></a>        .Flags = 0,
+<a id="L140"></a>        .Name = null,
+<a id="L141"></a>        .EntryContext = null,
+<a id="L142"></a>        .DefaultType = .NONE,
+<a id="L143"></a>        .DefaultData = null,
+<a id="L144"></a>        .DefaultLength = 0,
+<a id="L145"></a>    };
+<a id="L146"></a>
+<a id="L147"></a>    const res = std.os.windows.ntdll.RtlQueryRegistryValues(
+<a id="L148"></a>        std.os.windows.RTL_REGISTRY_ABSOLUTE,
+<a id="L149"></a>        topkey,
+<a id="L150"></a>        &amp;table,
+<a id="L151"></a>        null,
+<a id="L152"></a>        null,
+<a id="L153"></a>    );
+<a id="L154"></a>    switch (res) {
+<a id="L155"></a>        .SUCCESS =&gt; {
+<a id="L156"></a>            inline for (fields_info, 0..) |field, i| switch (@field(args, field.name).value_type) {
+<a id="L157"></a>                .SZ,
+<a id="L158"></a>                .EXPAND_SZ,
+<a id="L159"></a>                .MULTI_SZ,
+<a id="L160"></a>                =&gt; {
+<a id="L161"></a>                    var buf = @field(args, field.name).value_buf;
+<a id="L162"></a>                    const entry: *const std.os.windows.UNICODE_STRING = @ptrCast(table[i + 1].EntryContext);
+<a id="L163"></a>                    const len = try std.unicode.utf16LeToUtf8(buf, entry.slice());
+<a id="L164"></a>                    buf[len] = 0;
+<a id="L165"></a>                },
+<a id="L166"></a>
+<a id="L167"></a>                .DWORD,
+<a id="L168"></a>                .DWORD_BIG_ENDIAN,
+<a id="L169"></a>                .QWORD,
+<a id="L170"></a>                =&gt; {
+<a id="L171"></a>                    const entry: [*]const u8 = @ptrCast(table[i + 1].EntryContext);
+<a id="L172"></a>                    switch (@field(args, field.name).value_type) {
+<a id="L173"></a>                        .DWORD, .DWORD_BIG_ENDIAN =&gt; {
+<a id="L174"></a>                            @memcpy(@field(args, field.name).value_buf[0..4], entry[0..4]);
+<a id="L175"></a>                        },
+<a id="L176"></a>                        .QWORD =&gt; {
+<a id="L177"></a>                            @memcpy(@field(args, field.name).value_buf[0..8], entry[0..8]);
+<a id="L178"></a>                        },
+<a id="L179"></a>                        else =&gt; unreachable,
+<a id="L180"></a>                    }
+<a id="L181"></a>                },
+<a id="L182"></a>
+<a id="L183"></a>                else =&gt; unreachable,
+<a id="L184"></a>            };
+<a id="L185"></a>        },
+<a id="L186"></a>        else =&gt; return error.Unexpected,
+<a id="L187"></a>    }
+<a id="L188"></a>}
+<a id="L189"></a>
+<a id="L190"></a>fn setFeature(comptime Feature: type, cpu: *Target.Cpu, feature: Feature, enabled: bool) void {
+<a id="L191"></a>    const idx = @as(Target.Cpu.Feature.Set.Index, @intFromEnum(feature));
+<a id="L192"></a>
+<a id="L193"></a>    if (enabled) cpu.features.addFeature(idx) else cpu.features.removeFeature(idx);
+<a id="L194"></a>}
+<a id="L195"></a>
+<a id="L196"></a>fn getCpuCount() usize {
+<a id="L197"></a>    return std.os.windows.peb().NumberOfProcessors;
+<a id="L198"></a>}
+<a id="L199"></a>
+<a id="L200"></a>/// If the fine-grained detection of CPU features via Win registry fails,
+<a id="L201"></a>/// we fallback to a generic CPU model but we override the feature set
+<a id="L202"></a>/// using `SharedUserData` contents.
+<a id="L203"></a>/// This is effectively what LLVM does for all ARM chips on Windows.
+<a id="L204"></a>fn genericCpuAndNativeFeatures(arch: Target.Cpu.Arch) Target.Cpu {
+<a id="L205"></a>    var cpu = Target.Cpu{
+<a id="L206"></a>        .arch = arch,
+<a id="L207"></a>        .model = Target.Cpu.Model.generic(arch),
+<a id="L208"></a>        .features = Target.Cpu.Feature.Set.empty,
+<a id="L209"></a>    };
+<a id="L210"></a>
+<a id="L211"></a>    switch (arch) {
+<a id="L212"></a>        .aarch64, .aarch64_be =&gt; {
+<a id="L213"></a>            const Feature = Target.aarch64.Feature;
+<a id="L214"></a>
+<a id="L215"></a>            // Override any features that are either present or absent
+<a id="L216"></a>            setFeature(Feature, &amp;cpu, .neon, IsProcessorFeaturePresent(PF.ARM_NEON_INSTRUCTIONS_AVAILABLE));
+<a id="L217"></a>            setFeature(Feature, &amp;cpu, .crc, IsProcessorFeaturePresent(PF.ARM_V8_CRC32_INSTRUCTIONS_AVAILABLE));
+<a id="L218"></a>            setFeature(Feature, &amp;cpu, .crypto, IsProcessorFeaturePresent(PF.ARM_V8_CRYPTO_INSTRUCTIONS_AVAILABLE));
+<a id="L219"></a>            setFeature(Feature, &amp;cpu, .lse, IsProcessorFeaturePresent(PF.ARM_V81_ATOMIC_INSTRUCTIONS_AVAILABLE));
+<a id="L220"></a>            setFeature(Feature, &amp;cpu, .dotprod, IsProcessorFeaturePresent(PF.ARM_V82_DP_INSTRUCTIONS_AVAILABLE));
+<a id="L221"></a>            setFeature(Feature, &amp;cpu, .jsconv, IsProcessorFeaturePresent(PF.ARM_V83_JSCVT_INSTRUCTIONS_AVAILABLE));
+<a id="L222"></a>        },
+<a id="L223"></a>        else =&gt; {},
+<a id="L224"></a>    }
+<a id="L225"></a>
+<a id="L226"></a>    return cpu;
+<a id="L227"></a>}
+<a id="L228"></a>
+<a id="L229"></a>pub fn detectNativeCpuAndFeatures() ?Target.Cpu {
+<a id="L230"></a>    const current_arch = builtin.cpu.arch;
+<a id="L231"></a>    const cpu: ?Target.Cpu = switch (current_arch) {
+<a id="L232"></a>        .aarch64, .aarch64_be =&gt; blk: {
+<a id="L233"></a>            var cores: [128]Target.Cpu = undefined;
+<a id="L234"></a>            const core_count = getCpuCount();
+<a id="L235"></a>
+<a id="L236"></a>            if (core_count &gt; cores.len) break :blk null;
+<a id="L237"></a>
+<a id="L238"></a>            var i: usize = 0;
+<a id="L239"></a>            while (i &lt; core_count) : (i += 1) {
+<a id="L240"></a>                // Backing datastore
+<a id="L241"></a>                var registers: [12]u64 = undefined;
+<a id="L242"></a>
+<a id="L243"></a>                // Registry key to system ID register mapping
+<a id="L244"></a>                // CP 4000 -&gt; MIDR_EL1
+<a id="L245"></a>                // CP 4020 -&gt; ID_AA64PFR0_EL1
+<a id="L246"></a>                // CP 4021 -&gt; ID_AA64PFR1_EL1
+<a id="L247"></a>                // CP 4028 -&gt; ID_AA64DFR0_EL1
+<a id="L248"></a>                // CP 4029 -&gt; ID_AA64DFR1_EL1
+<a id="L249"></a>                // CP 402C -&gt; ID_AA64AFR0_EL1
+<a id="L250"></a>                // CP 402D -&gt; ID_AA64AFR1_EL1
+<a id="L251"></a>                // CP 4030 -&gt; ID_AA64ISAR0_EL1
+<a id="L252"></a>                // CP 4031 -&gt; ID_AA64ISAR1_EL1
+<a id="L253"></a>                // CP 4038 -&gt; ID_AA64MMFR0_EL1
+<a id="L254"></a>                // CP 4039 -&gt; ID_AA64MMFR1_EL1
+<a id="L255"></a>                // CP 403A -&gt; ID_AA64MMFR2_EL1
+<a id="L256"></a>                getCpuInfoFromRegistry(i, .{
+<a id="L257"></a>                    .{ .key = "CP 4000", .value_type = REG.ValueType.QWORD, .value_buf = @as(*[8]u8, @ptrCast(&amp;registers[0])) },
+<a id="L258"></a>                    .{ .key = "CP 4020", .value_type = REG.ValueType.QWORD, .value_buf = @as(*[8]u8, @ptrCast(&amp;registers[1])) },
+<a id="L259"></a>                    .{ .key = "CP 4021", .value_type = REG.ValueType.QWORD, .value_buf = @as(*[8]u8, @ptrCast(&amp;registers[2])) },
+<a id="L260"></a>                    .{ .key = "CP 4028", .value_type = REG.ValueType.QWORD, .value_buf = @as(*[8]u8, @ptrCast(&amp;registers[3])) },
+<a id="L261"></a>                    .{ .key = "CP 4029", .value_type = REG.ValueType.QWORD, .value_buf = @as(*[8]u8, @ptrCast(&amp;registers[4])) },
+<a id="L262"></a>                    .{ .key = "CP 402C", .value_type = REG.ValueType.QWORD, .value_buf = @as(*[8]u8, @ptrCast(&amp;registers[5])) },
+<a id="L263"></a>                    .{ .key = "CP 402D", .value_type = REG.ValueType.QWORD, .value_buf = @as(*[8]u8, @ptrCast(&amp;registers[6])) },
+<a id="L264"></a>                    .{ .key = "CP 4030", .value_type = REG.ValueType.QWORD, .value_buf = @as(*[8]u8, @ptrCast(&amp;registers[7])) },
+<a id="L265"></a>                    .{ .key = "CP 4031", .value_type = REG.ValueType.QWORD, .value_buf = @as(*[8]u8, @ptrCast(&amp;registers[8])) },
+<a id="L266"></a>                    .{ .key = "CP 4038", .value_type = REG.ValueType.QWORD, .value_buf = @as(*[8]u8, @ptrCast(&amp;registers[9])) },
+<a id="L267"></a>                    .{ .key = "CP 4039", .value_type = REG.ValueType.QWORD, .value_buf = @as(*[8]u8, @ptrCast(&amp;registers[10])) },
+<a id="L268"></a>                    .{ .key = "CP 403A", .value_type = REG.ValueType.QWORD, .value_buf = @as(*[8]u8, @ptrCast(&amp;registers[11])) },
+<a id="L269"></a>                }) catch break :blk null;
+<a id="L270"></a>
+<a id="L271"></a>                cores[i] = @import("arm.zig").aarch64.detectNativeCpuAndFeatures(current_arch, registers) orelse
+<a id="L272"></a>                    break :blk null;
+<a id="L273"></a>            }
+<a id="L274"></a>
+<a id="L275"></a>            // Pick the first core, usually LITTLE in big.LITTLE architecture.
+<a id="L276"></a>            break :blk cores[0];
+<a id="L277"></a>        },
+<a id="L278"></a>        else =&gt; null,
+<a id="L279"></a>    };
+<a id="L280"></a>    return cpu orelse genericCpuAndNativeFeatures(current_arch);
+<a id="L281"></a>}
+</pre>
 </body>
 </html>

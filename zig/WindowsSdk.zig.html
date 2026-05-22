@@ -2,1211 +2,1214 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Source: zig-0.16.0-std/zig/WindowsSdk.zig</title>
+    <title>Source: zig/WindowsSdk.zig</title>
     <style>
         body { background: #1e1e1e; color: #d4d4d4; font-family: monospace; padding: 20px; }
         pre { white-space: pre-wrap; word-wrap: break-word; }
         .header { border-bottom: 1px solid #444; padding-bottom: 10px; margin-bottom: 20px; }
         a { color: #569cd6; }
+        a[id] { color: inherit; text-decoration: none; }
+        :target { background: #3a3a00; }
     </style>
 </head>
 <body>
     <div class="header">
-        <a href="/">Index</a> | <strong>File: zig-0.16.0-std/zig/WindowsSdk.zig</strong>
+        <a href="/">Index</a> | <strong>File: zig/WindowsSdk.zig</strong>
     </div>
-    <pre>const WindowsSdk = @This();
-const builtin = @import("builtin");
-
-const std = @import("std");
-const Io = std.Io;
-const Dir = std.Io.Dir;
-const Writer = std.Io.Writer;
-const Allocator = std.mem.Allocator;
-const Environ = std.process.Environ;
-const L = std.unicode.wtf8ToWtf16LeStringLiteral;
-const is_32_bit = @bitSizeOf(usize) == 32;
-
-windows10sdk: ?Installation,
-windows81sdk: ?Installation,
-msvc_lib_dir: ?[]const u8,
-
-const windows = std.os.windows;
-
-const windows_kits_reg_key = "Microsoft\\Windows Kits\\Installed Roots";
-
-// https://learn.microsoft.com/en-us/windows/win32/msi/productversion
-const version_major_minor_max_length = "255.255".len;
-// ProductVersion in registry (created by Visual Studio installer) probably also follows this rule
-const product_version_max_length = version_major_minor_max_length + ".65535".len;
-
-/// Find path and version of Windows 10 SDK and Windows 8.1 SDK, and find path to MSVC's `lib/` directory.
-/// Caller owns the result's fields.
-/// Returns memory allocated by `gpa`
-pub fn find(
-    gpa: Allocator,
-    io: Io,
-    arch: std.Target.Cpu.Arch,
-    environ_map: *const Environ.Map,
-) error{ OutOfMemory, NotFound, PathTooLong }!WindowsSdk {
-    if (builtin.os.tag != .windows) return error.NotFound;
-
-    var registry: Registry = .{};
-    defer registry.deinit();
-
-    // If this key doesn't exist, neither the Win 8 SDK nor the Win 10 SDK is installed
-    const roots_key = registry.openSoftwareKey(.{ .root = .local_machine, .wow64 = .wow64_32 }, L(windows_kits_reg_key)) catch |err| switch (err) {
-        error.KeyNotFound =&gt; return error.NotFound,
-    };
-    defer roots_key.close();
-
-    const windows10sdk = Installation.find(gpa, io, &amp;registry, roots_key, L("KitsRoot10"), "", L("v10.0")) catch |err| switch (err) {
-        error.InstallationNotFound =&gt; null,
-        error.PathTooLong =&gt; null,
-        error.VersionTooLong =&gt; null,
-        error.OutOfMemory =&gt; return error.OutOfMemory,
-    };
-    errdefer if (windows10sdk) |*w| w.free(gpa);
-
-    const windows81sdk = Installation.find(gpa, io, &amp;registry, roots_key, L("KitsRoot81"), "winver", L("v8.1")) catch |err| switch (err) {
-        error.InstallationNotFound =&gt; null,
-        error.PathTooLong =&gt; null,
-        error.VersionTooLong =&gt; null,
-        error.OutOfMemory =&gt; return error.OutOfMemory,
-    };
-    errdefer if (windows81sdk) |*w| w.free(gpa);
-
-    const msvc_lib_dir: ?[]const u8 = MsvcLibDir.find(gpa, io, &amp;registry, arch, environ_map) catch |err| switch (err) {
-        error.MsvcLibDirNotFound =&gt; null,
-        error.OutOfMemory =&gt; return error.OutOfMemory,
-    };
-    errdefer gpa.free(msvc_lib_dir);
-
-    return .{
-        .windows10sdk = windows10sdk,
-        .windows81sdk = windows81sdk,
-        .msvc_lib_dir = msvc_lib_dir,
-    };
-}
-
-pub fn free(sdk: WindowsSdk, gpa: Allocator) void {
-    if (sdk.windows10sdk) |*w10sdk| {
-        w10sdk.free(gpa);
-    }
-    if (sdk.windows81sdk) |*w81sdk| {
-        w81sdk.free(gpa);
-    }
-    if (sdk.msvc_lib_dir) |msvc_lib_dir| {
-        gpa.free(msvc_lib_dir);
-    }
-}
-
-/// Iterates via `iterator` and collects all folders with names starting with `strip_prefix`
-/// and a version. Returns slice of version strings sorted in descending order.
-/// Caller owns result.
-fn iterateAndFilterByVersion(
-    iterator: *Dir.Iterator,
-    gpa: Allocator,
-    io: Io,
-    prefix: []const u8,
-) error{OutOfMemory}![][]const u8 {
-    const Version = struct {
-        nums: [4]u32,
-        build: []const u8,
-
-        fn parseNum(num: []const u8) ?u32 {
-            if (num[0] == '0' and num.len &gt; 1) return null;
-            return std.fmt.parseInt(u32, num, 10) catch null;
-        }
-
-        fn order(lhs: @This(), rhs: @This()) std.math.Order {
-            return std.mem.order(u32, &amp;lhs.nums, &amp;rhs.nums).differ() orelse
-                std.mem.order(u8, lhs.build, rhs.build);
-        }
-    };
-    var versions = std.array_list.Managed(Version).init(gpa);
-    var dirs = std.array_list.Managed([]const u8).init(gpa);
-    defer {
-        versions.deinit();
-        for (dirs.items) |filtered_dir| gpa.free(filtered_dir);
-        dirs.deinit();
-    }
-
-    iterate: while (iterator.next(io) catch null) |entry| {
-        if (entry.kind != .directory) continue;
-        if (!std.mem.startsWith(u8, entry.name, prefix)) continue;
-
-        var version: Version = .{
-            .nums = .{0} ** 4,
-            .build = "",
-        };
-        const suffix = entry.name[prefix.len..];
-        const underscore = std.mem.findScalar(u8, entry.name, '_');
-        var num_it = std.mem.splitScalar(u8, suffix[0 .. underscore orelse suffix.len], '.');
-        version.nums[0] = Version.parseNum(num_it.first()) orelse continue;
-        for (version.nums[1..]) |*num|
-            num.* = Version.parseNum(num_it.next() orelse break) orelse continue :iterate
-        else if (num_it.next()) |_| continue;
-
-        const name = try gpa.dupe(u8, suffix);
-        errdefer gpa.free(name);
-        if (underscore) |pos| version.build = name[pos + 1 ..];
-
-        try versions.append(version);
-        try dirs.append(name);
-    }
-
-    std.mem.sortUnstableContext(0, dirs.items.len, struct {
-        versions: []Version,
-        dirs: [][]const u8,
-        pub fn lessThan(context: @This(), lhs: usize, rhs: usize) bool {
-            return context.versions[lhs].order(context.versions[rhs]).compare(.gt);
-        }
-        pub fn swap(context: @This(), lhs: usize, rhs: usize) void {
-            std.mem.swap(Version, &amp;context.versions[lhs], &amp;context.versions[rhs]);
-            std.mem.swap([]const u8, &amp;context.dirs[lhs], &amp;context.dirs[rhs]);
-        }
-    }{ .versions = versions.items, .dirs = dirs.items });
-    return dirs.toOwnedSlice();
-}
-
-/// Not a general purpose implementation of an ntdll-based Registry API.
-/// Only intended to support the particular calls necessary for the purposes of finding
-/// the SDK/MSVC installation paths.
-///
-/// The advapi32 APIs internally open and cache `\Registry\Machine` and the current user
-/// key when HKEY_LOCAL_MACHINE (HKLM) and HKEY_CURRENT_USER (HKCU) are passed, and also
-/// rewrite key path values to go through WOW6432Node when appropriate.
-///
-/// For example, when opening `Software\Foo` relative to `HKEY_LOCAL_MACHINE` with
-/// the WOW64_32KEY option set, that will end up as a call to NtLoadKeyEx with the path
-/// rewritten to `Software\WOW6432Node\Foo` relative to a cached `\REGISTRY\Machine`
-/// key.
-///
-/// For our purposes, we really only care about 4 potential variations of the `Software` key:
-/// - Relative to HKLM, no redirection through WOW6432Node
-/// - Relative to HKLM, redirected through WOW6432Node
-/// - Relative to HKCU, no redirection through WOW6432Node
-/// - Relative to HKCU, redirected through WOW6432Node
-/// (e.g. all the values we care about are within one of those `Software` keys)
-///
-/// So, we cache those variants of the Software keys instead of HKLM/HKCU and treat them
-/// as the "root" keys that the user can specify, which in turn (1) allows all provided key
-/// paths to be agnostic to WOW6432Node, (2) avoids the need for internal path rewriting,
-/// and (3) works correctly on 32-bit targets without any special support.
-///
-/// For example, instead of an advapi32 call with `Software\Foo` relative to
-/// `HKEY_LOCAL_MACHINE` which may get rewritten to `Software\WOW6432Node\Foo`,
-/// the equivalent is now a call to open `Foo` relative to some Software key variant.
-const Registry = struct {
-    cache: Cache = .{},
-
-    pub fn deinit(self: Registry) void {
-        if (!is_32_bit) {
-            if (self.cache.hklm_software_foreign) |key| windows.CloseHandle(key);
-            if (self.cache.hkcu_software_foreign) |key| windows.CloseHandle(key);
-        }
-        if (self.cache.hklm_software_native) |key| windows.CloseHandle(key);
-        if (self.cache.hkcu_software_native) |key| windows.CloseHandle(key);
-        if (self.cache.hkcu) |key| windows.CloseHandle(key);
-    }
-
-    const Cache = struct {
-        hklm_software_foreign: if (is_32_bit) void else ?windows.HANDLE = if (is_32_bit) {} else null,
-        hkcu_software_foreign: if (is_32_bit) void else ?windows.HANDLE = if (is_32_bit) {} else null,
-        hklm_software_native: ?windows.HANDLE = null,
-        hkcu_software_native: ?windows.HANDLE = null,
-        hkcu: ?windows.HANDLE = null,
-
-        fn getSoftware(cache: *const Cache, variant: Software) ?windows.HANDLE {
-            if (!is_32_bit and variant.wow64 == .wow64_32) {
-                return switch (variant.root) {
-                    .local_machine =&gt; cache.hklm_software_foreign,
-                    .current_user =&gt; cache.hkcu_software_foreign,
-                };
-            }
-            return switch (variant.root) {
-                .local_machine =&gt; cache.hklm_software_native,
-                .current_user =&gt; cache.hkcu_software_native,
-            };
-        }
-    };
-
-    // This does not correspond to HKEY_LOCAL_MACHINE/HKEY_CURRENT_USER
-    // since WOW64 redirection is applicable to e.g. `HKLM\Software` instead of
-    // HKLM/HKCU directly. Since we are only ever interested in the
-    // `Software` key, it makes more sense to treat `Software` as the "root"
-    // since that allows us to work entirely with relative paths that are agnostic
-    // to WOW6432Node redirection.
-    const Software = struct {
-        root: Root,
-        wow64: Wow64 = .native,
-
-        const Root = enum {
-            local_machine,
-            current_user,
-        };
-
-        fn getOrOpenKey(self: Software, registry: *Registry) !Key {
-            if (registry.cache.getSoftware(self)) |handle| {
-                return .{ .handle = handle };
-            }
-
-            const is_foreign = !is_32_bit and self.wow64 == .wow64_32;
-            switch (self.root) {
-                .local_machine =&gt; {
-                    const path = if (is_foreign) L("\\Registry\\Machine\\Software\\WOW6432Node") else L("\\Registry\\Machine\\Software");
-                    var key: Key = undefined;
-                    const attr: windows.OBJECT.ATTRIBUTES = .{
-                        .RootDirectory = null,
-                        .Attributes = .{},
-                        .ObjectName = @constCast(&amp;windows.UNICODE_STRING.init(path)),
-                        .SecurityDescriptor = null,
-                        .SecurityQualityOfService = null,
-                    };
-                    const status = windows.ntdll.NtOpenKeyEx(
-                        &amp;key.handle,
-                        .{ .MAXIMUM_ALLOWED = true },
-                        &amp;attr,
-                        .{},
-                    );
-                    switch (status) {
-                        .SUCCESS =&gt; {},
-                        else =&gt; return error.KeyNotFound,
-                    }
-                    if (is_foreign) {
-                        registry.cache.hklm_software_foreign = key.handle;
-                    } else {
-                        registry.cache.hklm_software_native = key.handle;
-                    }
-                    return key;
-                },
-                .current_user =&gt; {
-                    const cu_handle: windows.HANDLE = registry.cache.hkcu orelse hkcu: {
-                        var cu_handle: windows.HANDLE = undefined;
-                        const status = windows.ntdll.RtlOpenCurrentUser(
-                            .{ .MAXIMUM_ALLOWED = true },
-                            &amp;cu_handle,
-                        );
-                        switch (status) {
-                            .SUCCESS =&gt; {},
-                            else =&gt; return error.KeyNotFound,
-                        }
-                        registry.cache.hkcu = cu_handle;
-                        break :hkcu cu_handle;
-                    };
-                    const cu_key: Registry.Key = .{ .handle = cu_handle };
-                    const path = if (is_foreign) L("Software\\WOW6432Node") else L("Software");
-                    const key = try cu_key.open(path);
-                    if (is_foreign) {
-                        registry.cache.hkcu_software_foreign = key.handle;
-                    } else {
-                        registry.cache.hkcu_software_native = key.handle;
-                    }
-                    return key;
-                },
-            }
-        }
-    };
-
-    /// For 32-bit programs on a 64-bit operating system, the WOW64
-    /// version of ntdll.dll handles the WOW6432Node redirection before
-    /// calling into ntdll.dll proper, so no special handling is needed
-    /// and this setting is irrelevant in that case.
-    const Wow64 = enum {
-        /// Use 64-bit registry on 64-bit targets and 32-bit registry on
-        /// 32-bit targets.
-        native,
-        /// Go through WOW6432Node on both 32-bit and 64-bit targets,
-        /// if relevant (ignored for 32-bit programs executed on a 32-bit
-        /// OS).
-        wow64_32,
-    };
-
-    fn tryOpenSoftwareKeyWithPrecedence(registry: *Registry, variants: []const Software, sub_path: []const u16) error{KeyNotFound}!Key {
-        for (variants) |variant| {
-            return registry.openSoftwareKey(variant, sub_path) catch continue;
-        }
-        return error.KeyNotFound;
-    }
-
-    fn openSoftwareKey(registry: *Registry, software: Software, sub_path: []const u16) error{KeyNotFound}!Key {
-        const software_key = try software.getOrOpenKey(registry);
-        return software_key.open(sub_path);
-    }
-
-    const Key = struct {
-        handle: windows.HANDLE,
-
-        fn close(self: Key) void {
-            windows.CloseHandle(self.handle);
-        }
-
-        fn open(self: Key, sub_path: []const u16) error{KeyNotFound}!Key {
-            var key: Key = undefined;
-            const attr: windows.OBJECT.ATTRIBUTES = .{
-                .RootDirectory = self.handle,
-                .Attributes = .{},
-                .ObjectName = @constCast(&amp;windows.UNICODE_STRING.init(sub_path)),
-                .SecurityDescriptor = null,
-                .SecurityQualityOfService = null,
-            };
-            const status = windows.ntdll.NtOpenKeyEx(
-                &amp;key.handle,
-                .{ .SPECIFIC = .{
-                    .KEY = .{
-                        .QUERY_VALUE = true,
-                        .ENUMERATE_SUB_KEYS = true,
-                    },
-                } },
-                &amp;attr,
-                .{},
-            );
-            switch (status) {
-                .SUCCESS =&gt; return key,
-                else =&gt; return error.KeyNotFound,
-            }
-        }
-
-        const ValueEntry = union(enum) {
-            default: void,
-            name: []const u16,
-        };
-
-        fn getString(
-            key: Key,
-            gpa: Allocator,
-            entry: ValueEntry,
-            comptime result_encoding: enum { wtf16, wtf8 },
-        ) error{ OutOfMemory, ValueNameNotFound, NotAString, StringNotFound }!(switch (result_encoding) {
-            .wtf8 =&gt; []u8,
-            .wtf16 =&gt; []u16,
-        }) {
-            const num_data_bytes = windows.MAX_PATH * 2;
-            const stack_buf_len = @sizeOf(windows.KEY.VALUE.PARTIAL_INFORMATION) + num_data_bytes;
-            var stack_info_buf: [stack_buf_len]u8 align(@alignOf(windows.KEY.VALUE.PARTIAL_INFORMATION)) = undefined;
-            var result_len: windows.ULONG = undefined;
-            const rc = windows.ntdll.NtQueryValueKey(
-                key.handle,
-                switch (entry) {
-                    .name =&gt; |name| @constCast(&amp;windows.UNICODE_STRING.init(name)),
-                    .default =&gt; @constCast(&amp;windows.UNICODE_STRING.empty),
-                },
-                .Partial,
-                &amp;stack_info_buf,
-                stack_buf_len,
-                &amp;result_len,
-            );
-            var heap_info_buf: ?[]align(@alignOf(windows.KEY.VALUE.PARTIAL_INFORMATION)) u8 = null;
-            defer if (heap_info_buf) |buf| gpa.free(buf);
-
-            const info: *const windows.KEY.VALUE.PARTIAL_INFORMATION = switch (rc) {
-                .SUCCESS =&gt; @ptrCast(&amp;stack_info_buf),
-                .BUFFER_OVERFLOW, .BUFFER_TOO_SMALL =&gt; heap_info: {
-                    heap_info_buf = try gpa.alignedAlloc(u8, .of(windows.KEY.VALUE.PARTIAL_INFORMATION), result_len);
-                    const heap_rc = windows.ntdll.NtQueryValueKey(
-                        key.handle,
-                        switch (entry) {
-                            .name =&gt; |name| @constCast(&amp;windows.UNICODE_STRING.init(name)),
-                            .default =&gt; @constCast(&amp;windows.UNICODE_STRING.empty),
-                        },
-                        .Partial,
-                        heap_info_buf.?.ptr,
-                        @intCast(heap_info_buf.?.len),
-                        &amp;result_len,
-                    );
-                    switch (heap_rc) {
-                        .SUCCESS =&gt; break :heap_info @ptrCast(heap_info_buf.?.ptr),
-                        .OBJECT_NAME_NOT_FOUND =&gt; return error.ValueNameNotFound,
-                        else =&gt; return error.StringNotFound,
-                    }
-                },
-                .OBJECT_NAME_NOT_FOUND =&gt; return error.ValueNameNotFound,
-                else =&gt; return error.StringNotFound,
-            };
-
-            switch (info.Type) {
-                .SZ =&gt; {},
-                else =&gt; return error.NotAString,
-            }
-
-            const data_wtf16_with_nul = @as([*]const u16, @ptrCast(@alignCast(info.data())))[0..@divExact(info.DataLength, 2)];
-            const data_wtf16 = std.mem.trimEnd(u16, data_wtf16_with_nul, L("\x00"));
-            switch (result_encoding) {
-                .wtf16 =&gt; return gpa.dupe(u16, data_wtf16),
-                .wtf8 =&gt; return std.unicode.wtf16LeToWtf8Alloc(gpa, data_wtf16),
-            }
-        }
-
-        fn getDword(key: Key, entry: ValueEntry) error{ ValueNameNotFound, NotADword, DwordNotFound }!windows.DWORD {
-            const num_data_bytes = @sizeOf(windows.DWORD);
-            const buf_len = @sizeOf(windows.KEY.VALUE.PARTIAL_INFORMATION) + num_data_bytes;
-            var info_buf: [buf_len]u8 align(@alignOf(windows.KEY.VALUE.PARTIAL_INFORMATION)) = undefined;
-            var result_len: windows.ULONG = undefined;
-            const rc = windows.ntdll.NtQueryValueKey(
-                key.handle,
-                switch (entry) {
-                    .name =&gt; |name| @constCast(&amp;windows.UNICODE_STRING.init(name)),
-                    .default =&gt; @constCast(&amp;windows.UNICODE_STRING.empty),
-                },
-                .Partial,
-                &amp;info_buf,
-                buf_len,
-                &amp;result_len,
-            );
-            switch (rc) {
-                .SUCCESS =&gt; {},
-                .OBJECT_NAME_NOT_FOUND =&gt; return error.ValueNameNotFound,
-                else =&gt; return error.DwordNotFound,
-            }
-
-            const info: *const windows.KEY.VALUE.PARTIAL_INFORMATION = @ptrCast(&amp;info_buf);
-
-            switch (info.Type) {
-                .DWORD =&gt; {},
-                else =&gt; return error.NotADword,
-            }
-
-            return std.mem.bytesToValue(windows.DWORD, info.data());
-        }
-    };
-};
-
-pub const Installation = struct {
-    path: []const u8,
-    version: []const u8,
-
-    /// Find path and version of Windows SDK.
-    /// Caller owns the result's fields.
-    fn find(
-        gpa: Allocator,
-        io: Io,
-        registry: *Registry,
-        roots_key: Registry.Key,
-        roots_subkey: []const u16,
-        prefix: []const u8,
-        version_key_name: []const u16,
-    ) error{ OutOfMemory, InstallationNotFound, PathTooLong, VersionTooLong }!Installation {
-        roots: {
-            const installation = findFromRoot(gpa, io, roots_key, roots_subkey, prefix) catch
-                break :roots;
-            if (installation.isValidVersion(roots_key)) return installation;
-            installation.free(gpa);
-        }
-        {
-            const installation = try findFromInstallationFolder(gpa, registry, version_key_name);
-            if (installation.isValidVersion(roots_key)) return installation;
-            installation.free(gpa);
-        }
-        return error.InstallationNotFound;
-    }
-
-    fn findFromRoot(
-        gpa: Allocator,
-        io: Io,
-        roots_key: Registry.Key,
-        roots_subkey: []const u16,
-        prefix: []const u8,
-    ) error{ OutOfMemory, InstallationNotFound, PathTooLong, VersionTooLong }!Installation {
-        const path = path: {
-            const path_w_maybe_with_trailing_slash = roots_key.getString(gpa, .{ .name = roots_subkey }, .wtf16) catch |err| switch (err) {
-                error.NotAString,
-                error.ValueNameNotFound,
-                error.StringNotFound,
-                =&gt; return error.InstallationNotFound,
-
-                error.OutOfMemory =&gt; return error.OutOfMemory,
-            };
-            defer gpa.free(path_w_maybe_with_trailing_slash);
-
-            if (!std.fs.path.isAbsoluteWindowsWtf16(path_w_maybe_with_trailing_slash)) {
-                return error.InstallationNotFound;
-            }
-
-            const path_w = std.mem.trimEnd(u16, path_w_maybe_with_trailing_slash, L("\\/"));
-            break :path try std.unicode.wtf16LeToWtf8Alloc(gpa, path_w);
-        };
-        errdefer gpa.free(path);
-
-        const version = version: {
-            var buf: [Dir.max_path_bytes]u8 = undefined;
-            const sdk_lib_dir_path = std.fmt.bufPrint(buf[0..], "{s}\\Lib\\", .{path}) catch |err| switch (err) {
-                error.NoSpaceLeft =&gt; return error.PathTooLong,
-            };
-            if (!Dir.path.isAbsolute(sdk_lib_dir_path)) return error.InstallationNotFound;
-
-            // enumerate files in sdk path looking for latest version
-            var sdk_lib_dir = Dir.openDirAbsolute(io, sdk_lib_dir_path, .{
-                .iterate = true,
-            }) catch |err| switch (err) {
-                error.NameTooLong =&gt; return error.PathTooLong,
-                else =&gt; return error.InstallationNotFound,
-            };
-            defer sdk_lib_dir.close(io);
-
-            var iterator = sdk_lib_dir.iterate();
-            const versions = try iterateAndFilterByVersion(&amp;iterator, gpa, io, prefix);
-            if (versions.len == 0) return error.InstallationNotFound;
-            defer {
-                for (versions[1..]) |version| gpa.free(version);
-                gpa.free(versions);
-            }
-            break :version versions[0];
-        };
-        errdefer gpa.free(version);
-
-        return .{ .path = path, .version = version };
-    }
-
-    fn findFromInstallationFolder(
-        gpa: Allocator,
-        registry: *Registry,
-        version_key_name: []const u16,
-    ) error{ OutOfMemory, InstallationNotFound, PathTooLong, VersionTooLong }!Installation {
-        const key_name = try std.mem.concat(gpa, u16, &amp;.{ L("Microsoft\\Microsoft SDKs\\Windows\\"), version_key_name });
-        defer gpa.free(key_name);
-
-        const key = registry.tryOpenSoftwareKeyWithPrecedence(switch (is_32_bit) {
-            true =&gt; &amp;.{
-                .{ .root = .local_machine },
-                .{ .root = .current_user },
-            },
-            false =&gt; &amp;.{
-                .{ .root = .local_machine, .wow64 = .wow64_32 },
-                .{ .root = .current_user, .wow64 = .wow64_32 },
-                .{ .root = .local_machine, .wow64 = .native },
-                .{ .root = .current_user, .wow64 = .native },
-            },
-        }, key_name) catch {
-            return error.InstallationNotFound;
-        };
-        defer key.close();
-
-        const path: []const u8 = path: {
-            const path_w_maybe_with_trailing_slash = key.getString(gpa, .{ .name = L("InstallationFolder") }, .wtf16) catch |err| switch (err) {
-                error.NotAString,
-                error.ValueNameNotFound,
-                error.StringNotFound,
-                =&gt; return error.InstallationNotFound,
-
-                error.OutOfMemory =&gt; return error.OutOfMemory,
-            };
-            defer gpa.free(path_w_maybe_with_trailing_slash);
-
-            if (!std.fs.path.isAbsoluteWindowsWtf16(path_w_maybe_with_trailing_slash)) {
-                return error.InstallationNotFound;
-            }
-
-            const path_w = std.mem.trimEnd(u16, path_w_maybe_with_trailing_slash, L("\\/"));
-            break :path try std.unicode.wtf16LeToWtf8Alloc(gpa, path_w);
-        };
-        errdefer gpa.free(path);
-
-        const version: []const u8 = version: {
-            // Microsoft doesn't include the .0 in the ProductVersion key
-            const version_without_0 = key.getString(gpa, .{ .name = L("ProductVersion") }, .wtf16) catch |err| switch (err) {
-                error.NotAString,
-                error.ValueNameNotFound,
-                error.StringNotFound,
-                =&gt; return error.InstallationNotFound,
-
-                error.OutOfMemory =&gt; return error.OutOfMemory,
-            };
-            defer gpa.free(version_without_0);
-
-            if (version_without_0.len + ".0".len &gt; product_version_max_length) {
-                return error.VersionTooLong;
-            }
-
-            var version: std.array_list.Managed(u8) = try .initCapacity(gpa, version_without_0.len + 2);
-            errdefer version.deinit();
-
-            try std.unicode.wtf16LeToWtf8ArrayList(&amp;version, version_without_0);
-            try version.appendSlice(".0");
-
-            break :version try version.toOwnedSlice();
-        };
-        errdefer gpa.free(version);
-
-        return .{ .path = path, .version = version };
-    }
-
-    /// Check whether this version is enumerated in registry.
-    fn isValidVersion(installation: Installation, roots_key: Registry.Key) bool {
-        var version_buf: [product_version_max_length]u16 = undefined;
-        const version_len = std.unicode.wtf8ToWtf16Le(&amp;version_buf, installation.version) catch return false;
-        const version = version_buf[0..version_len];
-        const options_key_name = "Installed Options";
-        const buf_len = product_version_max_length + options_key_name.len + 2;
-        var buf: [buf_len]u16 = undefined;
-        var query: std.ArrayList(u16) = .initBuffer(&amp;buf);
-        query.appendSliceAssumeCapacity(version);
-        query.appendAssumeCapacity('\\');
-        query.appendSliceAssumeCapacity(L(options_key_name));
-
-        const options_key = roots_key.open(query.items) catch |err| switch (err) {
-            error.KeyNotFound =&gt; return false,
-        };
-        defer options_key.close();
-
-        const option_name = comptime switch (builtin.target.cpu.arch) {
-            .thumb =&gt; "OptionId.DesktopCPParm",
-            .aarch64 =&gt; "OptionId.DesktopCPParm64",
-            .x86 =&gt; "OptionId.DesktopCPPx86",
-            .x86_64 =&gt; "OptionId.DesktopCPPx64",
-            else =&gt; |tag| @compileError("Windows SDK cannot be detected on architecture " ++ tag),
-        };
-
-        const reg_value = options_key.getDword(.{ .name = L(option_name) }) catch return false;
-        return (reg_value == 1);
-    }
-
-    fn free(install: Installation, gpa: Allocator) void {
-        gpa.free(install.path);
-        gpa.free(install.version);
-    }
-};
-
-const MsvcLibDir = struct {
-    fn findInstancesDirViaSetup(gpa: Allocator, io: Io, registry: *Registry) error{ OutOfMemory, PathNotFound }!Dir {
-        const vs_setup_key_path = L("Microsoft\\VisualStudio\\Setup");
-        const vs_setup_key = registry.openSoftwareKey(.{ .root = .local_machine }, vs_setup_key_path) catch |err| switch (err) {
-            error.KeyNotFound =&gt; return error.PathNotFound,
-        };
-        defer vs_setup_key.close();
-
-        const packages_path = vs_setup_key.getString(gpa, .{ .name = L("CachePath") }, .wtf8) catch |err| switch (err) {
-            error.NotAString,
-            error.ValueNameNotFound,
-            error.StringNotFound,
-            =&gt; return error.PathNotFound,
-
-            error.OutOfMemory =&gt; return error.OutOfMemory,
-        };
-        defer gpa.free(packages_path);
-
-        if (!std.fs.path.isAbsolute(packages_path)) return error.PathNotFound;
-
-        const instances_path = try std.fs.path.join(gpa, &amp;.{ packages_path, "_Instances" });
-        defer gpa.free(instances_path);
-
-        return Dir.openDirAbsolute(io, instances_path, .{ .iterate = true }) catch return error.PathNotFound;
-    }
-
-    fn findInstancesDirViaCLSID(gpa: Allocator, io: Io, registry: *Registry) error{ OutOfMemory, PathNotFound }!Dir {
-        const setup_configuration_clsid = "{177f0c4a-1cd3-4de7-a32c-71dbbb9fa36d}";
-
-        // HKEY_CLASSES_ROOT is not a single key but instead a combination of
-        // HKCU\Software\Classes and HKLM\Software\Classes with HKCU taking precedent
-        // https://learn.microsoft.com/en-us/windows/win32/sysinfo/hkey-classes-root-key
-        //
-        // Instead of a CLASSES_ROOT abstraction, we emulate the behavior with a more
-        // general abstraction, which also means we need to include `Classes` in the path since
-        // we're starting from the `Software` keys instead of the "classes root".
-        //
-        // The advapi32 APIs with `HKEY_CLASSES_ROOT` go through `\REGISTRY\USER\&lt;SID&gt;_Classes`
-        // instead of `\REGISTRY\USER\&lt;SID&gt;\Software\Classes`, but we go through the latter
-        // because it allows us to take advantage of `RtlOpenCurrentUser` to avoid needing to implement
-        // the logic for getting the current user registry path, and it appears that the two keys are
-        // effectively equivalent. Further investigation of the relationship of these keys would probably
-        // be beneficial, though.
-        const setup_config_key = registry.tryOpenSoftwareKeyWithPrecedence(&amp;.{
-            .{ .root = .current_user },
-            .{ .root = .local_machine },
-        }, L("Classes\\CLSID\\" ++ setup_configuration_clsid)) catch |err| switch (err) {
-            error.KeyNotFound =&gt; return error.PathNotFound,
-        };
-        defer setup_config_key.close();
-
-        const inproc_server = setup_config_key.open(L("InprocServer32")) catch return error.PathNotFound;
-        const dll_path = inproc_server.getString(gpa, .default, .wtf8) catch |err| switch (err) {
-            error.NotAString,
-            error.ValueNameNotFound,
-            error.StringNotFound,
-            =&gt; return error.PathNotFound,
-
-            error.OutOfMemory =&gt; return error.OutOfMemory,
-        };
-        defer gpa.free(dll_path);
-
-        if (!std.fs.path.isAbsolute(dll_path)) return error.PathNotFound;
-
-        var path_it = std.fs.path.componentIterator(dll_path);
-        // the .dll filename
-        _ = path_it.last();
-        const root_path = while (path_it.previous()) |dir_component| {
-            if (std.ascii.eqlIgnoreCase(dir_component.name, "VisualStudio")) {
-                break dir_component.path;
-            }
-        } else {
-            return error.PathNotFound;
-        };
-
-        const instances_path = try std.fs.path.join(gpa, &amp;.{ root_path, "Packages", "_Instances" });
-        defer gpa.free(instances_path);
-
-        return Dir.openDirAbsolute(io, instances_path, .{ .iterate = true }) catch return error.PathNotFound;
-    }
-
-    fn findInstancesDir(
-        gpa: Allocator,
-        io: Io,
-        registry: *Registry,
-        environ_map: *const Environ.Map,
-    ) error{ OutOfMemory, PathNotFound }!Dir {
-        // First, try getting the packages cache path from the registry.
-        // This only seems to exist when the path is different from the default.
-        method1: {
-            return findInstancesDirViaSetup(gpa, io, registry) catch |err| switch (err) {
-                error.OutOfMemory =&gt; |e| return e,
-                error.PathNotFound =&gt; break :method1,
-            };
-        }
-        // Otherwise, try to get the path from the .dll that would have been
-        // loaded via COM for SetupConfiguration.
-        method2: {
-            return findInstancesDirViaCLSID(gpa, io, registry) catch |err| switch (err) {
-                error.OutOfMemory =&gt; |e| return e,
-                error.PathNotFound =&gt; break :method2,
-            };
-        }
-        // If that can't be found, fall back to manually appending
-        // `Microsoft\VisualStudio\Packages\_Instances` to %PROGRAMDATA%
-        method3: {
-            const program_data = std.zig.EnvVar.PROGRAMDATA.get(environ_map) orelse break :method3;
-
-            if (!std.fs.path.isAbsolute(program_data)) break :method3;
-
-            const instances_path = try Dir.path.join(gpa, &amp;.{
-                program_data, "Microsoft", "VisualStudio", "Packages", "_Instances",
-            });
-            defer gpa.free(instances_path);
-
-            return Dir.openDirAbsolute(io, instances_path, .{ .iterate = true }) catch break :method3;
-        }
-        return error.PathNotFound;
-    }
-
-    /// Intended to be equivalent to `ISetupHelper.ParseVersion`
-    /// Example: 17.4.33205.214 -&gt; 0x0011000481b500d6
-    fn parseVersionQuad(version: []const u8) error{InvalidVersion}!u64 {
-        var it = std.mem.splitScalar(u8, version, '.');
-        const a = it.first();
-        const b = it.next() orelse return error.InvalidVersion;
-        const c = it.next() orelse return error.InvalidVersion;
-        const d = it.next() orelse return error.InvalidVersion;
-        if (it.next()) |_| return error.InvalidVersion;
-        var result: u64 = undefined;
-        var result_bytes = std.mem.asBytes(&amp;result);
-
-        std.mem.writeInt(
-            u16,
-            result_bytes[0..2],
-            std.fmt.parseUnsigned(u16, d, 10) catch return error.InvalidVersion,
-            .little,
-        );
-        std.mem.writeInt(
-            u16,
-            result_bytes[2..4],
-            std.fmt.parseUnsigned(u16, c, 10) catch return error.InvalidVersion,
-            .little,
-        );
-        std.mem.writeInt(
-            u16,
-            result_bytes[4..6],
-            std.fmt.parseUnsigned(u16, b, 10) catch return error.InvalidVersion,
-            .little,
-        );
-        std.mem.writeInt(
-            u16,
-            result_bytes[6..8],
-            std.fmt.parseUnsigned(u16, a, 10) catch return error.InvalidVersion,
-            .little,
-        );
-
-        return result;
-    }
-
-    /// Intended to be equivalent to ISetupConfiguration.EnumInstances:
-    /// https://learn.microsoft.com/en-us/dotnet/api/microsoft.visualstudio.setup.configuration
-    /// but without the use of COM in order to avoid a dependency on ole32.dll
-    ///
-    /// The logic in this function is intended to match what ISetupConfiguration does
-    /// under-the-hood, as verified using Procmon.
-    fn findViaCOM(
-        gpa: Allocator,
-        io: Io,
-        registry: *Registry,
-        arch: std.Target.Cpu.Arch,
-        environ_map: *const Environ.Map,
-    ) error{ OutOfMemory, PathNotFound }![]const u8 {
-        // Typically `%PROGRAMDATA%\Microsoft\VisualStudio\Packages\_Instances`
-        // This will contain directories with names of instance IDs like 80a758ca,
-        // which will contain `state.json` files that have the version and
-        // installation directory.
-        var instances_dir = try findInstancesDir(gpa, io, registry, environ_map);
-        defer instances_dir.close(io);
-
-        var state_subpath_buf: [Dir.max_name_bytes + 32]u8 = undefined;
-        var latest_version_lib_dir: std.ArrayList(u8) = .empty;
-        errdefer latest_version_lib_dir.deinit(gpa);
-
-        var latest_version: u64 = 0;
-        var instances_dir_it = instances_dir.iterateAssumeFirstIteration();
-        while (instances_dir_it.next(io) catch return error.PathNotFound) |entry| {
-            if (entry.kind != .directory) continue;
-
-            var writer: Writer = .fixed(&amp;state_subpath_buf);
-
-            writer.writeAll(entry.name) catch unreachable;
-            writer.writeByte(Dir.path.sep) catch unreachable;
-            writer.writeAll("state.json") catch unreachable;
-
-            const json_contents = instances_dir.readFileAlloc(io, writer.buffered(), gpa, .limited(std.math.maxInt(usize))) catch continue;
-            defer gpa.free(json_contents);
-
-            var parsed = std.json.parseFromSlice(std.json.Value, gpa, json_contents, .{}) catch continue;
-            defer parsed.deinit();
-
-            if (parsed.value != .object) continue;
-            const catalog_info = parsed.value.object.get("catalogInfo") orelse continue;
-            if (catalog_info != .object) continue;
-            const product_version_value = catalog_info.object.get("buildVersion") orelse continue;
-            if (product_version_value != .string) continue;
-            const product_version_text = product_version_value.string;
-            const parsed_version = parseVersionQuad(product_version_text) catch continue;
-
-            // We want to end up with the most recent version installed
-            if (parsed_version &lt;= latest_version) continue;
-
-            const installation_path = parsed.value.object.get("installationPath") orelse continue;
-            if (installation_path != .string) continue;
-
-            const lib_dir_path = libDirFromInstallationPath(gpa, io, installation_path.string, arch) catch |err| switch (err) {
-                error.OutOfMemory =&gt; |e| return e,
-                error.PathNotFound =&gt; continue,
-            };
-            defer gpa.free(lib_dir_path);
-
-            latest_version_lib_dir.clearRetainingCapacity();
-            try latest_version_lib_dir.appendSlice(gpa, lib_dir_path);
-            latest_version = parsed_version;
-        }
-
-        if (latest_version_lib_dir.items.len == 0) return error.PathNotFound;
-        return latest_version_lib_dir.toOwnedSlice(gpa);
-    }
-
-    fn libDirFromInstallationPath(
-        gpa: Allocator,
-        io: Io,
-        installation_path: []const u8,
-        arch: std.Target.Cpu.Arch,
-    ) error{ OutOfMemory, PathNotFound }![]const u8 {
-        var lib_dir_buf = try std.array_list.Managed(u8).initCapacity(gpa, installation_path.len + 64);
-        errdefer lib_dir_buf.deinit();
-
-        lib_dir_buf.appendSliceAssumeCapacity(installation_path);
-
-        if (!Dir.path.isSep(lib_dir_buf.getLast())) {
-            try lib_dir_buf.append('\\');
-        }
-        const installation_path_with_trailing_sep_len = lib_dir_buf.items.len;
-
-        try lib_dir_buf.appendSlice("VC\\Auxiliary\\Build\\Microsoft.VCToolsVersion.default.txt");
-        var default_tools_version_buf: [512]u8 = undefined;
-        const default_tools_version_contents = Dir.cwd().readFile(io, lib_dir_buf.items, &amp;default_tools_version_buf) catch {
-            return error.PathNotFound;
-        };
-        var tokenizer = std.mem.tokenizeAny(u8, default_tools_version_contents, " \r\n");
-        const default_tools_version = tokenizer.next() orelse return error.PathNotFound;
-
-        lib_dir_buf.shrinkRetainingCapacity(installation_path_with_trailing_sep_len);
-        try lib_dir_buf.appendSlice("VC\\Tools\\MSVC\\");
-        try lib_dir_buf.appendSlice(default_tools_version);
-        try lib_dir_buf.appendSlice("\\Lib\\");
-        try lib_dir_buf.appendSlice(switch (arch) {
-            .thumb =&gt; "arm",
-            .aarch64 =&gt; "arm64",
-            .x86 =&gt; "x86",
-            .x86_64 =&gt; "x64",
-            else =&gt; unreachable,
-        });
-
-        if (!verifyLibDir(io, lib_dir_buf.items)) {
-            return error.PathNotFound;
-        }
-
-        return lib_dir_buf.toOwnedSlice();
-    }
-
-    // https://learn.microsoft.com/en-us/visualstudio/install/tools-for-managing-visual-studio-instances?view=vs-2022#editing-the-registry-for-a-visual-studio-instance
-    fn findViaRegistry(
-        gpa: Allocator,
-        io: Io,
-        arch: std.Target.Cpu.Arch,
-        environ_map: *const Environ.Map,
-    ) error{ OutOfMemory, PathNotFound }![]const u8 {
-        // %localappdata%\Microsoft\VisualStudio\
-        // %appdata%\Local\Microsoft\VisualStudio\
-        const local_app_data_path = std.zig.EnvVar.LOCALAPPDATA.get(environ_map) orelse return error.PathNotFound;
-        const visualstudio_folder_path = try Dir.path.join(gpa, &amp;.{
-            local_app_data_path, "Microsoft\\VisualStudio\\",
-        });
-        defer gpa.free(visualstudio_folder_path);
-
-        if (!Dir.path.isAbsolute(visualstudio_folder_path)) return error.PathNotFound;
-        // To make things easier later on, we open the VisualStudio directory here which
-        // allows us to pass relative paths to NtLoadKeyEx in order to avoid dealing with
-        // conversion to NT namespace paths.
-        var visualstudio_folder = Dir.openDirAbsolute(io, visualstudio_folder_path, .{
-            .iterate = true,
-        }) catch return error.PathNotFound;
-        defer visualstudio_folder.close(io);
-
-        const vs_versions: []const []const u8 = vs_versions: {
-            // enumerate folders that contain `privateregistry.bin`, looking for all versions
-            // f.i. %localappdata%\Microsoft\VisualStudio\17.0_9e9cbb98\
-            var iterator = visualstudio_folder.iterate();
-            break :vs_versions try iterateAndFilterByVersion(&amp;iterator, gpa, io, "");
-        };
-        defer {
-            for (vs_versions) |vs_version| gpa.free(vs_version);
-            gpa.free(vs_versions);
-        }
-        var key_path_buf: [windows.NAME_MAX * 2]u16 = undefined;
-        var sub_path_buf: [windows.NAME_MAX * 2]u16 = undefined;
-        const source_directories: []const u8 = source_directories: for (vs_versions) |vs_version| {
-            const sub_path = blk: {
-                var buf: std.ArrayList(u16) = .initBuffer(&amp;sub_path_buf);
-                buf.items.len += std.unicode.wtf8ToWtf16Le(buf.unusedCapacitySlice(), vs_version) catch unreachable;
-                buf.appendSliceAssumeCapacity(L("\\privateregistry.bin"));
-                break :blk buf.items;
-            };
-
-            // The goal is to emulate advapi32.RegLoadAppKeyW with a direct call
-            // to NtLoadKeyEx instead.
-            //
-            // RegLoadAppKeyW loads the hive into a registry key of the format:
-            // \REGISTRY\A\{fdb2baa5-8ca8-ef03-78d0-3b1f868fd2a9}
-            // where `\REGISTRY\A` is a special unenumerable location intended for
-            // per-app hives, and the GUID is randomly generated (in testing, it
-            // was different for each run of the program).
-            //
-            // The OS is responsible for cleaning up `\REGISTRY\A` whenever all handles
-            // to one of its keys are closed, so we don't have to do anything special
-            // with regards to that.
-
-            const temp_key_path = blk: {
-                var guid: windows.GUID = undefined;
-                io.random(std.mem.asBytes(&amp;guid));
-
-                var guid_buf: [38]u8 = undefined;
-                const guid_str = std.fmt.bufPrint(&amp;guid_buf, "{f}", .{guid}) catch unreachable;
-
-                var buf: std.ArrayList(u16) = .initBuffer(&amp;key_path_buf);
-                buf.appendSliceAssumeCapacity(L("\\REGISTRY\\A\\"));
-                buf.items.len += std.unicode.wtf8ToWtf16Le(buf.unusedCapacitySlice(), guid_str) catch unreachable;
-                break :blk buf.items;
-            };
-
-            const target_key: windows.OBJECT.ATTRIBUTES = .{
-                .RootDirectory = null,
-                .Attributes = .{},
-                .ObjectName = @constCast(&amp;windows.UNICODE_STRING.init(temp_key_path)),
-                .SecurityDescriptor = null,
-            };
-            const source_file: windows.OBJECT.ATTRIBUTES = .{
-                .RootDirectory = visualstudio_folder.handle,
-                .Attributes = .{},
-                .ObjectName = @constCast(&amp;windows.UNICODE_STRING.init(sub_path)),
-                .SecurityDescriptor = null,
-            };
-            var root_key: Registry.Key = undefined;
-            const rc = windows.ntdll.NtLoadKeyEx(
-                &amp;target_key,
-                &amp;source_file,
-                .{
-                    .APP_HIVE = true,
-                    // This wasn't set by RegLoadAppKeyW, but it seems relevant
-                    // since we aren't intending to do any modifcation of the hive.
-                    .OPEN_READ_ONLY = true,
-                },
-                null,
-                null,
-                .{ .SPECIFIC = .{
-                    .KEY = .{
-                        .QUERY_VALUE = true,
-                        .ENUMERATE_SUB_KEYS = true,
-                    },
-                } },
-                &amp;root_key.handle,
-                null,
-            );
-            switch (rc) {
-                .SUCCESS =&gt; {},
-                else =&gt; continue,
-            }
-            defer root_key.close();
-
-            const config_path = blk: {
-                var buf: std.ArrayList(u16) = .initBuffer(&amp;key_path_buf);
-                buf.appendSliceAssumeCapacity(L("Software\\Microsoft\\VisualStudio\\"));
-                buf.items.len += std.unicode.wtf8ToWtf16Le(buf.unusedCapacitySlice(), vs_version) catch unreachable;
-                buf.appendSliceAssumeCapacity(L("_Config"));
-                break :blk buf.items;
-            };
-            const config_key = root_key.open(config_path) catch continue;
-
-            const source_directories_value = config_key.getString(gpa, .{ .name = L("Source Directories") }, .wtf8) catch |err| switch (err) {
-                error.OutOfMemory =&gt; return error.OutOfMemory,
-                else =&gt; continue,
-            };
-
-            break :source_directories source_directories_value;
-        } else return error.PathNotFound;
-        defer gpa.free(source_directories);
-
-        var source_directories_split = std.mem.splitScalar(u8, source_directories, ';');
-
-        const msvc_dir: []const u8 = msvc_dir: {
-            const msvc_include_dir_maybe_with_trailing_slash = try gpa.dupe(u8, source_directories_split.first());
-
-            if (msvc_include_dir_maybe_with_trailing_slash.len &gt; Dir.max_path_bytes or !Dir.path.isAbsolute(msvc_include_dir_maybe_with_trailing_slash)) {
-                gpa.free(msvc_include_dir_maybe_with_trailing_slash);
-                return error.PathNotFound;
-            }
-
-            var msvc_dir = std.array_list.Managed(u8).fromOwnedSlice(gpa, msvc_include_dir_maybe_with_trailing_slash);
-            errdefer msvc_dir.deinit();
-
-            // String might contain trailing slash, so trim it here
-            if (msvc_dir.items.len &gt; "C:\\".len and msvc_dir.getLast() == '\\') _ = msvc_dir.pop();
-
-            // Remove `\include` at the end of path
-            if (std.mem.endsWith(u8, msvc_dir.items, "\\include")) {
-                msvc_dir.shrinkRetainingCapacity(msvc_dir.items.len - "\\include".len);
-            }
-
-            try msvc_dir.appendSlice("\\Lib\\");
-            try msvc_dir.appendSlice(switch (arch) {
-                .thumb =&gt; "arm",
-                .aarch64 =&gt; "arm64",
-                .x86 =&gt; "x86",
-                .x86_64 =&gt; "x64",
-                else =&gt; unreachable,
-            });
-            const msvc_dir_with_arch = try msvc_dir.toOwnedSlice();
-            break :msvc_dir msvc_dir_with_arch;
-        };
-        errdefer gpa.free(msvc_dir);
-
-        if (!verifyLibDir(io, msvc_dir)) {
-            return error.PathNotFound;
-        }
-
-        return msvc_dir;
-    }
-
-    fn findViaVs7Key(
-        gpa: Allocator,
-        io: Io,
-        registry: *Registry,
-        arch: std.Target.Cpu.Arch,
-        environ_map: *const Environ.Map,
-    ) error{ OutOfMemory, PathNotFound }![]const u8 {
-        var base_path: std.array_list.Managed(u8) = base_path: {
-            try_env: {
-                if (environ_map.get("VS140COMNTOOLS")) |VS140COMNTOOLS| {
-                    if (VS140COMNTOOLS.len &lt; "C:\\Common7\\Tools".len) break :try_env;
-                    if (!Dir.path.isAbsolute(VS140COMNTOOLS)) break :try_env;
-                    var list = std.array_list.Managed(u8).init(gpa);
-                    errdefer list.deinit();
-
-                    try list.appendSlice(VS140COMNTOOLS); // C:\Program Files (x86)\Microsoft Visual Studio 14.0\Common7\Tools
-                    // String might contain trailing slash, so trim it here
-                    if (list.items.len &gt; "C:\\".len and list.getLast() == '\\') _ = list.pop();
-                    list.shrinkRetainingCapacity(list.items.len - "\\Common7\\Tools".len); // C:\Program Files (x86)\Microsoft Visual Studio 14.0
-                    break :base_path list;
-                }
-            }
-
-            const vs7_key = registry.openSoftwareKey(.{ .root = .local_machine, .wow64 = .wow64_32 }, L("Microsoft\\VisualStudio\\SxS\\VS7")) catch return error.PathNotFound;
-            defer vs7_key.close();
-            try_vs7_key: {
-                const path_maybe_with_trailing_slash = vs7_key.getString(gpa, .{ .name = L("14.0") }, .wtf8) catch |err| switch (err) {
-                    error.OutOfMemory =&gt; return error.OutOfMemory,
-                    else =&gt; break :try_vs7_key,
-                };
-
-                if (path_maybe_with_trailing_slash.len &gt; Dir.max_path_bytes or !Dir.path.isAbsolute(path_maybe_with_trailing_slash)) {
-                    gpa.free(path_maybe_with_trailing_slash);
-                    break :try_vs7_key;
-                }
-
-                var path = std.array_list.Managed(u8).fromOwnedSlice(gpa, path_maybe_with_trailing_slash);
-                errdefer path.deinit();
-
-                // String might contain trailing slash, so trim it here
-                if (path.items.len &gt; "C:\\".len and path.getLast() == '\\') _ = path.pop();
-                break :base_path path;
-            }
-            return error.PathNotFound;
-        };
-        errdefer base_path.deinit();
-
-        try base_path.appendSlice("\\VC\\lib\\");
-        try base_path.appendSlice(switch (arch) {
-            .thumb =&gt; "arm",
-            .aarch64 =&gt; "arm64",
-            .x86 =&gt; "", //x86 is in the root of the Lib folder
-            .x86_64 =&gt; "amd64",
-            else =&gt; unreachable,
-        });
-
-        if (!verifyLibDir(io, base_path.items)) {
-            return error.PathNotFound;
-        }
-
-        const full_path = try base_path.toOwnedSlice();
-        return full_path;
-    }
-
-    fn verifyLibDir(io: Io, lib_dir_path: []const u8) bool {
-        std.debug.assert(Dir.path.isAbsolute(lib_dir_path)); // should be already handled in `findVia*`
-
-        var dir = Dir.openDirAbsolute(io, lib_dir_path, .{}) catch return false;
-        defer dir.close(io);
-
-        const stat = dir.statFile(io, "vcruntime.lib", .{}) catch return false;
-        if (stat.kind != .file)
-            return false;
-
-        return true;
-    }
-
-    /// Find path to MSVC's `lib/` directory.
-    /// Caller owns the result.
-    pub fn find(
-        gpa: Allocator,
-        io: Io,
-        registry: *Registry,
-        arch: std.Target.Cpu.Arch,
-        environ_map: *const Environ.Map,
-    ) error{ OutOfMemory, MsvcLibDirNotFound }![]const u8 {
-        const full_path = MsvcLibDir.findViaCOM(gpa, io, registry, arch, environ_map) catch |err1| switch (err1) {
-            error.OutOfMemory =&gt; return error.OutOfMemory,
-            error.PathNotFound =&gt; MsvcLibDir.findViaRegistry(gpa, io, arch, environ_map) catch |err2| switch (err2) {
-                error.OutOfMemory =&gt; return error.OutOfMemory,
-                error.PathNotFound =&gt; MsvcLibDir.findViaVs7Key(gpa, io, registry, arch, environ_map) catch |err3| switch (err3) {
-                    error.OutOfMemory =&gt; return error.OutOfMemory,
-                    error.PathNotFound =&gt; return error.MsvcLibDirNotFound,
-                },
-            },
-        };
-        errdefer gpa.free(full_path);
-
-        return full_path;
-    }
-};</pre>
+    <pre><a id="L1"></a>const WindowsSdk = @This();
+<a id="L2"></a>const builtin = @import("builtin");
+<a id="L3"></a>
+<a id="L4"></a>const std = @import("std");
+<a id="L5"></a>const Io = std.Io;
+<a id="L6"></a>const Dir = std.Io.Dir;
+<a id="L7"></a>const Writer = std.Io.Writer;
+<a id="L8"></a>const Allocator = std.mem.Allocator;
+<a id="L9"></a>const Environ = std.process.Environ;
+<a id="L10"></a>const L = std.unicode.wtf8ToWtf16LeStringLiteral;
+<a id="L11"></a>const is_32_bit = @bitSizeOf(usize) == 32;
+<a id="L12"></a>
+<a id="L13"></a>windows10sdk: ?Installation,
+<a id="L14"></a>windows81sdk: ?Installation,
+<a id="L15"></a>msvc_lib_dir: ?[]const u8,
+<a id="L16"></a>
+<a id="L17"></a>const windows = std.os.windows;
+<a id="L18"></a>
+<a id="L19"></a>const windows_kits_reg_key = "Microsoft\\Windows Kits\\Installed Roots";
+<a id="L20"></a>
+<a id="L21"></a>// https://learn.microsoft.com/en-us/windows/win32/msi/productversion
+<a id="L22"></a>const version_major_minor_max_length = "255.255".len;
+<a id="L23"></a>// ProductVersion in registry (created by Visual Studio installer) probably also follows this rule
+<a id="L24"></a>const product_version_max_length = version_major_minor_max_length + ".65535".len;
+<a id="L25"></a>
+<a id="L26"></a>/// Find path and version of Windows 10 SDK and Windows 8.1 SDK, and find path to MSVC's `lib/` directory.
+<a id="L27"></a>/// Caller owns the result's fields.
+<a id="L28"></a>/// Returns memory allocated by `gpa`
+<a id="L29"></a>pub fn find(
+<a id="L30"></a>    gpa: Allocator,
+<a id="L31"></a>    io: Io,
+<a id="L32"></a>    arch: std.Target.Cpu.Arch,
+<a id="L33"></a>    environ_map: *const Environ.Map,
+<a id="L34"></a>) error{ OutOfMemory, NotFound, PathTooLong }!WindowsSdk {
+<a id="L35"></a>    if (builtin.os.tag != .windows) return error.NotFound;
+<a id="L36"></a>
+<a id="L37"></a>    var registry: Registry = .{};
+<a id="L38"></a>    defer registry.deinit();
+<a id="L39"></a>
+<a id="L40"></a>    // If this key doesn't exist, neither the Win 8 SDK nor the Win 10 SDK is installed
+<a id="L41"></a>    const roots_key = registry.openSoftwareKey(.{ .root = .local_machine, .wow64 = .wow64_32 }, L(windows_kits_reg_key)) catch |err| switch (err) {
+<a id="L42"></a>        error.KeyNotFound =&gt; return error.NotFound,
+<a id="L43"></a>    };
+<a id="L44"></a>    defer roots_key.close();
+<a id="L45"></a>
+<a id="L46"></a>    const windows10sdk = Installation.find(gpa, io, &amp;registry, roots_key, L("KitsRoot10"), "", L("v10.0")) catch |err| switch (err) {
+<a id="L47"></a>        error.InstallationNotFound =&gt; null,
+<a id="L48"></a>        error.PathTooLong =&gt; null,
+<a id="L49"></a>        error.VersionTooLong =&gt; null,
+<a id="L50"></a>        error.OutOfMemory =&gt; return error.OutOfMemory,
+<a id="L51"></a>    };
+<a id="L52"></a>    errdefer if (windows10sdk) |*w| w.free(gpa);
+<a id="L53"></a>
+<a id="L54"></a>    const windows81sdk = Installation.find(gpa, io, &amp;registry, roots_key, L("KitsRoot81"), "winver", L("v8.1")) catch |err| switch (err) {
+<a id="L55"></a>        error.InstallationNotFound =&gt; null,
+<a id="L56"></a>        error.PathTooLong =&gt; null,
+<a id="L57"></a>        error.VersionTooLong =&gt; null,
+<a id="L58"></a>        error.OutOfMemory =&gt; return error.OutOfMemory,
+<a id="L59"></a>    };
+<a id="L60"></a>    errdefer if (windows81sdk) |*w| w.free(gpa);
+<a id="L61"></a>
+<a id="L62"></a>    const msvc_lib_dir: ?[]const u8 = MsvcLibDir.find(gpa, io, &amp;registry, arch, environ_map) catch |err| switch (err) {
+<a id="L63"></a>        error.MsvcLibDirNotFound =&gt; null,
+<a id="L64"></a>        error.OutOfMemory =&gt; return error.OutOfMemory,
+<a id="L65"></a>    };
+<a id="L66"></a>    errdefer gpa.free(msvc_lib_dir);
+<a id="L67"></a>
+<a id="L68"></a>    return .{
+<a id="L69"></a>        .windows10sdk = windows10sdk,
+<a id="L70"></a>        .windows81sdk = windows81sdk,
+<a id="L71"></a>        .msvc_lib_dir = msvc_lib_dir,
+<a id="L72"></a>    };
+<a id="L73"></a>}
+<a id="L74"></a>
+<a id="L75"></a>pub fn free(sdk: WindowsSdk, gpa: Allocator) void {
+<a id="L76"></a>    if (sdk.windows10sdk) |*w10sdk| {
+<a id="L77"></a>        w10sdk.free(gpa);
+<a id="L78"></a>    }
+<a id="L79"></a>    if (sdk.windows81sdk) |*w81sdk| {
+<a id="L80"></a>        w81sdk.free(gpa);
+<a id="L81"></a>    }
+<a id="L82"></a>    if (sdk.msvc_lib_dir) |msvc_lib_dir| {
+<a id="L83"></a>        gpa.free(msvc_lib_dir);
+<a id="L84"></a>    }
+<a id="L85"></a>}
+<a id="L86"></a>
+<a id="L87"></a>/// Iterates via `iterator` and collects all folders with names starting with `strip_prefix`
+<a id="L88"></a>/// and a version. Returns slice of version strings sorted in descending order.
+<a id="L89"></a>/// Caller owns result.
+<a id="L90"></a>fn iterateAndFilterByVersion(
+<a id="L91"></a>    iterator: *Dir.Iterator,
+<a id="L92"></a>    gpa: Allocator,
+<a id="L93"></a>    io: Io,
+<a id="L94"></a>    prefix: []const u8,
+<a id="L95"></a>) error{OutOfMemory}![][]const u8 {
+<a id="L96"></a>    const Version = struct {
+<a id="L97"></a>        nums: [4]u32,
+<a id="L98"></a>        build: []const u8,
+<a id="L99"></a>
+<a id="L100"></a>        fn parseNum(num: []const u8) ?u32 {
+<a id="L101"></a>            if (num[0] == '0' and num.len &gt; 1) return null;
+<a id="L102"></a>            return std.fmt.parseInt(u32, num, 10) catch null;
+<a id="L103"></a>        }
+<a id="L104"></a>
+<a id="L105"></a>        fn order(lhs: @This(), rhs: @This()) std.math.Order {
+<a id="L106"></a>            return std.mem.order(u32, &amp;lhs.nums, &amp;rhs.nums).differ() orelse
+<a id="L107"></a>                std.mem.order(u8, lhs.build, rhs.build);
+<a id="L108"></a>        }
+<a id="L109"></a>    };
+<a id="L110"></a>    var versions = std.array_list.Managed(Version).init(gpa);
+<a id="L111"></a>    var dirs = std.array_list.Managed([]const u8).init(gpa);
+<a id="L112"></a>    defer {
+<a id="L113"></a>        versions.deinit();
+<a id="L114"></a>        for (dirs.items) |filtered_dir| gpa.free(filtered_dir);
+<a id="L115"></a>        dirs.deinit();
+<a id="L116"></a>    }
+<a id="L117"></a>
+<a id="L118"></a>    iterate: while (iterator.next(io) catch null) |entry| {
+<a id="L119"></a>        if (entry.kind != .directory) continue;
+<a id="L120"></a>        if (!std.mem.startsWith(u8, entry.name, prefix)) continue;
+<a id="L121"></a>
+<a id="L122"></a>        var version: Version = .{
+<a id="L123"></a>            .nums = .{0} ** 4,
+<a id="L124"></a>            .build = "",
+<a id="L125"></a>        };
+<a id="L126"></a>        const suffix = entry.name[prefix.len..];
+<a id="L127"></a>        const underscore = std.mem.findScalar(u8, entry.name, '_');
+<a id="L128"></a>        var num_it = std.mem.splitScalar(u8, suffix[0 .. underscore orelse suffix.len], '.');
+<a id="L129"></a>        version.nums[0] = Version.parseNum(num_it.first()) orelse continue;
+<a id="L130"></a>        for (version.nums[1..]) |*num|
+<a id="L131"></a>            num.* = Version.parseNum(num_it.next() orelse break) orelse continue :iterate
+<a id="L132"></a>        else if (num_it.next()) |_| continue;
+<a id="L133"></a>
+<a id="L134"></a>        const name = try gpa.dupe(u8, suffix);
+<a id="L135"></a>        errdefer gpa.free(name);
+<a id="L136"></a>        if (underscore) |pos| version.build = name[pos + 1 ..];
+<a id="L137"></a>
+<a id="L138"></a>        try versions.append(version);
+<a id="L139"></a>        try dirs.append(name);
+<a id="L140"></a>    }
+<a id="L141"></a>
+<a id="L142"></a>    std.mem.sortUnstableContext(0, dirs.items.len, struct {
+<a id="L143"></a>        versions: []Version,
+<a id="L144"></a>        dirs: [][]const u8,
+<a id="L145"></a>        pub fn lessThan(context: @This(), lhs: usize, rhs: usize) bool {
+<a id="L146"></a>            return context.versions[lhs].order(context.versions[rhs]).compare(.gt);
+<a id="L147"></a>        }
+<a id="L148"></a>        pub fn swap(context: @This(), lhs: usize, rhs: usize) void {
+<a id="L149"></a>            std.mem.swap(Version, &amp;context.versions[lhs], &amp;context.versions[rhs]);
+<a id="L150"></a>            std.mem.swap([]const u8, &amp;context.dirs[lhs], &amp;context.dirs[rhs]);
+<a id="L151"></a>        }
+<a id="L152"></a>    }{ .versions = versions.items, .dirs = dirs.items });
+<a id="L153"></a>    return dirs.toOwnedSlice();
+<a id="L154"></a>}
+<a id="L155"></a>
+<a id="L156"></a>/// Not a general purpose implementation of an ntdll-based Registry API.
+<a id="L157"></a>/// Only intended to support the particular calls necessary for the purposes of finding
+<a id="L158"></a>/// the SDK/MSVC installation paths.
+<a id="L159"></a>///
+<a id="L160"></a>/// The advapi32 APIs internally open and cache `\Registry\Machine` and the current user
+<a id="L161"></a>/// key when HKEY_LOCAL_MACHINE (HKLM) and HKEY_CURRENT_USER (HKCU) are passed, and also
+<a id="L162"></a>/// rewrite key path values to go through WOW6432Node when appropriate.
+<a id="L163"></a>///
+<a id="L164"></a>/// For example, when opening `Software\Foo` relative to `HKEY_LOCAL_MACHINE` with
+<a id="L165"></a>/// the WOW64_32KEY option set, that will end up as a call to NtLoadKeyEx with the path
+<a id="L166"></a>/// rewritten to `Software\WOW6432Node\Foo` relative to a cached `\REGISTRY\Machine`
+<a id="L167"></a>/// key.
+<a id="L168"></a>///
+<a id="L169"></a>/// For our purposes, we really only care about 4 potential variations of the `Software` key:
+<a id="L170"></a>/// - Relative to HKLM, no redirection through WOW6432Node
+<a id="L171"></a>/// - Relative to HKLM, redirected through WOW6432Node
+<a id="L172"></a>/// - Relative to HKCU, no redirection through WOW6432Node
+<a id="L173"></a>/// - Relative to HKCU, redirected through WOW6432Node
+<a id="L174"></a>/// (e.g. all the values we care about are within one of those `Software` keys)
+<a id="L175"></a>///
+<a id="L176"></a>/// So, we cache those variants of the Software keys instead of HKLM/HKCU and treat them
+<a id="L177"></a>/// as the "root" keys that the user can specify, which in turn (1) allows all provided key
+<a id="L178"></a>/// paths to be agnostic to WOW6432Node, (2) avoids the need for internal path rewriting,
+<a id="L179"></a>/// and (3) works correctly on 32-bit targets without any special support.
+<a id="L180"></a>///
+<a id="L181"></a>/// For example, instead of an advapi32 call with `Software\Foo` relative to
+<a id="L182"></a>/// `HKEY_LOCAL_MACHINE` which may get rewritten to `Software\WOW6432Node\Foo`,
+<a id="L183"></a>/// the equivalent is now a call to open `Foo` relative to some Software key variant.
+<a id="L184"></a>const Registry = struct {
+<a id="L185"></a>    cache: Cache = .{},
+<a id="L186"></a>
+<a id="L187"></a>    pub fn deinit(self: Registry) void {
+<a id="L188"></a>        if (!is_32_bit) {
+<a id="L189"></a>            if (self.cache.hklm_software_foreign) |key| windows.CloseHandle(key);
+<a id="L190"></a>            if (self.cache.hkcu_software_foreign) |key| windows.CloseHandle(key);
+<a id="L191"></a>        }
+<a id="L192"></a>        if (self.cache.hklm_software_native) |key| windows.CloseHandle(key);
+<a id="L193"></a>        if (self.cache.hkcu_software_native) |key| windows.CloseHandle(key);
+<a id="L194"></a>        if (self.cache.hkcu) |key| windows.CloseHandle(key);
+<a id="L195"></a>    }
+<a id="L196"></a>
+<a id="L197"></a>    const Cache = struct {
+<a id="L198"></a>        hklm_software_foreign: if (is_32_bit) void else ?windows.HANDLE = if (is_32_bit) {} else null,
+<a id="L199"></a>        hkcu_software_foreign: if (is_32_bit) void else ?windows.HANDLE = if (is_32_bit) {} else null,
+<a id="L200"></a>        hklm_software_native: ?windows.HANDLE = null,
+<a id="L201"></a>        hkcu_software_native: ?windows.HANDLE = null,
+<a id="L202"></a>        hkcu: ?windows.HANDLE = null,
+<a id="L203"></a>
+<a id="L204"></a>        fn getSoftware(cache: *const Cache, variant: Software) ?windows.HANDLE {
+<a id="L205"></a>            if (!is_32_bit and variant.wow64 == .wow64_32) {
+<a id="L206"></a>                return switch (variant.root) {
+<a id="L207"></a>                    .local_machine =&gt; cache.hklm_software_foreign,
+<a id="L208"></a>                    .current_user =&gt; cache.hkcu_software_foreign,
+<a id="L209"></a>                };
+<a id="L210"></a>            }
+<a id="L211"></a>            return switch (variant.root) {
+<a id="L212"></a>                .local_machine =&gt; cache.hklm_software_native,
+<a id="L213"></a>                .current_user =&gt; cache.hkcu_software_native,
+<a id="L214"></a>            };
+<a id="L215"></a>        }
+<a id="L216"></a>    };
+<a id="L217"></a>
+<a id="L218"></a>    // This does not correspond to HKEY_LOCAL_MACHINE/HKEY_CURRENT_USER
+<a id="L219"></a>    // since WOW64 redirection is applicable to e.g. `HKLM\Software` instead of
+<a id="L220"></a>    // HKLM/HKCU directly. Since we are only ever interested in the
+<a id="L221"></a>    // `Software` key, it makes more sense to treat `Software` as the "root"
+<a id="L222"></a>    // since that allows us to work entirely with relative paths that are agnostic
+<a id="L223"></a>    // to WOW6432Node redirection.
+<a id="L224"></a>    const Software = struct {
+<a id="L225"></a>        root: Root,
+<a id="L226"></a>        wow64: Wow64 = .native,
+<a id="L227"></a>
+<a id="L228"></a>        const Root = enum {
+<a id="L229"></a>            local_machine,
+<a id="L230"></a>            current_user,
+<a id="L231"></a>        };
+<a id="L232"></a>
+<a id="L233"></a>        fn getOrOpenKey(self: Software, registry: *Registry) !Key {
+<a id="L234"></a>            if (registry.cache.getSoftware(self)) |handle| {
+<a id="L235"></a>                return .{ .handle = handle };
+<a id="L236"></a>            }
+<a id="L237"></a>
+<a id="L238"></a>            const is_foreign = !is_32_bit and self.wow64 == .wow64_32;
+<a id="L239"></a>            switch (self.root) {
+<a id="L240"></a>                .local_machine =&gt; {
+<a id="L241"></a>                    const path = if (is_foreign) L("\\Registry\\Machine\\Software\\WOW6432Node") else L("\\Registry\\Machine\\Software");
+<a id="L242"></a>                    var key: Key = undefined;
+<a id="L243"></a>                    const attr: windows.OBJECT.ATTRIBUTES = .{
+<a id="L244"></a>                        .RootDirectory = null,
+<a id="L245"></a>                        .Attributes = .{},
+<a id="L246"></a>                        .ObjectName = @constCast(&amp;windows.UNICODE_STRING.init(path)),
+<a id="L247"></a>                        .SecurityDescriptor = null,
+<a id="L248"></a>                        .SecurityQualityOfService = null,
+<a id="L249"></a>                    };
+<a id="L250"></a>                    const status = windows.ntdll.NtOpenKeyEx(
+<a id="L251"></a>                        &amp;key.handle,
+<a id="L252"></a>                        .{ .MAXIMUM_ALLOWED = true },
+<a id="L253"></a>                        &amp;attr,
+<a id="L254"></a>                        .{},
+<a id="L255"></a>                    );
+<a id="L256"></a>                    switch (status) {
+<a id="L257"></a>                        .SUCCESS =&gt; {},
+<a id="L258"></a>                        else =&gt; return error.KeyNotFound,
+<a id="L259"></a>                    }
+<a id="L260"></a>                    if (is_foreign) {
+<a id="L261"></a>                        registry.cache.hklm_software_foreign = key.handle;
+<a id="L262"></a>                    } else {
+<a id="L263"></a>                        registry.cache.hklm_software_native = key.handle;
+<a id="L264"></a>                    }
+<a id="L265"></a>                    return key;
+<a id="L266"></a>                },
+<a id="L267"></a>                .current_user =&gt; {
+<a id="L268"></a>                    const cu_handle: windows.HANDLE = registry.cache.hkcu orelse hkcu: {
+<a id="L269"></a>                        var cu_handle: windows.HANDLE = undefined;
+<a id="L270"></a>                        const status = windows.ntdll.RtlOpenCurrentUser(
+<a id="L271"></a>                            .{ .MAXIMUM_ALLOWED = true },
+<a id="L272"></a>                            &amp;cu_handle,
+<a id="L273"></a>                        );
+<a id="L274"></a>                        switch (status) {
+<a id="L275"></a>                            .SUCCESS =&gt; {},
+<a id="L276"></a>                            else =&gt; return error.KeyNotFound,
+<a id="L277"></a>                        }
+<a id="L278"></a>                        registry.cache.hkcu = cu_handle;
+<a id="L279"></a>                        break :hkcu cu_handle;
+<a id="L280"></a>                    };
+<a id="L281"></a>                    const cu_key: Registry.Key = .{ .handle = cu_handle };
+<a id="L282"></a>                    const path = if (is_foreign) L("Software\\WOW6432Node") else L("Software");
+<a id="L283"></a>                    const key = try cu_key.open(path);
+<a id="L284"></a>                    if (is_foreign) {
+<a id="L285"></a>                        registry.cache.hkcu_software_foreign = key.handle;
+<a id="L286"></a>                    } else {
+<a id="L287"></a>                        registry.cache.hkcu_software_native = key.handle;
+<a id="L288"></a>                    }
+<a id="L289"></a>                    return key;
+<a id="L290"></a>                },
+<a id="L291"></a>            }
+<a id="L292"></a>        }
+<a id="L293"></a>    };
+<a id="L294"></a>
+<a id="L295"></a>    /// For 32-bit programs on a 64-bit operating system, the WOW64
+<a id="L296"></a>    /// version of ntdll.dll handles the WOW6432Node redirection before
+<a id="L297"></a>    /// calling into ntdll.dll proper, so no special handling is needed
+<a id="L298"></a>    /// and this setting is irrelevant in that case.
+<a id="L299"></a>    const Wow64 = enum {
+<a id="L300"></a>        /// Use 64-bit registry on 64-bit targets and 32-bit registry on
+<a id="L301"></a>        /// 32-bit targets.
+<a id="L302"></a>        native,
+<a id="L303"></a>        /// Go through WOW6432Node on both 32-bit and 64-bit targets,
+<a id="L304"></a>        /// if relevant (ignored for 32-bit programs executed on a 32-bit
+<a id="L305"></a>        /// OS).
+<a id="L306"></a>        wow64_32,
+<a id="L307"></a>    };
+<a id="L308"></a>
+<a id="L309"></a>    fn tryOpenSoftwareKeyWithPrecedence(registry: *Registry, variants: []const Software, sub_path: []const u16) error{KeyNotFound}!Key {
+<a id="L310"></a>        for (variants) |variant| {
+<a id="L311"></a>            return registry.openSoftwareKey(variant, sub_path) catch continue;
+<a id="L312"></a>        }
+<a id="L313"></a>        return error.KeyNotFound;
+<a id="L314"></a>    }
+<a id="L315"></a>
+<a id="L316"></a>    fn openSoftwareKey(registry: *Registry, software: Software, sub_path: []const u16) error{KeyNotFound}!Key {
+<a id="L317"></a>        const software_key = try software.getOrOpenKey(registry);
+<a id="L318"></a>        return software_key.open(sub_path);
+<a id="L319"></a>    }
+<a id="L320"></a>
+<a id="L321"></a>    const Key = struct {
+<a id="L322"></a>        handle: windows.HANDLE,
+<a id="L323"></a>
+<a id="L324"></a>        fn close(self: Key) void {
+<a id="L325"></a>            windows.CloseHandle(self.handle);
+<a id="L326"></a>        }
+<a id="L327"></a>
+<a id="L328"></a>        fn open(self: Key, sub_path: []const u16) error{KeyNotFound}!Key {
+<a id="L329"></a>            var key: Key = undefined;
+<a id="L330"></a>            const attr: windows.OBJECT.ATTRIBUTES = .{
+<a id="L331"></a>                .RootDirectory = self.handle,
+<a id="L332"></a>                .Attributes = .{},
+<a id="L333"></a>                .ObjectName = @constCast(&amp;windows.UNICODE_STRING.init(sub_path)),
+<a id="L334"></a>                .SecurityDescriptor = null,
+<a id="L335"></a>                .SecurityQualityOfService = null,
+<a id="L336"></a>            };
+<a id="L337"></a>            const status = windows.ntdll.NtOpenKeyEx(
+<a id="L338"></a>                &amp;key.handle,
+<a id="L339"></a>                .{ .SPECIFIC = .{
+<a id="L340"></a>                    .KEY = .{
+<a id="L341"></a>                        .QUERY_VALUE = true,
+<a id="L342"></a>                        .ENUMERATE_SUB_KEYS = true,
+<a id="L343"></a>                    },
+<a id="L344"></a>                } },
+<a id="L345"></a>                &amp;attr,
+<a id="L346"></a>                .{},
+<a id="L347"></a>            );
+<a id="L348"></a>            switch (status) {
+<a id="L349"></a>                .SUCCESS =&gt; return key,
+<a id="L350"></a>                else =&gt; return error.KeyNotFound,
+<a id="L351"></a>            }
+<a id="L352"></a>        }
+<a id="L353"></a>
+<a id="L354"></a>        const ValueEntry = union(enum) {
+<a id="L355"></a>            default: void,
+<a id="L356"></a>            name: []const u16,
+<a id="L357"></a>        };
+<a id="L358"></a>
+<a id="L359"></a>        fn getString(
+<a id="L360"></a>            key: Key,
+<a id="L361"></a>            gpa: Allocator,
+<a id="L362"></a>            entry: ValueEntry,
+<a id="L363"></a>            comptime result_encoding: enum { wtf16, wtf8 },
+<a id="L364"></a>        ) error{ OutOfMemory, ValueNameNotFound, NotAString, StringNotFound }!(switch (result_encoding) {
+<a id="L365"></a>            .wtf8 =&gt; []u8,
+<a id="L366"></a>            .wtf16 =&gt; []u16,
+<a id="L367"></a>        }) {
+<a id="L368"></a>            const num_data_bytes = windows.MAX_PATH * 2;
+<a id="L369"></a>            const stack_buf_len = @sizeOf(windows.KEY.VALUE.PARTIAL_INFORMATION) + num_data_bytes;
+<a id="L370"></a>            var stack_info_buf: [stack_buf_len]u8 align(@alignOf(windows.KEY.VALUE.PARTIAL_INFORMATION)) = undefined;
+<a id="L371"></a>            var result_len: windows.ULONG = undefined;
+<a id="L372"></a>            const rc = windows.ntdll.NtQueryValueKey(
+<a id="L373"></a>                key.handle,
+<a id="L374"></a>                switch (entry) {
+<a id="L375"></a>                    .name =&gt; |name| @constCast(&amp;windows.UNICODE_STRING.init(name)),
+<a id="L376"></a>                    .default =&gt; @constCast(&amp;windows.UNICODE_STRING.empty),
+<a id="L377"></a>                },
+<a id="L378"></a>                .Partial,
+<a id="L379"></a>                &amp;stack_info_buf,
+<a id="L380"></a>                stack_buf_len,
+<a id="L381"></a>                &amp;result_len,
+<a id="L382"></a>            );
+<a id="L383"></a>            var heap_info_buf: ?[]align(@alignOf(windows.KEY.VALUE.PARTIAL_INFORMATION)) u8 = null;
+<a id="L384"></a>            defer if (heap_info_buf) |buf| gpa.free(buf);
+<a id="L385"></a>
+<a id="L386"></a>            const info: *const windows.KEY.VALUE.PARTIAL_INFORMATION = switch (rc) {
+<a id="L387"></a>                .SUCCESS =&gt; @ptrCast(&amp;stack_info_buf),
+<a id="L388"></a>                .BUFFER_OVERFLOW, .BUFFER_TOO_SMALL =&gt; heap_info: {
+<a id="L389"></a>                    heap_info_buf = try gpa.alignedAlloc(u8, .of(windows.KEY.VALUE.PARTIAL_INFORMATION), result_len);
+<a id="L390"></a>                    const heap_rc = windows.ntdll.NtQueryValueKey(
+<a id="L391"></a>                        key.handle,
+<a id="L392"></a>                        switch (entry) {
+<a id="L393"></a>                            .name =&gt; |name| @constCast(&amp;windows.UNICODE_STRING.init(name)),
+<a id="L394"></a>                            .default =&gt; @constCast(&amp;windows.UNICODE_STRING.empty),
+<a id="L395"></a>                        },
+<a id="L396"></a>                        .Partial,
+<a id="L397"></a>                        heap_info_buf.?.ptr,
+<a id="L398"></a>                        @intCast(heap_info_buf.?.len),
+<a id="L399"></a>                        &amp;result_len,
+<a id="L400"></a>                    );
+<a id="L401"></a>                    switch (heap_rc) {
+<a id="L402"></a>                        .SUCCESS =&gt; break :heap_info @ptrCast(heap_info_buf.?.ptr),
+<a id="L403"></a>                        .OBJECT_NAME_NOT_FOUND =&gt; return error.ValueNameNotFound,
+<a id="L404"></a>                        else =&gt; return error.StringNotFound,
+<a id="L405"></a>                    }
+<a id="L406"></a>                },
+<a id="L407"></a>                .OBJECT_NAME_NOT_FOUND =&gt; return error.ValueNameNotFound,
+<a id="L408"></a>                else =&gt; return error.StringNotFound,
+<a id="L409"></a>            };
+<a id="L410"></a>
+<a id="L411"></a>            switch (info.Type) {
+<a id="L412"></a>                .SZ =&gt; {},
+<a id="L413"></a>                else =&gt; return error.NotAString,
+<a id="L414"></a>            }
+<a id="L415"></a>
+<a id="L416"></a>            const data_wtf16_with_nul = @as([*]const u16, @ptrCast(@alignCast(info.data())))[0..@divExact(info.DataLength, 2)];
+<a id="L417"></a>            const data_wtf16 = std.mem.trimEnd(u16, data_wtf16_with_nul, L("\x00"));
+<a id="L418"></a>            switch (result_encoding) {
+<a id="L419"></a>                .wtf16 =&gt; return gpa.dupe(u16, data_wtf16),
+<a id="L420"></a>                .wtf8 =&gt; return std.unicode.wtf16LeToWtf8Alloc(gpa, data_wtf16),
+<a id="L421"></a>            }
+<a id="L422"></a>        }
+<a id="L423"></a>
+<a id="L424"></a>        fn getDword(key: Key, entry: ValueEntry) error{ ValueNameNotFound, NotADword, DwordNotFound }!windows.DWORD {
+<a id="L425"></a>            const num_data_bytes = @sizeOf(windows.DWORD);
+<a id="L426"></a>            const buf_len = @sizeOf(windows.KEY.VALUE.PARTIAL_INFORMATION) + num_data_bytes;
+<a id="L427"></a>            var info_buf: [buf_len]u8 align(@alignOf(windows.KEY.VALUE.PARTIAL_INFORMATION)) = undefined;
+<a id="L428"></a>            var result_len: windows.ULONG = undefined;
+<a id="L429"></a>            const rc = windows.ntdll.NtQueryValueKey(
+<a id="L430"></a>                key.handle,
+<a id="L431"></a>                switch (entry) {
+<a id="L432"></a>                    .name =&gt; |name| @constCast(&amp;windows.UNICODE_STRING.init(name)),
+<a id="L433"></a>                    .default =&gt; @constCast(&amp;windows.UNICODE_STRING.empty),
+<a id="L434"></a>                },
+<a id="L435"></a>                .Partial,
+<a id="L436"></a>                &amp;info_buf,
+<a id="L437"></a>                buf_len,
+<a id="L438"></a>                &amp;result_len,
+<a id="L439"></a>            );
+<a id="L440"></a>            switch (rc) {
+<a id="L441"></a>                .SUCCESS =&gt; {},
+<a id="L442"></a>                .OBJECT_NAME_NOT_FOUND =&gt; return error.ValueNameNotFound,
+<a id="L443"></a>                else =&gt; return error.DwordNotFound,
+<a id="L444"></a>            }
+<a id="L445"></a>
+<a id="L446"></a>            const info: *const windows.KEY.VALUE.PARTIAL_INFORMATION = @ptrCast(&amp;info_buf);
+<a id="L447"></a>
+<a id="L448"></a>            switch (info.Type) {
+<a id="L449"></a>                .DWORD =&gt; {},
+<a id="L450"></a>                else =&gt; return error.NotADword,
+<a id="L451"></a>            }
+<a id="L452"></a>
+<a id="L453"></a>            return std.mem.bytesToValue(windows.DWORD, info.data());
+<a id="L454"></a>        }
+<a id="L455"></a>    };
+<a id="L456"></a>};
+<a id="L457"></a>
+<a id="L458"></a>pub const Installation = struct {
+<a id="L459"></a>    path: []const u8,
+<a id="L460"></a>    version: []const u8,
+<a id="L461"></a>
+<a id="L462"></a>    /// Find path and version of Windows SDK.
+<a id="L463"></a>    /// Caller owns the result's fields.
+<a id="L464"></a>    fn find(
+<a id="L465"></a>        gpa: Allocator,
+<a id="L466"></a>        io: Io,
+<a id="L467"></a>        registry: *Registry,
+<a id="L468"></a>        roots_key: Registry.Key,
+<a id="L469"></a>        roots_subkey: []const u16,
+<a id="L470"></a>        prefix: []const u8,
+<a id="L471"></a>        version_key_name: []const u16,
+<a id="L472"></a>    ) error{ OutOfMemory, InstallationNotFound, PathTooLong, VersionTooLong }!Installation {
+<a id="L473"></a>        roots: {
+<a id="L474"></a>            const installation = findFromRoot(gpa, io, roots_key, roots_subkey, prefix) catch
+<a id="L475"></a>                break :roots;
+<a id="L476"></a>            if (installation.isValidVersion(roots_key)) return installation;
+<a id="L477"></a>            installation.free(gpa);
+<a id="L478"></a>        }
+<a id="L479"></a>        {
+<a id="L480"></a>            const installation = try findFromInstallationFolder(gpa, registry, version_key_name);
+<a id="L481"></a>            if (installation.isValidVersion(roots_key)) return installation;
+<a id="L482"></a>            installation.free(gpa);
+<a id="L483"></a>        }
+<a id="L484"></a>        return error.InstallationNotFound;
+<a id="L485"></a>    }
+<a id="L486"></a>
+<a id="L487"></a>    fn findFromRoot(
+<a id="L488"></a>        gpa: Allocator,
+<a id="L489"></a>        io: Io,
+<a id="L490"></a>        roots_key: Registry.Key,
+<a id="L491"></a>        roots_subkey: []const u16,
+<a id="L492"></a>        prefix: []const u8,
+<a id="L493"></a>    ) error{ OutOfMemory, InstallationNotFound, PathTooLong, VersionTooLong }!Installation {
+<a id="L494"></a>        const path = path: {
+<a id="L495"></a>            const path_w_maybe_with_trailing_slash = roots_key.getString(gpa, .{ .name = roots_subkey }, .wtf16) catch |err| switch (err) {
+<a id="L496"></a>                error.NotAString,
+<a id="L497"></a>                error.ValueNameNotFound,
+<a id="L498"></a>                error.StringNotFound,
+<a id="L499"></a>                =&gt; return error.InstallationNotFound,
+<a id="L500"></a>
+<a id="L501"></a>                error.OutOfMemory =&gt; return error.OutOfMemory,
+<a id="L502"></a>            };
+<a id="L503"></a>            defer gpa.free(path_w_maybe_with_trailing_slash);
+<a id="L504"></a>
+<a id="L505"></a>            if (!std.fs.path.isAbsoluteWindowsWtf16(path_w_maybe_with_trailing_slash)) {
+<a id="L506"></a>                return error.InstallationNotFound;
+<a id="L507"></a>            }
+<a id="L508"></a>
+<a id="L509"></a>            const path_w = std.mem.trimEnd(u16, path_w_maybe_with_trailing_slash, L("\\/"));
+<a id="L510"></a>            break :path try std.unicode.wtf16LeToWtf8Alloc(gpa, path_w);
+<a id="L511"></a>        };
+<a id="L512"></a>        errdefer gpa.free(path);
+<a id="L513"></a>
+<a id="L514"></a>        const version = version: {
+<a id="L515"></a>            var buf: [Dir.max_path_bytes]u8 = undefined;
+<a id="L516"></a>            const sdk_lib_dir_path = std.fmt.bufPrint(buf[0..], "{s}\\Lib\\", .{path}) catch |err| switch (err) {
+<a id="L517"></a>                error.NoSpaceLeft =&gt; return error.PathTooLong,
+<a id="L518"></a>            };
+<a id="L519"></a>            if (!Dir.path.isAbsolute(sdk_lib_dir_path)) return error.InstallationNotFound;
+<a id="L520"></a>
+<a id="L521"></a>            // enumerate files in sdk path looking for latest version
+<a id="L522"></a>            var sdk_lib_dir = Dir.openDirAbsolute(io, sdk_lib_dir_path, .{
+<a id="L523"></a>                .iterate = true,
+<a id="L524"></a>            }) catch |err| switch (err) {
+<a id="L525"></a>                error.NameTooLong =&gt; return error.PathTooLong,
+<a id="L526"></a>                else =&gt; return error.InstallationNotFound,
+<a id="L527"></a>            };
+<a id="L528"></a>            defer sdk_lib_dir.close(io);
+<a id="L529"></a>
+<a id="L530"></a>            var iterator = sdk_lib_dir.iterate();
+<a id="L531"></a>            const versions = try iterateAndFilterByVersion(&amp;iterator, gpa, io, prefix);
+<a id="L532"></a>            if (versions.len == 0) return error.InstallationNotFound;
+<a id="L533"></a>            defer {
+<a id="L534"></a>                for (versions[1..]) |version| gpa.free(version);
+<a id="L535"></a>                gpa.free(versions);
+<a id="L536"></a>            }
+<a id="L537"></a>            break :version versions[0];
+<a id="L538"></a>        };
+<a id="L539"></a>        errdefer gpa.free(version);
+<a id="L540"></a>
+<a id="L541"></a>        return .{ .path = path, .version = version };
+<a id="L542"></a>    }
+<a id="L543"></a>
+<a id="L544"></a>    fn findFromInstallationFolder(
+<a id="L545"></a>        gpa: Allocator,
+<a id="L546"></a>        registry: *Registry,
+<a id="L547"></a>        version_key_name: []const u16,
+<a id="L548"></a>    ) error{ OutOfMemory, InstallationNotFound, PathTooLong, VersionTooLong }!Installation {
+<a id="L549"></a>        const key_name = try std.mem.concat(gpa, u16, &amp;.{ L("Microsoft\\Microsoft SDKs\\Windows\\"), version_key_name });
+<a id="L550"></a>        defer gpa.free(key_name);
+<a id="L551"></a>
+<a id="L552"></a>        const key = registry.tryOpenSoftwareKeyWithPrecedence(switch (is_32_bit) {
+<a id="L553"></a>            true =&gt; &amp;.{
+<a id="L554"></a>                .{ .root = .local_machine },
+<a id="L555"></a>                .{ .root = .current_user },
+<a id="L556"></a>            },
+<a id="L557"></a>            false =&gt; &amp;.{
+<a id="L558"></a>                .{ .root = .local_machine, .wow64 = .wow64_32 },
+<a id="L559"></a>                .{ .root = .current_user, .wow64 = .wow64_32 },
+<a id="L560"></a>                .{ .root = .local_machine, .wow64 = .native },
+<a id="L561"></a>                .{ .root = .current_user, .wow64 = .native },
+<a id="L562"></a>            },
+<a id="L563"></a>        }, key_name) catch {
+<a id="L564"></a>            return error.InstallationNotFound;
+<a id="L565"></a>        };
+<a id="L566"></a>        defer key.close();
+<a id="L567"></a>
+<a id="L568"></a>        const path: []const u8 = path: {
+<a id="L569"></a>            const path_w_maybe_with_trailing_slash = key.getString(gpa, .{ .name = L("InstallationFolder") }, .wtf16) catch |err| switch (err) {
+<a id="L570"></a>                error.NotAString,
+<a id="L571"></a>                error.ValueNameNotFound,
+<a id="L572"></a>                error.StringNotFound,
+<a id="L573"></a>                =&gt; return error.InstallationNotFound,
+<a id="L574"></a>
+<a id="L575"></a>                error.OutOfMemory =&gt; return error.OutOfMemory,
+<a id="L576"></a>            };
+<a id="L577"></a>            defer gpa.free(path_w_maybe_with_trailing_slash);
+<a id="L578"></a>
+<a id="L579"></a>            if (!std.fs.path.isAbsoluteWindowsWtf16(path_w_maybe_with_trailing_slash)) {
+<a id="L580"></a>                return error.InstallationNotFound;
+<a id="L581"></a>            }
+<a id="L582"></a>
+<a id="L583"></a>            const path_w = std.mem.trimEnd(u16, path_w_maybe_with_trailing_slash, L("\\/"));
+<a id="L584"></a>            break :path try std.unicode.wtf16LeToWtf8Alloc(gpa, path_w);
+<a id="L585"></a>        };
+<a id="L586"></a>        errdefer gpa.free(path);
+<a id="L587"></a>
+<a id="L588"></a>        const version: []const u8 = version: {
+<a id="L589"></a>            // Microsoft doesn't include the .0 in the ProductVersion key
+<a id="L590"></a>            const version_without_0 = key.getString(gpa, .{ .name = L("ProductVersion") }, .wtf16) catch |err| switch (err) {
+<a id="L591"></a>                error.NotAString,
+<a id="L592"></a>                error.ValueNameNotFound,
+<a id="L593"></a>                error.StringNotFound,
+<a id="L594"></a>                =&gt; return error.InstallationNotFound,
+<a id="L595"></a>
+<a id="L596"></a>                error.OutOfMemory =&gt; return error.OutOfMemory,
+<a id="L597"></a>            };
+<a id="L598"></a>            defer gpa.free(version_without_0);
+<a id="L599"></a>
+<a id="L600"></a>            if (version_without_0.len + ".0".len &gt; product_version_max_length) {
+<a id="L601"></a>                return error.VersionTooLong;
+<a id="L602"></a>            }
+<a id="L603"></a>
+<a id="L604"></a>            var version: std.array_list.Managed(u8) = try .initCapacity(gpa, version_without_0.len + 2);
+<a id="L605"></a>            errdefer version.deinit();
+<a id="L606"></a>
+<a id="L607"></a>            try std.unicode.wtf16LeToWtf8ArrayList(&amp;version, version_without_0);
+<a id="L608"></a>            try version.appendSlice(".0");
+<a id="L609"></a>
+<a id="L610"></a>            break :version try version.toOwnedSlice();
+<a id="L611"></a>        };
+<a id="L612"></a>        errdefer gpa.free(version);
+<a id="L613"></a>
+<a id="L614"></a>        return .{ .path = path, .version = version };
+<a id="L615"></a>    }
+<a id="L616"></a>
+<a id="L617"></a>    /// Check whether this version is enumerated in registry.
+<a id="L618"></a>    fn isValidVersion(installation: Installation, roots_key: Registry.Key) bool {
+<a id="L619"></a>        var version_buf: [product_version_max_length]u16 = undefined;
+<a id="L620"></a>        const version_len = std.unicode.wtf8ToWtf16Le(&amp;version_buf, installation.version) catch return false;
+<a id="L621"></a>        const version = version_buf[0..version_len];
+<a id="L622"></a>        const options_key_name = "Installed Options";
+<a id="L623"></a>        const buf_len = product_version_max_length + options_key_name.len + 2;
+<a id="L624"></a>        var buf: [buf_len]u16 = undefined;
+<a id="L625"></a>        var query: std.ArrayList(u16) = .initBuffer(&amp;buf);
+<a id="L626"></a>        query.appendSliceAssumeCapacity(version);
+<a id="L627"></a>        query.appendAssumeCapacity('\\');
+<a id="L628"></a>        query.appendSliceAssumeCapacity(L(options_key_name));
+<a id="L629"></a>
+<a id="L630"></a>        const options_key = roots_key.open(query.items) catch |err| switch (err) {
+<a id="L631"></a>            error.KeyNotFound =&gt; return false,
+<a id="L632"></a>        };
+<a id="L633"></a>        defer options_key.close();
+<a id="L634"></a>
+<a id="L635"></a>        const option_name = comptime switch (builtin.target.cpu.arch) {
+<a id="L636"></a>            .thumb =&gt; "OptionId.DesktopCPParm",
+<a id="L637"></a>            .aarch64 =&gt; "OptionId.DesktopCPParm64",
+<a id="L638"></a>            .x86 =&gt; "OptionId.DesktopCPPx86",
+<a id="L639"></a>            .x86_64 =&gt; "OptionId.DesktopCPPx64",
+<a id="L640"></a>            else =&gt; |tag| @compileError("Windows SDK cannot be detected on architecture " ++ tag),
+<a id="L641"></a>        };
+<a id="L642"></a>
+<a id="L643"></a>        const reg_value = options_key.getDword(.{ .name = L(option_name) }) catch return false;
+<a id="L644"></a>        return (reg_value == 1);
+<a id="L645"></a>    }
+<a id="L646"></a>
+<a id="L647"></a>    fn free(install: Installation, gpa: Allocator) void {
+<a id="L648"></a>        gpa.free(install.path);
+<a id="L649"></a>        gpa.free(install.version);
+<a id="L650"></a>    }
+<a id="L651"></a>};
+<a id="L652"></a>
+<a id="L653"></a>const MsvcLibDir = struct {
+<a id="L654"></a>    fn findInstancesDirViaSetup(gpa: Allocator, io: Io, registry: *Registry) error{ OutOfMemory, PathNotFound }!Dir {
+<a id="L655"></a>        const vs_setup_key_path = L("Microsoft\\VisualStudio\\Setup");
+<a id="L656"></a>        const vs_setup_key = registry.openSoftwareKey(.{ .root = .local_machine }, vs_setup_key_path) catch |err| switch (err) {
+<a id="L657"></a>            error.KeyNotFound =&gt; return error.PathNotFound,
+<a id="L658"></a>        };
+<a id="L659"></a>        defer vs_setup_key.close();
+<a id="L660"></a>
+<a id="L661"></a>        const packages_path = vs_setup_key.getString(gpa, .{ .name = L("CachePath") }, .wtf8) catch |err| switch (err) {
+<a id="L662"></a>            error.NotAString,
+<a id="L663"></a>            error.ValueNameNotFound,
+<a id="L664"></a>            error.StringNotFound,
+<a id="L665"></a>            =&gt; return error.PathNotFound,
+<a id="L666"></a>
+<a id="L667"></a>            error.OutOfMemory =&gt; return error.OutOfMemory,
+<a id="L668"></a>        };
+<a id="L669"></a>        defer gpa.free(packages_path);
+<a id="L670"></a>
+<a id="L671"></a>        if (!std.fs.path.isAbsolute(packages_path)) return error.PathNotFound;
+<a id="L672"></a>
+<a id="L673"></a>        const instances_path = try std.fs.path.join(gpa, &amp;.{ packages_path, "_Instances" });
+<a id="L674"></a>        defer gpa.free(instances_path);
+<a id="L675"></a>
+<a id="L676"></a>        return Dir.openDirAbsolute(io, instances_path, .{ .iterate = true }) catch return error.PathNotFound;
+<a id="L677"></a>    }
+<a id="L678"></a>
+<a id="L679"></a>    fn findInstancesDirViaCLSID(gpa: Allocator, io: Io, registry: *Registry) error{ OutOfMemory, PathNotFound }!Dir {
+<a id="L680"></a>        const setup_configuration_clsid = "{177f0c4a-1cd3-4de7-a32c-71dbbb9fa36d}";
+<a id="L681"></a>
+<a id="L682"></a>        // HKEY_CLASSES_ROOT is not a single key but instead a combination of
+<a id="L683"></a>        // HKCU\Software\Classes and HKLM\Software\Classes with HKCU taking precedent
+<a id="L684"></a>        // https://learn.microsoft.com/en-us/windows/win32/sysinfo/hkey-classes-root-key
+<a id="L685"></a>        //
+<a id="L686"></a>        // Instead of a CLASSES_ROOT abstraction, we emulate the behavior with a more
+<a id="L687"></a>        // general abstraction, which also means we need to include `Classes` in the path since
+<a id="L688"></a>        // we're starting from the `Software` keys instead of the "classes root".
+<a id="L689"></a>        //
+<a id="L690"></a>        // The advapi32 APIs with `HKEY_CLASSES_ROOT` go through `\REGISTRY\USER\&lt;SID&gt;_Classes`
+<a id="L691"></a>        // instead of `\REGISTRY\USER\&lt;SID&gt;\Software\Classes`, but we go through the latter
+<a id="L692"></a>        // because it allows us to take advantage of `RtlOpenCurrentUser` to avoid needing to implement
+<a id="L693"></a>        // the logic for getting the current user registry path, and it appears that the two keys are
+<a id="L694"></a>        // effectively equivalent. Further investigation of the relationship of these keys would probably
+<a id="L695"></a>        // be beneficial, though.
+<a id="L696"></a>        const setup_config_key = registry.tryOpenSoftwareKeyWithPrecedence(&amp;.{
+<a id="L697"></a>            .{ .root = .current_user },
+<a id="L698"></a>            .{ .root = .local_machine },
+<a id="L699"></a>        }, L("Classes\\CLSID\\" ++ setup_configuration_clsid)) catch |err| switch (err) {
+<a id="L700"></a>            error.KeyNotFound =&gt; return error.PathNotFound,
+<a id="L701"></a>        };
+<a id="L702"></a>        defer setup_config_key.close();
+<a id="L703"></a>
+<a id="L704"></a>        const inproc_server = setup_config_key.open(L("InprocServer32")) catch return error.PathNotFound;
+<a id="L705"></a>        const dll_path = inproc_server.getString(gpa, .default, .wtf8) catch |err| switch (err) {
+<a id="L706"></a>            error.NotAString,
+<a id="L707"></a>            error.ValueNameNotFound,
+<a id="L708"></a>            error.StringNotFound,
+<a id="L709"></a>            =&gt; return error.PathNotFound,
+<a id="L710"></a>
+<a id="L711"></a>            error.OutOfMemory =&gt; return error.OutOfMemory,
+<a id="L712"></a>        };
+<a id="L713"></a>        defer gpa.free(dll_path);
+<a id="L714"></a>
+<a id="L715"></a>        if (!std.fs.path.isAbsolute(dll_path)) return error.PathNotFound;
+<a id="L716"></a>
+<a id="L717"></a>        var path_it = std.fs.path.componentIterator(dll_path);
+<a id="L718"></a>        // the .dll filename
+<a id="L719"></a>        _ = path_it.last();
+<a id="L720"></a>        const root_path = while (path_it.previous()) |dir_component| {
+<a id="L721"></a>            if (std.ascii.eqlIgnoreCase(dir_component.name, "VisualStudio")) {
+<a id="L722"></a>                break dir_component.path;
+<a id="L723"></a>            }
+<a id="L724"></a>        } else {
+<a id="L725"></a>            return error.PathNotFound;
+<a id="L726"></a>        };
+<a id="L727"></a>
+<a id="L728"></a>        const instances_path = try std.fs.path.join(gpa, &amp;.{ root_path, "Packages", "_Instances" });
+<a id="L729"></a>        defer gpa.free(instances_path);
+<a id="L730"></a>
+<a id="L731"></a>        return Dir.openDirAbsolute(io, instances_path, .{ .iterate = true }) catch return error.PathNotFound;
+<a id="L732"></a>    }
+<a id="L733"></a>
+<a id="L734"></a>    fn findInstancesDir(
+<a id="L735"></a>        gpa: Allocator,
+<a id="L736"></a>        io: Io,
+<a id="L737"></a>        registry: *Registry,
+<a id="L738"></a>        environ_map: *const Environ.Map,
+<a id="L739"></a>    ) error{ OutOfMemory, PathNotFound }!Dir {
+<a id="L740"></a>        // First, try getting the packages cache path from the registry.
+<a id="L741"></a>        // This only seems to exist when the path is different from the default.
+<a id="L742"></a>        method1: {
+<a id="L743"></a>            return findInstancesDirViaSetup(gpa, io, registry) catch |err| switch (err) {
+<a id="L744"></a>                error.OutOfMemory =&gt; |e| return e,
+<a id="L745"></a>                error.PathNotFound =&gt; break :method1,
+<a id="L746"></a>            };
+<a id="L747"></a>        }
+<a id="L748"></a>        // Otherwise, try to get the path from the .dll that would have been
+<a id="L749"></a>        // loaded via COM for SetupConfiguration.
+<a id="L750"></a>        method2: {
+<a id="L751"></a>            return findInstancesDirViaCLSID(gpa, io, registry) catch |err| switch (err) {
+<a id="L752"></a>                error.OutOfMemory =&gt; |e| return e,
+<a id="L753"></a>                error.PathNotFound =&gt; break :method2,
+<a id="L754"></a>            };
+<a id="L755"></a>        }
+<a id="L756"></a>        // If that can't be found, fall back to manually appending
+<a id="L757"></a>        // `Microsoft\VisualStudio\Packages\_Instances` to %PROGRAMDATA%
+<a id="L758"></a>        method3: {
+<a id="L759"></a>            const program_data = std.zig.EnvVar.PROGRAMDATA.get(environ_map) orelse break :method3;
+<a id="L760"></a>
+<a id="L761"></a>            if (!std.fs.path.isAbsolute(program_data)) break :method3;
+<a id="L762"></a>
+<a id="L763"></a>            const instances_path = try Dir.path.join(gpa, &amp;.{
+<a id="L764"></a>                program_data, "Microsoft", "VisualStudio", "Packages", "_Instances",
+<a id="L765"></a>            });
+<a id="L766"></a>            defer gpa.free(instances_path);
+<a id="L767"></a>
+<a id="L768"></a>            return Dir.openDirAbsolute(io, instances_path, .{ .iterate = true }) catch break :method3;
+<a id="L769"></a>        }
+<a id="L770"></a>        return error.PathNotFound;
+<a id="L771"></a>    }
+<a id="L772"></a>
+<a id="L773"></a>    /// Intended to be equivalent to `ISetupHelper.ParseVersion`
+<a id="L774"></a>    /// Example: 17.4.33205.214 -&gt; 0x0011000481b500d6
+<a id="L775"></a>    fn parseVersionQuad(version: []const u8) error{InvalidVersion}!u64 {
+<a id="L776"></a>        var it = std.mem.splitScalar(u8, version, '.');
+<a id="L777"></a>        const a = it.first();
+<a id="L778"></a>        const b = it.next() orelse return error.InvalidVersion;
+<a id="L779"></a>        const c = it.next() orelse return error.InvalidVersion;
+<a id="L780"></a>        const d = it.next() orelse return error.InvalidVersion;
+<a id="L781"></a>        if (it.next()) |_| return error.InvalidVersion;
+<a id="L782"></a>        var result: u64 = undefined;
+<a id="L783"></a>        var result_bytes = std.mem.asBytes(&amp;result);
+<a id="L784"></a>
+<a id="L785"></a>        std.mem.writeInt(
+<a id="L786"></a>            u16,
+<a id="L787"></a>            result_bytes[0..2],
+<a id="L788"></a>            std.fmt.parseUnsigned(u16, d, 10) catch return error.InvalidVersion,
+<a id="L789"></a>            .little,
+<a id="L790"></a>        );
+<a id="L791"></a>        std.mem.writeInt(
+<a id="L792"></a>            u16,
+<a id="L793"></a>            result_bytes[2..4],
+<a id="L794"></a>            std.fmt.parseUnsigned(u16, c, 10) catch return error.InvalidVersion,
+<a id="L795"></a>            .little,
+<a id="L796"></a>        );
+<a id="L797"></a>        std.mem.writeInt(
+<a id="L798"></a>            u16,
+<a id="L799"></a>            result_bytes[4..6],
+<a id="L800"></a>            std.fmt.parseUnsigned(u16, b, 10) catch return error.InvalidVersion,
+<a id="L801"></a>            .little,
+<a id="L802"></a>        );
+<a id="L803"></a>        std.mem.writeInt(
+<a id="L804"></a>            u16,
+<a id="L805"></a>            result_bytes[6..8],
+<a id="L806"></a>            std.fmt.parseUnsigned(u16, a, 10) catch return error.InvalidVersion,
+<a id="L807"></a>            .little,
+<a id="L808"></a>        );
+<a id="L809"></a>
+<a id="L810"></a>        return result;
+<a id="L811"></a>    }
+<a id="L812"></a>
+<a id="L813"></a>    /// Intended to be equivalent to ISetupConfiguration.EnumInstances:
+<a id="L814"></a>    /// https://learn.microsoft.com/en-us/dotnet/api/microsoft.visualstudio.setup.configuration
+<a id="L815"></a>    /// but without the use of COM in order to avoid a dependency on ole32.dll
+<a id="L816"></a>    ///
+<a id="L817"></a>    /// The logic in this function is intended to match what ISetupConfiguration does
+<a id="L818"></a>    /// under-the-hood, as verified using Procmon.
+<a id="L819"></a>    fn findViaCOM(
+<a id="L820"></a>        gpa: Allocator,
+<a id="L821"></a>        io: Io,
+<a id="L822"></a>        registry: *Registry,
+<a id="L823"></a>        arch: std.Target.Cpu.Arch,
+<a id="L824"></a>        environ_map: *const Environ.Map,
+<a id="L825"></a>    ) error{ OutOfMemory, PathNotFound }![]const u8 {
+<a id="L826"></a>        // Typically `%PROGRAMDATA%\Microsoft\VisualStudio\Packages\_Instances`
+<a id="L827"></a>        // This will contain directories with names of instance IDs like 80a758ca,
+<a id="L828"></a>        // which will contain `state.json` files that have the version and
+<a id="L829"></a>        // installation directory.
+<a id="L830"></a>        var instances_dir = try findInstancesDir(gpa, io, registry, environ_map);
+<a id="L831"></a>        defer instances_dir.close(io);
+<a id="L832"></a>
+<a id="L833"></a>        var state_subpath_buf: [Dir.max_name_bytes + 32]u8 = undefined;
+<a id="L834"></a>        var latest_version_lib_dir: std.ArrayList(u8) = .empty;
+<a id="L835"></a>        errdefer latest_version_lib_dir.deinit(gpa);
+<a id="L836"></a>
+<a id="L837"></a>        var latest_version: u64 = 0;
+<a id="L838"></a>        var instances_dir_it = instances_dir.iterateAssumeFirstIteration();
+<a id="L839"></a>        while (instances_dir_it.next(io) catch return error.PathNotFound) |entry| {
+<a id="L840"></a>            if (entry.kind != .directory) continue;
+<a id="L841"></a>
+<a id="L842"></a>            var writer: Writer = .fixed(&amp;state_subpath_buf);
+<a id="L843"></a>
+<a id="L844"></a>            writer.writeAll(entry.name) catch unreachable;
+<a id="L845"></a>            writer.writeByte(Dir.path.sep) catch unreachable;
+<a id="L846"></a>            writer.writeAll("state.json") catch unreachable;
+<a id="L847"></a>
+<a id="L848"></a>            const json_contents = instances_dir.readFileAlloc(io, writer.buffered(), gpa, .limited(std.math.maxInt(usize))) catch continue;
+<a id="L849"></a>            defer gpa.free(json_contents);
+<a id="L850"></a>
+<a id="L851"></a>            var parsed = std.json.parseFromSlice(std.json.Value, gpa, json_contents, .{}) catch continue;
+<a id="L852"></a>            defer parsed.deinit();
+<a id="L853"></a>
+<a id="L854"></a>            if (parsed.value != .object) continue;
+<a id="L855"></a>            const catalog_info = parsed.value.object.get("catalogInfo") orelse continue;
+<a id="L856"></a>            if (catalog_info != .object) continue;
+<a id="L857"></a>            const product_version_value = catalog_info.object.get("buildVersion") orelse continue;
+<a id="L858"></a>            if (product_version_value != .string) continue;
+<a id="L859"></a>            const product_version_text = product_version_value.string;
+<a id="L860"></a>            const parsed_version = parseVersionQuad(product_version_text) catch continue;
+<a id="L861"></a>
+<a id="L862"></a>            // We want to end up with the most recent version installed
+<a id="L863"></a>            if (parsed_version &lt;= latest_version) continue;
+<a id="L864"></a>
+<a id="L865"></a>            const installation_path = parsed.value.object.get("installationPath") orelse continue;
+<a id="L866"></a>            if (installation_path != .string) continue;
+<a id="L867"></a>
+<a id="L868"></a>            const lib_dir_path = libDirFromInstallationPath(gpa, io, installation_path.string, arch) catch |err| switch (err) {
+<a id="L869"></a>                error.OutOfMemory =&gt; |e| return e,
+<a id="L870"></a>                error.PathNotFound =&gt; continue,
+<a id="L871"></a>            };
+<a id="L872"></a>            defer gpa.free(lib_dir_path);
+<a id="L873"></a>
+<a id="L874"></a>            latest_version_lib_dir.clearRetainingCapacity();
+<a id="L875"></a>            try latest_version_lib_dir.appendSlice(gpa, lib_dir_path);
+<a id="L876"></a>            latest_version = parsed_version;
+<a id="L877"></a>        }
+<a id="L878"></a>
+<a id="L879"></a>        if (latest_version_lib_dir.items.len == 0) return error.PathNotFound;
+<a id="L880"></a>        return latest_version_lib_dir.toOwnedSlice(gpa);
+<a id="L881"></a>    }
+<a id="L882"></a>
+<a id="L883"></a>    fn libDirFromInstallationPath(
+<a id="L884"></a>        gpa: Allocator,
+<a id="L885"></a>        io: Io,
+<a id="L886"></a>        installation_path: []const u8,
+<a id="L887"></a>        arch: std.Target.Cpu.Arch,
+<a id="L888"></a>    ) error{ OutOfMemory, PathNotFound }![]const u8 {
+<a id="L889"></a>        var lib_dir_buf = try std.array_list.Managed(u8).initCapacity(gpa, installation_path.len + 64);
+<a id="L890"></a>        errdefer lib_dir_buf.deinit();
+<a id="L891"></a>
+<a id="L892"></a>        lib_dir_buf.appendSliceAssumeCapacity(installation_path);
+<a id="L893"></a>
+<a id="L894"></a>        if (!Dir.path.isSep(lib_dir_buf.getLast())) {
+<a id="L895"></a>            try lib_dir_buf.append('\\');
+<a id="L896"></a>        }
+<a id="L897"></a>        const installation_path_with_trailing_sep_len = lib_dir_buf.items.len;
+<a id="L898"></a>
+<a id="L899"></a>        try lib_dir_buf.appendSlice("VC\\Auxiliary\\Build\\Microsoft.VCToolsVersion.default.txt");
+<a id="L900"></a>        var default_tools_version_buf: [512]u8 = undefined;
+<a id="L901"></a>        const default_tools_version_contents = Dir.cwd().readFile(io, lib_dir_buf.items, &amp;default_tools_version_buf) catch {
+<a id="L902"></a>            return error.PathNotFound;
+<a id="L903"></a>        };
+<a id="L904"></a>        var tokenizer = std.mem.tokenizeAny(u8, default_tools_version_contents, " \r\n");
+<a id="L905"></a>        const default_tools_version = tokenizer.next() orelse return error.PathNotFound;
+<a id="L906"></a>
+<a id="L907"></a>        lib_dir_buf.shrinkRetainingCapacity(installation_path_with_trailing_sep_len);
+<a id="L908"></a>        try lib_dir_buf.appendSlice("VC\\Tools\\MSVC\\");
+<a id="L909"></a>        try lib_dir_buf.appendSlice(default_tools_version);
+<a id="L910"></a>        try lib_dir_buf.appendSlice("\\Lib\\");
+<a id="L911"></a>        try lib_dir_buf.appendSlice(switch (arch) {
+<a id="L912"></a>            .thumb =&gt; "arm",
+<a id="L913"></a>            .aarch64 =&gt; "arm64",
+<a id="L914"></a>            .x86 =&gt; "x86",
+<a id="L915"></a>            .x86_64 =&gt; "x64",
+<a id="L916"></a>            else =&gt; unreachable,
+<a id="L917"></a>        });
+<a id="L918"></a>
+<a id="L919"></a>        if (!verifyLibDir(io, lib_dir_buf.items)) {
+<a id="L920"></a>            return error.PathNotFound;
+<a id="L921"></a>        }
+<a id="L922"></a>
+<a id="L923"></a>        return lib_dir_buf.toOwnedSlice();
+<a id="L924"></a>    }
+<a id="L925"></a>
+<a id="L926"></a>    // https://learn.microsoft.com/en-us/visualstudio/install/tools-for-managing-visual-studio-instances?view=vs-2022#editing-the-registry-for-a-visual-studio-instance
+<a id="L927"></a>    fn findViaRegistry(
+<a id="L928"></a>        gpa: Allocator,
+<a id="L929"></a>        io: Io,
+<a id="L930"></a>        arch: std.Target.Cpu.Arch,
+<a id="L931"></a>        environ_map: *const Environ.Map,
+<a id="L932"></a>    ) error{ OutOfMemory, PathNotFound }![]const u8 {
+<a id="L933"></a>        // %localappdata%\Microsoft\VisualStudio\
+<a id="L934"></a>        // %appdata%\Local\Microsoft\VisualStudio\
+<a id="L935"></a>        const local_app_data_path = std.zig.EnvVar.LOCALAPPDATA.get(environ_map) orelse return error.PathNotFound;
+<a id="L936"></a>        const visualstudio_folder_path = try Dir.path.join(gpa, &amp;.{
+<a id="L937"></a>            local_app_data_path, "Microsoft\\VisualStudio\\",
+<a id="L938"></a>        });
+<a id="L939"></a>        defer gpa.free(visualstudio_folder_path);
+<a id="L940"></a>
+<a id="L941"></a>        if (!Dir.path.isAbsolute(visualstudio_folder_path)) return error.PathNotFound;
+<a id="L942"></a>        // To make things easier later on, we open the VisualStudio directory here which
+<a id="L943"></a>        // allows us to pass relative paths to NtLoadKeyEx in order to avoid dealing with
+<a id="L944"></a>        // conversion to NT namespace paths.
+<a id="L945"></a>        var visualstudio_folder = Dir.openDirAbsolute(io, visualstudio_folder_path, .{
+<a id="L946"></a>            .iterate = true,
+<a id="L947"></a>        }) catch return error.PathNotFound;
+<a id="L948"></a>        defer visualstudio_folder.close(io);
+<a id="L949"></a>
+<a id="L950"></a>        const vs_versions: []const []const u8 = vs_versions: {
+<a id="L951"></a>            // enumerate folders that contain `privateregistry.bin`, looking for all versions
+<a id="L952"></a>            // f.i. %localappdata%\Microsoft\VisualStudio\17.0_9e9cbb98\
+<a id="L953"></a>            var iterator = visualstudio_folder.iterate();
+<a id="L954"></a>            break :vs_versions try iterateAndFilterByVersion(&amp;iterator, gpa, io, "");
+<a id="L955"></a>        };
+<a id="L956"></a>        defer {
+<a id="L957"></a>            for (vs_versions) |vs_version| gpa.free(vs_version);
+<a id="L958"></a>            gpa.free(vs_versions);
+<a id="L959"></a>        }
+<a id="L960"></a>        var key_path_buf: [windows.NAME_MAX * 2]u16 = undefined;
+<a id="L961"></a>        var sub_path_buf: [windows.NAME_MAX * 2]u16 = undefined;
+<a id="L962"></a>        const source_directories: []const u8 = source_directories: for (vs_versions) |vs_version| {
+<a id="L963"></a>            const sub_path = blk: {
+<a id="L964"></a>                var buf: std.ArrayList(u16) = .initBuffer(&amp;sub_path_buf);
+<a id="L965"></a>                buf.items.len += std.unicode.wtf8ToWtf16Le(buf.unusedCapacitySlice(), vs_version) catch unreachable;
+<a id="L966"></a>                buf.appendSliceAssumeCapacity(L("\\privateregistry.bin"));
+<a id="L967"></a>                break :blk buf.items;
+<a id="L968"></a>            };
+<a id="L969"></a>
+<a id="L970"></a>            // The goal is to emulate advapi32.RegLoadAppKeyW with a direct call
+<a id="L971"></a>            // to NtLoadKeyEx instead.
+<a id="L972"></a>            //
+<a id="L973"></a>            // RegLoadAppKeyW loads the hive into a registry key of the format:
+<a id="L974"></a>            // \REGISTRY\A\{fdb2baa5-8ca8-ef03-78d0-3b1f868fd2a9}
+<a id="L975"></a>            // where `\REGISTRY\A` is a special unenumerable location intended for
+<a id="L976"></a>            // per-app hives, and the GUID is randomly generated (in testing, it
+<a id="L977"></a>            // was different for each run of the program).
+<a id="L978"></a>            //
+<a id="L979"></a>            // The OS is responsible for cleaning up `\REGISTRY\A` whenever all handles
+<a id="L980"></a>            // to one of its keys are closed, so we don't have to do anything special
+<a id="L981"></a>            // with regards to that.
+<a id="L982"></a>
+<a id="L983"></a>            const temp_key_path = blk: {
+<a id="L984"></a>                var guid: windows.GUID = undefined;
+<a id="L985"></a>                io.random(std.mem.asBytes(&amp;guid));
+<a id="L986"></a>
+<a id="L987"></a>                var guid_buf: [38]u8 = undefined;
+<a id="L988"></a>                const guid_str = std.fmt.bufPrint(&amp;guid_buf, "{f}", .{guid}) catch unreachable;
+<a id="L989"></a>
+<a id="L990"></a>                var buf: std.ArrayList(u16) = .initBuffer(&amp;key_path_buf);
+<a id="L991"></a>                buf.appendSliceAssumeCapacity(L("\\REGISTRY\\A\\"));
+<a id="L992"></a>                buf.items.len += std.unicode.wtf8ToWtf16Le(buf.unusedCapacitySlice(), guid_str) catch unreachable;
+<a id="L993"></a>                break :blk buf.items;
+<a id="L994"></a>            };
+<a id="L995"></a>
+<a id="L996"></a>            const target_key: windows.OBJECT.ATTRIBUTES = .{
+<a id="L997"></a>                .RootDirectory = null,
+<a id="L998"></a>                .Attributes = .{},
+<a id="L999"></a>                .ObjectName = @constCast(&amp;windows.UNICODE_STRING.init(temp_key_path)),
+<a id="L1000"></a>                .SecurityDescriptor = null,
+<a id="L1001"></a>            };
+<a id="L1002"></a>            const source_file: windows.OBJECT.ATTRIBUTES = .{
+<a id="L1003"></a>                .RootDirectory = visualstudio_folder.handle,
+<a id="L1004"></a>                .Attributes = .{},
+<a id="L1005"></a>                .ObjectName = @constCast(&amp;windows.UNICODE_STRING.init(sub_path)),
+<a id="L1006"></a>                .SecurityDescriptor = null,
+<a id="L1007"></a>            };
+<a id="L1008"></a>            var root_key: Registry.Key = undefined;
+<a id="L1009"></a>            const rc = windows.ntdll.NtLoadKeyEx(
+<a id="L1010"></a>                &amp;target_key,
+<a id="L1011"></a>                &amp;source_file,
+<a id="L1012"></a>                .{
+<a id="L1013"></a>                    .APP_HIVE = true,
+<a id="L1014"></a>                    // This wasn't set by RegLoadAppKeyW, but it seems relevant
+<a id="L1015"></a>                    // since we aren't intending to do any modifcation of the hive.
+<a id="L1016"></a>                    .OPEN_READ_ONLY = true,
+<a id="L1017"></a>                },
+<a id="L1018"></a>                null,
+<a id="L1019"></a>                null,
+<a id="L1020"></a>                .{ .SPECIFIC = .{
+<a id="L1021"></a>                    .KEY = .{
+<a id="L1022"></a>                        .QUERY_VALUE = true,
+<a id="L1023"></a>                        .ENUMERATE_SUB_KEYS = true,
+<a id="L1024"></a>                    },
+<a id="L1025"></a>                } },
+<a id="L1026"></a>                &amp;root_key.handle,
+<a id="L1027"></a>                null,
+<a id="L1028"></a>            );
+<a id="L1029"></a>            switch (rc) {
+<a id="L1030"></a>                .SUCCESS =&gt; {},
+<a id="L1031"></a>                else =&gt; continue,
+<a id="L1032"></a>            }
+<a id="L1033"></a>            defer root_key.close();
+<a id="L1034"></a>
+<a id="L1035"></a>            const config_path = blk: {
+<a id="L1036"></a>                var buf: std.ArrayList(u16) = .initBuffer(&amp;key_path_buf);
+<a id="L1037"></a>                buf.appendSliceAssumeCapacity(L("Software\\Microsoft\\VisualStudio\\"));
+<a id="L1038"></a>                buf.items.len += std.unicode.wtf8ToWtf16Le(buf.unusedCapacitySlice(), vs_version) catch unreachable;
+<a id="L1039"></a>                buf.appendSliceAssumeCapacity(L("_Config"));
+<a id="L1040"></a>                break :blk buf.items;
+<a id="L1041"></a>            };
+<a id="L1042"></a>            const config_key = root_key.open(config_path) catch continue;
+<a id="L1043"></a>
+<a id="L1044"></a>            const source_directories_value = config_key.getString(gpa, .{ .name = L("Source Directories") }, .wtf8) catch |err| switch (err) {
+<a id="L1045"></a>                error.OutOfMemory =&gt; return error.OutOfMemory,
+<a id="L1046"></a>                else =&gt; continue,
+<a id="L1047"></a>            };
+<a id="L1048"></a>
+<a id="L1049"></a>            break :source_directories source_directories_value;
+<a id="L1050"></a>        } else return error.PathNotFound;
+<a id="L1051"></a>        defer gpa.free(source_directories);
+<a id="L1052"></a>
+<a id="L1053"></a>        var source_directories_split = std.mem.splitScalar(u8, source_directories, ';');
+<a id="L1054"></a>
+<a id="L1055"></a>        const msvc_dir: []const u8 = msvc_dir: {
+<a id="L1056"></a>            const msvc_include_dir_maybe_with_trailing_slash = try gpa.dupe(u8, source_directories_split.first());
+<a id="L1057"></a>
+<a id="L1058"></a>            if (msvc_include_dir_maybe_with_trailing_slash.len &gt; Dir.max_path_bytes or !Dir.path.isAbsolute(msvc_include_dir_maybe_with_trailing_slash)) {
+<a id="L1059"></a>                gpa.free(msvc_include_dir_maybe_with_trailing_slash);
+<a id="L1060"></a>                return error.PathNotFound;
+<a id="L1061"></a>            }
+<a id="L1062"></a>
+<a id="L1063"></a>            var msvc_dir = std.array_list.Managed(u8).fromOwnedSlice(gpa, msvc_include_dir_maybe_with_trailing_slash);
+<a id="L1064"></a>            errdefer msvc_dir.deinit();
+<a id="L1065"></a>
+<a id="L1066"></a>            // String might contain trailing slash, so trim it here
+<a id="L1067"></a>            if (msvc_dir.items.len &gt; "C:\\".len and msvc_dir.getLast() == '\\') _ = msvc_dir.pop();
+<a id="L1068"></a>
+<a id="L1069"></a>            // Remove `\include` at the end of path
+<a id="L1070"></a>            if (std.mem.endsWith(u8, msvc_dir.items, "\\include")) {
+<a id="L1071"></a>                msvc_dir.shrinkRetainingCapacity(msvc_dir.items.len - "\\include".len);
+<a id="L1072"></a>            }
+<a id="L1073"></a>
+<a id="L1074"></a>            try msvc_dir.appendSlice("\\Lib\\");
+<a id="L1075"></a>            try msvc_dir.appendSlice(switch (arch) {
+<a id="L1076"></a>                .thumb =&gt; "arm",
+<a id="L1077"></a>                .aarch64 =&gt; "arm64",
+<a id="L1078"></a>                .x86 =&gt; "x86",
+<a id="L1079"></a>                .x86_64 =&gt; "x64",
+<a id="L1080"></a>                else =&gt; unreachable,
+<a id="L1081"></a>            });
+<a id="L1082"></a>            const msvc_dir_with_arch = try msvc_dir.toOwnedSlice();
+<a id="L1083"></a>            break :msvc_dir msvc_dir_with_arch;
+<a id="L1084"></a>        };
+<a id="L1085"></a>        errdefer gpa.free(msvc_dir);
+<a id="L1086"></a>
+<a id="L1087"></a>        if (!verifyLibDir(io, msvc_dir)) {
+<a id="L1088"></a>            return error.PathNotFound;
+<a id="L1089"></a>        }
+<a id="L1090"></a>
+<a id="L1091"></a>        return msvc_dir;
+<a id="L1092"></a>    }
+<a id="L1093"></a>
+<a id="L1094"></a>    fn findViaVs7Key(
+<a id="L1095"></a>        gpa: Allocator,
+<a id="L1096"></a>        io: Io,
+<a id="L1097"></a>        registry: *Registry,
+<a id="L1098"></a>        arch: std.Target.Cpu.Arch,
+<a id="L1099"></a>        environ_map: *const Environ.Map,
+<a id="L1100"></a>    ) error{ OutOfMemory, PathNotFound }![]const u8 {
+<a id="L1101"></a>        var base_path: std.array_list.Managed(u8) = base_path: {
+<a id="L1102"></a>            try_env: {
+<a id="L1103"></a>                if (environ_map.get("VS140COMNTOOLS")) |VS140COMNTOOLS| {
+<a id="L1104"></a>                    if (VS140COMNTOOLS.len &lt; "C:\\Common7\\Tools".len) break :try_env;
+<a id="L1105"></a>                    if (!Dir.path.isAbsolute(VS140COMNTOOLS)) break :try_env;
+<a id="L1106"></a>                    var list = std.array_list.Managed(u8).init(gpa);
+<a id="L1107"></a>                    errdefer list.deinit();
+<a id="L1108"></a>
+<a id="L1109"></a>                    try list.appendSlice(VS140COMNTOOLS); // C:\Program Files (x86)\Microsoft Visual Studio 14.0\Common7\Tools
+<a id="L1110"></a>                    // String might contain trailing slash, so trim it here
+<a id="L1111"></a>                    if (list.items.len &gt; "C:\\".len and list.getLast() == '\\') _ = list.pop();
+<a id="L1112"></a>                    list.shrinkRetainingCapacity(list.items.len - "\\Common7\\Tools".len); // C:\Program Files (x86)\Microsoft Visual Studio 14.0
+<a id="L1113"></a>                    break :base_path list;
+<a id="L1114"></a>                }
+<a id="L1115"></a>            }
+<a id="L1116"></a>
+<a id="L1117"></a>            const vs7_key = registry.openSoftwareKey(.{ .root = .local_machine, .wow64 = .wow64_32 }, L("Microsoft\\VisualStudio\\SxS\\VS7")) catch return error.PathNotFound;
+<a id="L1118"></a>            defer vs7_key.close();
+<a id="L1119"></a>            try_vs7_key: {
+<a id="L1120"></a>                const path_maybe_with_trailing_slash = vs7_key.getString(gpa, .{ .name = L("14.0") }, .wtf8) catch |err| switch (err) {
+<a id="L1121"></a>                    error.OutOfMemory =&gt; return error.OutOfMemory,
+<a id="L1122"></a>                    else =&gt; break :try_vs7_key,
+<a id="L1123"></a>                };
+<a id="L1124"></a>
+<a id="L1125"></a>                if (path_maybe_with_trailing_slash.len &gt; Dir.max_path_bytes or !Dir.path.isAbsolute(path_maybe_with_trailing_slash)) {
+<a id="L1126"></a>                    gpa.free(path_maybe_with_trailing_slash);
+<a id="L1127"></a>                    break :try_vs7_key;
+<a id="L1128"></a>                }
+<a id="L1129"></a>
+<a id="L1130"></a>                var path = std.array_list.Managed(u8).fromOwnedSlice(gpa, path_maybe_with_trailing_slash);
+<a id="L1131"></a>                errdefer path.deinit();
+<a id="L1132"></a>
+<a id="L1133"></a>                // String might contain trailing slash, so trim it here
+<a id="L1134"></a>                if (path.items.len &gt; "C:\\".len and path.getLast() == '\\') _ = path.pop();
+<a id="L1135"></a>                break :base_path path;
+<a id="L1136"></a>            }
+<a id="L1137"></a>            return error.PathNotFound;
+<a id="L1138"></a>        };
+<a id="L1139"></a>        errdefer base_path.deinit();
+<a id="L1140"></a>
+<a id="L1141"></a>        try base_path.appendSlice("\\VC\\lib\\");
+<a id="L1142"></a>        try base_path.appendSlice(switch (arch) {
+<a id="L1143"></a>            .thumb =&gt; "arm",
+<a id="L1144"></a>            .aarch64 =&gt; "arm64",
+<a id="L1145"></a>            .x86 =&gt; "", //x86 is in the root of the Lib folder
+<a id="L1146"></a>            .x86_64 =&gt; "amd64",
+<a id="L1147"></a>            else =&gt; unreachable,
+<a id="L1148"></a>        });
+<a id="L1149"></a>
+<a id="L1150"></a>        if (!verifyLibDir(io, base_path.items)) {
+<a id="L1151"></a>            return error.PathNotFound;
+<a id="L1152"></a>        }
+<a id="L1153"></a>
+<a id="L1154"></a>        const full_path = try base_path.toOwnedSlice();
+<a id="L1155"></a>        return full_path;
+<a id="L1156"></a>    }
+<a id="L1157"></a>
+<a id="L1158"></a>    fn verifyLibDir(io: Io, lib_dir_path: []const u8) bool {
+<a id="L1159"></a>        std.debug.assert(Dir.path.isAbsolute(lib_dir_path)); // should be already handled in `findVia*`
+<a id="L1160"></a>
+<a id="L1161"></a>        var dir = Dir.openDirAbsolute(io, lib_dir_path, .{}) catch return false;
+<a id="L1162"></a>        defer dir.close(io);
+<a id="L1163"></a>
+<a id="L1164"></a>        const stat = dir.statFile(io, "vcruntime.lib", .{}) catch return false;
+<a id="L1165"></a>        if (stat.kind != .file)
+<a id="L1166"></a>            return false;
+<a id="L1167"></a>
+<a id="L1168"></a>        return true;
+<a id="L1169"></a>    }
+<a id="L1170"></a>
+<a id="L1171"></a>    /// Find path to MSVC's `lib/` directory.
+<a id="L1172"></a>    /// Caller owns the result.
+<a id="L1173"></a>    pub fn find(
+<a id="L1174"></a>        gpa: Allocator,
+<a id="L1175"></a>        io: Io,
+<a id="L1176"></a>        registry: *Registry,
+<a id="L1177"></a>        arch: std.Target.Cpu.Arch,
+<a id="L1178"></a>        environ_map: *const Environ.Map,
+<a id="L1179"></a>    ) error{ OutOfMemory, MsvcLibDirNotFound }![]const u8 {
+<a id="L1180"></a>        const full_path = MsvcLibDir.findViaCOM(gpa, io, registry, arch, environ_map) catch |err1| switch (err1) {
+<a id="L1181"></a>            error.OutOfMemory =&gt; return error.OutOfMemory,
+<a id="L1182"></a>            error.PathNotFound =&gt; MsvcLibDir.findViaRegistry(gpa, io, arch, environ_map) catch |err2| switch (err2) {
+<a id="L1183"></a>                error.OutOfMemory =&gt; return error.OutOfMemory,
+<a id="L1184"></a>                error.PathNotFound =&gt; MsvcLibDir.findViaVs7Key(gpa, io, registry, arch, environ_map) catch |err3| switch (err3) {
+<a id="L1185"></a>                    error.OutOfMemory =&gt; return error.OutOfMemory,
+<a id="L1186"></a>                    error.PathNotFound =&gt; return error.MsvcLibDirNotFound,
+<a id="L1187"></a>                },
+<a id="L1188"></a>            },
+<a id="L1189"></a>        };
+<a id="L1190"></a>        errdefer gpa.free(full_path);
+<a id="L1191"></a>
+<a id="L1192"></a>        return full_path;
+<a id="L1193"></a>    }
+<a id="L1194"></a>};
+</pre>
 </body>
 </html>

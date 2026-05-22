@@ -2,1620 +2,1623 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Source: zig-0.16.0-std/debug/Dwarf.zig</title>
+    <title>Source: debug/Dwarf.zig</title>
     <style>
         body { background: #1e1e1e; color: #d4d4d4; font-family: monospace; padding: 20px; }
         pre { white-space: pre-wrap; word-wrap: break-word; }
         .header { border-bottom: 1px solid #444; padding-bottom: 10px; margin-bottom: 20px; }
         a { color: #569cd6; }
+        a[id] { color: inherit; text-decoration: none; }
+        :target { background: #3a3a00; }
     </style>
 </head>
 <body>
     <div class="header">
-        <a href="/">Index</a> | <strong>File: zig-0.16.0-std/debug/Dwarf.zig</strong>
+        <a href="/">Index</a> | <strong>File: debug/Dwarf.zig</strong>
     </div>
-    <pre>//! Implements parsing, decoding, and caching of DWARF information.
-//!
-//! This API makes no assumptions about the relationship between the host and
-//! the target being debugged. In other words, any DWARF information can be used
-//! from any host via this API. Note, however, that the limits of 32-bit
-//! addressing can cause very large 64-bit binaries to be impossible to open on
-//! 32-bit hosts.
-//!
-//! For unopinionated types and bits, see `std.dwarf`.
-
-const std = @import("../std.zig");
-const Allocator = std.mem.Allocator;
-const mem = std.mem;
-const DW = std.dwarf;
-const AT = DW.AT;
-const FORM = DW.FORM;
-const Format = DW.Format;
-const RLE = DW.RLE;
-const UT = DW.UT;
-const assert = std.debug.assert;
-const cast = std.math.cast;
-const maxInt = std.math.maxInt;
-const ArrayList = std.ArrayList;
-const Endian = std.builtin.Endian;
-const Io = std.Io;
-const Reader = Io.Reader;
-const Error = std.debug.SelfInfoError;
-
-const Dwarf = @This();
-
-pub const expression = @import("Dwarf/expression.zig");
-pub const Unwind = @import("Dwarf/Unwind.zig");
-pub const SelfUnwinder = @import("Dwarf/SelfUnwinder.zig");
-
-/// Useful to temporarily enable while working on this file.
-const debug_debug_mode = false;
-
-sections: SectionArray = @splat(null),
-
-/// Filled later by the initializer
-abbrev_table_list: ArrayList(Abbrev.Table) = .empty,
-/// Filled later by the initializer
-compile_unit_list: ArrayList(CompileUnit) = .empty,
-/// Filled later by the initializer
-func_list: ArrayList(Func) = .empty,
-
-/// Populated by `populateRanges`.
-ranges: ArrayList(Range) = .empty,
-
-pub const Range = struct {
-    start: u64,
-    end: u64,
-    /// Index into `compile_unit_list`.
-    compile_unit_index: usize,
-};
-
-pub const Section = struct {
-    data: []const u8,
-    /// If `data` is owned by this Dwarf.
-    owned: bool,
-
-    pub const Id = enum {
-        debug_info,
-        debug_abbrev,
-        debug_str,
-        debug_str_offsets,
-        debug_line,
-        debug_line_str,
-        debug_ranges,
-        debug_loclists,
-        debug_rnglists,
-        debug_addr,
-        debug_names,
-    };
-};
-
-pub const Abbrev = struct {
-    code: u64,
-    tag_id: u64,
-    has_children: bool,
-    attrs: []Attr,
-
-    fn deinit(abbrev: *Abbrev, gpa: Allocator) void {
-        gpa.free(abbrev.attrs);
-        abbrev.* = undefined;
-    }
-
-    const Attr = struct {
-        id: u64,
-        form_id: u64,
-        /// Only valid if form_id is .implicit_const
-        payload: i64,
-    };
-
-    const Table = struct {
-        // offset from .debug_abbrev
-        offset: u64,
-        abbrevs: []Abbrev,
-
-        fn deinit(table: *Table, gpa: Allocator) void {
-            for (table.abbrevs) |*abbrev| {
-                abbrev.deinit(gpa);
-            }
-            gpa.free(table.abbrevs);
-            table.* = undefined;
-        }
-
-        fn get(table: *const Table, abbrev_code: u64) ?*const Abbrev {
-            return for (table.abbrevs) |*abbrev| {
-                if (abbrev.code == abbrev_code) break abbrev;
-            } else null;
-        }
-    };
-};
-
-pub const CompileUnit = struct {
-    version: u16,
-    format: Format,
-    addr_size_bytes: u8,
-    die: Die,
-    pc_range: ?PcRange,
-
-    str_offsets_base: usize,
-    addr_base: usize,
-    rnglists_base: usize,
-    loclists_base: usize,
-    frame_base: ?*const FormValue,
-
-    src_loc_cache: ?SrcLocCache,
-
-    pub const SrcLocCache = struct {
-        line_table: LineTable,
-        directories: []const FileEntry,
-        files: []FileEntry,
-        version: u16,
-
-        pub const LineTable = std.AutoArrayHashMapUnmanaged(u64, LineEntry);
-
-        pub const LineEntry = struct {
-            line: u32,
-            column: u32,
-            /// Offset by 1 depending on whether Dwarf version is &gt;= 5.
-            file: u32,
-
-            pub const invalid: LineEntry = .{
-                .line = undefined,
-                .column = undefined,
-                .file = std.math.maxInt(u32),
-            };
-
-            pub fn isInvalid(le: LineEntry) bool {
-                return le.file == invalid.file;
-            }
-        };
-
-        pub fn findSource(slc: *const SrcLocCache, address: u64) !LineEntry {
-            const index = std.sort.upperBound(u64, slc.line_table.keys(), address, struct {
-                fn order(context: u64, item: u64) std.math.Order {
-                    return std.math.order(context, item);
-                }
-            }.order);
-            if (index == 0) return missing();
-            return slc.line_table.values()[index - 1];
-        }
-    };
-};
-
-pub const FormValue = union(enum) {
-    addr: u64,
-    addrx: u64,
-    block: []const u8,
-    udata: u64,
-    data16: *const [16]u8,
-    sdata: i64,
-    exprloc: []const u8,
-    flag: bool,
-    sec_offset: u64,
-    ref: u64,
-    ref_addr: u64,
-    string: [:0]const u8,
-    strp: u64,
-    strx: u64,
-    line_strp: u64,
-    loclistx: u64,
-    rnglistx: u64,
-
-    fn getString(fv: FormValue, di: Dwarf) ![:0]const u8 {
-        switch (fv) {
-            .string =&gt; |s| return s,
-            .strp =&gt; |off| return di.getString(off),
-            .line_strp =&gt; |off| return di.getLineString(off),
-            else =&gt; return bad(),
-        }
-    }
-
-    fn getUInt(fv: FormValue, comptime U: type) !U {
-        return switch (fv) {
-            inline .udata,
-            .sdata,
-            .sec_offset,
-            =&gt; |c| cast(U, c) orelse bad(),
-            else =&gt; bad(),
-        };
-    }
-};
-
-pub const Die = struct {
-    tag_id: u64,
-    has_children: bool,
-    attrs: []Attr,
-
-    const Attr = struct {
-        id: u64,
-        value: FormValue,
-    };
-
-    fn deinit(self: *Die, gpa: Allocator) void {
-        gpa.free(self.attrs);
-        self.* = undefined;
-    }
-
-    fn getAttr(self: *const Die, id: u64) ?*const FormValue {
-        for (self.attrs) |*attr| {
-            if (attr.id == id) return &amp;attr.value;
-        }
-        return null;
-    }
-
-    fn getAttrAddr(
-        self: *const Die,
-        di: *const Dwarf,
-        endian: Endian,
-        id: u64,
-        compile_unit: *const CompileUnit,
-    ) error{ InvalidDebugInfo, MissingDebugInfo }!u64 {
-        const form_value = self.getAttr(id) orelse return error.MissingDebugInfo;
-        return switch (form_value.*) {
-            .addr =&gt; |value| value,
-            .addrx =&gt; |index| di.readDebugAddr(endian, compile_unit, index),
-            else =&gt; bad(),
-        };
-    }
-
-    fn getAttrSecOffset(self: *const Die, id: u64) !u64 {
-        const form_value = self.getAttr(id) orelse return error.MissingDebugInfo;
-        return form_value.getUInt(u64);
-    }
-
-    fn getAttrUnsignedLe(self: *const Die, id: u64) !u64 {
-        const form_value = self.getAttr(id) orelse return error.MissingDebugInfo;
-        return switch (form_value.*) {
-            .Const =&gt; |value| value.asUnsignedLe(),
-            else =&gt; bad(),
-        };
-    }
-
-    fn getAttrRef(self: *const Die, id: u64, unit_offset: u64, unit_len: u64) !u64 {
-        const form_value = self.getAttr(id) orelse return error.MissingDebugInfo;
-        return switch (form_value.*) {
-            .ref =&gt; |offset| if (offset &lt; unit_len) unit_offset + offset else bad(),
-            .ref_addr =&gt; |addr| addr,
-            else =&gt; bad(),
-        };
-    }
-
-    pub fn getAttrString(
-        self: *const Die,
-        di: *Dwarf,
-        endian: Endian,
-        id: u64,
-        opt_str: ?[]const u8,
-        compile_unit: *const CompileUnit,
-    ) error{ InvalidDebugInfo, MissingDebugInfo }![]const u8 {
-        const form_value = self.getAttr(id) orelse return error.MissingDebugInfo;
-        switch (form_value.*) {
-            .string =&gt; |value| return value,
-            .strp =&gt; |offset| return di.getString(offset),
-            .strx =&gt; |index| {
-                const debug_str_offsets = di.section(.debug_str_offsets) orelse return bad();
-                if (compile_unit.str_offsets_base == 0) return bad();
-                switch (compile_unit.format) {
-                    .@"32" =&gt; {
-                        const byte_offset = compile_unit.str_offsets_base + 4 * index;
-                        if (byte_offset + 4 &gt; debug_str_offsets.len) return bad();
-                        const offset = mem.readInt(u32, debug_str_offsets[@intCast(byte_offset)..][0..4], endian);
-                        return getStringGeneric(opt_str, offset);
-                    },
-                    .@"64" =&gt; {
-                        const byte_offset = compile_unit.str_offsets_base + 8 * index;
-                        if (byte_offset + 8 &gt; debug_str_offsets.len) return bad();
-                        const offset = mem.readInt(u64, debug_str_offsets[@intCast(byte_offset)..][0..8], endian);
-                        return getStringGeneric(opt_str, offset);
-                    },
-                }
-            },
-            .line_strp =&gt; |offset| return di.getLineString(offset),
-            else =&gt; return bad(),
-        }
-    }
-};
-
-const num_sections = std.enums.directEnumArrayLen(Section.Id, 0);
-pub const SectionArray = [num_sections]?Section;
-
-pub const OpenError = ScanError;
-
-/// Initialize DWARF info. The caller has the responsibility to initialize most
-/// the `Dwarf` fields before calling. `binary_mem` is the raw bytes of the
-/// main binary file (not the secondary debug info file).
-pub fn open(d: *Dwarf, gpa: Allocator, endian: Endian) OpenError!void {
-    try d.scanAllFunctions(gpa, endian);
-    try d.scanAllCompileUnits(gpa, endian);
-}
-
-const PcRange = struct {
-    start: u64,
-    end: u64,
-};
-
-const Func = struct {
-    pc_range: ?PcRange,
-    name: ?[]const u8,
-};
-
-pub fn section(di: Dwarf, dwarf_section: Section.Id) ?[]const u8 {
-    return if (di.sections[@intFromEnum(dwarf_section)]) |s| s.data else null;
-}
-
-pub fn deinit(di: *Dwarf, gpa: Allocator) void {
-    for (di.sections) |opt_section| {
-        if (opt_section) |s| if (s.owned) gpa.free(s.data);
-    }
-    for (di.abbrev_table_list.items) |*abbrev| {
-        abbrev.deinit(gpa);
-    }
-    di.abbrev_table_list.deinit(gpa);
-    for (di.compile_unit_list.items) |*cu| {
-        if (cu.src_loc_cache) |*slc| {
-            slc.line_table.deinit(gpa);
-            gpa.free(slc.directories);
-            gpa.free(slc.files);
-        }
-        cu.die.deinit(gpa);
-    }
-    di.compile_unit_list.deinit(gpa);
-    di.func_list.deinit(gpa);
-    di.ranges.deinit(gpa);
-    di.* = undefined;
-}
-
-pub fn getSymbolName(di: *const Dwarf, address: u64) ?[]const u8 {
-    // Iterate the function list backwards so that we see child DIEs before their parents. This is
-    // important because `DW_TAG_inlined_subroutine` DIEs will have a range which is a sub-range of
-    // their caller, and we want to return the callee's name, not the caller's.
-    var i: usize = di.func_list.items.len;
-    while (i &gt; 0) {
-        i -= 1;
-        const func = &amp;di.func_list.items[i];
-        if (func.pc_range) |range| {
-            if (address &gt;= range.start and address &lt; range.end) {
-                return func.name;
-            }
-        }
-    }
-
-    return null;
-}
-
-pub const ScanError = error{
-    InvalidDebugInfo,
-    MissingDebugInfo,
-    ReadFailed,
-    EndOfStream,
-    Overflow,
-    StreamTooLong,
-} || Allocator.Error;
-
-fn scanAllFunctions(di: *Dwarf, gpa: Allocator, endian: Endian) ScanError!void {
-    var fr: Reader = .fixed(di.section(.debug_info).?);
-    var this_unit_offset: u64 = 0;
-
-    while (this_unit_offset &lt; fr.buffer.len) {
-        fr.seek = @intCast(this_unit_offset);
-
-        const unit_header = try readUnitHeader(&amp;fr, endian);
-        if (unit_header.unit_length == 0) return;
-        const next_offset = unit_header.header_length + unit_header.unit_length;
-
-        const version = try fr.takeInt(u16, endian);
-        if (version &lt; 2 or version &gt; 5) return bad();
-
-        var address_size: u8 = undefined;
-        var debug_abbrev_offset: u64 = undefined;
-        if (version &gt;= 5) {
-            const unit_type = try fr.takeByte();
-            if (unit_type != DW.UT.compile) return bad();
-            address_size = try fr.takeByte();
-            debug_abbrev_offset = try readFormatSizedInt(&amp;fr, unit_header.format, endian);
-        } else {
-            debug_abbrev_offset = try readFormatSizedInt(&amp;fr, unit_header.format, endian);
-            address_size = try fr.takeByte();
-        }
-
-        const abbrev_table = try di.getAbbrevTable(gpa, debug_abbrev_offset);
-
-        var max_attrs: usize = 0;
-        var zig_padding_abbrev_code: u7 = 0;
-        for (abbrev_table.abbrevs) |abbrev| {
-            max_attrs = @max(max_attrs, abbrev.attrs.len);
-            if (cast(u7, abbrev.code)) |code| {
-                if (abbrev.tag_id == DW.TAG.ZIG_padding and
-                    !abbrev.has_children and
-                    abbrev.attrs.len == 0)
-                {
-                    zig_padding_abbrev_code = code;
-                }
-            }
-        }
-        const attrs_buf = try gpa.alloc(Die.Attr, max_attrs * 3);
-        defer gpa.free(attrs_buf);
-        var attrs_bufs: [3][]Die.Attr = undefined;
-        for (&amp;attrs_bufs, 0..) |*buf, index| buf.* = attrs_buf[index * max_attrs ..][0..max_attrs];
-
-        const next_unit_pos = this_unit_offset + next_offset;
-
-        var compile_unit: CompileUnit = .{
-            .version = version,
-            .format = unit_header.format,
-            .addr_size_bytes = address_size,
-            .die = undefined,
-            .pc_range = null,
-
-            .str_offsets_base = 0,
-            .addr_base = 0,
-            .rnglists_base = 0,
-            .loclists_base = 0,
-            .frame_base = null,
-            .src_loc_cache = null,
-        };
-
-        while (true) {
-            fr.seek = std.mem.findNonePos(u8, fr.buffer, fr.seek, &amp;.{
-                zig_padding_abbrev_code, 0,
-            }) orelse fr.buffer.len;
-            if (fr.seek &gt;= next_unit_pos) break;
-            var die_obj = (try parseDie(
-                &amp;fr,
-                attrs_bufs[0],
-                abbrev_table,
-                unit_header.format,
-                endian,
-                address_size,
-            )) orelse continue;
-
-            switch (die_obj.tag_id) {
-                DW.TAG.compile_unit =&gt; {
-                    compile_unit.die = die_obj;
-                    compile_unit.die.attrs = attrs_bufs[1][0..die_obj.attrs.len];
-                    @memcpy(compile_unit.die.attrs, die_obj.attrs);
-
-                    compile_unit.str_offsets_base = if (die_obj.getAttr(AT.str_offsets_base)) |fv| try fv.getUInt(usize) else 0;
-                    compile_unit.addr_base = if (die_obj.getAttr(AT.addr_base)) |fv| try fv.getUInt(usize) else 0;
-                    compile_unit.rnglists_base = if (die_obj.getAttr(AT.rnglists_base)) |fv| try fv.getUInt(usize) else 0;
-                    compile_unit.loclists_base = if (die_obj.getAttr(AT.loclists_base)) |fv| try fv.getUInt(usize) else 0;
-                    compile_unit.frame_base = die_obj.getAttr(AT.frame_base);
-                },
-                DW.TAG.subprogram, DW.TAG.inlined_subroutine, DW.TAG.subroutine, DW.TAG.entry_point =&gt; {
-                    const fn_name = x: {
-                        var this_die_obj = die_obj;
-                        // Prevent endless loops
-                        for (0..3) |_| {
-                            if (this_die_obj.getAttr(AT.name)) |_| {
-                                break :x try this_die_obj.getAttrString(di, endian, AT.name, di.section(.debug_str), &amp;compile_unit);
-                            } else if (this_die_obj.getAttr(AT.abstract_origin)) |_| {
-                                const after_die_offset = fr.seek;
-                                defer fr.seek = after_die_offset;
-
-                                // Follow the DIE it points to and repeat
-                                const ref_offset = try this_die_obj.getAttrRef(AT.abstract_origin, this_unit_offset, next_offset);
-                                fr.seek = @intCast(ref_offset);
-                                this_die_obj = (try parseDie(
-                                    &amp;fr,
-                                    attrs_bufs[2],
-                                    abbrev_table, // wrong abbrev table for different cu
-                                    unit_header.format,
-                                    endian,
-                                    address_size,
-                                )) orelse return bad();
-                            } else if (this_die_obj.getAttr(AT.specification)) |_| {
-                                const after_die_offset = fr.seek;
-                                defer fr.seek = after_die_offset;
-
-                                // Follow the DIE it points to and repeat
-                                const ref_offset = try this_die_obj.getAttrRef(AT.specification, this_unit_offset, next_offset);
-                                fr.seek = @intCast(ref_offset);
-                                this_die_obj = (try parseDie(
-                                    &amp;fr,
-                                    attrs_bufs[2],
-                                    abbrev_table, // wrong abbrev table for different cu
-                                    unit_header.format,
-                                    endian,
-                                    address_size,
-                                )) orelse return bad();
-                            } else {
-                                break :x null;
-                            }
-                        }
-
-                        break :x null;
-                    };
-
-                    var range_added = if (die_obj.getAttrAddr(di, endian, AT.low_pc, &amp;compile_unit)) |low_pc| blk: {
-                        if (die_obj.getAttr(AT.high_pc)) |high_pc_value| {
-                            const pc_end = switch (high_pc_value.*) {
-                                .addr =&gt; |value| value,
-                                .udata =&gt; |offset| low_pc + offset,
-                                else =&gt; return bad(),
-                            };
-
-                            try di.func_list.append(gpa, .{
-                                .name = fn_name,
-                                .pc_range = .{
-                                    .start = low_pc,
-                                    .end = pc_end,
-                                },
-                            });
-
-                            break :blk true;
-                        }
-
-                        break :blk false;
-                    } else |err| blk: {
-                        if (err != error.MissingDebugInfo) return err;
-                        break :blk false;
-                    };
-
-                    if (die_obj.getAttr(AT.ranges)) |ranges_value| blk: {
-                        var iter = DebugRangeIterator.init(ranges_value, di, endian, &amp;compile_unit) catch |err| {
-                            if (err != error.MissingDebugInfo) return err;
-                            break :blk;
-                        };
-
-                        while (try iter.next()) |range| {
-                            range_added = true;
-                            try di.func_list.append(gpa, .{
-                                .name = fn_name,
-                                .pc_range = .{
-                                    .start = range.start,
-                                    .end = range.end,
-                                },
-                            });
-                        }
-                    }
-
-                    if (fn_name != null and !range_added) {
-                        try di.func_list.append(gpa, .{
-                            .name = fn_name,
-                            .pc_range = null,
-                        });
-                    }
-                },
-                else =&gt; {},
-            }
-        }
-
-        this_unit_offset += next_offset;
-    }
-}
-
-fn scanAllCompileUnits(di: *Dwarf, gpa: Allocator, endian: Endian) ScanError!void {
-    var fr: Reader = .fixed(di.section(.debug_info).?);
-    var this_unit_offset: u64 = 0;
-
-    var attrs_buf = std.array_list.Managed(Die.Attr).init(gpa);
-    defer attrs_buf.deinit();
-
-    while (this_unit_offset &lt; fr.buffer.len) {
-        fr.seek = @intCast(this_unit_offset);
-
-        const unit_header = try readUnitHeader(&amp;fr, endian);
-        if (unit_header.unit_length == 0) return;
-        const next_offset = unit_header.header_length + unit_header.unit_length;
-
-        const version = try fr.takeInt(u16, endian);
-        if (version &lt; 2 or version &gt; 5) return bad();
-
-        var address_size: u8 = undefined;
-        var debug_abbrev_offset: u64 = undefined;
-        if (version &gt;= 5) {
-            const unit_type = try fr.takeByte();
-            if (unit_type != UT.compile) return bad();
-            address_size = try fr.takeByte();
-            debug_abbrev_offset = try readFormatSizedInt(&amp;fr, unit_header.format, endian);
-        } else {
-            debug_abbrev_offset = try readFormatSizedInt(&amp;fr, unit_header.format, endian);
-            address_size = try fr.takeByte();
-        }
-
-        const abbrev_table = try di.getAbbrevTable(gpa, debug_abbrev_offset);
-
-        var max_attrs: usize = 0;
-        for (abbrev_table.abbrevs) |abbrev| {
-            max_attrs = @max(max_attrs, abbrev.attrs.len);
-        }
-        try attrs_buf.resize(max_attrs);
-
-        var compile_unit_die = (try parseDie(
-            &amp;fr,
-            attrs_buf.items,
-            abbrev_table,
-            unit_header.format,
-            endian,
-            address_size,
-        )) orelse return bad();
-
-        if (compile_unit_die.tag_id != DW.TAG.compile_unit) return bad();
-
-        compile_unit_die.attrs = try gpa.dupe(Die.Attr, compile_unit_die.attrs);
-
-        var compile_unit: CompileUnit = .{
-            .version = version,
-            .format = unit_header.format,
-            .addr_size_bytes = address_size,
-            .pc_range = null,
-            .die = compile_unit_die,
-            .str_offsets_base = if (compile_unit_die.getAttr(AT.str_offsets_base)) |fv| try fv.getUInt(usize) else 0,
-            .addr_base = if (compile_unit_die.getAttr(AT.addr_base)) |fv| try fv.getUInt(usize) else 0,
-            .rnglists_base = if (compile_unit_die.getAttr(AT.rnglists_base)) |fv| try fv.getUInt(usize) else 0,
-            .loclists_base = if (compile_unit_die.getAttr(AT.loclists_base)) |fv| try fv.getUInt(usize) else 0,
-            .frame_base = compile_unit_die.getAttr(AT.frame_base),
-            .src_loc_cache = null,
-        };
-
-        compile_unit.pc_range = x: {
-            if (compile_unit_die.getAttrAddr(di, endian, AT.low_pc, &amp;compile_unit)) |low_pc| {
-                if (compile_unit_die.getAttr(AT.high_pc)) |high_pc_value| {
-                    const pc_end = switch (high_pc_value.*) {
-                        .addr =&gt; |value| value,
-                        .udata =&gt; |offset| low_pc + offset,
-                        else =&gt; return bad(),
-                    };
-                    break :x PcRange{
-                        .start = low_pc,
-                        .end = pc_end,
-                    };
-                } else {
-                    break :x null;
-                }
-            } else |err| {
-                if (err != error.MissingDebugInfo) return err;
-                break :x null;
-            }
-        };
-
-        try di.compile_unit_list.append(gpa, compile_unit);
-
-        this_unit_offset += next_offset;
-    }
-}
-
-pub fn populateRanges(d: *Dwarf, gpa: Allocator, endian: Endian) ScanError!void {
-    assert(d.ranges.items.len == 0);
-
-    for (d.compile_unit_list.items, 0..) |*cu, cu_index| {
-        if (cu.pc_range) |range| {
-            try d.ranges.append(gpa, .{
-                .start = range.start,
-                .end = range.end,
-                .compile_unit_index = cu_index,
-            });
-            continue;
-        }
-        const ranges_value = cu.die.getAttr(AT.ranges) orelse continue;
-        var iter = DebugRangeIterator.init(ranges_value, d, endian, cu) catch continue;
-        while (try iter.next()) |range| {
-            // Not sure why LLVM thinks it's OK to emit these...
-            if (range.start == range.end) continue;
-
-            try d.ranges.append(gpa, .{
-                .start = range.start,
-                .end = range.end,
-                .compile_unit_index = cu_index,
-            });
-        }
-    }
-
-    std.mem.sortUnstable(Range, d.ranges.items, {}, struct {
-        pub fn lessThan(ctx: void, a: Range, b: Range) bool {
-            _ = ctx;
-            return a.start &lt; b.start;
-        }
-    }.lessThan);
-}
-
-const DebugRangeIterator = struct {
-    base_address: u64,
-    section_type: Section.Id,
-    di: *const Dwarf,
-    endian: Endian,
-    compile_unit: *const CompileUnit,
-    fr: Reader,
-
-    pub fn init(ranges_value: *const FormValue, di: *const Dwarf, endian: Endian, compile_unit: *const CompileUnit) !@This() {
-        const section_type = if (compile_unit.version &gt;= 5) Section.Id.debug_rnglists else Section.Id.debug_ranges;
-        const debug_ranges = di.section(section_type) orelse return error.MissingDebugInfo;
-
-        const ranges_offset = switch (ranges_value.*) {
-            .sec_offset, .udata =&gt; |off| off,
-            .rnglistx =&gt; |idx| off: {
-                switch (compile_unit.format) {
-                    .@"32" =&gt; {
-                        const offset_loc = compile_unit.rnglists_base + 4 * idx;
-                        if (offset_loc + 4 &gt; debug_ranges.len) return bad();
-                        const offset = mem.readInt(u32, debug_ranges[@intCast(offset_loc)..][0..4], endian);
-                        break :off compile_unit.rnglists_base + offset;
-                    },
-                    .@"64" =&gt; {
-                        const offset_loc = compile_unit.rnglists_base + 8 * idx;
-                        if (offset_loc + 8 &gt; debug_ranges.len) return bad();
-                        const offset = mem.readInt(u64, debug_ranges[@intCast(offset_loc)..][0..8], endian);
-                        break :off compile_unit.rnglists_base + offset;
-                    },
-                }
-            },
-            else =&gt; return bad(),
-        };
-
-        // All the addresses in the list are relative to the value
-        // specified by DW_AT.low_pc or to some other value encoded
-        // in the list itself.
-        // If no starting value is specified use zero.
-        const base_address = compile_unit.die.getAttrAddr(di, endian, AT.low_pc, compile_unit) catch |err| switch (err) {
-            error.MissingDebugInfo =&gt; 0,
-            else =&gt; return err,
-        };
-
-        var fr: Reader = .fixed(debug_ranges);
-        fr.seek = cast(usize, ranges_offset) orelse return bad();
-
-        return .{
-            .base_address = base_address,
-            .section_type = section_type,
-            .di = di,
-            .endian = endian,
-            .compile_unit = compile_unit,
-            .fr = fr,
-        };
-    }
-
-    // Returns the next range in the list, or null if the end was reached.
-    pub fn next(self: *@This()) !?PcRange {
-        const endian = self.endian;
-        const addr_size_bytes = self.compile_unit.addr_size_bytes;
-        switch (self.section_type) {
-            .debug_rnglists =&gt; {
-                const kind = try self.fr.takeByte();
-                switch (kind) {
-                    RLE.end_of_list =&gt; return null,
-                    RLE.base_addressx =&gt; {
-                        const index = try self.fr.takeLeb128(u64);
-                        self.base_address = try self.di.readDebugAddr(endian, self.compile_unit, index);
-                        return try self.next();
-                    },
-                    RLE.startx_endx =&gt; {
-                        const start_index = try self.fr.takeLeb128(u64);
-                        const start_addr = try self.di.readDebugAddr(endian, self.compile_unit, start_index);
-
-                        const end_index = try self.fr.takeLeb128(u64);
-                        const end_addr = try self.di.readDebugAddr(endian, self.compile_unit, end_index);
-
-                        return .{
-                            .start = start_addr,
-                            .end = end_addr,
-                        };
-                    },
-                    RLE.startx_length =&gt; {
-                        const start_index = try self.fr.takeLeb128(u64);
-                        const start_addr = try self.di.readDebugAddr(endian, self.compile_unit, start_index);
-
-                        const len = try self.fr.takeLeb128(u64);
-                        const end_addr = start_addr + len;
-
-                        return .{
-                            .start = start_addr,
-                            .end = end_addr,
-                        };
-                    },
-                    RLE.offset_pair =&gt; {
-                        const start_addr = try self.fr.takeLeb128(u64);
-                        const end_addr = try self.fr.takeLeb128(u64);
-
-                        // This is the only kind that uses the base address
-                        return .{
-                            .start = self.base_address + start_addr,
-                            .end = self.base_address + end_addr,
-                        };
-                    },
-                    RLE.base_address =&gt; {
-                        self.base_address = try readAddress(&amp;self.fr, endian, addr_size_bytes);
-                        return try self.next();
-                    },
-                    RLE.start_end =&gt; {
-                        const start_addr = try readAddress(&amp;self.fr, endian, addr_size_bytes);
-                        const end_addr = try readAddress(&amp;self.fr, endian, addr_size_bytes);
-
-                        return .{
-                            .start = start_addr,
-                            .end = end_addr,
-                        };
-                    },
-                    RLE.start_length =&gt; {
-                        const start_addr = try readAddress(&amp;self.fr, endian, addr_size_bytes);
-                        const len = try self.fr.takeLeb128(u64);
-                        const end_addr = start_addr + len;
-
-                        return .{
-                            .start = start_addr,
-                            .end = end_addr,
-                        };
-                    },
-                    else =&gt; return bad(),
-                }
-            },
-            .debug_ranges =&gt; {
-                const start_addr = try readAddress(&amp;self.fr, endian, addr_size_bytes);
-                const end_addr = try readAddress(&amp;self.fr, endian, addr_size_bytes);
-                if (start_addr == 0 and end_addr == 0) return null;
-
-                // The entry with start_addr = max_representable_address selects a new value for the base address
-                const max_representable_address = ~@as(u64, 0) &gt;&gt; @intCast(64 - addr_size_bytes);
-                if (start_addr == max_representable_address) {
-                    self.base_address = end_addr;
-                    return try self.next();
-                }
-
-                return .{
-                    .start = self.base_address + start_addr,
-                    .end = self.base_address + end_addr,
-                };
-            },
-            else =&gt; unreachable,
-        }
-    }
-};
-
-/// TODO: change this to binary searching the sorted compile unit list
-pub fn findCompileUnit(di: *const Dwarf, endian: Endian, target_address: u64) !*CompileUnit {
-    for (di.compile_unit_list.items) |*compile_unit| {
-        if (compile_unit.pc_range) |range| {
-            if (target_address &gt;= range.start and target_address &lt; range.end) return compile_unit;
-        }
-
-        const ranges_value = compile_unit.die.getAttr(AT.ranges) orelse continue;
-        var iter = DebugRangeIterator.init(ranges_value, di, endian, compile_unit) catch continue;
-        while (try iter.next()) |range| {
-            if (target_address &gt;= range.start and target_address &lt; range.end) return compile_unit;
-        }
-    }
-
-    return missing();
-}
-
-/// Gets an already existing AbbrevTable given the abbrev_offset, or if not found,
-/// seeks in the stream and parses it.
-fn getAbbrevTable(di: *Dwarf, gpa: Allocator, abbrev_offset: u64) !*const Abbrev.Table {
-    for (di.abbrev_table_list.items) |*table| {
-        if (table.offset == abbrev_offset) {
-            return table;
-        }
-    }
-    try di.abbrev_table_list.append(
-        gpa,
-        try di.parseAbbrevTable(gpa, abbrev_offset),
-    );
-    return &amp;di.abbrev_table_list.items[di.abbrev_table_list.items.len - 1];
-}
-
-fn parseAbbrevTable(di: *Dwarf, gpa: Allocator, offset: u64) !Abbrev.Table {
-    var fr: Reader = .fixed(di.section(.debug_abbrev).?);
-    fr.seek = cast(usize, offset) orelse return bad();
-
-    var abbrevs = std.array_list.Managed(Abbrev).init(gpa);
-    defer {
-        for (abbrevs.items) |*abbrev| {
-            abbrev.deinit(gpa);
-        }
-        abbrevs.deinit();
-    }
-
-    var attrs = std.array_list.Managed(Abbrev.Attr).init(gpa);
-    defer attrs.deinit();
-
-    while (true) {
-        const code = try fr.takeLeb128(u64);
-        if (code == 0) break;
-        const tag_id = try fr.takeLeb128(u64);
-        const has_children = (try fr.takeByte()) == DW.CHILDREN.yes;
-
-        while (true) {
-            const attr_id = try fr.takeLeb128(u64);
-            const form_id = try fr.takeLeb128(u64);
-            if (attr_id == 0 and form_id == 0) break;
-            try attrs.append(.{
-                .id = attr_id,
-                .form_id = form_id,
-                .payload = switch (form_id) {
-                    FORM.implicit_const =&gt; try fr.takeLeb128(i64),
-                    else =&gt; undefined,
-                },
-            });
-        }
-
-        try abbrevs.append(.{
-            .code = code,
-            .tag_id = tag_id,
-            .has_children = has_children,
-            .attrs = try attrs.toOwnedSlice(),
-        });
-    }
-
-    return .{
-        .offset = offset,
-        .abbrevs = try abbrevs.toOwnedSlice(),
-    };
-}
-
-fn parseDie(
-    fr: *Reader,
-    attrs_buf: []Die.Attr,
-    abbrev_table: *const Abbrev.Table,
-    format: Format,
-    endian: Endian,
-    addr_size_bytes: u8,
-) ScanError!?Die {
-    const abbrev_code = try fr.takeLeb128(u64);
-    if (abbrev_code == 0) return null;
-    const table_entry = abbrev_table.get(abbrev_code) orelse return bad();
-
-    const attrs = attrs_buf[0..table_entry.attrs.len];
-    for (attrs, table_entry.attrs) |*result_attr, attr| result_attr.* = .{
-        .id = attr.id,
-        .value = try parseFormValue(fr, attr.form_id, format, endian, addr_size_bytes, attr.payload),
-    };
-    return .{
-        .tag_id = table_entry.tag_id,
-        .has_children = table_entry.has_children,
-        .attrs = attrs,
-    };
-}
-
-/// Ensures that addresses in the returned LineTable are monotonically increasing.
-fn runLineNumberProgram(d: *Dwarf, gpa: Allocator, endian: Endian, compile_unit: *const CompileUnit) !CompileUnit.SrcLocCache {
-    const compile_unit_cwd = try compile_unit.die.getAttrString(d, endian, AT.comp_dir, d.section(.debug_line_str), compile_unit);
-    const line_info_offset = try compile_unit.die.getAttrSecOffset(AT.stmt_list);
-
-    var fr: Reader = .fixed(d.section(.debug_line).?);
-    fr.seek = @intCast(line_info_offset);
-
-    const unit_header = try readUnitHeader(&amp;fr, endian);
-    if (unit_header.unit_length == 0) return missing();
-
-    const next_offset = unit_header.header_length + unit_header.unit_length;
-
-    const version = try fr.takeInt(u16, endian);
-    if (version &lt; 2) return bad();
-
-    const addr_size_bytes: u8, const seg_size: u8 = if (version &gt;= 5) .{
-        try fr.takeByte(),
-        try fr.takeByte(),
-    } else .{
-        compile_unit.addr_size_bytes,
-        0,
-    };
-    if (seg_size != 0) return bad(); // unsupported
-
-    const prologue_length = try readFormatSizedInt(&amp;fr, unit_header.format, endian);
-    const prog_start_offset = fr.seek + prologue_length;
-
-    const minimum_instruction_length = try fr.takeByte();
-    if (minimum_instruction_length == 0) return bad();
-
-    if (version &gt;= 4) {
-        const maximum_operations_per_instruction = try fr.takeByte();
-        _ = maximum_operations_per_instruction;
-    }
-
-    const default_is_stmt = (try fr.takeByte()) != 0;
-    const line_base = try fr.takeByteSigned();
-
-    const line_range = try fr.takeByte();
-    if (line_range == 0) return bad();
-
-    const opcode_base = try fr.takeByte();
-
-    const standard_opcode_lengths = try fr.take(opcode_base - 1);
-
-    var directories: ArrayList(FileEntry) = .empty;
-    defer directories.deinit(gpa);
-    var file_entries: ArrayList(FileEntry) = .empty;
-    defer file_entries.deinit(gpa);
-
-    if (version &lt; 5) {
-        try directories.append(gpa, .{ .path = compile_unit_cwd });
-
-        while (true) {
-            const dir = try fr.takeSentinel(0);
-            if (dir.len == 0) break;
-            try directories.append(gpa, .{ .path = dir });
-        }
-
-        while (true) {
-            const file_name = try fr.takeSentinel(0);
-            if (file_name.len == 0) break;
-            const dir_index = try fr.takeLeb128(u32);
-            const mtime = try fr.takeLeb128(u64);
-            const size = try fr.takeLeb128(u64);
-            try file_entries.append(gpa, .{
-                .path = file_name,
-                .dir_index = dir_index,
-                .mtime = mtime,
-                .size = size,
-            });
-        }
-    } else {
-        const FileEntFmt = struct {
-            content_type_code: u16,
-            form_code: u16,
-        };
-        {
-            var dir_ent_fmt_buf: [10]FileEntFmt = undefined;
-            const directory_entry_format_count = try fr.takeByte();
-            if (directory_entry_format_count &gt; dir_ent_fmt_buf.len) return bad();
-            for (dir_ent_fmt_buf[0..directory_entry_format_count]) |*ent_fmt| {
-                ent_fmt.* = .{
-                    .content_type_code = try fr.takeLeb128(u8),
-                    .form_code = try fr.takeLeb128(u16),
-                };
-            }
-
-            const directories_count = try fr.takeLeb128(usize);
-
-            for (try directories.addManyAsSlice(gpa, directories_count)) |*e| {
-                e.* = .{ .path = &amp;.{} };
-                for (dir_ent_fmt_buf[0..directory_entry_format_count]) |ent_fmt| {
-                    const form_value = try parseFormValue(&amp;fr, ent_fmt.form_code, unit_header.format, endian, addr_size_bytes, null);
-                    switch (ent_fmt.content_type_code) {
-                        DW.LNCT.path =&gt; e.path = try form_value.getString(d.*),
-                        DW.LNCT.directory_index =&gt; e.dir_index = try form_value.getUInt(u32),
-                        DW.LNCT.timestamp =&gt; e.mtime = try form_value.getUInt(u64),
-                        DW.LNCT.size =&gt; e.size = try form_value.getUInt(u64),
-                        DW.LNCT.MD5 =&gt; e.md5 = switch (form_value) {
-                            .data16 =&gt; |data16| data16.*,
-                            else =&gt; return bad(),
-                        },
-                        else =&gt; continue,
-                    }
-                }
-            }
-        }
-
-        var file_ent_fmt_buf: [10]FileEntFmt = undefined;
-        const file_name_entry_format_count = try fr.takeByte();
-        if (file_name_entry_format_count &gt; file_ent_fmt_buf.len) return bad();
-        for (file_ent_fmt_buf[0..file_name_entry_format_count]) |*ent_fmt| {
-            ent_fmt.* = .{
-                .content_type_code = try fr.takeLeb128(u16),
-                .form_code = try fr.takeLeb128(u16),
-            };
-        }
-
-        const file_names_count = try fr.takeLeb128(usize);
-        try file_entries.ensureUnusedCapacity(gpa, file_names_count);
-
-        for (try file_entries.addManyAsSlice(gpa, file_names_count)) |*e| {
-            e.* = .{ .path = &amp;.{} };
-            for (file_ent_fmt_buf[0..file_name_entry_format_count]) |ent_fmt| {
-                const form_value = try parseFormValue(&amp;fr, ent_fmt.form_code, unit_header.format, endian, addr_size_bytes, null);
-                switch (ent_fmt.content_type_code) {
-                    DW.LNCT.path =&gt; e.path = try form_value.getString(d.*),
-                    DW.LNCT.directory_index =&gt; e.dir_index = try form_value.getUInt(u32),
-                    DW.LNCT.timestamp =&gt; e.mtime = try form_value.getUInt(u64),
-                    DW.LNCT.size =&gt; e.size = try form_value.getUInt(u64),
-                    DW.LNCT.MD5 =&gt; e.md5 = switch (form_value) {
-                        .data16 =&gt; |data16| data16.*,
-                        else =&gt; return bad(),
-                    },
-                    else =&gt; continue,
-                }
-            }
-        }
-    }
-
-    var prog = LineNumberProgram.init(default_is_stmt, version);
-    var line_table: CompileUnit.SrcLocCache.LineTable = .{};
-    errdefer line_table.deinit(gpa);
-
-    fr.seek = @intCast(prog_start_offset);
-
-    const next_unit_pos = line_info_offset + next_offset;
-
-    while (fr.seek &lt; next_unit_pos) {
-        const opcode = try fr.takeByte();
-
-        if (opcode == DW.LNS.extended_op) {
-            const op_size = try fr.takeLeb128(u64);
-            if (op_size &lt; 1) return bad();
-            const sub_op = try fr.takeByte();
-            switch (sub_op) {
-                DW.LNE.end_sequence =&gt; {
-                    // The row being added here is an "end" address, meaning
-                    // that it does not map to the source location here -
-                    // rather it marks the previous address as the last address
-                    // that maps to this source location.
-
-                    // In this implementation we don't mark end of addresses.
-                    // This is a performance optimization based on the fact
-                    // that we don't need to know if an address is missing
-                    // source location info; we are only interested in being
-                    // able to look up source location info for addresses that
-                    // are known to have debug info.
-                    //if (debug_debug_mode) assert(!line_table.contains(prog.address));
-                    //try line_table.put(gpa, prog.address, CompileUnit.SrcLocCache.LineEntry.invalid);
-                    prog.reset();
-                },
-                DW.LNE.set_address =&gt; {
-                    prog.address = try readAddress(&amp;fr, endian, addr_size_bytes);
-                },
-                DW.LNE.define_file =&gt; {
-                    const path = try fr.takeSentinel(0);
-                    const dir_index = try fr.takeLeb128(u32);
-                    const mtime = try fr.takeLeb128(u64);
-                    const size = try fr.takeLeb128(u64);
-                    try file_entries.append(gpa, .{
-                        .path = path,
-                        .dir_index = dir_index,
-                        .mtime = mtime,
-                        .size = size,
-                    });
-                },
-                else =&gt; try fr.discardAll64(op_size - 1),
-            }
-        } else if (opcode &gt;= opcode_base) {
-            // special opcodes
-            const adjusted_opcode = opcode - opcode_base;
-            const inc_addr = minimum_instruction_length * (adjusted_opcode / line_range);
-            const inc_line = @as(i32, line_base) + @as(i32, adjusted_opcode % line_range);
-            prog.line += inc_line;
-            prog.address += inc_addr;
-            try prog.addRow(gpa, &amp;line_table);
-            prog.basic_block = false;
-        } else {
-            switch (opcode) {
-                DW.LNS.copy =&gt; {
-                    try prog.addRow(gpa, &amp;line_table);
-                    prog.basic_block = false;
-                },
-                DW.LNS.advance_pc =&gt; {
-                    const arg = try fr.takeLeb128(u64);
-                    prog.address += arg * minimum_instruction_length;
-                },
-                DW.LNS.advance_line =&gt; {
-                    const arg = try fr.takeLeb128(i64);
-                    prog.line += arg;
-                },
-                DW.LNS.set_file =&gt; {
-                    const arg = try fr.takeLeb128(usize);
-                    prog.file = arg;
-                },
-                DW.LNS.set_column =&gt; {
-                    const arg = try fr.takeLeb128(u64);
-                    prog.column = arg;
-                },
-                DW.LNS.negate_stmt =&gt; {
-                    prog.is_stmt = !prog.is_stmt;
-                },
-                DW.LNS.set_basic_block =&gt; {
-                    prog.basic_block = true;
-                },
-                DW.LNS.const_add_pc =&gt; {
-                    const inc_addr = minimum_instruction_length * ((255 - opcode_base) / line_range);
-                    prog.address += inc_addr;
-                },
-                DW.LNS.fixed_advance_pc =&gt; {
-                    const arg = try fr.takeInt(u16, endian);
-                    prog.address += arg;
-                },
-                DW.LNS.set_prologue_end =&gt; {},
-                else =&gt; {
-                    if (opcode - 1 &gt;= standard_opcode_lengths.len) return bad();
-                    try fr.discardAll(standard_opcode_lengths[opcode - 1]);
-                },
-            }
-        }
-    }
-
-    // Dwarf standard v5, 6.2.5 says
-    // &gt; Within a sequence, addresses and operation pointers may only increase.
-    // However, this is empirically not the case in reality, so we sort here.
-    line_table.sortUnstable(struct {
-        keys: []const u64,
-
-        pub fn lessThan(ctx: @This(), a_index: usize, b_index: usize) bool {
-            return ctx.keys[a_index] &lt; ctx.keys[b_index];
-        }
-    }{ .keys = line_table.keys() });
-
-    return .{
-        .line_table = line_table,
-        .directories = try directories.toOwnedSlice(gpa),
-        .files = try file_entries.toOwnedSlice(gpa),
-        .version = version,
-    };
-}
-
-pub fn populateSrcLocCache(d: *Dwarf, gpa: Allocator, endian: Endian, cu: *CompileUnit) ScanError!void {
-    if (cu.src_loc_cache != null) return;
-    cu.src_loc_cache = try d.runLineNumberProgram(gpa, endian, cu);
-}
-
-pub fn getLineNumberInfo(
-    d: *Dwarf,
-    gpa: Allocator,
-    text_arena: Allocator,
-    endian: Endian,
-    compile_unit: *CompileUnit,
-    target_address: u64,
-) !std.debug.SourceLocation {
-    try d.populateSrcLocCache(gpa, endian, compile_unit);
-    const slc = &amp;compile_unit.src_loc_cache.?;
-    const entry = try slc.findSource(target_address);
-    const file_index = entry.file - @intFromBool(slc.version &lt; 5);
-    if (file_index &gt;= slc.files.len) return bad();
-    const file_entry = &amp;slc.files[file_index];
-    if (file_entry.dir_index &gt;= slc.directories.len) return bad();
-    const dir_name = slc.directories[file_entry.dir_index].path;
-    const file_name = try std.fs.path.join(text_arena, &amp;.{ dir_name, file_entry.path });
-    return .{
-        .line = entry.line,
-        .column = entry.column,
-        .file_name = file_name,
-    };
-}
-
-fn getString(di: Dwarf, offset: u64) ![:0]const u8 {
-    return getStringGeneric(di.section(.debug_str), offset);
-}
-
-fn getLineString(di: Dwarf, offset: u64) ![:0]const u8 {
-    return getStringGeneric(di.section(.debug_line_str), offset);
-}
-
-fn readDebugAddr(di: Dwarf, endian: Endian, compile_unit: *const CompileUnit, index: u64) !u64 {
-    const debug_addr = di.section(.debug_addr) orelse return bad();
-
-    // addr_base points to the first item after the header, however we
-    // need to read the header to know the size of each item. Empirically,
-    // it may disagree with is_64 on the compile unit.
-    // The header is 8 or 12 bytes depending on is_64.
-    if (compile_unit.addr_base &lt; 8) return bad();
-
-    const version = mem.readInt(u16, debug_addr[compile_unit.addr_base - 4 ..][0..2], endian);
-    if (version != 5) return bad();
-
-    const addr_size = debug_addr[compile_unit.addr_base - 2];
-    const seg_size = debug_addr[compile_unit.addr_base - 1];
-
-    const byte_offset = compile_unit.addr_base + (addr_size + seg_size) * index;
-    if (byte_offset + addr_size &gt; debug_addr.len) return bad();
-    return switch (addr_size) {
-        1 =&gt; debug_addr[@intCast(byte_offset)],
-        2 =&gt; mem.readInt(u16, debug_addr[@intCast(byte_offset)..][0..2], endian),
-        4 =&gt; mem.readInt(u32, debug_addr[@intCast(byte_offset)..][0..4], endian),
-        8 =&gt; mem.readInt(u64, debug_addr[@intCast(byte_offset)..][0..8], endian),
-        else =&gt; bad(),
-    };
-}
-
-fn parseFormValue(
-    r: *Reader,
-    form_id: u64,
-    format: Format,
-    endian: Endian,
-    addr_size_bytes: u8,
-    implicit_const: ?i64,
-) ScanError!FormValue {
-    return switch (form_id) {
-        // DWARF5.pdf page 213: the size of this value is encoded in the
-        // compilation unit header as address size.
-        FORM.addr =&gt; .{ .addr = try readAddress(r, endian, addr_size_bytes) },
-        FORM.addrx1 =&gt; .{ .addrx = try r.takeByte() },
-        FORM.addrx2 =&gt; .{ .addrx = try r.takeInt(u16, endian) },
-        FORM.addrx3 =&gt; .{ .addrx = try r.takeInt(u24, endian) },
-        FORM.addrx4 =&gt; .{ .addrx = try r.takeInt(u32, endian) },
-        FORM.addrx =&gt; .{ .addrx = try r.takeLeb128(u64) },
-
-        FORM.block1 =&gt; .{ .block = try r.take(try r.takeByte()) },
-        FORM.block2 =&gt; .{ .block = try r.take(try r.takeInt(u16, endian)) },
-        FORM.block4 =&gt; .{ .block = try r.take(try r.takeInt(u32, endian)) },
-        FORM.block =&gt; .{ .block = try r.take(try r.takeLeb128(usize)) },
-
-        FORM.data1 =&gt; .{ .udata = try r.takeByte() },
-        FORM.data2 =&gt; .{ .udata = try r.takeInt(u16, endian) },
-        FORM.data4 =&gt; .{ .udata = try r.takeInt(u32, endian) },
-        FORM.data8 =&gt; .{ .udata = try r.takeInt(u64, endian) },
-        FORM.data16 =&gt; .{ .data16 = try r.takeArray(16) },
-        FORM.udata =&gt; .{ .udata = try r.takeLeb128(u64) },
-        FORM.sdata =&gt; .{ .sdata = try r.takeLeb128(i64) },
-        FORM.exprloc =&gt; .{ .exprloc = try r.take(try r.takeLeb128(usize)) },
-        FORM.flag =&gt; .{ .flag = (try r.takeByte()) != 0 },
-        FORM.flag_present =&gt; .{ .flag = true },
-        FORM.sec_offset =&gt; .{ .sec_offset = try readFormatSizedInt(r, format, endian) },
-
-        FORM.ref1 =&gt; .{ .ref = try r.takeByte() },
-        FORM.ref2 =&gt; .{ .ref = try r.takeInt(u16, endian) },
-        FORM.ref4 =&gt; .{ .ref = try r.takeInt(u32, endian) },
-        FORM.ref8 =&gt; .{ .ref = try r.takeInt(u64, endian) },
-        FORM.ref_udata =&gt; .{ .ref = try r.takeLeb128(u64) },
-
-        FORM.ref_addr =&gt; .{ .ref_addr = try readFormatSizedInt(r, format, endian) },
-        FORM.ref_sig8 =&gt; .{ .ref = try r.takeInt(u64, endian) },
-
-        FORM.string =&gt; .{ .string = try r.takeSentinel(0) },
-        FORM.strp =&gt; .{ .strp = try readFormatSizedInt(r, format, endian) },
-        FORM.strx1 =&gt; .{ .strx = try r.takeByte() },
-        FORM.strx2 =&gt; .{ .strx = try r.takeInt(u16, endian) },
-        FORM.strx3 =&gt; .{ .strx = try r.takeInt(u24, endian) },
-        FORM.strx4 =&gt; .{ .strx = try r.takeInt(u32, endian) },
-        FORM.strx =&gt; .{ .strx = try r.takeLeb128(usize) },
-        FORM.line_strp =&gt; .{ .line_strp = try readFormatSizedInt(r, format, endian) },
-        FORM.indirect =&gt; parseFormValue(r, try r.takeLeb128(u64), format, endian, addr_size_bytes, implicit_const),
-        FORM.implicit_const =&gt; .{ .sdata = implicit_const orelse return bad() },
-        FORM.loclistx =&gt; .{ .loclistx = try r.takeLeb128(u64) },
-        FORM.rnglistx =&gt; .{ .rnglistx = try r.takeLeb128(u64) },
-        else =&gt; {
-            //debug.print("unrecognized form id: {x}\n", .{form_id});
-            return bad();
-        },
-    };
-}
-
-const FileEntry = struct {
-    path: []const u8,
-    dir_index: u32 = 0,
-    mtime: u64 = 0,
-    size: u64 = 0,
-    md5: [16]u8 = [1]u8{0} ** 16,
-};
-
-const LineNumberProgram = struct {
-    address: u64,
-    file: usize,
-    line: i64,
-    column: u64,
-    version: u16,
-    is_stmt: bool,
-    basic_block: bool,
-
-    default_is_stmt: bool,
-
-    // Reset the state machine following the DWARF specification
-    pub fn reset(self: *LineNumberProgram) void {
-        self.address = 0;
-        self.file = 1;
-        self.line = 1;
-        self.column = 0;
-        self.is_stmt = self.default_is_stmt;
-        self.basic_block = false;
-    }
-
-    pub fn init(is_stmt: bool, version: u16) LineNumberProgram {
-        return .{
-            .address = 0,
-            .file = 1,
-            .line = 1,
-            .column = 0,
-            .version = version,
-            .is_stmt = is_stmt,
-            .basic_block = false,
-            .default_is_stmt = is_stmt,
-        };
-    }
-
-    pub fn addRow(prog: *LineNumberProgram, gpa: Allocator, table: *CompileUnit.SrcLocCache.LineTable) !void {
-        if (prog.line == 0) {
-            //if (debug_debug_mode) @panic("garbage line data");
-            return;
-        }
-        if (debug_debug_mode) assert(!table.contains(prog.address));
-        try table.put(gpa, prog.address, .{
-            .line = cast(u32, prog.line) orelse maxInt(u32),
-            .column = cast(u32, prog.column) orelse maxInt(u32),
-            .file = cast(u32, prog.file) orelse return bad(),
-        });
-    }
-};
-
-const UnitHeader = struct {
-    format: Format,
-    header_length: u4,
-    unit_length: u64,
-};
-
-pub fn readUnitHeader(r: *Reader, endian: Endian) ScanError!UnitHeader {
-    return switch (try r.takeInt(u32, endian)) {
-        0...0xfffffff0 - 1 =&gt; |unit_length| .{
-            .format = .@"32",
-            .header_length = 4,
-            .unit_length = unit_length,
-        },
-        0xfffffff0...0xffffffff - 1 =&gt; bad(),
-        0xffffffff =&gt; .{
-            .format = .@"64",
-            .header_length = 12,
-            .unit_length = try r.takeInt(u64, endian),
-        },
-    };
-}
-
-/// Returns the DWARF register number for an x86_64 register number found in compact unwind info
-pub fn compactUnwindToDwarfRegNumber(unwind_reg_number: u3) !u16 {
-    return switch (unwind_reg_number) {
-        1 =&gt; 3, // RBX
-        2 =&gt; 12, // R12
-        3 =&gt; 13, // R13
-        4 =&gt; 14, // R14
-        5 =&gt; 15, // R15
-        6 =&gt; 6, // RBP
-        else =&gt; error.InvalidRegister,
-    };
-}
-
-/// Returns `null` for CPU architectures without an instruction pointer register.
-pub fn ipRegNum(arch: std.Target.Cpu.Arch) ?u16 {
-    return switch (arch) {
-        .aarch64, .aarch64_be =&gt; 32,
-        .arc, .arceb =&gt; 160,
-        .arm, .armeb, .thumb, .thumbeb =&gt; 15,
-        .csky =&gt; 64,
-        .hexagon =&gt; 76,
-        .kvx =&gt; 64,
-        .lanai =&gt; 2,
-        .loongarch32, .loongarch64 =&gt; 64,
-        .m68k =&gt; 26,
-        .mips, .mipsel, .mips64, .mips64el =&gt; 66,
-        .or1k =&gt; 35,
-        .powerpc, .powerpcle, .powerpc64, .powerpc64le =&gt; 67,
-        .riscv32, .riscv32be, .riscv64, .riscv64be =&gt; 65,
-        .s390x =&gt; 65,
-        .sparc, .sparc64 =&gt; 32,
-        .ve =&gt; 144,
-        .x86 =&gt; 8,
-        .x86_64 =&gt; 16,
-        else =&gt; null,
-    };
-}
-
-pub fn fpRegNum(arch: std.Target.Cpu.Arch) u16 {
-    return switch (arch) {
-        .aarch64, .aarch64_be =&gt; 29,
-        .arc, .arceb =&gt; 27,
-        .arm, .armeb, .thumb, .thumbeb =&gt; 11,
-        .csky =&gt; 14,
-        .hexagon =&gt; 30,
-        .kvx =&gt; 14,
-        .lanai =&gt; 5,
-        .loongarch32, .loongarch64 =&gt; 22,
-        .m68k =&gt; 14,
-        .mips, .mipsel, .mips64, .mips64el =&gt; 30,
-        .or1k =&gt; 2,
-        .powerpc, .powerpcle, .powerpc64, .powerpc64le =&gt; 1,
-        .riscv32, .riscv32be, .riscv64, .riscv64be =&gt; 8,
-        .s390x =&gt; 11,
-        .sparc, .sparc64 =&gt; 30,
-        .ve =&gt; 9,
-        .x86 =&gt; 5,
-        .x86_64 =&gt; 6,
-        else =&gt; unreachable,
-    };
-}
-
-pub fn spRegNum(arch: std.Target.Cpu.Arch) u16 {
-    return switch (arch) {
-        .aarch64, .aarch64_be =&gt; 31,
-        .arc, .arceb =&gt; 28,
-        .arm, .armeb, .thumb, .thumbeb =&gt; 13,
-        .csky =&gt; 14,
-        .hexagon =&gt; 29,
-        .kvx =&gt; 12,
-        .lanai =&gt; 4,
-        .loongarch32, .loongarch64 =&gt; 3,
-        .m68k =&gt; 15,
-        .mips, .mipsel, .mips64, .mips64el =&gt; 29,
-        .or1k =&gt; 1,
-        .powerpc, .powerpcle, .powerpc64, .powerpc64le =&gt; 1,
-        .riscv32, .riscv32be, .riscv64, .riscv64be =&gt; 2,
-        .s390x =&gt; 15,
-        .sparc, .sparc64 =&gt; 14,
-        .ve =&gt; 11,
-        .x86 =&gt; 4,
-        .x86_64 =&gt; 7,
-        else =&gt; unreachable,
-    };
-}
-
-/// Tells whether unwinding for this target is supported by the Dwarf standard.
-///
-/// See also `std.debug.SelfInfo.can_unwind` which tells whether the Zig standard
-/// library has a working implementation of unwinding for the current target.
-pub fn supportsUnwinding(target: *const std.Target) bool {
-    return switch (target.cpu.arch) {
-        .amdgcn,
-        .nvptx,
-        .nvptx64,
-        .spirv32,
-        .spirv64,
-        =&gt; false,
-
-        // Conservative guess. Feel free to update this logic with any targets
-        // that are known to not support Dwarf unwinding.
-        else =&gt; true,
-    };
-}
-
-/// This function is to make it handy to comment out the return and make it
-/// into a crash when working on this file.
-pub fn bad() error{InvalidDebugInfo} {
-    invalidDebugInfoDetected();
-    return error.InvalidDebugInfo;
-}
-
-pub fn invalidDebugInfoDetected() void {
-    if (debug_debug_mode) @panic("bad dwarf");
-}
-
-pub fn missing() error{MissingDebugInfo} {
-    if (debug_debug_mode) @panic("missing dwarf");
-    return error.MissingDebugInfo;
-}
-
-fn getStringGeneric(opt_str: ?[]const u8, offset: u64) ![:0]const u8 {
-    const str = opt_str orelse return bad();
-    if (offset &gt; str.len) return bad();
-    const casted_offset = cast(usize, offset) orelse return bad();
-    // Valid strings always have a terminating zero byte
-    const last = std.mem.findScalarPos(u8, str, casted_offset, 0) orelse return bad();
-    return str[casted_offset..last :0];
-}
-
-pub fn getSymbols(
-    di: *Dwarf,
-    symbol_allocator: Allocator,
-    text_arena: Allocator,
-    endian: Endian,
-    address: u64,
-    resolve_inline_callers: bool,
-    symbols: *std.ArrayList(std.debug.Symbol),
-) std.debug.SelfInfoError!void {
-    _ = resolve_inline_callers;
-    const gpa = std.debug.getDebugInfoAllocator();
-
-    const compile_unit = di.findCompileUnit(endian, address) catch |err| switch (err) {
-        error.EndOfStream =&gt; return error.MissingDebugInfo,
-        error.Overflow =&gt; return error.InvalidDebugInfo,
-        error.ReadFailed, error.InvalidDebugInfo, error.MissingDebugInfo =&gt; |e| return e,
-    };
-    try symbols.append(symbol_allocator, .{
-        .name = di.getSymbolName(address),
-        .compile_unit_name = compile_unit.die.getAttrString(di, endian, std.dwarf.AT.name, di.section(.debug_str), compile_unit) catch |err| switch (err) {
-            error.MissingDebugInfo, error.InvalidDebugInfo =&gt; null,
-        },
-        .source_location = di.getLineNumberInfo(gpa, text_arena, endian, compile_unit, address) catch |err| switch (err) {
-            error.MissingDebugInfo, error.InvalidDebugInfo =&gt; null,
-            error.ReadFailed,
-            error.EndOfStream,
-            error.Overflow,
-            error.StreamTooLong,
-            =&gt; return error.InvalidDebugInfo,
-            else =&gt; |e| return e,
-        },
-    });
-}
-
-/// DWARF5 7.4: "In the 32-bit DWARF format, all values that represent lengths of DWARF sections and
-/// offsets relative to the beginning of DWARF sections are represented using four bytes. In the
-/// 64-bit DWARF format, all values that represent lengths of DWARF sections and offsets relative to
-/// the beginning of DWARF sections are represented using eight bytes".
-///
-/// This function is for reading such values.
-fn readFormatSizedInt(r: *Reader, format: std.dwarf.Format, endian: Endian) !u64 {
-    return switch (format) {
-        .@"32" =&gt; try r.takeInt(u32, endian),
-        .@"64" =&gt; try r.takeInt(u64, endian),
-    };
-}
-
-fn readAddress(r: *Reader, endian: Endian, addr_size_bytes: u8) !u64 {
-    return switch (addr_size_bytes) {
-        2 =&gt; try r.takeInt(u16, endian),
-        4 =&gt; try r.takeInt(u32, endian),
-        8 =&gt; try r.takeInt(u64, endian),
-        else =&gt; return bad(),
-    };
-}</pre>
+    <pre><a id="L1"></a>//! Implements parsing, decoding, and caching of DWARF information.
+<a id="L2"></a>//!
+<a id="L3"></a>//! This API makes no assumptions about the relationship between the host and
+<a id="L4"></a>//! the target being debugged. In other words, any DWARF information can be used
+<a id="L5"></a>//! from any host via this API. Note, however, that the limits of 32-bit
+<a id="L6"></a>//! addressing can cause very large 64-bit binaries to be impossible to open on
+<a id="L7"></a>//! 32-bit hosts.
+<a id="L8"></a>//!
+<a id="L9"></a>//! For unopinionated types and bits, see `std.dwarf`.
+<a id="L10"></a>
+<a id="L11"></a>const std = @import("../std.zig");
+<a id="L12"></a>const Allocator = std.mem.Allocator;
+<a id="L13"></a>const mem = std.mem;
+<a id="L14"></a>const DW = std.dwarf;
+<a id="L15"></a>const AT = DW.AT;
+<a id="L16"></a>const FORM = DW.FORM;
+<a id="L17"></a>const Format = DW.Format;
+<a id="L18"></a>const RLE = DW.RLE;
+<a id="L19"></a>const UT = DW.UT;
+<a id="L20"></a>const assert = std.debug.assert;
+<a id="L21"></a>const cast = std.math.cast;
+<a id="L22"></a>const maxInt = std.math.maxInt;
+<a id="L23"></a>const ArrayList = std.ArrayList;
+<a id="L24"></a>const Endian = std.builtin.Endian;
+<a id="L25"></a>const Io = std.Io;
+<a id="L26"></a>const Reader = Io.Reader;
+<a id="L27"></a>const Error = std.debug.SelfInfoError;
+<a id="L28"></a>
+<a id="L29"></a>const Dwarf = @This();
+<a id="L30"></a>
+<a id="L31"></a>pub const expression = @import("Dwarf/expression.zig");
+<a id="L32"></a>pub const Unwind = @import("Dwarf/Unwind.zig");
+<a id="L33"></a>pub const SelfUnwinder = @import("Dwarf/SelfUnwinder.zig");
+<a id="L34"></a>
+<a id="L35"></a>/// Useful to temporarily enable while working on this file.
+<a id="L36"></a>const debug_debug_mode = false;
+<a id="L37"></a>
+<a id="L38"></a>sections: SectionArray = @splat(null),
+<a id="L39"></a>
+<a id="L40"></a>/// Filled later by the initializer
+<a id="L41"></a>abbrev_table_list: ArrayList(Abbrev.Table) = .empty,
+<a id="L42"></a>/// Filled later by the initializer
+<a id="L43"></a>compile_unit_list: ArrayList(CompileUnit) = .empty,
+<a id="L44"></a>/// Filled later by the initializer
+<a id="L45"></a>func_list: ArrayList(Func) = .empty,
+<a id="L46"></a>
+<a id="L47"></a>/// Populated by `populateRanges`.
+<a id="L48"></a>ranges: ArrayList(Range) = .empty,
+<a id="L49"></a>
+<a id="L50"></a>pub const Range = struct {
+<a id="L51"></a>    start: u64,
+<a id="L52"></a>    end: u64,
+<a id="L53"></a>    /// Index into `compile_unit_list`.
+<a id="L54"></a>    compile_unit_index: usize,
+<a id="L55"></a>};
+<a id="L56"></a>
+<a id="L57"></a>pub const Section = struct {
+<a id="L58"></a>    data: []const u8,
+<a id="L59"></a>    /// If `data` is owned by this Dwarf.
+<a id="L60"></a>    owned: bool,
+<a id="L61"></a>
+<a id="L62"></a>    pub const Id = enum {
+<a id="L63"></a>        debug_info,
+<a id="L64"></a>        debug_abbrev,
+<a id="L65"></a>        debug_str,
+<a id="L66"></a>        debug_str_offsets,
+<a id="L67"></a>        debug_line,
+<a id="L68"></a>        debug_line_str,
+<a id="L69"></a>        debug_ranges,
+<a id="L70"></a>        debug_loclists,
+<a id="L71"></a>        debug_rnglists,
+<a id="L72"></a>        debug_addr,
+<a id="L73"></a>        debug_names,
+<a id="L74"></a>    };
+<a id="L75"></a>};
+<a id="L76"></a>
+<a id="L77"></a>pub const Abbrev = struct {
+<a id="L78"></a>    code: u64,
+<a id="L79"></a>    tag_id: u64,
+<a id="L80"></a>    has_children: bool,
+<a id="L81"></a>    attrs: []Attr,
+<a id="L82"></a>
+<a id="L83"></a>    fn deinit(abbrev: *Abbrev, gpa: Allocator) void {
+<a id="L84"></a>        gpa.free(abbrev.attrs);
+<a id="L85"></a>        abbrev.* = undefined;
+<a id="L86"></a>    }
+<a id="L87"></a>
+<a id="L88"></a>    const Attr = struct {
+<a id="L89"></a>        id: u64,
+<a id="L90"></a>        form_id: u64,
+<a id="L91"></a>        /// Only valid if form_id is .implicit_const
+<a id="L92"></a>        payload: i64,
+<a id="L93"></a>    };
+<a id="L94"></a>
+<a id="L95"></a>    const Table = struct {
+<a id="L96"></a>        // offset from .debug_abbrev
+<a id="L97"></a>        offset: u64,
+<a id="L98"></a>        abbrevs: []Abbrev,
+<a id="L99"></a>
+<a id="L100"></a>        fn deinit(table: *Table, gpa: Allocator) void {
+<a id="L101"></a>            for (table.abbrevs) |*abbrev| {
+<a id="L102"></a>                abbrev.deinit(gpa);
+<a id="L103"></a>            }
+<a id="L104"></a>            gpa.free(table.abbrevs);
+<a id="L105"></a>            table.* = undefined;
+<a id="L106"></a>        }
+<a id="L107"></a>
+<a id="L108"></a>        fn get(table: *const Table, abbrev_code: u64) ?*const Abbrev {
+<a id="L109"></a>            return for (table.abbrevs) |*abbrev| {
+<a id="L110"></a>                if (abbrev.code == abbrev_code) break abbrev;
+<a id="L111"></a>            } else null;
+<a id="L112"></a>        }
+<a id="L113"></a>    };
+<a id="L114"></a>};
+<a id="L115"></a>
+<a id="L116"></a>pub const CompileUnit = struct {
+<a id="L117"></a>    version: u16,
+<a id="L118"></a>    format: Format,
+<a id="L119"></a>    addr_size_bytes: u8,
+<a id="L120"></a>    die: Die,
+<a id="L121"></a>    pc_range: ?PcRange,
+<a id="L122"></a>
+<a id="L123"></a>    str_offsets_base: usize,
+<a id="L124"></a>    addr_base: usize,
+<a id="L125"></a>    rnglists_base: usize,
+<a id="L126"></a>    loclists_base: usize,
+<a id="L127"></a>    frame_base: ?*const FormValue,
+<a id="L128"></a>
+<a id="L129"></a>    src_loc_cache: ?SrcLocCache,
+<a id="L130"></a>
+<a id="L131"></a>    pub const SrcLocCache = struct {
+<a id="L132"></a>        line_table: LineTable,
+<a id="L133"></a>        directories: []const FileEntry,
+<a id="L134"></a>        files: []FileEntry,
+<a id="L135"></a>        version: u16,
+<a id="L136"></a>
+<a id="L137"></a>        pub const LineTable = std.AutoArrayHashMapUnmanaged(u64, LineEntry);
+<a id="L138"></a>
+<a id="L139"></a>        pub const LineEntry = struct {
+<a id="L140"></a>            line: u32,
+<a id="L141"></a>            column: u32,
+<a id="L142"></a>            /// Offset by 1 depending on whether Dwarf version is &gt;= 5.
+<a id="L143"></a>            file: u32,
+<a id="L144"></a>
+<a id="L145"></a>            pub const invalid: LineEntry = .{
+<a id="L146"></a>                .line = undefined,
+<a id="L147"></a>                .column = undefined,
+<a id="L148"></a>                .file = std.math.maxInt(u32),
+<a id="L149"></a>            };
+<a id="L150"></a>
+<a id="L151"></a>            pub fn isInvalid(le: LineEntry) bool {
+<a id="L152"></a>                return le.file == invalid.file;
+<a id="L153"></a>            }
+<a id="L154"></a>        };
+<a id="L155"></a>
+<a id="L156"></a>        pub fn findSource(slc: *const SrcLocCache, address: u64) !LineEntry {
+<a id="L157"></a>            const index = std.sort.upperBound(u64, slc.line_table.keys(), address, struct {
+<a id="L158"></a>                fn order(context: u64, item: u64) std.math.Order {
+<a id="L159"></a>                    return std.math.order(context, item);
+<a id="L160"></a>                }
+<a id="L161"></a>            }.order);
+<a id="L162"></a>            if (index == 0) return missing();
+<a id="L163"></a>            return slc.line_table.values()[index - 1];
+<a id="L164"></a>        }
+<a id="L165"></a>    };
+<a id="L166"></a>};
+<a id="L167"></a>
+<a id="L168"></a>pub const FormValue = union(enum) {
+<a id="L169"></a>    addr: u64,
+<a id="L170"></a>    addrx: u64,
+<a id="L171"></a>    block: []const u8,
+<a id="L172"></a>    udata: u64,
+<a id="L173"></a>    data16: *const [16]u8,
+<a id="L174"></a>    sdata: i64,
+<a id="L175"></a>    exprloc: []const u8,
+<a id="L176"></a>    flag: bool,
+<a id="L177"></a>    sec_offset: u64,
+<a id="L178"></a>    ref: u64,
+<a id="L179"></a>    ref_addr: u64,
+<a id="L180"></a>    string: [:0]const u8,
+<a id="L181"></a>    strp: u64,
+<a id="L182"></a>    strx: u64,
+<a id="L183"></a>    line_strp: u64,
+<a id="L184"></a>    loclistx: u64,
+<a id="L185"></a>    rnglistx: u64,
+<a id="L186"></a>
+<a id="L187"></a>    fn getString(fv: FormValue, di: Dwarf) ![:0]const u8 {
+<a id="L188"></a>        switch (fv) {
+<a id="L189"></a>            .string =&gt; |s| return s,
+<a id="L190"></a>            .strp =&gt; |off| return di.getString(off),
+<a id="L191"></a>            .line_strp =&gt; |off| return di.getLineString(off),
+<a id="L192"></a>            else =&gt; return bad(),
+<a id="L193"></a>        }
+<a id="L194"></a>    }
+<a id="L195"></a>
+<a id="L196"></a>    fn getUInt(fv: FormValue, comptime U: type) !U {
+<a id="L197"></a>        return switch (fv) {
+<a id="L198"></a>            inline .udata,
+<a id="L199"></a>            .sdata,
+<a id="L200"></a>            .sec_offset,
+<a id="L201"></a>            =&gt; |c| cast(U, c) orelse bad(),
+<a id="L202"></a>            else =&gt; bad(),
+<a id="L203"></a>        };
+<a id="L204"></a>    }
+<a id="L205"></a>};
+<a id="L206"></a>
+<a id="L207"></a>pub const Die = struct {
+<a id="L208"></a>    tag_id: u64,
+<a id="L209"></a>    has_children: bool,
+<a id="L210"></a>    attrs: []Attr,
+<a id="L211"></a>
+<a id="L212"></a>    const Attr = struct {
+<a id="L213"></a>        id: u64,
+<a id="L214"></a>        value: FormValue,
+<a id="L215"></a>    };
+<a id="L216"></a>
+<a id="L217"></a>    fn deinit(self: *Die, gpa: Allocator) void {
+<a id="L218"></a>        gpa.free(self.attrs);
+<a id="L219"></a>        self.* = undefined;
+<a id="L220"></a>    }
+<a id="L221"></a>
+<a id="L222"></a>    fn getAttr(self: *const Die, id: u64) ?*const FormValue {
+<a id="L223"></a>        for (self.attrs) |*attr| {
+<a id="L224"></a>            if (attr.id == id) return &amp;attr.value;
+<a id="L225"></a>        }
+<a id="L226"></a>        return null;
+<a id="L227"></a>    }
+<a id="L228"></a>
+<a id="L229"></a>    fn getAttrAddr(
+<a id="L230"></a>        self: *const Die,
+<a id="L231"></a>        di: *const Dwarf,
+<a id="L232"></a>        endian: Endian,
+<a id="L233"></a>        id: u64,
+<a id="L234"></a>        compile_unit: *const CompileUnit,
+<a id="L235"></a>    ) error{ InvalidDebugInfo, MissingDebugInfo }!u64 {
+<a id="L236"></a>        const form_value = self.getAttr(id) orelse return error.MissingDebugInfo;
+<a id="L237"></a>        return switch (form_value.*) {
+<a id="L238"></a>            .addr =&gt; |value| value,
+<a id="L239"></a>            .addrx =&gt; |index| di.readDebugAddr(endian, compile_unit, index),
+<a id="L240"></a>            else =&gt; bad(),
+<a id="L241"></a>        };
+<a id="L242"></a>    }
+<a id="L243"></a>
+<a id="L244"></a>    fn getAttrSecOffset(self: *const Die, id: u64) !u64 {
+<a id="L245"></a>        const form_value = self.getAttr(id) orelse return error.MissingDebugInfo;
+<a id="L246"></a>        return form_value.getUInt(u64);
+<a id="L247"></a>    }
+<a id="L248"></a>
+<a id="L249"></a>    fn getAttrUnsignedLe(self: *const Die, id: u64) !u64 {
+<a id="L250"></a>        const form_value = self.getAttr(id) orelse return error.MissingDebugInfo;
+<a id="L251"></a>        return switch (form_value.*) {
+<a id="L252"></a>            .Const =&gt; |value| value.asUnsignedLe(),
+<a id="L253"></a>            else =&gt; bad(),
+<a id="L254"></a>        };
+<a id="L255"></a>    }
+<a id="L256"></a>
+<a id="L257"></a>    fn getAttrRef(self: *const Die, id: u64, unit_offset: u64, unit_len: u64) !u64 {
+<a id="L258"></a>        const form_value = self.getAttr(id) orelse return error.MissingDebugInfo;
+<a id="L259"></a>        return switch (form_value.*) {
+<a id="L260"></a>            .ref =&gt; |offset| if (offset &lt; unit_len) unit_offset + offset else bad(),
+<a id="L261"></a>            .ref_addr =&gt; |addr| addr,
+<a id="L262"></a>            else =&gt; bad(),
+<a id="L263"></a>        };
+<a id="L264"></a>    }
+<a id="L265"></a>
+<a id="L266"></a>    pub fn getAttrString(
+<a id="L267"></a>        self: *const Die,
+<a id="L268"></a>        di: *Dwarf,
+<a id="L269"></a>        endian: Endian,
+<a id="L270"></a>        id: u64,
+<a id="L271"></a>        opt_str: ?[]const u8,
+<a id="L272"></a>        compile_unit: *const CompileUnit,
+<a id="L273"></a>    ) error{ InvalidDebugInfo, MissingDebugInfo }![]const u8 {
+<a id="L274"></a>        const form_value = self.getAttr(id) orelse return error.MissingDebugInfo;
+<a id="L275"></a>        switch (form_value.*) {
+<a id="L276"></a>            .string =&gt; |value| return value,
+<a id="L277"></a>            .strp =&gt; |offset| return di.getString(offset),
+<a id="L278"></a>            .strx =&gt; |index| {
+<a id="L279"></a>                const debug_str_offsets = di.section(.debug_str_offsets) orelse return bad();
+<a id="L280"></a>                if (compile_unit.str_offsets_base == 0) return bad();
+<a id="L281"></a>                switch (compile_unit.format) {
+<a id="L282"></a>                    .@"32" =&gt; {
+<a id="L283"></a>                        const byte_offset = compile_unit.str_offsets_base + 4 * index;
+<a id="L284"></a>                        if (byte_offset + 4 &gt; debug_str_offsets.len) return bad();
+<a id="L285"></a>                        const offset = mem.readInt(u32, debug_str_offsets[@intCast(byte_offset)..][0..4], endian);
+<a id="L286"></a>                        return getStringGeneric(opt_str, offset);
+<a id="L287"></a>                    },
+<a id="L288"></a>                    .@"64" =&gt; {
+<a id="L289"></a>                        const byte_offset = compile_unit.str_offsets_base + 8 * index;
+<a id="L290"></a>                        if (byte_offset + 8 &gt; debug_str_offsets.len) return bad();
+<a id="L291"></a>                        const offset = mem.readInt(u64, debug_str_offsets[@intCast(byte_offset)..][0..8], endian);
+<a id="L292"></a>                        return getStringGeneric(opt_str, offset);
+<a id="L293"></a>                    },
+<a id="L294"></a>                }
+<a id="L295"></a>            },
+<a id="L296"></a>            .line_strp =&gt; |offset| return di.getLineString(offset),
+<a id="L297"></a>            else =&gt; return bad(),
+<a id="L298"></a>        }
+<a id="L299"></a>    }
+<a id="L300"></a>};
+<a id="L301"></a>
+<a id="L302"></a>const num_sections = std.enums.directEnumArrayLen(Section.Id, 0);
+<a id="L303"></a>pub const SectionArray = [num_sections]?Section;
+<a id="L304"></a>
+<a id="L305"></a>pub const OpenError = ScanError;
+<a id="L306"></a>
+<a id="L307"></a>/// Initialize DWARF info. The caller has the responsibility to initialize most
+<a id="L308"></a>/// the `Dwarf` fields before calling. `binary_mem` is the raw bytes of the
+<a id="L309"></a>/// main binary file (not the secondary debug info file).
+<a id="L310"></a>pub fn open(d: *Dwarf, gpa: Allocator, endian: Endian) OpenError!void {
+<a id="L311"></a>    try d.scanAllFunctions(gpa, endian);
+<a id="L312"></a>    try d.scanAllCompileUnits(gpa, endian);
+<a id="L313"></a>}
+<a id="L314"></a>
+<a id="L315"></a>const PcRange = struct {
+<a id="L316"></a>    start: u64,
+<a id="L317"></a>    end: u64,
+<a id="L318"></a>};
+<a id="L319"></a>
+<a id="L320"></a>const Func = struct {
+<a id="L321"></a>    pc_range: ?PcRange,
+<a id="L322"></a>    name: ?[]const u8,
+<a id="L323"></a>};
+<a id="L324"></a>
+<a id="L325"></a>pub fn section(di: Dwarf, dwarf_section: Section.Id) ?[]const u8 {
+<a id="L326"></a>    return if (di.sections[@intFromEnum(dwarf_section)]) |s| s.data else null;
+<a id="L327"></a>}
+<a id="L328"></a>
+<a id="L329"></a>pub fn deinit(di: *Dwarf, gpa: Allocator) void {
+<a id="L330"></a>    for (di.sections) |opt_section| {
+<a id="L331"></a>        if (opt_section) |s| if (s.owned) gpa.free(s.data);
+<a id="L332"></a>    }
+<a id="L333"></a>    for (di.abbrev_table_list.items) |*abbrev| {
+<a id="L334"></a>        abbrev.deinit(gpa);
+<a id="L335"></a>    }
+<a id="L336"></a>    di.abbrev_table_list.deinit(gpa);
+<a id="L337"></a>    for (di.compile_unit_list.items) |*cu| {
+<a id="L338"></a>        if (cu.src_loc_cache) |*slc| {
+<a id="L339"></a>            slc.line_table.deinit(gpa);
+<a id="L340"></a>            gpa.free(slc.directories);
+<a id="L341"></a>            gpa.free(slc.files);
+<a id="L342"></a>        }
+<a id="L343"></a>        cu.die.deinit(gpa);
+<a id="L344"></a>    }
+<a id="L345"></a>    di.compile_unit_list.deinit(gpa);
+<a id="L346"></a>    di.func_list.deinit(gpa);
+<a id="L347"></a>    di.ranges.deinit(gpa);
+<a id="L348"></a>    di.* = undefined;
+<a id="L349"></a>}
+<a id="L350"></a>
+<a id="L351"></a>pub fn getSymbolName(di: *const Dwarf, address: u64) ?[]const u8 {
+<a id="L352"></a>    // Iterate the function list backwards so that we see child DIEs before their parents. This is
+<a id="L353"></a>    // important because `DW_TAG_inlined_subroutine` DIEs will have a range which is a sub-range of
+<a id="L354"></a>    // their caller, and we want to return the callee's name, not the caller's.
+<a id="L355"></a>    var i: usize = di.func_list.items.len;
+<a id="L356"></a>    while (i &gt; 0) {
+<a id="L357"></a>        i -= 1;
+<a id="L358"></a>        const func = &amp;di.func_list.items[i];
+<a id="L359"></a>        if (func.pc_range) |range| {
+<a id="L360"></a>            if (address &gt;= range.start and address &lt; range.end) {
+<a id="L361"></a>                return func.name;
+<a id="L362"></a>            }
+<a id="L363"></a>        }
+<a id="L364"></a>    }
+<a id="L365"></a>
+<a id="L366"></a>    return null;
+<a id="L367"></a>}
+<a id="L368"></a>
+<a id="L369"></a>pub const ScanError = error{
+<a id="L370"></a>    InvalidDebugInfo,
+<a id="L371"></a>    MissingDebugInfo,
+<a id="L372"></a>    ReadFailed,
+<a id="L373"></a>    EndOfStream,
+<a id="L374"></a>    Overflow,
+<a id="L375"></a>    StreamTooLong,
+<a id="L376"></a>} || Allocator.Error;
+<a id="L377"></a>
+<a id="L378"></a>fn scanAllFunctions(di: *Dwarf, gpa: Allocator, endian: Endian) ScanError!void {
+<a id="L379"></a>    var fr: Reader = .fixed(di.section(.debug_info).?);
+<a id="L380"></a>    var this_unit_offset: u64 = 0;
+<a id="L381"></a>
+<a id="L382"></a>    while (this_unit_offset &lt; fr.buffer.len) {
+<a id="L383"></a>        fr.seek = @intCast(this_unit_offset);
+<a id="L384"></a>
+<a id="L385"></a>        const unit_header = try readUnitHeader(&amp;fr, endian);
+<a id="L386"></a>        if (unit_header.unit_length == 0) return;
+<a id="L387"></a>        const next_offset = unit_header.header_length + unit_header.unit_length;
+<a id="L388"></a>
+<a id="L389"></a>        const version = try fr.takeInt(u16, endian);
+<a id="L390"></a>        if (version &lt; 2 or version &gt; 5) return bad();
+<a id="L391"></a>
+<a id="L392"></a>        var address_size: u8 = undefined;
+<a id="L393"></a>        var debug_abbrev_offset: u64 = undefined;
+<a id="L394"></a>        if (version &gt;= 5) {
+<a id="L395"></a>            const unit_type = try fr.takeByte();
+<a id="L396"></a>            if (unit_type != DW.UT.compile) return bad();
+<a id="L397"></a>            address_size = try fr.takeByte();
+<a id="L398"></a>            debug_abbrev_offset = try readFormatSizedInt(&amp;fr, unit_header.format, endian);
+<a id="L399"></a>        } else {
+<a id="L400"></a>            debug_abbrev_offset = try readFormatSizedInt(&amp;fr, unit_header.format, endian);
+<a id="L401"></a>            address_size = try fr.takeByte();
+<a id="L402"></a>        }
+<a id="L403"></a>
+<a id="L404"></a>        const abbrev_table = try di.getAbbrevTable(gpa, debug_abbrev_offset);
+<a id="L405"></a>
+<a id="L406"></a>        var max_attrs: usize = 0;
+<a id="L407"></a>        var zig_padding_abbrev_code: u7 = 0;
+<a id="L408"></a>        for (abbrev_table.abbrevs) |abbrev| {
+<a id="L409"></a>            max_attrs = @max(max_attrs, abbrev.attrs.len);
+<a id="L410"></a>            if (cast(u7, abbrev.code)) |code| {
+<a id="L411"></a>                if (abbrev.tag_id == DW.TAG.ZIG_padding and
+<a id="L412"></a>                    !abbrev.has_children and
+<a id="L413"></a>                    abbrev.attrs.len == 0)
+<a id="L414"></a>                {
+<a id="L415"></a>                    zig_padding_abbrev_code = code;
+<a id="L416"></a>                }
+<a id="L417"></a>            }
+<a id="L418"></a>        }
+<a id="L419"></a>        const attrs_buf = try gpa.alloc(Die.Attr, max_attrs * 3);
+<a id="L420"></a>        defer gpa.free(attrs_buf);
+<a id="L421"></a>        var attrs_bufs: [3][]Die.Attr = undefined;
+<a id="L422"></a>        for (&amp;attrs_bufs, 0..) |*buf, index| buf.* = attrs_buf[index * max_attrs ..][0..max_attrs];
+<a id="L423"></a>
+<a id="L424"></a>        const next_unit_pos = this_unit_offset + next_offset;
+<a id="L425"></a>
+<a id="L426"></a>        var compile_unit: CompileUnit = .{
+<a id="L427"></a>            .version = version,
+<a id="L428"></a>            .format = unit_header.format,
+<a id="L429"></a>            .addr_size_bytes = address_size,
+<a id="L430"></a>            .die = undefined,
+<a id="L431"></a>            .pc_range = null,
+<a id="L432"></a>
+<a id="L433"></a>            .str_offsets_base = 0,
+<a id="L434"></a>            .addr_base = 0,
+<a id="L435"></a>            .rnglists_base = 0,
+<a id="L436"></a>            .loclists_base = 0,
+<a id="L437"></a>            .frame_base = null,
+<a id="L438"></a>            .src_loc_cache = null,
+<a id="L439"></a>        };
+<a id="L440"></a>
+<a id="L441"></a>        while (true) {
+<a id="L442"></a>            fr.seek = std.mem.findNonePos(u8, fr.buffer, fr.seek, &amp;.{
+<a id="L443"></a>                zig_padding_abbrev_code, 0,
+<a id="L444"></a>            }) orelse fr.buffer.len;
+<a id="L445"></a>            if (fr.seek &gt;= next_unit_pos) break;
+<a id="L446"></a>            var die_obj = (try parseDie(
+<a id="L447"></a>                &amp;fr,
+<a id="L448"></a>                attrs_bufs[0],
+<a id="L449"></a>                abbrev_table,
+<a id="L450"></a>                unit_header.format,
+<a id="L451"></a>                endian,
+<a id="L452"></a>                address_size,
+<a id="L453"></a>            )) orelse continue;
+<a id="L454"></a>
+<a id="L455"></a>            switch (die_obj.tag_id) {
+<a id="L456"></a>                DW.TAG.compile_unit =&gt; {
+<a id="L457"></a>                    compile_unit.die = die_obj;
+<a id="L458"></a>                    compile_unit.die.attrs = attrs_bufs[1][0..die_obj.attrs.len];
+<a id="L459"></a>                    @memcpy(compile_unit.die.attrs, die_obj.attrs);
+<a id="L460"></a>
+<a id="L461"></a>                    compile_unit.str_offsets_base = if (die_obj.getAttr(AT.str_offsets_base)) |fv| try fv.getUInt(usize) else 0;
+<a id="L462"></a>                    compile_unit.addr_base = if (die_obj.getAttr(AT.addr_base)) |fv| try fv.getUInt(usize) else 0;
+<a id="L463"></a>                    compile_unit.rnglists_base = if (die_obj.getAttr(AT.rnglists_base)) |fv| try fv.getUInt(usize) else 0;
+<a id="L464"></a>                    compile_unit.loclists_base = if (die_obj.getAttr(AT.loclists_base)) |fv| try fv.getUInt(usize) else 0;
+<a id="L465"></a>                    compile_unit.frame_base = die_obj.getAttr(AT.frame_base);
+<a id="L466"></a>                },
+<a id="L467"></a>                DW.TAG.subprogram, DW.TAG.inlined_subroutine, DW.TAG.subroutine, DW.TAG.entry_point =&gt; {
+<a id="L468"></a>                    const fn_name = x: {
+<a id="L469"></a>                        var this_die_obj = die_obj;
+<a id="L470"></a>                        // Prevent endless loops
+<a id="L471"></a>                        for (0..3) |_| {
+<a id="L472"></a>                            if (this_die_obj.getAttr(AT.name)) |_| {
+<a id="L473"></a>                                break :x try this_die_obj.getAttrString(di, endian, AT.name, di.section(.debug_str), &amp;compile_unit);
+<a id="L474"></a>                            } else if (this_die_obj.getAttr(AT.abstract_origin)) |_| {
+<a id="L475"></a>                                const after_die_offset = fr.seek;
+<a id="L476"></a>                                defer fr.seek = after_die_offset;
+<a id="L477"></a>
+<a id="L478"></a>                                // Follow the DIE it points to and repeat
+<a id="L479"></a>                                const ref_offset = try this_die_obj.getAttrRef(AT.abstract_origin, this_unit_offset, next_offset);
+<a id="L480"></a>                                fr.seek = @intCast(ref_offset);
+<a id="L481"></a>                                this_die_obj = (try parseDie(
+<a id="L482"></a>                                    &amp;fr,
+<a id="L483"></a>                                    attrs_bufs[2],
+<a id="L484"></a>                                    abbrev_table, // wrong abbrev table for different cu
+<a id="L485"></a>                                    unit_header.format,
+<a id="L486"></a>                                    endian,
+<a id="L487"></a>                                    address_size,
+<a id="L488"></a>                                )) orelse return bad();
+<a id="L489"></a>                            } else if (this_die_obj.getAttr(AT.specification)) |_| {
+<a id="L490"></a>                                const after_die_offset = fr.seek;
+<a id="L491"></a>                                defer fr.seek = after_die_offset;
+<a id="L492"></a>
+<a id="L493"></a>                                // Follow the DIE it points to and repeat
+<a id="L494"></a>                                const ref_offset = try this_die_obj.getAttrRef(AT.specification, this_unit_offset, next_offset);
+<a id="L495"></a>                                fr.seek = @intCast(ref_offset);
+<a id="L496"></a>                                this_die_obj = (try parseDie(
+<a id="L497"></a>                                    &amp;fr,
+<a id="L498"></a>                                    attrs_bufs[2],
+<a id="L499"></a>                                    abbrev_table, // wrong abbrev table for different cu
+<a id="L500"></a>                                    unit_header.format,
+<a id="L501"></a>                                    endian,
+<a id="L502"></a>                                    address_size,
+<a id="L503"></a>                                )) orelse return bad();
+<a id="L504"></a>                            } else {
+<a id="L505"></a>                                break :x null;
+<a id="L506"></a>                            }
+<a id="L507"></a>                        }
+<a id="L508"></a>
+<a id="L509"></a>                        break :x null;
+<a id="L510"></a>                    };
+<a id="L511"></a>
+<a id="L512"></a>                    var range_added = if (die_obj.getAttrAddr(di, endian, AT.low_pc, &amp;compile_unit)) |low_pc| blk: {
+<a id="L513"></a>                        if (die_obj.getAttr(AT.high_pc)) |high_pc_value| {
+<a id="L514"></a>                            const pc_end = switch (high_pc_value.*) {
+<a id="L515"></a>                                .addr =&gt; |value| value,
+<a id="L516"></a>                                .udata =&gt; |offset| low_pc + offset,
+<a id="L517"></a>                                else =&gt; return bad(),
+<a id="L518"></a>                            };
+<a id="L519"></a>
+<a id="L520"></a>                            try di.func_list.append(gpa, .{
+<a id="L521"></a>                                .name = fn_name,
+<a id="L522"></a>                                .pc_range = .{
+<a id="L523"></a>                                    .start = low_pc,
+<a id="L524"></a>                                    .end = pc_end,
+<a id="L525"></a>                                },
+<a id="L526"></a>                            });
+<a id="L527"></a>
+<a id="L528"></a>                            break :blk true;
+<a id="L529"></a>                        }
+<a id="L530"></a>
+<a id="L531"></a>                        break :blk false;
+<a id="L532"></a>                    } else |err| blk: {
+<a id="L533"></a>                        if (err != error.MissingDebugInfo) return err;
+<a id="L534"></a>                        break :blk false;
+<a id="L535"></a>                    };
+<a id="L536"></a>
+<a id="L537"></a>                    if (die_obj.getAttr(AT.ranges)) |ranges_value| blk: {
+<a id="L538"></a>                        var iter = DebugRangeIterator.init(ranges_value, di, endian, &amp;compile_unit) catch |err| {
+<a id="L539"></a>                            if (err != error.MissingDebugInfo) return err;
+<a id="L540"></a>                            break :blk;
+<a id="L541"></a>                        };
+<a id="L542"></a>
+<a id="L543"></a>                        while (try iter.next()) |range| {
+<a id="L544"></a>                            range_added = true;
+<a id="L545"></a>                            try di.func_list.append(gpa, .{
+<a id="L546"></a>                                .name = fn_name,
+<a id="L547"></a>                                .pc_range = .{
+<a id="L548"></a>                                    .start = range.start,
+<a id="L549"></a>                                    .end = range.end,
+<a id="L550"></a>                                },
+<a id="L551"></a>                            });
+<a id="L552"></a>                        }
+<a id="L553"></a>                    }
+<a id="L554"></a>
+<a id="L555"></a>                    if (fn_name != null and !range_added) {
+<a id="L556"></a>                        try di.func_list.append(gpa, .{
+<a id="L557"></a>                            .name = fn_name,
+<a id="L558"></a>                            .pc_range = null,
+<a id="L559"></a>                        });
+<a id="L560"></a>                    }
+<a id="L561"></a>                },
+<a id="L562"></a>                else =&gt; {},
+<a id="L563"></a>            }
+<a id="L564"></a>        }
+<a id="L565"></a>
+<a id="L566"></a>        this_unit_offset += next_offset;
+<a id="L567"></a>    }
+<a id="L568"></a>}
+<a id="L569"></a>
+<a id="L570"></a>fn scanAllCompileUnits(di: *Dwarf, gpa: Allocator, endian: Endian) ScanError!void {
+<a id="L571"></a>    var fr: Reader = .fixed(di.section(.debug_info).?);
+<a id="L572"></a>    var this_unit_offset: u64 = 0;
+<a id="L573"></a>
+<a id="L574"></a>    var attrs_buf = std.array_list.Managed(Die.Attr).init(gpa);
+<a id="L575"></a>    defer attrs_buf.deinit();
+<a id="L576"></a>
+<a id="L577"></a>    while (this_unit_offset &lt; fr.buffer.len) {
+<a id="L578"></a>        fr.seek = @intCast(this_unit_offset);
+<a id="L579"></a>
+<a id="L580"></a>        const unit_header = try readUnitHeader(&amp;fr, endian);
+<a id="L581"></a>        if (unit_header.unit_length == 0) return;
+<a id="L582"></a>        const next_offset = unit_header.header_length + unit_header.unit_length;
+<a id="L583"></a>
+<a id="L584"></a>        const version = try fr.takeInt(u16, endian);
+<a id="L585"></a>        if (version &lt; 2 or version &gt; 5) return bad();
+<a id="L586"></a>
+<a id="L587"></a>        var address_size: u8 = undefined;
+<a id="L588"></a>        var debug_abbrev_offset: u64 = undefined;
+<a id="L589"></a>        if (version &gt;= 5) {
+<a id="L590"></a>            const unit_type = try fr.takeByte();
+<a id="L591"></a>            if (unit_type != UT.compile) return bad();
+<a id="L592"></a>            address_size = try fr.takeByte();
+<a id="L593"></a>            debug_abbrev_offset = try readFormatSizedInt(&amp;fr, unit_header.format, endian);
+<a id="L594"></a>        } else {
+<a id="L595"></a>            debug_abbrev_offset = try readFormatSizedInt(&amp;fr, unit_header.format, endian);
+<a id="L596"></a>            address_size = try fr.takeByte();
+<a id="L597"></a>        }
+<a id="L598"></a>
+<a id="L599"></a>        const abbrev_table = try di.getAbbrevTable(gpa, debug_abbrev_offset);
+<a id="L600"></a>
+<a id="L601"></a>        var max_attrs: usize = 0;
+<a id="L602"></a>        for (abbrev_table.abbrevs) |abbrev| {
+<a id="L603"></a>            max_attrs = @max(max_attrs, abbrev.attrs.len);
+<a id="L604"></a>        }
+<a id="L605"></a>        try attrs_buf.resize(max_attrs);
+<a id="L606"></a>
+<a id="L607"></a>        var compile_unit_die = (try parseDie(
+<a id="L608"></a>            &amp;fr,
+<a id="L609"></a>            attrs_buf.items,
+<a id="L610"></a>            abbrev_table,
+<a id="L611"></a>            unit_header.format,
+<a id="L612"></a>            endian,
+<a id="L613"></a>            address_size,
+<a id="L614"></a>        )) orelse return bad();
+<a id="L615"></a>
+<a id="L616"></a>        if (compile_unit_die.tag_id != DW.TAG.compile_unit) return bad();
+<a id="L617"></a>
+<a id="L618"></a>        compile_unit_die.attrs = try gpa.dupe(Die.Attr, compile_unit_die.attrs);
+<a id="L619"></a>
+<a id="L620"></a>        var compile_unit: CompileUnit = .{
+<a id="L621"></a>            .version = version,
+<a id="L622"></a>            .format = unit_header.format,
+<a id="L623"></a>            .addr_size_bytes = address_size,
+<a id="L624"></a>            .pc_range = null,
+<a id="L625"></a>            .die = compile_unit_die,
+<a id="L626"></a>            .str_offsets_base = if (compile_unit_die.getAttr(AT.str_offsets_base)) |fv| try fv.getUInt(usize) else 0,
+<a id="L627"></a>            .addr_base = if (compile_unit_die.getAttr(AT.addr_base)) |fv| try fv.getUInt(usize) else 0,
+<a id="L628"></a>            .rnglists_base = if (compile_unit_die.getAttr(AT.rnglists_base)) |fv| try fv.getUInt(usize) else 0,
+<a id="L629"></a>            .loclists_base = if (compile_unit_die.getAttr(AT.loclists_base)) |fv| try fv.getUInt(usize) else 0,
+<a id="L630"></a>            .frame_base = compile_unit_die.getAttr(AT.frame_base),
+<a id="L631"></a>            .src_loc_cache = null,
+<a id="L632"></a>        };
+<a id="L633"></a>
+<a id="L634"></a>        compile_unit.pc_range = x: {
+<a id="L635"></a>            if (compile_unit_die.getAttrAddr(di, endian, AT.low_pc, &amp;compile_unit)) |low_pc| {
+<a id="L636"></a>                if (compile_unit_die.getAttr(AT.high_pc)) |high_pc_value| {
+<a id="L637"></a>                    const pc_end = switch (high_pc_value.*) {
+<a id="L638"></a>                        .addr =&gt; |value| value,
+<a id="L639"></a>                        .udata =&gt; |offset| low_pc + offset,
+<a id="L640"></a>                        else =&gt; return bad(),
+<a id="L641"></a>                    };
+<a id="L642"></a>                    break :x PcRange{
+<a id="L643"></a>                        .start = low_pc,
+<a id="L644"></a>                        .end = pc_end,
+<a id="L645"></a>                    };
+<a id="L646"></a>                } else {
+<a id="L647"></a>                    break :x null;
+<a id="L648"></a>                }
+<a id="L649"></a>            } else |err| {
+<a id="L650"></a>                if (err != error.MissingDebugInfo) return err;
+<a id="L651"></a>                break :x null;
+<a id="L652"></a>            }
+<a id="L653"></a>        };
+<a id="L654"></a>
+<a id="L655"></a>        try di.compile_unit_list.append(gpa, compile_unit);
+<a id="L656"></a>
+<a id="L657"></a>        this_unit_offset += next_offset;
+<a id="L658"></a>    }
+<a id="L659"></a>}
+<a id="L660"></a>
+<a id="L661"></a>pub fn populateRanges(d: *Dwarf, gpa: Allocator, endian: Endian) ScanError!void {
+<a id="L662"></a>    assert(d.ranges.items.len == 0);
+<a id="L663"></a>
+<a id="L664"></a>    for (d.compile_unit_list.items, 0..) |*cu, cu_index| {
+<a id="L665"></a>        if (cu.pc_range) |range| {
+<a id="L666"></a>            try d.ranges.append(gpa, .{
+<a id="L667"></a>                .start = range.start,
+<a id="L668"></a>                .end = range.end,
+<a id="L669"></a>                .compile_unit_index = cu_index,
+<a id="L670"></a>            });
+<a id="L671"></a>            continue;
+<a id="L672"></a>        }
+<a id="L673"></a>        const ranges_value = cu.die.getAttr(AT.ranges) orelse continue;
+<a id="L674"></a>        var iter = DebugRangeIterator.init(ranges_value, d, endian, cu) catch continue;
+<a id="L675"></a>        while (try iter.next()) |range| {
+<a id="L676"></a>            // Not sure why LLVM thinks it's OK to emit these...
+<a id="L677"></a>            if (range.start == range.end) continue;
+<a id="L678"></a>
+<a id="L679"></a>            try d.ranges.append(gpa, .{
+<a id="L680"></a>                .start = range.start,
+<a id="L681"></a>                .end = range.end,
+<a id="L682"></a>                .compile_unit_index = cu_index,
+<a id="L683"></a>            });
+<a id="L684"></a>        }
+<a id="L685"></a>    }
+<a id="L686"></a>
+<a id="L687"></a>    std.mem.sortUnstable(Range, d.ranges.items, {}, struct {
+<a id="L688"></a>        pub fn lessThan(ctx: void, a: Range, b: Range) bool {
+<a id="L689"></a>            _ = ctx;
+<a id="L690"></a>            return a.start &lt; b.start;
+<a id="L691"></a>        }
+<a id="L692"></a>    }.lessThan);
+<a id="L693"></a>}
+<a id="L694"></a>
+<a id="L695"></a>const DebugRangeIterator = struct {
+<a id="L696"></a>    base_address: u64,
+<a id="L697"></a>    section_type: Section.Id,
+<a id="L698"></a>    di: *const Dwarf,
+<a id="L699"></a>    endian: Endian,
+<a id="L700"></a>    compile_unit: *const CompileUnit,
+<a id="L701"></a>    fr: Reader,
+<a id="L702"></a>
+<a id="L703"></a>    pub fn init(ranges_value: *const FormValue, di: *const Dwarf, endian: Endian, compile_unit: *const CompileUnit) !@This() {
+<a id="L704"></a>        const section_type = if (compile_unit.version &gt;= 5) Section.Id.debug_rnglists else Section.Id.debug_ranges;
+<a id="L705"></a>        const debug_ranges = di.section(section_type) orelse return error.MissingDebugInfo;
+<a id="L706"></a>
+<a id="L707"></a>        const ranges_offset = switch (ranges_value.*) {
+<a id="L708"></a>            .sec_offset, .udata =&gt; |off| off,
+<a id="L709"></a>            .rnglistx =&gt; |idx| off: {
+<a id="L710"></a>                switch (compile_unit.format) {
+<a id="L711"></a>                    .@"32" =&gt; {
+<a id="L712"></a>                        const offset_loc = compile_unit.rnglists_base + 4 * idx;
+<a id="L713"></a>                        if (offset_loc + 4 &gt; debug_ranges.len) return bad();
+<a id="L714"></a>                        const offset = mem.readInt(u32, debug_ranges[@intCast(offset_loc)..][0..4], endian);
+<a id="L715"></a>                        break :off compile_unit.rnglists_base + offset;
+<a id="L716"></a>                    },
+<a id="L717"></a>                    .@"64" =&gt; {
+<a id="L718"></a>                        const offset_loc = compile_unit.rnglists_base + 8 * idx;
+<a id="L719"></a>                        if (offset_loc + 8 &gt; debug_ranges.len) return bad();
+<a id="L720"></a>                        const offset = mem.readInt(u64, debug_ranges[@intCast(offset_loc)..][0..8], endian);
+<a id="L721"></a>                        break :off compile_unit.rnglists_base + offset;
+<a id="L722"></a>                    },
+<a id="L723"></a>                }
+<a id="L724"></a>            },
+<a id="L725"></a>            else =&gt; return bad(),
+<a id="L726"></a>        };
+<a id="L727"></a>
+<a id="L728"></a>        // All the addresses in the list are relative to the value
+<a id="L729"></a>        // specified by DW_AT.low_pc or to some other value encoded
+<a id="L730"></a>        // in the list itself.
+<a id="L731"></a>        // If no starting value is specified use zero.
+<a id="L732"></a>        const base_address = compile_unit.die.getAttrAddr(di, endian, AT.low_pc, compile_unit) catch |err| switch (err) {
+<a id="L733"></a>            error.MissingDebugInfo =&gt; 0,
+<a id="L734"></a>            else =&gt; return err,
+<a id="L735"></a>        };
+<a id="L736"></a>
+<a id="L737"></a>        var fr: Reader = .fixed(debug_ranges);
+<a id="L738"></a>        fr.seek = cast(usize, ranges_offset) orelse return bad();
+<a id="L739"></a>
+<a id="L740"></a>        return .{
+<a id="L741"></a>            .base_address = base_address,
+<a id="L742"></a>            .section_type = section_type,
+<a id="L743"></a>            .di = di,
+<a id="L744"></a>            .endian = endian,
+<a id="L745"></a>            .compile_unit = compile_unit,
+<a id="L746"></a>            .fr = fr,
+<a id="L747"></a>        };
+<a id="L748"></a>    }
+<a id="L749"></a>
+<a id="L750"></a>    // Returns the next range in the list, or null if the end was reached.
+<a id="L751"></a>    pub fn next(self: *@This()) !?PcRange {
+<a id="L752"></a>        const endian = self.endian;
+<a id="L753"></a>        const addr_size_bytes = self.compile_unit.addr_size_bytes;
+<a id="L754"></a>        switch (self.section_type) {
+<a id="L755"></a>            .debug_rnglists =&gt; {
+<a id="L756"></a>                const kind = try self.fr.takeByte();
+<a id="L757"></a>                switch (kind) {
+<a id="L758"></a>                    RLE.end_of_list =&gt; return null,
+<a id="L759"></a>                    RLE.base_addressx =&gt; {
+<a id="L760"></a>                        const index = try self.fr.takeLeb128(u64);
+<a id="L761"></a>                        self.base_address = try self.di.readDebugAddr(endian, self.compile_unit, index);
+<a id="L762"></a>                        return try self.next();
+<a id="L763"></a>                    },
+<a id="L764"></a>                    RLE.startx_endx =&gt; {
+<a id="L765"></a>                        const start_index = try self.fr.takeLeb128(u64);
+<a id="L766"></a>                        const start_addr = try self.di.readDebugAddr(endian, self.compile_unit, start_index);
+<a id="L767"></a>
+<a id="L768"></a>                        const end_index = try self.fr.takeLeb128(u64);
+<a id="L769"></a>                        const end_addr = try self.di.readDebugAddr(endian, self.compile_unit, end_index);
+<a id="L770"></a>
+<a id="L771"></a>                        return .{
+<a id="L772"></a>                            .start = start_addr,
+<a id="L773"></a>                            .end = end_addr,
+<a id="L774"></a>                        };
+<a id="L775"></a>                    },
+<a id="L776"></a>                    RLE.startx_length =&gt; {
+<a id="L777"></a>                        const start_index = try self.fr.takeLeb128(u64);
+<a id="L778"></a>                        const start_addr = try self.di.readDebugAddr(endian, self.compile_unit, start_index);
+<a id="L779"></a>
+<a id="L780"></a>                        const len = try self.fr.takeLeb128(u64);
+<a id="L781"></a>                        const end_addr = start_addr + len;
+<a id="L782"></a>
+<a id="L783"></a>                        return .{
+<a id="L784"></a>                            .start = start_addr,
+<a id="L785"></a>                            .end = end_addr,
+<a id="L786"></a>                        };
+<a id="L787"></a>                    },
+<a id="L788"></a>                    RLE.offset_pair =&gt; {
+<a id="L789"></a>                        const start_addr = try self.fr.takeLeb128(u64);
+<a id="L790"></a>                        const end_addr = try self.fr.takeLeb128(u64);
+<a id="L791"></a>
+<a id="L792"></a>                        // This is the only kind that uses the base address
+<a id="L793"></a>                        return .{
+<a id="L794"></a>                            .start = self.base_address + start_addr,
+<a id="L795"></a>                            .end = self.base_address + end_addr,
+<a id="L796"></a>                        };
+<a id="L797"></a>                    },
+<a id="L798"></a>                    RLE.base_address =&gt; {
+<a id="L799"></a>                        self.base_address = try readAddress(&amp;self.fr, endian, addr_size_bytes);
+<a id="L800"></a>                        return try self.next();
+<a id="L801"></a>                    },
+<a id="L802"></a>                    RLE.start_end =&gt; {
+<a id="L803"></a>                        const start_addr = try readAddress(&amp;self.fr, endian, addr_size_bytes);
+<a id="L804"></a>                        const end_addr = try readAddress(&amp;self.fr, endian, addr_size_bytes);
+<a id="L805"></a>
+<a id="L806"></a>                        return .{
+<a id="L807"></a>                            .start = start_addr,
+<a id="L808"></a>                            .end = end_addr,
+<a id="L809"></a>                        };
+<a id="L810"></a>                    },
+<a id="L811"></a>                    RLE.start_length =&gt; {
+<a id="L812"></a>                        const start_addr = try readAddress(&amp;self.fr, endian, addr_size_bytes);
+<a id="L813"></a>                        const len = try self.fr.takeLeb128(u64);
+<a id="L814"></a>                        const end_addr = start_addr + len;
+<a id="L815"></a>
+<a id="L816"></a>                        return .{
+<a id="L817"></a>                            .start = start_addr,
+<a id="L818"></a>                            .end = end_addr,
+<a id="L819"></a>                        };
+<a id="L820"></a>                    },
+<a id="L821"></a>                    else =&gt; return bad(),
+<a id="L822"></a>                }
+<a id="L823"></a>            },
+<a id="L824"></a>            .debug_ranges =&gt; {
+<a id="L825"></a>                const start_addr = try readAddress(&amp;self.fr, endian, addr_size_bytes);
+<a id="L826"></a>                const end_addr = try readAddress(&amp;self.fr, endian, addr_size_bytes);
+<a id="L827"></a>                if (start_addr == 0 and end_addr == 0) return null;
+<a id="L828"></a>
+<a id="L829"></a>                // The entry with start_addr = max_representable_address selects a new value for the base address
+<a id="L830"></a>                const max_representable_address = ~@as(u64, 0) &gt;&gt; @intCast(64 - addr_size_bytes);
+<a id="L831"></a>                if (start_addr == max_representable_address) {
+<a id="L832"></a>                    self.base_address = end_addr;
+<a id="L833"></a>                    return try self.next();
+<a id="L834"></a>                }
+<a id="L835"></a>
+<a id="L836"></a>                return .{
+<a id="L837"></a>                    .start = self.base_address + start_addr,
+<a id="L838"></a>                    .end = self.base_address + end_addr,
+<a id="L839"></a>                };
+<a id="L840"></a>            },
+<a id="L841"></a>            else =&gt; unreachable,
+<a id="L842"></a>        }
+<a id="L843"></a>    }
+<a id="L844"></a>};
+<a id="L845"></a>
+<a id="L846"></a>/// TODO: change this to binary searching the sorted compile unit list
+<a id="L847"></a>pub fn findCompileUnit(di: *const Dwarf, endian: Endian, target_address: u64) !*CompileUnit {
+<a id="L848"></a>    for (di.compile_unit_list.items) |*compile_unit| {
+<a id="L849"></a>        if (compile_unit.pc_range) |range| {
+<a id="L850"></a>            if (target_address &gt;= range.start and target_address &lt; range.end) return compile_unit;
+<a id="L851"></a>        }
+<a id="L852"></a>
+<a id="L853"></a>        const ranges_value = compile_unit.die.getAttr(AT.ranges) orelse continue;
+<a id="L854"></a>        var iter = DebugRangeIterator.init(ranges_value, di, endian, compile_unit) catch continue;
+<a id="L855"></a>        while (try iter.next()) |range| {
+<a id="L856"></a>            if (target_address &gt;= range.start and target_address &lt; range.end) return compile_unit;
+<a id="L857"></a>        }
+<a id="L858"></a>    }
+<a id="L859"></a>
+<a id="L860"></a>    return missing();
+<a id="L861"></a>}
+<a id="L862"></a>
+<a id="L863"></a>/// Gets an already existing AbbrevTable given the abbrev_offset, or if not found,
+<a id="L864"></a>/// seeks in the stream and parses it.
+<a id="L865"></a>fn getAbbrevTable(di: *Dwarf, gpa: Allocator, abbrev_offset: u64) !*const Abbrev.Table {
+<a id="L866"></a>    for (di.abbrev_table_list.items) |*table| {
+<a id="L867"></a>        if (table.offset == abbrev_offset) {
+<a id="L868"></a>            return table;
+<a id="L869"></a>        }
+<a id="L870"></a>    }
+<a id="L871"></a>    try di.abbrev_table_list.append(
+<a id="L872"></a>        gpa,
+<a id="L873"></a>        try di.parseAbbrevTable(gpa, abbrev_offset),
+<a id="L874"></a>    );
+<a id="L875"></a>    return &amp;di.abbrev_table_list.items[di.abbrev_table_list.items.len - 1];
+<a id="L876"></a>}
+<a id="L877"></a>
+<a id="L878"></a>fn parseAbbrevTable(di: *Dwarf, gpa: Allocator, offset: u64) !Abbrev.Table {
+<a id="L879"></a>    var fr: Reader = .fixed(di.section(.debug_abbrev).?);
+<a id="L880"></a>    fr.seek = cast(usize, offset) orelse return bad();
+<a id="L881"></a>
+<a id="L882"></a>    var abbrevs = std.array_list.Managed(Abbrev).init(gpa);
+<a id="L883"></a>    defer {
+<a id="L884"></a>        for (abbrevs.items) |*abbrev| {
+<a id="L885"></a>            abbrev.deinit(gpa);
+<a id="L886"></a>        }
+<a id="L887"></a>        abbrevs.deinit();
+<a id="L888"></a>    }
+<a id="L889"></a>
+<a id="L890"></a>    var attrs = std.array_list.Managed(Abbrev.Attr).init(gpa);
+<a id="L891"></a>    defer attrs.deinit();
+<a id="L892"></a>
+<a id="L893"></a>    while (true) {
+<a id="L894"></a>        const code = try fr.takeLeb128(u64);
+<a id="L895"></a>        if (code == 0) break;
+<a id="L896"></a>        const tag_id = try fr.takeLeb128(u64);
+<a id="L897"></a>        const has_children = (try fr.takeByte()) == DW.CHILDREN.yes;
+<a id="L898"></a>
+<a id="L899"></a>        while (true) {
+<a id="L900"></a>            const attr_id = try fr.takeLeb128(u64);
+<a id="L901"></a>            const form_id = try fr.takeLeb128(u64);
+<a id="L902"></a>            if (attr_id == 0 and form_id == 0) break;
+<a id="L903"></a>            try attrs.append(.{
+<a id="L904"></a>                .id = attr_id,
+<a id="L905"></a>                .form_id = form_id,
+<a id="L906"></a>                .payload = switch (form_id) {
+<a id="L907"></a>                    FORM.implicit_const =&gt; try fr.takeLeb128(i64),
+<a id="L908"></a>                    else =&gt; undefined,
+<a id="L909"></a>                },
+<a id="L910"></a>            });
+<a id="L911"></a>        }
+<a id="L912"></a>
+<a id="L913"></a>        try abbrevs.append(.{
+<a id="L914"></a>            .code = code,
+<a id="L915"></a>            .tag_id = tag_id,
+<a id="L916"></a>            .has_children = has_children,
+<a id="L917"></a>            .attrs = try attrs.toOwnedSlice(),
+<a id="L918"></a>        });
+<a id="L919"></a>    }
+<a id="L920"></a>
+<a id="L921"></a>    return .{
+<a id="L922"></a>        .offset = offset,
+<a id="L923"></a>        .abbrevs = try abbrevs.toOwnedSlice(),
+<a id="L924"></a>    };
+<a id="L925"></a>}
+<a id="L926"></a>
+<a id="L927"></a>fn parseDie(
+<a id="L928"></a>    fr: *Reader,
+<a id="L929"></a>    attrs_buf: []Die.Attr,
+<a id="L930"></a>    abbrev_table: *const Abbrev.Table,
+<a id="L931"></a>    format: Format,
+<a id="L932"></a>    endian: Endian,
+<a id="L933"></a>    addr_size_bytes: u8,
+<a id="L934"></a>) ScanError!?Die {
+<a id="L935"></a>    const abbrev_code = try fr.takeLeb128(u64);
+<a id="L936"></a>    if (abbrev_code == 0) return null;
+<a id="L937"></a>    const table_entry = abbrev_table.get(abbrev_code) orelse return bad();
+<a id="L938"></a>
+<a id="L939"></a>    const attrs = attrs_buf[0..table_entry.attrs.len];
+<a id="L940"></a>    for (attrs, table_entry.attrs) |*result_attr, attr| result_attr.* = .{
+<a id="L941"></a>        .id = attr.id,
+<a id="L942"></a>        .value = try parseFormValue(fr, attr.form_id, format, endian, addr_size_bytes, attr.payload),
+<a id="L943"></a>    };
+<a id="L944"></a>    return .{
+<a id="L945"></a>        .tag_id = table_entry.tag_id,
+<a id="L946"></a>        .has_children = table_entry.has_children,
+<a id="L947"></a>        .attrs = attrs,
+<a id="L948"></a>    };
+<a id="L949"></a>}
+<a id="L950"></a>
+<a id="L951"></a>/// Ensures that addresses in the returned LineTable are monotonically increasing.
+<a id="L952"></a>fn runLineNumberProgram(d: *Dwarf, gpa: Allocator, endian: Endian, compile_unit: *const CompileUnit) !CompileUnit.SrcLocCache {
+<a id="L953"></a>    const compile_unit_cwd = try compile_unit.die.getAttrString(d, endian, AT.comp_dir, d.section(.debug_line_str), compile_unit);
+<a id="L954"></a>    const line_info_offset = try compile_unit.die.getAttrSecOffset(AT.stmt_list);
+<a id="L955"></a>
+<a id="L956"></a>    var fr: Reader = .fixed(d.section(.debug_line).?);
+<a id="L957"></a>    fr.seek = @intCast(line_info_offset);
+<a id="L958"></a>
+<a id="L959"></a>    const unit_header = try readUnitHeader(&amp;fr, endian);
+<a id="L960"></a>    if (unit_header.unit_length == 0) return missing();
+<a id="L961"></a>
+<a id="L962"></a>    const next_offset = unit_header.header_length + unit_header.unit_length;
+<a id="L963"></a>
+<a id="L964"></a>    const version = try fr.takeInt(u16, endian);
+<a id="L965"></a>    if (version &lt; 2) return bad();
+<a id="L966"></a>
+<a id="L967"></a>    const addr_size_bytes: u8, const seg_size: u8 = if (version &gt;= 5) .{
+<a id="L968"></a>        try fr.takeByte(),
+<a id="L969"></a>        try fr.takeByte(),
+<a id="L970"></a>    } else .{
+<a id="L971"></a>        compile_unit.addr_size_bytes,
+<a id="L972"></a>        0,
+<a id="L973"></a>    };
+<a id="L974"></a>    if (seg_size != 0) return bad(); // unsupported
+<a id="L975"></a>
+<a id="L976"></a>    const prologue_length = try readFormatSizedInt(&amp;fr, unit_header.format, endian);
+<a id="L977"></a>    const prog_start_offset = fr.seek + prologue_length;
+<a id="L978"></a>
+<a id="L979"></a>    const minimum_instruction_length = try fr.takeByte();
+<a id="L980"></a>    if (minimum_instruction_length == 0) return bad();
+<a id="L981"></a>
+<a id="L982"></a>    if (version &gt;= 4) {
+<a id="L983"></a>        const maximum_operations_per_instruction = try fr.takeByte();
+<a id="L984"></a>        _ = maximum_operations_per_instruction;
+<a id="L985"></a>    }
+<a id="L986"></a>
+<a id="L987"></a>    const default_is_stmt = (try fr.takeByte()) != 0;
+<a id="L988"></a>    const line_base = try fr.takeByteSigned();
+<a id="L989"></a>
+<a id="L990"></a>    const line_range = try fr.takeByte();
+<a id="L991"></a>    if (line_range == 0) return bad();
+<a id="L992"></a>
+<a id="L993"></a>    const opcode_base = try fr.takeByte();
+<a id="L994"></a>
+<a id="L995"></a>    const standard_opcode_lengths = try fr.take(opcode_base - 1);
+<a id="L996"></a>
+<a id="L997"></a>    var directories: ArrayList(FileEntry) = .empty;
+<a id="L998"></a>    defer directories.deinit(gpa);
+<a id="L999"></a>    var file_entries: ArrayList(FileEntry) = .empty;
+<a id="L1000"></a>    defer file_entries.deinit(gpa);
+<a id="L1001"></a>
+<a id="L1002"></a>    if (version &lt; 5) {
+<a id="L1003"></a>        try directories.append(gpa, .{ .path = compile_unit_cwd });
+<a id="L1004"></a>
+<a id="L1005"></a>        while (true) {
+<a id="L1006"></a>            const dir = try fr.takeSentinel(0);
+<a id="L1007"></a>            if (dir.len == 0) break;
+<a id="L1008"></a>            try directories.append(gpa, .{ .path = dir });
+<a id="L1009"></a>        }
+<a id="L1010"></a>
+<a id="L1011"></a>        while (true) {
+<a id="L1012"></a>            const file_name = try fr.takeSentinel(0);
+<a id="L1013"></a>            if (file_name.len == 0) break;
+<a id="L1014"></a>            const dir_index = try fr.takeLeb128(u32);
+<a id="L1015"></a>            const mtime = try fr.takeLeb128(u64);
+<a id="L1016"></a>            const size = try fr.takeLeb128(u64);
+<a id="L1017"></a>            try file_entries.append(gpa, .{
+<a id="L1018"></a>                .path = file_name,
+<a id="L1019"></a>                .dir_index = dir_index,
+<a id="L1020"></a>                .mtime = mtime,
+<a id="L1021"></a>                .size = size,
+<a id="L1022"></a>            });
+<a id="L1023"></a>        }
+<a id="L1024"></a>    } else {
+<a id="L1025"></a>        const FileEntFmt = struct {
+<a id="L1026"></a>            content_type_code: u16,
+<a id="L1027"></a>            form_code: u16,
+<a id="L1028"></a>        };
+<a id="L1029"></a>        {
+<a id="L1030"></a>            var dir_ent_fmt_buf: [10]FileEntFmt = undefined;
+<a id="L1031"></a>            const directory_entry_format_count = try fr.takeByte();
+<a id="L1032"></a>            if (directory_entry_format_count &gt; dir_ent_fmt_buf.len) return bad();
+<a id="L1033"></a>            for (dir_ent_fmt_buf[0..directory_entry_format_count]) |*ent_fmt| {
+<a id="L1034"></a>                ent_fmt.* = .{
+<a id="L1035"></a>                    .content_type_code = try fr.takeLeb128(u8),
+<a id="L1036"></a>                    .form_code = try fr.takeLeb128(u16),
+<a id="L1037"></a>                };
+<a id="L1038"></a>            }
+<a id="L1039"></a>
+<a id="L1040"></a>            const directories_count = try fr.takeLeb128(usize);
+<a id="L1041"></a>
+<a id="L1042"></a>            for (try directories.addManyAsSlice(gpa, directories_count)) |*e| {
+<a id="L1043"></a>                e.* = .{ .path = &amp;.{} };
+<a id="L1044"></a>                for (dir_ent_fmt_buf[0..directory_entry_format_count]) |ent_fmt| {
+<a id="L1045"></a>                    const form_value = try parseFormValue(&amp;fr, ent_fmt.form_code, unit_header.format, endian, addr_size_bytes, null);
+<a id="L1046"></a>                    switch (ent_fmt.content_type_code) {
+<a id="L1047"></a>                        DW.LNCT.path =&gt; e.path = try form_value.getString(d.*),
+<a id="L1048"></a>                        DW.LNCT.directory_index =&gt; e.dir_index = try form_value.getUInt(u32),
+<a id="L1049"></a>                        DW.LNCT.timestamp =&gt; e.mtime = try form_value.getUInt(u64),
+<a id="L1050"></a>                        DW.LNCT.size =&gt; e.size = try form_value.getUInt(u64),
+<a id="L1051"></a>                        DW.LNCT.MD5 =&gt; e.md5 = switch (form_value) {
+<a id="L1052"></a>                            .data16 =&gt; |data16| data16.*,
+<a id="L1053"></a>                            else =&gt; return bad(),
+<a id="L1054"></a>                        },
+<a id="L1055"></a>                        else =&gt; continue,
+<a id="L1056"></a>                    }
+<a id="L1057"></a>                }
+<a id="L1058"></a>            }
+<a id="L1059"></a>        }
+<a id="L1060"></a>
+<a id="L1061"></a>        var file_ent_fmt_buf: [10]FileEntFmt = undefined;
+<a id="L1062"></a>        const file_name_entry_format_count = try fr.takeByte();
+<a id="L1063"></a>        if (file_name_entry_format_count &gt; file_ent_fmt_buf.len) return bad();
+<a id="L1064"></a>        for (file_ent_fmt_buf[0..file_name_entry_format_count]) |*ent_fmt| {
+<a id="L1065"></a>            ent_fmt.* = .{
+<a id="L1066"></a>                .content_type_code = try fr.takeLeb128(u16),
+<a id="L1067"></a>                .form_code = try fr.takeLeb128(u16),
+<a id="L1068"></a>            };
+<a id="L1069"></a>        }
+<a id="L1070"></a>
+<a id="L1071"></a>        const file_names_count = try fr.takeLeb128(usize);
+<a id="L1072"></a>        try file_entries.ensureUnusedCapacity(gpa, file_names_count);
+<a id="L1073"></a>
+<a id="L1074"></a>        for (try file_entries.addManyAsSlice(gpa, file_names_count)) |*e| {
+<a id="L1075"></a>            e.* = .{ .path = &amp;.{} };
+<a id="L1076"></a>            for (file_ent_fmt_buf[0..file_name_entry_format_count]) |ent_fmt| {
+<a id="L1077"></a>                const form_value = try parseFormValue(&amp;fr, ent_fmt.form_code, unit_header.format, endian, addr_size_bytes, null);
+<a id="L1078"></a>                switch (ent_fmt.content_type_code) {
+<a id="L1079"></a>                    DW.LNCT.path =&gt; e.path = try form_value.getString(d.*),
+<a id="L1080"></a>                    DW.LNCT.directory_index =&gt; e.dir_index = try form_value.getUInt(u32),
+<a id="L1081"></a>                    DW.LNCT.timestamp =&gt; e.mtime = try form_value.getUInt(u64),
+<a id="L1082"></a>                    DW.LNCT.size =&gt; e.size = try form_value.getUInt(u64),
+<a id="L1083"></a>                    DW.LNCT.MD5 =&gt; e.md5 = switch (form_value) {
+<a id="L1084"></a>                        .data16 =&gt; |data16| data16.*,
+<a id="L1085"></a>                        else =&gt; return bad(),
+<a id="L1086"></a>                    },
+<a id="L1087"></a>                    else =&gt; continue,
+<a id="L1088"></a>                }
+<a id="L1089"></a>            }
+<a id="L1090"></a>        }
+<a id="L1091"></a>    }
+<a id="L1092"></a>
+<a id="L1093"></a>    var prog = LineNumberProgram.init(default_is_stmt, version);
+<a id="L1094"></a>    var line_table: CompileUnit.SrcLocCache.LineTable = .{};
+<a id="L1095"></a>    errdefer line_table.deinit(gpa);
+<a id="L1096"></a>
+<a id="L1097"></a>    fr.seek = @intCast(prog_start_offset);
+<a id="L1098"></a>
+<a id="L1099"></a>    const next_unit_pos = line_info_offset + next_offset;
+<a id="L1100"></a>
+<a id="L1101"></a>    while (fr.seek &lt; next_unit_pos) {
+<a id="L1102"></a>        const opcode = try fr.takeByte();
+<a id="L1103"></a>
+<a id="L1104"></a>        if (opcode == DW.LNS.extended_op) {
+<a id="L1105"></a>            const op_size = try fr.takeLeb128(u64);
+<a id="L1106"></a>            if (op_size &lt; 1) return bad();
+<a id="L1107"></a>            const sub_op = try fr.takeByte();
+<a id="L1108"></a>            switch (sub_op) {
+<a id="L1109"></a>                DW.LNE.end_sequence =&gt; {
+<a id="L1110"></a>                    // The row being added here is an "end" address, meaning
+<a id="L1111"></a>                    // that it does not map to the source location here -
+<a id="L1112"></a>                    // rather it marks the previous address as the last address
+<a id="L1113"></a>                    // that maps to this source location.
+<a id="L1114"></a>
+<a id="L1115"></a>                    // In this implementation we don't mark end of addresses.
+<a id="L1116"></a>                    // This is a performance optimization based on the fact
+<a id="L1117"></a>                    // that we don't need to know if an address is missing
+<a id="L1118"></a>                    // source location info; we are only interested in being
+<a id="L1119"></a>                    // able to look up source location info for addresses that
+<a id="L1120"></a>                    // are known to have debug info.
+<a id="L1121"></a>                    //if (debug_debug_mode) assert(!line_table.contains(prog.address));
+<a id="L1122"></a>                    //try line_table.put(gpa, prog.address, CompileUnit.SrcLocCache.LineEntry.invalid);
+<a id="L1123"></a>                    prog.reset();
+<a id="L1124"></a>                },
+<a id="L1125"></a>                DW.LNE.set_address =&gt; {
+<a id="L1126"></a>                    prog.address = try readAddress(&amp;fr, endian, addr_size_bytes);
+<a id="L1127"></a>                },
+<a id="L1128"></a>                DW.LNE.define_file =&gt; {
+<a id="L1129"></a>                    const path = try fr.takeSentinel(0);
+<a id="L1130"></a>                    const dir_index = try fr.takeLeb128(u32);
+<a id="L1131"></a>                    const mtime = try fr.takeLeb128(u64);
+<a id="L1132"></a>                    const size = try fr.takeLeb128(u64);
+<a id="L1133"></a>                    try file_entries.append(gpa, .{
+<a id="L1134"></a>                        .path = path,
+<a id="L1135"></a>                        .dir_index = dir_index,
+<a id="L1136"></a>                        .mtime = mtime,
+<a id="L1137"></a>                        .size = size,
+<a id="L1138"></a>                    });
+<a id="L1139"></a>                },
+<a id="L1140"></a>                else =&gt; try fr.discardAll64(op_size - 1),
+<a id="L1141"></a>            }
+<a id="L1142"></a>        } else if (opcode &gt;= opcode_base) {
+<a id="L1143"></a>            // special opcodes
+<a id="L1144"></a>            const adjusted_opcode = opcode - opcode_base;
+<a id="L1145"></a>            const inc_addr = minimum_instruction_length * (adjusted_opcode / line_range);
+<a id="L1146"></a>            const inc_line = @as(i32, line_base) + @as(i32, adjusted_opcode % line_range);
+<a id="L1147"></a>            prog.line += inc_line;
+<a id="L1148"></a>            prog.address += inc_addr;
+<a id="L1149"></a>            try prog.addRow(gpa, &amp;line_table);
+<a id="L1150"></a>            prog.basic_block = false;
+<a id="L1151"></a>        } else {
+<a id="L1152"></a>            switch (opcode) {
+<a id="L1153"></a>                DW.LNS.copy =&gt; {
+<a id="L1154"></a>                    try prog.addRow(gpa, &amp;line_table);
+<a id="L1155"></a>                    prog.basic_block = false;
+<a id="L1156"></a>                },
+<a id="L1157"></a>                DW.LNS.advance_pc =&gt; {
+<a id="L1158"></a>                    const arg = try fr.takeLeb128(u64);
+<a id="L1159"></a>                    prog.address += arg * minimum_instruction_length;
+<a id="L1160"></a>                },
+<a id="L1161"></a>                DW.LNS.advance_line =&gt; {
+<a id="L1162"></a>                    const arg = try fr.takeLeb128(i64);
+<a id="L1163"></a>                    prog.line += arg;
+<a id="L1164"></a>                },
+<a id="L1165"></a>                DW.LNS.set_file =&gt; {
+<a id="L1166"></a>                    const arg = try fr.takeLeb128(usize);
+<a id="L1167"></a>                    prog.file = arg;
+<a id="L1168"></a>                },
+<a id="L1169"></a>                DW.LNS.set_column =&gt; {
+<a id="L1170"></a>                    const arg = try fr.takeLeb128(u64);
+<a id="L1171"></a>                    prog.column = arg;
+<a id="L1172"></a>                },
+<a id="L1173"></a>                DW.LNS.negate_stmt =&gt; {
+<a id="L1174"></a>                    prog.is_stmt = !prog.is_stmt;
+<a id="L1175"></a>                },
+<a id="L1176"></a>                DW.LNS.set_basic_block =&gt; {
+<a id="L1177"></a>                    prog.basic_block = true;
+<a id="L1178"></a>                },
+<a id="L1179"></a>                DW.LNS.const_add_pc =&gt; {
+<a id="L1180"></a>                    const inc_addr = minimum_instruction_length * ((255 - opcode_base) / line_range);
+<a id="L1181"></a>                    prog.address += inc_addr;
+<a id="L1182"></a>                },
+<a id="L1183"></a>                DW.LNS.fixed_advance_pc =&gt; {
+<a id="L1184"></a>                    const arg = try fr.takeInt(u16, endian);
+<a id="L1185"></a>                    prog.address += arg;
+<a id="L1186"></a>                },
+<a id="L1187"></a>                DW.LNS.set_prologue_end =&gt; {},
+<a id="L1188"></a>                else =&gt; {
+<a id="L1189"></a>                    if (opcode - 1 &gt;= standard_opcode_lengths.len) return bad();
+<a id="L1190"></a>                    try fr.discardAll(standard_opcode_lengths[opcode - 1]);
+<a id="L1191"></a>                },
+<a id="L1192"></a>            }
+<a id="L1193"></a>        }
+<a id="L1194"></a>    }
+<a id="L1195"></a>
+<a id="L1196"></a>    // Dwarf standard v5, 6.2.5 says
+<a id="L1197"></a>    // &gt; Within a sequence, addresses and operation pointers may only increase.
+<a id="L1198"></a>    // However, this is empirically not the case in reality, so we sort here.
+<a id="L1199"></a>    line_table.sortUnstable(struct {
+<a id="L1200"></a>        keys: []const u64,
+<a id="L1201"></a>
+<a id="L1202"></a>        pub fn lessThan(ctx: @This(), a_index: usize, b_index: usize) bool {
+<a id="L1203"></a>            return ctx.keys[a_index] &lt; ctx.keys[b_index];
+<a id="L1204"></a>        }
+<a id="L1205"></a>    }{ .keys = line_table.keys() });
+<a id="L1206"></a>
+<a id="L1207"></a>    return .{
+<a id="L1208"></a>        .line_table = line_table,
+<a id="L1209"></a>        .directories = try directories.toOwnedSlice(gpa),
+<a id="L1210"></a>        .files = try file_entries.toOwnedSlice(gpa),
+<a id="L1211"></a>        .version = version,
+<a id="L1212"></a>    };
+<a id="L1213"></a>}
+<a id="L1214"></a>
+<a id="L1215"></a>pub fn populateSrcLocCache(d: *Dwarf, gpa: Allocator, endian: Endian, cu: *CompileUnit) ScanError!void {
+<a id="L1216"></a>    if (cu.src_loc_cache != null) return;
+<a id="L1217"></a>    cu.src_loc_cache = try d.runLineNumberProgram(gpa, endian, cu);
+<a id="L1218"></a>}
+<a id="L1219"></a>
+<a id="L1220"></a>pub fn getLineNumberInfo(
+<a id="L1221"></a>    d: *Dwarf,
+<a id="L1222"></a>    gpa: Allocator,
+<a id="L1223"></a>    text_arena: Allocator,
+<a id="L1224"></a>    endian: Endian,
+<a id="L1225"></a>    compile_unit: *CompileUnit,
+<a id="L1226"></a>    target_address: u64,
+<a id="L1227"></a>) !std.debug.SourceLocation {
+<a id="L1228"></a>    try d.populateSrcLocCache(gpa, endian, compile_unit);
+<a id="L1229"></a>    const slc = &amp;compile_unit.src_loc_cache.?;
+<a id="L1230"></a>    const entry = try slc.findSource(target_address);
+<a id="L1231"></a>    const file_index = entry.file - @intFromBool(slc.version &lt; 5);
+<a id="L1232"></a>    if (file_index &gt;= slc.files.len) return bad();
+<a id="L1233"></a>    const file_entry = &amp;slc.files[file_index];
+<a id="L1234"></a>    if (file_entry.dir_index &gt;= slc.directories.len) return bad();
+<a id="L1235"></a>    const dir_name = slc.directories[file_entry.dir_index].path;
+<a id="L1236"></a>    const file_name = try std.fs.path.join(text_arena, &amp;.{ dir_name, file_entry.path });
+<a id="L1237"></a>    return .{
+<a id="L1238"></a>        .line = entry.line,
+<a id="L1239"></a>        .column = entry.column,
+<a id="L1240"></a>        .file_name = file_name,
+<a id="L1241"></a>    };
+<a id="L1242"></a>}
+<a id="L1243"></a>
+<a id="L1244"></a>fn getString(di: Dwarf, offset: u64) ![:0]const u8 {
+<a id="L1245"></a>    return getStringGeneric(di.section(.debug_str), offset);
+<a id="L1246"></a>}
+<a id="L1247"></a>
+<a id="L1248"></a>fn getLineString(di: Dwarf, offset: u64) ![:0]const u8 {
+<a id="L1249"></a>    return getStringGeneric(di.section(.debug_line_str), offset);
+<a id="L1250"></a>}
+<a id="L1251"></a>
+<a id="L1252"></a>fn readDebugAddr(di: Dwarf, endian: Endian, compile_unit: *const CompileUnit, index: u64) !u64 {
+<a id="L1253"></a>    const debug_addr = di.section(.debug_addr) orelse return bad();
+<a id="L1254"></a>
+<a id="L1255"></a>    // addr_base points to the first item after the header, however we
+<a id="L1256"></a>    // need to read the header to know the size of each item. Empirically,
+<a id="L1257"></a>    // it may disagree with is_64 on the compile unit.
+<a id="L1258"></a>    // The header is 8 or 12 bytes depending on is_64.
+<a id="L1259"></a>    if (compile_unit.addr_base &lt; 8) return bad();
+<a id="L1260"></a>
+<a id="L1261"></a>    const version = mem.readInt(u16, debug_addr[compile_unit.addr_base - 4 ..][0..2], endian);
+<a id="L1262"></a>    if (version != 5) return bad();
+<a id="L1263"></a>
+<a id="L1264"></a>    const addr_size = debug_addr[compile_unit.addr_base - 2];
+<a id="L1265"></a>    const seg_size = debug_addr[compile_unit.addr_base - 1];
+<a id="L1266"></a>
+<a id="L1267"></a>    const byte_offset = compile_unit.addr_base + (addr_size + seg_size) * index;
+<a id="L1268"></a>    if (byte_offset + addr_size &gt; debug_addr.len) return bad();
+<a id="L1269"></a>    return switch (addr_size) {
+<a id="L1270"></a>        1 =&gt; debug_addr[@intCast(byte_offset)],
+<a id="L1271"></a>        2 =&gt; mem.readInt(u16, debug_addr[@intCast(byte_offset)..][0..2], endian),
+<a id="L1272"></a>        4 =&gt; mem.readInt(u32, debug_addr[@intCast(byte_offset)..][0..4], endian),
+<a id="L1273"></a>        8 =&gt; mem.readInt(u64, debug_addr[@intCast(byte_offset)..][0..8], endian),
+<a id="L1274"></a>        else =&gt; bad(),
+<a id="L1275"></a>    };
+<a id="L1276"></a>}
+<a id="L1277"></a>
+<a id="L1278"></a>fn parseFormValue(
+<a id="L1279"></a>    r: *Reader,
+<a id="L1280"></a>    form_id: u64,
+<a id="L1281"></a>    format: Format,
+<a id="L1282"></a>    endian: Endian,
+<a id="L1283"></a>    addr_size_bytes: u8,
+<a id="L1284"></a>    implicit_const: ?i64,
+<a id="L1285"></a>) ScanError!FormValue {
+<a id="L1286"></a>    return switch (form_id) {
+<a id="L1287"></a>        // DWARF5.pdf page 213: the size of this value is encoded in the
+<a id="L1288"></a>        // compilation unit header as address size.
+<a id="L1289"></a>        FORM.addr =&gt; .{ .addr = try readAddress(r, endian, addr_size_bytes) },
+<a id="L1290"></a>        FORM.addrx1 =&gt; .{ .addrx = try r.takeByte() },
+<a id="L1291"></a>        FORM.addrx2 =&gt; .{ .addrx = try r.takeInt(u16, endian) },
+<a id="L1292"></a>        FORM.addrx3 =&gt; .{ .addrx = try r.takeInt(u24, endian) },
+<a id="L1293"></a>        FORM.addrx4 =&gt; .{ .addrx = try r.takeInt(u32, endian) },
+<a id="L1294"></a>        FORM.addrx =&gt; .{ .addrx = try r.takeLeb128(u64) },
+<a id="L1295"></a>
+<a id="L1296"></a>        FORM.block1 =&gt; .{ .block = try r.take(try r.takeByte()) },
+<a id="L1297"></a>        FORM.block2 =&gt; .{ .block = try r.take(try r.takeInt(u16, endian)) },
+<a id="L1298"></a>        FORM.block4 =&gt; .{ .block = try r.take(try r.takeInt(u32, endian)) },
+<a id="L1299"></a>        FORM.block =&gt; .{ .block = try r.take(try r.takeLeb128(usize)) },
+<a id="L1300"></a>
+<a id="L1301"></a>        FORM.data1 =&gt; .{ .udata = try r.takeByte() },
+<a id="L1302"></a>        FORM.data2 =&gt; .{ .udata = try r.takeInt(u16, endian) },
+<a id="L1303"></a>        FORM.data4 =&gt; .{ .udata = try r.takeInt(u32, endian) },
+<a id="L1304"></a>        FORM.data8 =&gt; .{ .udata = try r.takeInt(u64, endian) },
+<a id="L1305"></a>        FORM.data16 =&gt; .{ .data16 = try r.takeArray(16) },
+<a id="L1306"></a>        FORM.udata =&gt; .{ .udata = try r.takeLeb128(u64) },
+<a id="L1307"></a>        FORM.sdata =&gt; .{ .sdata = try r.takeLeb128(i64) },
+<a id="L1308"></a>        FORM.exprloc =&gt; .{ .exprloc = try r.take(try r.takeLeb128(usize)) },
+<a id="L1309"></a>        FORM.flag =&gt; .{ .flag = (try r.takeByte()) != 0 },
+<a id="L1310"></a>        FORM.flag_present =&gt; .{ .flag = true },
+<a id="L1311"></a>        FORM.sec_offset =&gt; .{ .sec_offset = try readFormatSizedInt(r, format, endian) },
+<a id="L1312"></a>
+<a id="L1313"></a>        FORM.ref1 =&gt; .{ .ref = try r.takeByte() },
+<a id="L1314"></a>        FORM.ref2 =&gt; .{ .ref = try r.takeInt(u16, endian) },
+<a id="L1315"></a>        FORM.ref4 =&gt; .{ .ref = try r.takeInt(u32, endian) },
+<a id="L1316"></a>        FORM.ref8 =&gt; .{ .ref = try r.takeInt(u64, endian) },
+<a id="L1317"></a>        FORM.ref_udata =&gt; .{ .ref = try r.takeLeb128(u64) },
+<a id="L1318"></a>
+<a id="L1319"></a>        FORM.ref_addr =&gt; .{ .ref_addr = try readFormatSizedInt(r, format, endian) },
+<a id="L1320"></a>        FORM.ref_sig8 =&gt; .{ .ref = try r.takeInt(u64, endian) },
+<a id="L1321"></a>
+<a id="L1322"></a>        FORM.string =&gt; .{ .string = try r.takeSentinel(0) },
+<a id="L1323"></a>        FORM.strp =&gt; .{ .strp = try readFormatSizedInt(r, format, endian) },
+<a id="L1324"></a>        FORM.strx1 =&gt; .{ .strx = try r.takeByte() },
+<a id="L1325"></a>        FORM.strx2 =&gt; .{ .strx = try r.takeInt(u16, endian) },
+<a id="L1326"></a>        FORM.strx3 =&gt; .{ .strx = try r.takeInt(u24, endian) },
+<a id="L1327"></a>        FORM.strx4 =&gt; .{ .strx = try r.takeInt(u32, endian) },
+<a id="L1328"></a>        FORM.strx =&gt; .{ .strx = try r.takeLeb128(usize) },
+<a id="L1329"></a>        FORM.line_strp =&gt; .{ .line_strp = try readFormatSizedInt(r, format, endian) },
+<a id="L1330"></a>        FORM.indirect =&gt; parseFormValue(r, try r.takeLeb128(u64), format, endian, addr_size_bytes, implicit_const),
+<a id="L1331"></a>        FORM.implicit_const =&gt; .{ .sdata = implicit_const orelse return bad() },
+<a id="L1332"></a>        FORM.loclistx =&gt; .{ .loclistx = try r.takeLeb128(u64) },
+<a id="L1333"></a>        FORM.rnglistx =&gt; .{ .rnglistx = try r.takeLeb128(u64) },
+<a id="L1334"></a>        else =&gt; {
+<a id="L1335"></a>            //debug.print("unrecognized form id: {x}\n", .{form_id});
+<a id="L1336"></a>            return bad();
+<a id="L1337"></a>        },
+<a id="L1338"></a>    };
+<a id="L1339"></a>}
+<a id="L1340"></a>
+<a id="L1341"></a>const FileEntry = struct {
+<a id="L1342"></a>    path: []const u8,
+<a id="L1343"></a>    dir_index: u32 = 0,
+<a id="L1344"></a>    mtime: u64 = 0,
+<a id="L1345"></a>    size: u64 = 0,
+<a id="L1346"></a>    md5: [16]u8 = [1]u8{0} ** 16,
+<a id="L1347"></a>};
+<a id="L1348"></a>
+<a id="L1349"></a>const LineNumberProgram = struct {
+<a id="L1350"></a>    address: u64,
+<a id="L1351"></a>    file: usize,
+<a id="L1352"></a>    line: i64,
+<a id="L1353"></a>    column: u64,
+<a id="L1354"></a>    version: u16,
+<a id="L1355"></a>    is_stmt: bool,
+<a id="L1356"></a>    basic_block: bool,
+<a id="L1357"></a>
+<a id="L1358"></a>    default_is_stmt: bool,
+<a id="L1359"></a>
+<a id="L1360"></a>    // Reset the state machine following the DWARF specification
+<a id="L1361"></a>    pub fn reset(self: *LineNumberProgram) void {
+<a id="L1362"></a>        self.address = 0;
+<a id="L1363"></a>        self.file = 1;
+<a id="L1364"></a>        self.line = 1;
+<a id="L1365"></a>        self.column = 0;
+<a id="L1366"></a>        self.is_stmt = self.default_is_stmt;
+<a id="L1367"></a>        self.basic_block = false;
+<a id="L1368"></a>    }
+<a id="L1369"></a>
+<a id="L1370"></a>    pub fn init(is_stmt: bool, version: u16) LineNumberProgram {
+<a id="L1371"></a>        return .{
+<a id="L1372"></a>            .address = 0,
+<a id="L1373"></a>            .file = 1,
+<a id="L1374"></a>            .line = 1,
+<a id="L1375"></a>            .column = 0,
+<a id="L1376"></a>            .version = version,
+<a id="L1377"></a>            .is_stmt = is_stmt,
+<a id="L1378"></a>            .basic_block = false,
+<a id="L1379"></a>            .default_is_stmt = is_stmt,
+<a id="L1380"></a>        };
+<a id="L1381"></a>    }
+<a id="L1382"></a>
+<a id="L1383"></a>    pub fn addRow(prog: *LineNumberProgram, gpa: Allocator, table: *CompileUnit.SrcLocCache.LineTable) !void {
+<a id="L1384"></a>        if (prog.line == 0) {
+<a id="L1385"></a>            //if (debug_debug_mode) @panic("garbage line data");
+<a id="L1386"></a>            return;
+<a id="L1387"></a>        }
+<a id="L1388"></a>        if (debug_debug_mode) assert(!table.contains(prog.address));
+<a id="L1389"></a>        try table.put(gpa, prog.address, .{
+<a id="L1390"></a>            .line = cast(u32, prog.line) orelse maxInt(u32),
+<a id="L1391"></a>            .column = cast(u32, prog.column) orelse maxInt(u32),
+<a id="L1392"></a>            .file = cast(u32, prog.file) orelse return bad(),
+<a id="L1393"></a>        });
+<a id="L1394"></a>    }
+<a id="L1395"></a>};
+<a id="L1396"></a>
+<a id="L1397"></a>const UnitHeader = struct {
+<a id="L1398"></a>    format: Format,
+<a id="L1399"></a>    header_length: u4,
+<a id="L1400"></a>    unit_length: u64,
+<a id="L1401"></a>};
+<a id="L1402"></a>
+<a id="L1403"></a>pub fn readUnitHeader(r: *Reader, endian: Endian) ScanError!UnitHeader {
+<a id="L1404"></a>    return switch (try r.takeInt(u32, endian)) {
+<a id="L1405"></a>        0...0xfffffff0 - 1 =&gt; |unit_length| .{
+<a id="L1406"></a>            .format = .@"32",
+<a id="L1407"></a>            .header_length = 4,
+<a id="L1408"></a>            .unit_length = unit_length,
+<a id="L1409"></a>        },
+<a id="L1410"></a>        0xfffffff0...0xffffffff - 1 =&gt; bad(),
+<a id="L1411"></a>        0xffffffff =&gt; .{
+<a id="L1412"></a>            .format = .@"64",
+<a id="L1413"></a>            .header_length = 12,
+<a id="L1414"></a>            .unit_length = try r.takeInt(u64, endian),
+<a id="L1415"></a>        },
+<a id="L1416"></a>    };
+<a id="L1417"></a>}
+<a id="L1418"></a>
+<a id="L1419"></a>/// Returns the DWARF register number for an x86_64 register number found in compact unwind info
+<a id="L1420"></a>pub fn compactUnwindToDwarfRegNumber(unwind_reg_number: u3) !u16 {
+<a id="L1421"></a>    return switch (unwind_reg_number) {
+<a id="L1422"></a>        1 =&gt; 3, // RBX
+<a id="L1423"></a>        2 =&gt; 12, // R12
+<a id="L1424"></a>        3 =&gt; 13, // R13
+<a id="L1425"></a>        4 =&gt; 14, // R14
+<a id="L1426"></a>        5 =&gt; 15, // R15
+<a id="L1427"></a>        6 =&gt; 6, // RBP
+<a id="L1428"></a>        else =&gt; error.InvalidRegister,
+<a id="L1429"></a>    };
+<a id="L1430"></a>}
+<a id="L1431"></a>
+<a id="L1432"></a>/// Returns `null` for CPU architectures without an instruction pointer register.
+<a id="L1433"></a>pub fn ipRegNum(arch: std.Target.Cpu.Arch) ?u16 {
+<a id="L1434"></a>    return switch (arch) {
+<a id="L1435"></a>        .aarch64, .aarch64_be =&gt; 32,
+<a id="L1436"></a>        .arc, .arceb =&gt; 160,
+<a id="L1437"></a>        .arm, .armeb, .thumb, .thumbeb =&gt; 15,
+<a id="L1438"></a>        .csky =&gt; 64,
+<a id="L1439"></a>        .hexagon =&gt; 76,
+<a id="L1440"></a>        .kvx =&gt; 64,
+<a id="L1441"></a>        .lanai =&gt; 2,
+<a id="L1442"></a>        .loongarch32, .loongarch64 =&gt; 64,
+<a id="L1443"></a>        .m68k =&gt; 26,
+<a id="L1444"></a>        .mips, .mipsel, .mips64, .mips64el =&gt; 66,
+<a id="L1445"></a>        .or1k =&gt; 35,
+<a id="L1446"></a>        .powerpc, .powerpcle, .powerpc64, .powerpc64le =&gt; 67,
+<a id="L1447"></a>        .riscv32, .riscv32be, .riscv64, .riscv64be =&gt; 65,
+<a id="L1448"></a>        .s390x =&gt; 65,
+<a id="L1449"></a>        .sparc, .sparc64 =&gt; 32,
+<a id="L1450"></a>        .ve =&gt; 144,
+<a id="L1451"></a>        .x86 =&gt; 8,
+<a id="L1452"></a>        .x86_64 =&gt; 16,
+<a id="L1453"></a>        else =&gt; null,
+<a id="L1454"></a>    };
+<a id="L1455"></a>}
+<a id="L1456"></a>
+<a id="L1457"></a>pub fn fpRegNum(arch: std.Target.Cpu.Arch) u16 {
+<a id="L1458"></a>    return switch (arch) {
+<a id="L1459"></a>        .aarch64, .aarch64_be =&gt; 29,
+<a id="L1460"></a>        .arc, .arceb =&gt; 27,
+<a id="L1461"></a>        .arm, .armeb, .thumb, .thumbeb =&gt; 11,
+<a id="L1462"></a>        .csky =&gt; 14,
+<a id="L1463"></a>        .hexagon =&gt; 30,
+<a id="L1464"></a>        .kvx =&gt; 14,
+<a id="L1465"></a>        .lanai =&gt; 5,
+<a id="L1466"></a>        .loongarch32, .loongarch64 =&gt; 22,
+<a id="L1467"></a>        .m68k =&gt; 14,
+<a id="L1468"></a>        .mips, .mipsel, .mips64, .mips64el =&gt; 30,
+<a id="L1469"></a>        .or1k =&gt; 2,
+<a id="L1470"></a>        .powerpc, .powerpcle, .powerpc64, .powerpc64le =&gt; 1,
+<a id="L1471"></a>        .riscv32, .riscv32be, .riscv64, .riscv64be =&gt; 8,
+<a id="L1472"></a>        .s390x =&gt; 11,
+<a id="L1473"></a>        .sparc, .sparc64 =&gt; 30,
+<a id="L1474"></a>        .ve =&gt; 9,
+<a id="L1475"></a>        .x86 =&gt; 5,
+<a id="L1476"></a>        .x86_64 =&gt; 6,
+<a id="L1477"></a>        else =&gt; unreachable,
+<a id="L1478"></a>    };
+<a id="L1479"></a>}
+<a id="L1480"></a>
+<a id="L1481"></a>pub fn spRegNum(arch: std.Target.Cpu.Arch) u16 {
+<a id="L1482"></a>    return switch (arch) {
+<a id="L1483"></a>        .aarch64, .aarch64_be =&gt; 31,
+<a id="L1484"></a>        .arc, .arceb =&gt; 28,
+<a id="L1485"></a>        .arm, .armeb, .thumb, .thumbeb =&gt; 13,
+<a id="L1486"></a>        .csky =&gt; 14,
+<a id="L1487"></a>        .hexagon =&gt; 29,
+<a id="L1488"></a>        .kvx =&gt; 12,
+<a id="L1489"></a>        .lanai =&gt; 4,
+<a id="L1490"></a>        .loongarch32, .loongarch64 =&gt; 3,
+<a id="L1491"></a>        .m68k =&gt; 15,
+<a id="L1492"></a>        .mips, .mipsel, .mips64, .mips64el =&gt; 29,
+<a id="L1493"></a>        .or1k =&gt; 1,
+<a id="L1494"></a>        .powerpc, .powerpcle, .powerpc64, .powerpc64le =&gt; 1,
+<a id="L1495"></a>        .riscv32, .riscv32be, .riscv64, .riscv64be =&gt; 2,
+<a id="L1496"></a>        .s390x =&gt; 15,
+<a id="L1497"></a>        .sparc, .sparc64 =&gt; 14,
+<a id="L1498"></a>        .ve =&gt; 11,
+<a id="L1499"></a>        .x86 =&gt; 4,
+<a id="L1500"></a>        .x86_64 =&gt; 7,
+<a id="L1501"></a>        else =&gt; unreachable,
+<a id="L1502"></a>    };
+<a id="L1503"></a>}
+<a id="L1504"></a>
+<a id="L1505"></a>/// Tells whether unwinding for this target is supported by the Dwarf standard.
+<a id="L1506"></a>///
+<a id="L1507"></a>/// See also `std.debug.SelfInfo.can_unwind` which tells whether the Zig standard
+<a id="L1508"></a>/// library has a working implementation of unwinding for the current target.
+<a id="L1509"></a>pub fn supportsUnwinding(target: *const std.Target) bool {
+<a id="L1510"></a>    return switch (target.cpu.arch) {
+<a id="L1511"></a>        .amdgcn,
+<a id="L1512"></a>        .nvptx,
+<a id="L1513"></a>        .nvptx64,
+<a id="L1514"></a>        .spirv32,
+<a id="L1515"></a>        .spirv64,
+<a id="L1516"></a>        =&gt; false,
+<a id="L1517"></a>
+<a id="L1518"></a>        // Conservative guess. Feel free to update this logic with any targets
+<a id="L1519"></a>        // that are known to not support Dwarf unwinding.
+<a id="L1520"></a>        else =&gt; true,
+<a id="L1521"></a>    };
+<a id="L1522"></a>}
+<a id="L1523"></a>
+<a id="L1524"></a>/// This function is to make it handy to comment out the return and make it
+<a id="L1525"></a>/// into a crash when working on this file.
+<a id="L1526"></a>pub fn bad() error{InvalidDebugInfo} {
+<a id="L1527"></a>    invalidDebugInfoDetected();
+<a id="L1528"></a>    return error.InvalidDebugInfo;
+<a id="L1529"></a>}
+<a id="L1530"></a>
+<a id="L1531"></a>pub fn invalidDebugInfoDetected() void {
+<a id="L1532"></a>    if (debug_debug_mode) @panic("bad dwarf");
+<a id="L1533"></a>}
+<a id="L1534"></a>
+<a id="L1535"></a>pub fn missing() error{MissingDebugInfo} {
+<a id="L1536"></a>    if (debug_debug_mode) @panic("missing dwarf");
+<a id="L1537"></a>    return error.MissingDebugInfo;
+<a id="L1538"></a>}
+<a id="L1539"></a>
+<a id="L1540"></a>fn getStringGeneric(opt_str: ?[]const u8, offset: u64) ![:0]const u8 {
+<a id="L1541"></a>    const str = opt_str orelse return bad();
+<a id="L1542"></a>    if (offset &gt; str.len) return bad();
+<a id="L1543"></a>    const casted_offset = cast(usize, offset) orelse return bad();
+<a id="L1544"></a>    // Valid strings always have a terminating zero byte
+<a id="L1545"></a>    const last = std.mem.findScalarPos(u8, str, casted_offset, 0) orelse return bad();
+<a id="L1546"></a>    return str[casted_offset..last :0];
+<a id="L1547"></a>}
+<a id="L1548"></a>
+<a id="L1549"></a>pub fn getSymbols(
+<a id="L1550"></a>    di: *Dwarf,
+<a id="L1551"></a>    symbol_allocator: Allocator,
+<a id="L1552"></a>    text_arena: Allocator,
+<a id="L1553"></a>    endian: Endian,
+<a id="L1554"></a>    address: u64,
+<a id="L1555"></a>    resolve_inline_callers: bool,
+<a id="L1556"></a>    symbols: *std.ArrayList(std.debug.Symbol),
+<a id="L1557"></a>) std.debug.SelfInfoError!void {
+<a id="L1558"></a>    _ = resolve_inline_callers;
+<a id="L1559"></a>    const gpa = std.debug.getDebugInfoAllocator();
+<a id="L1560"></a>
+<a id="L1561"></a>    const compile_unit = di.findCompileUnit(endian, address) catch |err| switch (err) {
+<a id="L1562"></a>        error.EndOfStream =&gt; return error.MissingDebugInfo,
+<a id="L1563"></a>        error.Overflow =&gt; return error.InvalidDebugInfo,
+<a id="L1564"></a>        error.ReadFailed, error.InvalidDebugInfo, error.MissingDebugInfo =&gt; |e| return e,
+<a id="L1565"></a>    };
+<a id="L1566"></a>    try symbols.append(symbol_allocator, .{
+<a id="L1567"></a>        .name = di.getSymbolName(address),
+<a id="L1568"></a>        .compile_unit_name = compile_unit.die.getAttrString(di, endian, std.dwarf.AT.name, di.section(.debug_str), compile_unit) catch |err| switch (err) {
+<a id="L1569"></a>            error.MissingDebugInfo, error.InvalidDebugInfo =&gt; null,
+<a id="L1570"></a>        },
+<a id="L1571"></a>        .source_location = di.getLineNumberInfo(gpa, text_arena, endian, compile_unit, address) catch |err| switch (err) {
+<a id="L1572"></a>            error.MissingDebugInfo, error.InvalidDebugInfo =&gt; null,
+<a id="L1573"></a>            error.ReadFailed,
+<a id="L1574"></a>            error.EndOfStream,
+<a id="L1575"></a>            error.Overflow,
+<a id="L1576"></a>            error.StreamTooLong,
+<a id="L1577"></a>            =&gt; return error.InvalidDebugInfo,
+<a id="L1578"></a>            else =&gt; |e| return e,
+<a id="L1579"></a>        },
+<a id="L1580"></a>    });
+<a id="L1581"></a>}
+<a id="L1582"></a>
+<a id="L1583"></a>/// DWARF5 7.4: "In the 32-bit DWARF format, all values that represent lengths of DWARF sections and
+<a id="L1584"></a>/// offsets relative to the beginning of DWARF sections are represented using four bytes. In the
+<a id="L1585"></a>/// 64-bit DWARF format, all values that represent lengths of DWARF sections and offsets relative to
+<a id="L1586"></a>/// the beginning of DWARF sections are represented using eight bytes".
+<a id="L1587"></a>///
+<a id="L1588"></a>/// This function is for reading such values.
+<a id="L1589"></a>fn readFormatSizedInt(r: *Reader, format: std.dwarf.Format, endian: Endian) !u64 {
+<a id="L1590"></a>    return switch (format) {
+<a id="L1591"></a>        .@"32" =&gt; try r.takeInt(u32, endian),
+<a id="L1592"></a>        .@"64" =&gt; try r.takeInt(u64, endian),
+<a id="L1593"></a>    };
+<a id="L1594"></a>}
+<a id="L1595"></a>
+<a id="L1596"></a>fn readAddress(r: *Reader, endian: Endian, addr_size_bytes: u8) !u64 {
+<a id="L1597"></a>    return switch (addr_size_bytes) {
+<a id="L1598"></a>        2 =&gt; try r.takeInt(u16, endian),
+<a id="L1599"></a>        4 =&gt; try r.takeInt(u32, endian),
+<a id="L1600"></a>        8 =&gt; try r.takeInt(u64, endian),
+<a id="L1601"></a>        else =&gt; return bad(),
+<a id="L1602"></a>    };
+<a id="L1603"></a>}
+</pre>
 </body>
 </html>

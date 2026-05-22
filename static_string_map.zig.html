@@ -2,555 +2,558 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Source: zig-0.16.0-std/static_string_map.zig</title>
+    <title>Source: static_string_map.zig</title>
     <style>
         body { background: #1e1e1e; color: #d4d4d4; font-family: monospace; padding: 20px; }
         pre { white-space: pre-wrap; word-wrap: break-word; }
         .header { border-bottom: 1px solid #444; padding-bottom: 10px; margin-bottom: 20px; }
         a { color: #569cd6; }
+        a[id] { color: inherit; text-decoration: none; }
+        :target { background: #3a3a00; }
     </style>
 </head>
 <body>
     <div class="header">
-        <a href="/">Index</a> | <strong>File: zig-0.16.0-std/static_string_map.zig</strong>
+        <a href="/">Index</a> | <strong>File: static_string_map.zig</strong>
     </div>
-    <pre>const std = @import("std.zig");
-const mem = std.mem;
-
-/// Static string map optimized for small sets of disparate string keys.
-/// Works by separating the keys by length at initialization and only checking
-/// strings of equal length at runtime.
-pub fn StaticStringMap(comptime V: type) type {
-    return StaticStringMapWithEql(V, defaultEql);
-}
-
-/// Like `std.mem.eql`, but takes advantage of the fact that the lengths
-/// of `a` and `b` are known to be equal.
-pub fn defaultEql(a: []const u8, b: []const u8) bool {
-    if (a.ptr == b.ptr) return true;
-    for (a, b) |a_elem, b_elem| {
-        if (a_elem != b_elem) return false;
-    }
-    return true;
-}
-
-/// Like `std.ascii.eqlIgnoreCase` but takes advantage of the fact that
-/// the lengths of `a` and `b` are known to be equal.
-pub fn eqlAsciiIgnoreCase(a: []const u8, b: []const u8) bool {
-    if (a.ptr == b.ptr) return true;
-    for (a, b) |a_c, b_c| {
-        if (std.ascii.toLower(a_c) != std.ascii.toLower(b_c)) return false;
-    }
-    return true;
-}
-
-/// StaticStringMap, but accepts an equality function (`eql`).
-/// The `eql` function is only called to determine the equality
-/// of equal length strings. Any strings that are not equal length
-/// are never compared using the `eql` function.
-pub fn StaticStringMapWithEql(
-    comptime V: type,
-    comptime eql: fn (a: []const u8, b: []const u8) bool,
-) type {
-    return struct {
-        kvs: *const KVs = &amp;empty_kvs,
-        len_indexes: [*]const u32 = &amp;empty_len_indexes,
-        len_indexes_len: u32 = 0,
-        min_len: u32 = std.math.maxInt(u32),
-        max_len: u32 = 0,
-
-        pub const KV = struct {
-            key: []const u8,
-            value: V,
-        };
-
-        const Self = @This();
-        const KVs = struct {
-            keys: [*]const []const u8,
-            values: [*]const V,
-            len: u32,
-        };
-        const empty_kvs = KVs{
-            .keys = &amp;empty_keys,
-            .values = &amp;empty_vals,
-            .len = 0,
-        };
-        const empty_len_indexes = [0]u32{};
-        const empty_keys = [0][]const u8{};
-        const empty_vals = [0]V{};
-
-        /// Returns a map backed by static, comptime allocated memory.
-        ///
-        /// `kvs_list` must be either a list of `struct { []const u8, V }`
-        /// (key-value pair) tuples, or a list of `struct { []const u8 }`
-        /// (only keys) tuples if `V` is `void`.
-        pub inline fn initComptime(comptime kvs_list: anytype) Self {
-            comptime {
-                var self = Self{};
-                if (kvs_list.len == 0)
-                    return self;
-
-                // Since the KVs are sorted, a linearly-growing bound will never
-                // be sufficient for extreme cases. So we grow proportional to
-                // N*log2(N).
-                @setEvalBranchQuota(10 * kvs_list.len * std.math.log2_int_ceil(usize, kvs_list.len));
-
-                var sorted_keys: [kvs_list.len][]const u8 = undefined;
-                var sorted_vals: [kvs_list.len]V = undefined;
-
-                self.initSortedKVs(kvs_list, &amp;sorted_keys, &amp;sorted_vals);
-                const final_keys = sorted_keys;
-                const final_vals = sorted_vals;
-                self.kvs = &amp;.{
-                    .keys = &amp;final_keys,
-                    .values = &amp;final_vals,
-                    .len = @intCast(kvs_list.len),
-                };
-
-                var len_indexes: [self.max_len + 1]u32 = undefined;
-                self.initLenIndexes(&amp;len_indexes);
-                const final_len_indexes = len_indexes;
-                self.len_indexes = &amp;final_len_indexes;
-                self.len_indexes_len = @intCast(len_indexes.len);
-                return self;
-            }
-        }
-
-        /// Returns a map backed by memory allocated with `allocator`.
-        ///
-        /// Handles `kvs_list` the same way as `initComptime()`.
-        pub fn init(kvs_list: anytype, allocator: mem.Allocator) !Self {
-            var self = Self{};
-            if (kvs_list.len == 0)
-                return self;
-
-            const sorted_keys = try allocator.alloc([]const u8, kvs_list.len);
-            errdefer allocator.free(sorted_keys);
-            const sorted_vals = try allocator.alloc(V, kvs_list.len);
-            errdefer allocator.free(sorted_vals);
-            const kvs = try allocator.create(KVs);
-            errdefer allocator.destroy(kvs);
-
-            self.initSortedKVs(kvs_list, sorted_keys, sorted_vals);
-            kvs.* = .{
-                .keys = sorted_keys.ptr,
-                .values = sorted_vals.ptr,
-                .len = @intCast(kvs_list.len),
-            };
-            self.kvs = kvs;
-
-            const len_indexes = try allocator.alloc(u32, self.max_len + 1);
-            self.initLenIndexes(len_indexes);
-            self.len_indexes = len_indexes.ptr;
-            self.len_indexes_len = @intCast(len_indexes.len);
-            return self;
-        }
-
-        /// this method should only be used with init() and not with initComptime().
-        pub fn deinit(self: Self, allocator: mem.Allocator) void {
-            allocator.free(self.len_indexes[0..self.len_indexes_len]);
-            allocator.free(self.kvs.keys[0..self.kvs.len]);
-            allocator.free(self.kvs.values[0..self.kvs.len]);
-            allocator.destroy(self.kvs);
-        }
-
-        const SortContext = struct {
-            keys: [][]const u8,
-            vals: []V,
-
-            pub fn lessThan(ctx: @This(), a: usize, b: usize) bool {
-                return ctx.keys[a].len &lt; ctx.keys[b].len;
-            }
-
-            pub fn swap(ctx: @This(), a: usize, b: usize) void {
-                std.mem.swap([]const u8, &amp;ctx.keys[a], &amp;ctx.keys[b]);
-                std.mem.swap(V, &amp;ctx.vals[a], &amp;ctx.vals[b]);
-            }
-        };
-
-        fn initSortedKVs(
-            self: *Self,
-            kvs_list: anytype,
-            sorted_keys: [][]const u8,
-            sorted_vals: []V,
-        ) void {
-            for (kvs_list, 0..) |kv, i| {
-                sorted_keys[i] = kv.@"0";
-                sorted_vals[i] = if (V == void) {} else kv.@"1";
-                self.min_len = @intCast(@min(self.min_len, kv.@"0".len));
-                self.max_len = @intCast(@max(self.max_len, kv.@"0".len));
-            }
-            mem.sortUnstableContext(0, sorted_keys.len, SortContext{
-                .keys = sorted_keys,
-                .vals = sorted_vals,
-            });
-        }
-
-        fn initLenIndexes(self: Self, len_indexes: []u32) void {
-            var len: usize = 0;
-            var i: u32 = 0;
-            while (len &lt;= self.max_len) : (len += 1) {
-                // find the first keyword len == len
-                while (len &gt; self.kvs.keys[i].len) {
-                    i += 1;
-                }
-                len_indexes[len] = i;
-            }
-        }
-
-        /// Checks if the map has a value for the key.
-        pub fn has(self: Self, str: []const u8) bool {
-            return self.get(str) != null;
-        }
-
-        /// Returns the value for the key if any, else null.
-        pub fn get(self: Self, str: []const u8) ?V {
-            if (self.kvs.len == 0)
-                return null;
-
-            return self.kvs.values[self.getIndex(str) orelse return null];
-        }
-
-        pub fn getIndex(self: Self, str: []const u8) ?usize {
-            const kvs = self.kvs.*;
-            if (kvs.len == 0)
-                return null;
-
-            if (str.len &lt; self.min_len or str.len &gt; self.max_len)
-                return null;
-
-            var i = self.len_indexes[str.len];
-            while (true) {
-                const key = kvs.keys[i];
-                if (key.len != str.len)
-                    return null;
-                if (eql(key, str))
-                    return i;
-                i += 1;
-                if (i &gt;= kvs.len)
-                    return null;
-            }
-        }
-
-        /// Returns the key-value pair where key is the longest prefix of `str`
-        /// else null.
-        ///
-        /// This is effectively an O(N) algorithm which loops from `max_len` to
-        /// `min_len` and calls `getIndex()` to check all keys with the given
-        /// len.
-        pub fn getLongestPrefix(self: Self, str: []const u8) ?KV {
-            if (self.kvs.len == 0)
-                return null;
-            const i = self.getLongestPrefixIndex(str) orelse return null;
-            const kvs = self.kvs.*;
-            return .{
-                .key = kvs.keys[i],
-                .value = kvs.values[i],
-            };
-        }
-
-        pub fn getLongestPrefixIndex(self: Self, str: []const u8) ?usize {
-            if (self.kvs.len == 0)
-                return null;
-
-            if (str.len &lt; self.min_len)
-                return null;
-
-            var len = @min(self.max_len, str.len);
-            while (len &gt;= self.min_len) : (len -= 1) {
-                if (self.getIndex(str[0..len])) |i|
-                    return i;
-            }
-            return null;
-        }
-
-        pub fn keys(self: Self) []const []const u8 {
-            const kvs = self.kvs.*;
-            return kvs.keys[0..kvs.len];
-        }
-
-        pub fn values(self: Self) []const V {
-            const kvs = self.kvs.*;
-            return kvs.values[0..kvs.len];
-        }
-    };
-}
-
-const TestEnum = enum { A, B, C, D, E };
-const TestMap = StaticStringMap(TestEnum);
-const TestKV = struct { []const u8, TestEnum };
-const TestMapVoid = StaticStringMap(void);
-const TestKVVoid = struct { []const u8 };
-const TestMapWithEql = StaticStringMapWithEql(TestEnum, eqlAsciiIgnoreCase);
-const testing = std.testing;
-const test_alloc = testing.allocator;
-
-test "list literal of list literals" {
-    const slice: []const TestKV = &amp;.{
-        .{ "these", .D },
-        .{ "have", .A },
-        .{ "nothing", .B },
-        .{ "incommon", .C },
-        .{ "samelen", .E },
-    };
-
-    const map = TestMap.initComptime(slice);
-    try testMap(map);
-    // Default comparison is case sensitive
-    try testing.expect(null == map.get("NOTHING"));
-
-    // runtime init(), deinit()
-    const map_rt = try TestMap.init(slice, test_alloc);
-    defer map_rt.deinit(test_alloc);
-    try testMap(map_rt);
-    // Default comparison is case sensitive
-    try testing.expect(null == map_rt.get("NOTHING"));
-}
-
-test "array of structs" {
-    const slice = [_]TestKV{
-        .{ "these", .D },
-        .{ "have", .A },
-        .{ "nothing", .B },
-        .{ "incommon", .C },
-        .{ "samelen", .E },
-    };
-
-    try testMap(TestMap.initComptime(slice));
-}
-
-test "slice of structs" {
-    const slice = [_]TestKV{
-        .{ "these", .D },
-        .{ "have", .A },
-        .{ "nothing", .B },
-        .{ "incommon", .C },
-        .{ "samelen", .E },
-    };
-
-    try testMap(TestMap.initComptime(slice));
-}
-
-fn testMap(map: anytype) !void {
-    try testing.expectEqual(TestEnum.A, map.get("have").?);
-    try testing.expectEqual(TestEnum.B, map.get("nothing").?);
-    try testing.expect(null == map.get("missing"));
-    try testing.expectEqual(TestEnum.D, map.get("these").?);
-    try testing.expectEqual(TestEnum.E, map.get("samelen").?);
-
-    try testing.expect(!map.has("missing"));
-    try testing.expect(map.has("these"));
-
-    try testing.expect(null == map.get(""));
-    try testing.expect(null == map.get("averylongstringthathasnomatches"));
-}
-
-test "void value type, slice of structs" {
-    const slice = [_]TestKVVoid{
-        .{"these"},
-        .{"have"},
-        .{"nothing"},
-        .{"incommon"},
-        .{"samelen"},
-    };
-    const map = TestMapVoid.initComptime(slice);
-    try testSet(map);
-    // Default comparison is case sensitive
-    try testing.expect(null == map.get("NOTHING"));
-}
-
-test "void value type, list literal of list literals" {
-    const slice = [_]TestKVVoid{
-        .{"these"},
-        .{"have"},
-        .{"nothing"},
-        .{"incommon"},
-        .{"samelen"},
-    };
-
-    try testSet(TestMapVoid.initComptime(slice));
-}
-
-fn testSet(map: TestMapVoid) !void {
-    try testing.expectEqual({}, map.get("have").?);
-    try testing.expectEqual({}, map.get("nothing").?);
-    try testing.expect(null == map.get("missing"));
-    try testing.expectEqual({}, map.get("these").?);
-    try testing.expectEqual({}, map.get("samelen").?);
-
-    try testing.expect(!map.has("missing"));
-    try testing.expect(map.has("these"));
-
-    try testing.expect(null == map.get(""));
-    try testing.expect(null == map.get("averylongstringthathasnomatches"));
-}
-
-fn testStaticStringMapWithEql(map: TestMapWithEql) !void {
-    try testMap(map);
-    try testing.expectEqual(TestEnum.A, map.get("HAVE").?);
-    try testing.expectEqual(TestEnum.E, map.get("SameLen").?);
-    try testing.expect(null == map.get("SameLength"));
-    try testing.expect(map.has("ThESe"));
-}
-
-test "StaticStringMapWithEql" {
-    const slice = [_]TestKV{
-        .{ "these", .D },
-        .{ "have", .A },
-        .{ "nothing", .B },
-        .{ "incommon", .C },
-        .{ "samelen", .E },
-    };
-
-    try testStaticStringMapWithEql(TestMapWithEql.initComptime(slice));
-}
-
-test "empty" {
-    const m1 = StaticStringMap(usize).initComptime(.{});
-    try testing.expect(null == m1.get("anything"));
-
-    const m2 = StaticStringMapWithEql(usize, eqlAsciiIgnoreCase).initComptime(.{});
-    try testing.expect(null == m2.get("anything"));
-
-    const m3 = try StaticStringMap(usize).init(.{}, test_alloc);
-    try testing.expect(null == m3.get("anything"));
-
-    const m4 = try StaticStringMapWithEql(usize, eqlAsciiIgnoreCase).init(.{}, test_alloc);
-    try testing.expect(null == m4.get("anything"));
-}
-
-test "redundant entries" {
-    const slice = [_]TestKV{
-        .{ "redundant", .D },
-        .{ "theNeedle", .A },
-        .{ "redundant", .B },
-        .{ "re" ++ "dundant", .C },
-        .{ "redun" ++ "dant", .E },
-    };
-    const map = TestMap.initComptime(slice);
-
-    // No promises about which one you get:
-    try testing.expect(null != map.get("redundant"));
-
-    // Default map is not case sensitive:
-    try testing.expect(null == map.get("REDUNDANT"));
-
-    try testing.expectEqual(TestEnum.A, map.get("theNeedle").?);
-}
-
-test "redundant insensitive" {
-    const slice = [_]TestKV{
-        .{ "redundant", .D },
-        .{ "theNeedle", .A },
-        .{ "redundanT", .B },
-        .{ "RE" ++ "dundant", .C },
-        .{ "redun" ++ "DANT", .E },
-    };
-
-    const map = TestMapWithEql.initComptime(slice);
-
-    // No promises about which result you'll get ...
-    try testing.expect(null != map.get("REDUNDANT"));
-    try testing.expect(null != map.get("ReDuNdAnT"));
-    try testing.expectEqual(TestEnum.A, map.get("theNeedle").?);
-}
-
-test "comptime-only value" {
-    const map = StaticStringMap(type).initComptime(.{
-        .{ "a", struct {
-            pub const foo = 1;
-        } },
-        .{ "b", struct {
-            pub const foo = 2;
-        } },
-        .{ "c", struct {
-            pub const foo = 3;
-        } },
-    });
-
-    try testing.expect(map.get("a").?.foo == 1);
-    try testing.expect(map.get("b").?.foo == 2);
-    try testing.expect(map.get("c").?.foo == 3);
-    try testing.expect(map.get("d") == null);
-}
-
-test "getLongestPrefix" {
-    const slice = [_]TestKV{
-        .{ "a", .A },
-        .{ "aa", .B },
-        .{ "aaa", .C },
-        .{ "aaaa", .D },
-    };
-
-    const map = TestMap.initComptime(slice);
-
-    try testing.expectEqual(null, map.getLongestPrefix(""));
-    try testing.expectEqual(null, map.getLongestPrefix("bar"));
-    try testing.expectEqualStrings("aaaa", map.getLongestPrefix("aaaabar").?.key);
-    try testing.expectEqualStrings("aaa", map.getLongestPrefix("aaabar").?.key);
-}
-
-test "getLongestPrefix2" {
-    const slice = [_]struct { []const u8, u8 }{
-        .{ "one", 1 },
-        .{ "two", 2 },
-        .{ "three", 3 },
-        .{ "four", 4 },
-        .{ "five", 5 },
-        .{ "six", 6 },
-        .{ "seven", 7 },
-        .{ "eight", 8 },
-        .{ "nine", 9 },
-    };
-    const map = StaticStringMap(u8).initComptime(slice);
-
-    try testing.expectEqual(1, map.get("one"));
-    try testing.expectEqual(null, map.get("o"));
-    try testing.expectEqual(null, map.get("onexxx"));
-    try testing.expectEqual(9, map.get("nine"));
-    try testing.expectEqual(null, map.get("n"));
-    try testing.expectEqual(null, map.get("ninexxx"));
-    try testing.expectEqual(null, map.get("xxx"));
-
-    try testing.expectEqual(1, map.getLongestPrefix("one").?.value);
-    try testing.expectEqual(1, map.getLongestPrefix("onexxx").?.value);
-    try testing.expectEqual(null, map.getLongestPrefix("o"));
-    try testing.expectEqual(null, map.getLongestPrefix("on"));
-    try testing.expectEqual(9, map.getLongestPrefix("nine").?.value);
-    try testing.expectEqual(9, map.getLongestPrefix("ninexxx").?.value);
-    try testing.expectEqual(null, map.getLongestPrefix("n"));
-    try testing.expectEqual(null, map.getLongestPrefix("xxx"));
-}
-
-test "sorting kvs doesn't exceed eval branch quota" {
-    // from https://github.com/ziglang/zig/issues/19803
-    const TypeToByteSizeLUT = std.StaticStringMap(u32).initComptime(.{
-        .{ "bool", 0 },
-        .{ "c_int", 0 },
-        .{ "c_long", 0 },
-        .{ "c_longdouble", 0 },
-        .{ "t20", 0 },
-        .{ "t19", 0 },
-        .{ "t18", 0 },
-        .{ "t17", 0 },
-        .{ "t16", 0 },
-        .{ "t15", 0 },
-        .{ "t14", 0 },
-        .{ "t13", 0 },
-        .{ "t12", 0 },
-        .{ "t11", 0 },
-        .{ "t10", 0 },
-        .{ "t9", 0 },
-        .{ "t8", 0 },
-        .{ "t7", 0 },
-        .{ "t6", 0 },
-        .{ "t5", 0 },
-        .{ "t4", 0 },
-        .{ "t3", 0 },
-        .{ "t2", 0 },
-        .{ "t1", 1 },
-    });
-    try testing.expectEqual(1, TypeToByteSizeLUT.get("t1"));
-}</pre>
+    <pre><a id="L1"></a>const std = @import("std.zig");
+<a id="L2"></a>const mem = std.mem;
+<a id="L3"></a>
+<a id="L4"></a>/// Static string map optimized for small sets of disparate string keys.
+<a id="L5"></a>/// Works by separating the keys by length at initialization and only checking
+<a id="L6"></a>/// strings of equal length at runtime.
+<a id="L7"></a>pub fn StaticStringMap(comptime V: type) type {
+<a id="L8"></a>    return StaticStringMapWithEql(V, defaultEql);
+<a id="L9"></a>}
+<a id="L10"></a>
+<a id="L11"></a>/// Like `std.mem.eql`, but takes advantage of the fact that the lengths
+<a id="L12"></a>/// of `a` and `b` are known to be equal.
+<a id="L13"></a>pub fn defaultEql(a: []const u8, b: []const u8) bool {
+<a id="L14"></a>    if (a.ptr == b.ptr) return true;
+<a id="L15"></a>    for (a, b) |a_elem, b_elem| {
+<a id="L16"></a>        if (a_elem != b_elem) return false;
+<a id="L17"></a>    }
+<a id="L18"></a>    return true;
+<a id="L19"></a>}
+<a id="L20"></a>
+<a id="L21"></a>/// Like `std.ascii.eqlIgnoreCase` but takes advantage of the fact that
+<a id="L22"></a>/// the lengths of `a` and `b` are known to be equal.
+<a id="L23"></a>pub fn eqlAsciiIgnoreCase(a: []const u8, b: []const u8) bool {
+<a id="L24"></a>    if (a.ptr == b.ptr) return true;
+<a id="L25"></a>    for (a, b) |a_c, b_c| {
+<a id="L26"></a>        if (std.ascii.toLower(a_c) != std.ascii.toLower(b_c)) return false;
+<a id="L27"></a>    }
+<a id="L28"></a>    return true;
+<a id="L29"></a>}
+<a id="L30"></a>
+<a id="L31"></a>/// StaticStringMap, but accepts an equality function (`eql`).
+<a id="L32"></a>/// The `eql` function is only called to determine the equality
+<a id="L33"></a>/// of equal length strings. Any strings that are not equal length
+<a id="L34"></a>/// are never compared using the `eql` function.
+<a id="L35"></a>pub fn StaticStringMapWithEql(
+<a id="L36"></a>    comptime V: type,
+<a id="L37"></a>    comptime eql: fn (a: []const u8, b: []const u8) bool,
+<a id="L38"></a>) type {
+<a id="L39"></a>    return struct {
+<a id="L40"></a>        kvs: *const KVs = &amp;empty_kvs,
+<a id="L41"></a>        len_indexes: [*]const u32 = &amp;empty_len_indexes,
+<a id="L42"></a>        len_indexes_len: u32 = 0,
+<a id="L43"></a>        min_len: u32 = std.math.maxInt(u32),
+<a id="L44"></a>        max_len: u32 = 0,
+<a id="L45"></a>
+<a id="L46"></a>        pub const KV = struct {
+<a id="L47"></a>            key: []const u8,
+<a id="L48"></a>            value: V,
+<a id="L49"></a>        };
+<a id="L50"></a>
+<a id="L51"></a>        const Self = @This();
+<a id="L52"></a>        const KVs = struct {
+<a id="L53"></a>            keys: [*]const []const u8,
+<a id="L54"></a>            values: [*]const V,
+<a id="L55"></a>            len: u32,
+<a id="L56"></a>        };
+<a id="L57"></a>        const empty_kvs = KVs{
+<a id="L58"></a>            .keys = &amp;empty_keys,
+<a id="L59"></a>            .values = &amp;empty_vals,
+<a id="L60"></a>            .len = 0,
+<a id="L61"></a>        };
+<a id="L62"></a>        const empty_len_indexes = [0]u32{};
+<a id="L63"></a>        const empty_keys = [0][]const u8{};
+<a id="L64"></a>        const empty_vals = [0]V{};
+<a id="L65"></a>
+<a id="L66"></a>        /// Returns a map backed by static, comptime allocated memory.
+<a id="L67"></a>        ///
+<a id="L68"></a>        /// `kvs_list` must be either a list of `struct { []const u8, V }`
+<a id="L69"></a>        /// (key-value pair) tuples, or a list of `struct { []const u8 }`
+<a id="L70"></a>        /// (only keys) tuples if `V` is `void`.
+<a id="L71"></a>        pub inline fn initComptime(comptime kvs_list: anytype) Self {
+<a id="L72"></a>            comptime {
+<a id="L73"></a>                var self = Self{};
+<a id="L74"></a>                if (kvs_list.len == 0)
+<a id="L75"></a>                    return self;
+<a id="L76"></a>
+<a id="L77"></a>                // Since the KVs are sorted, a linearly-growing bound will never
+<a id="L78"></a>                // be sufficient for extreme cases. So we grow proportional to
+<a id="L79"></a>                // N*log2(N).
+<a id="L80"></a>                @setEvalBranchQuota(10 * kvs_list.len * std.math.log2_int_ceil(usize, kvs_list.len));
+<a id="L81"></a>
+<a id="L82"></a>                var sorted_keys: [kvs_list.len][]const u8 = undefined;
+<a id="L83"></a>                var sorted_vals: [kvs_list.len]V = undefined;
+<a id="L84"></a>
+<a id="L85"></a>                self.initSortedKVs(kvs_list, &amp;sorted_keys, &amp;sorted_vals);
+<a id="L86"></a>                const final_keys = sorted_keys;
+<a id="L87"></a>                const final_vals = sorted_vals;
+<a id="L88"></a>                self.kvs = &amp;.{
+<a id="L89"></a>                    .keys = &amp;final_keys,
+<a id="L90"></a>                    .values = &amp;final_vals,
+<a id="L91"></a>                    .len = @intCast(kvs_list.len),
+<a id="L92"></a>                };
+<a id="L93"></a>
+<a id="L94"></a>                var len_indexes: [self.max_len + 1]u32 = undefined;
+<a id="L95"></a>                self.initLenIndexes(&amp;len_indexes);
+<a id="L96"></a>                const final_len_indexes = len_indexes;
+<a id="L97"></a>                self.len_indexes = &amp;final_len_indexes;
+<a id="L98"></a>                self.len_indexes_len = @intCast(len_indexes.len);
+<a id="L99"></a>                return self;
+<a id="L100"></a>            }
+<a id="L101"></a>        }
+<a id="L102"></a>
+<a id="L103"></a>        /// Returns a map backed by memory allocated with `allocator`.
+<a id="L104"></a>        ///
+<a id="L105"></a>        /// Handles `kvs_list` the same way as `initComptime()`.
+<a id="L106"></a>        pub fn init(kvs_list: anytype, allocator: mem.Allocator) !Self {
+<a id="L107"></a>            var self = Self{};
+<a id="L108"></a>            if (kvs_list.len == 0)
+<a id="L109"></a>                return self;
+<a id="L110"></a>
+<a id="L111"></a>            const sorted_keys = try allocator.alloc([]const u8, kvs_list.len);
+<a id="L112"></a>            errdefer allocator.free(sorted_keys);
+<a id="L113"></a>            const sorted_vals = try allocator.alloc(V, kvs_list.len);
+<a id="L114"></a>            errdefer allocator.free(sorted_vals);
+<a id="L115"></a>            const kvs = try allocator.create(KVs);
+<a id="L116"></a>            errdefer allocator.destroy(kvs);
+<a id="L117"></a>
+<a id="L118"></a>            self.initSortedKVs(kvs_list, sorted_keys, sorted_vals);
+<a id="L119"></a>            kvs.* = .{
+<a id="L120"></a>                .keys = sorted_keys.ptr,
+<a id="L121"></a>                .values = sorted_vals.ptr,
+<a id="L122"></a>                .len = @intCast(kvs_list.len),
+<a id="L123"></a>            };
+<a id="L124"></a>            self.kvs = kvs;
+<a id="L125"></a>
+<a id="L126"></a>            const len_indexes = try allocator.alloc(u32, self.max_len + 1);
+<a id="L127"></a>            self.initLenIndexes(len_indexes);
+<a id="L128"></a>            self.len_indexes = len_indexes.ptr;
+<a id="L129"></a>            self.len_indexes_len = @intCast(len_indexes.len);
+<a id="L130"></a>            return self;
+<a id="L131"></a>        }
+<a id="L132"></a>
+<a id="L133"></a>        /// this method should only be used with init() and not with initComptime().
+<a id="L134"></a>        pub fn deinit(self: Self, allocator: mem.Allocator) void {
+<a id="L135"></a>            allocator.free(self.len_indexes[0..self.len_indexes_len]);
+<a id="L136"></a>            allocator.free(self.kvs.keys[0..self.kvs.len]);
+<a id="L137"></a>            allocator.free(self.kvs.values[0..self.kvs.len]);
+<a id="L138"></a>            allocator.destroy(self.kvs);
+<a id="L139"></a>        }
+<a id="L140"></a>
+<a id="L141"></a>        const SortContext = struct {
+<a id="L142"></a>            keys: [][]const u8,
+<a id="L143"></a>            vals: []V,
+<a id="L144"></a>
+<a id="L145"></a>            pub fn lessThan(ctx: @This(), a: usize, b: usize) bool {
+<a id="L146"></a>                return ctx.keys[a].len &lt; ctx.keys[b].len;
+<a id="L147"></a>            }
+<a id="L148"></a>
+<a id="L149"></a>            pub fn swap(ctx: @This(), a: usize, b: usize) void {
+<a id="L150"></a>                std.mem.swap([]const u8, &amp;ctx.keys[a], &amp;ctx.keys[b]);
+<a id="L151"></a>                std.mem.swap(V, &amp;ctx.vals[a], &amp;ctx.vals[b]);
+<a id="L152"></a>            }
+<a id="L153"></a>        };
+<a id="L154"></a>
+<a id="L155"></a>        fn initSortedKVs(
+<a id="L156"></a>            self: *Self,
+<a id="L157"></a>            kvs_list: anytype,
+<a id="L158"></a>            sorted_keys: [][]const u8,
+<a id="L159"></a>            sorted_vals: []V,
+<a id="L160"></a>        ) void {
+<a id="L161"></a>            for (kvs_list, 0..) |kv, i| {
+<a id="L162"></a>                sorted_keys[i] = kv.@"0";
+<a id="L163"></a>                sorted_vals[i] = if (V == void) {} else kv.@"1";
+<a id="L164"></a>                self.min_len = @intCast(@min(self.min_len, kv.@"0".len));
+<a id="L165"></a>                self.max_len = @intCast(@max(self.max_len, kv.@"0".len));
+<a id="L166"></a>            }
+<a id="L167"></a>            mem.sortUnstableContext(0, sorted_keys.len, SortContext{
+<a id="L168"></a>                .keys = sorted_keys,
+<a id="L169"></a>                .vals = sorted_vals,
+<a id="L170"></a>            });
+<a id="L171"></a>        }
+<a id="L172"></a>
+<a id="L173"></a>        fn initLenIndexes(self: Self, len_indexes: []u32) void {
+<a id="L174"></a>            var len: usize = 0;
+<a id="L175"></a>            var i: u32 = 0;
+<a id="L176"></a>            while (len &lt;= self.max_len) : (len += 1) {
+<a id="L177"></a>                // find the first keyword len == len
+<a id="L178"></a>                while (len &gt; self.kvs.keys[i].len) {
+<a id="L179"></a>                    i += 1;
+<a id="L180"></a>                }
+<a id="L181"></a>                len_indexes[len] = i;
+<a id="L182"></a>            }
+<a id="L183"></a>        }
+<a id="L184"></a>
+<a id="L185"></a>        /// Checks if the map has a value for the key.
+<a id="L186"></a>        pub fn has(self: Self, str: []const u8) bool {
+<a id="L187"></a>            return self.get(str) != null;
+<a id="L188"></a>        }
+<a id="L189"></a>
+<a id="L190"></a>        /// Returns the value for the key if any, else null.
+<a id="L191"></a>        pub fn get(self: Self, str: []const u8) ?V {
+<a id="L192"></a>            if (self.kvs.len == 0)
+<a id="L193"></a>                return null;
+<a id="L194"></a>
+<a id="L195"></a>            return self.kvs.values[self.getIndex(str) orelse return null];
+<a id="L196"></a>        }
+<a id="L197"></a>
+<a id="L198"></a>        pub fn getIndex(self: Self, str: []const u8) ?usize {
+<a id="L199"></a>            const kvs = self.kvs.*;
+<a id="L200"></a>            if (kvs.len == 0)
+<a id="L201"></a>                return null;
+<a id="L202"></a>
+<a id="L203"></a>            if (str.len &lt; self.min_len or str.len &gt; self.max_len)
+<a id="L204"></a>                return null;
+<a id="L205"></a>
+<a id="L206"></a>            var i = self.len_indexes[str.len];
+<a id="L207"></a>            while (true) {
+<a id="L208"></a>                const key = kvs.keys[i];
+<a id="L209"></a>                if (key.len != str.len)
+<a id="L210"></a>                    return null;
+<a id="L211"></a>                if (eql(key, str))
+<a id="L212"></a>                    return i;
+<a id="L213"></a>                i += 1;
+<a id="L214"></a>                if (i &gt;= kvs.len)
+<a id="L215"></a>                    return null;
+<a id="L216"></a>            }
+<a id="L217"></a>        }
+<a id="L218"></a>
+<a id="L219"></a>        /// Returns the key-value pair where key is the longest prefix of `str`
+<a id="L220"></a>        /// else null.
+<a id="L221"></a>        ///
+<a id="L222"></a>        /// This is effectively an O(N) algorithm which loops from `max_len` to
+<a id="L223"></a>        /// `min_len` and calls `getIndex()` to check all keys with the given
+<a id="L224"></a>        /// len.
+<a id="L225"></a>        pub fn getLongestPrefix(self: Self, str: []const u8) ?KV {
+<a id="L226"></a>            if (self.kvs.len == 0)
+<a id="L227"></a>                return null;
+<a id="L228"></a>            const i = self.getLongestPrefixIndex(str) orelse return null;
+<a id="L229"></a>            const kvs = self.kvs.*;
+<a id="L230"></a>            return .{
+<a id="L231"></a>                .key = kvs.keys[i],
+<a id="L232"></a>                .value = kvs.values[i],
+<a id="L233"></a>            };
+<a id="L234"></a>        }
+<a id="L235"></a>
+<a id="L236"></a>        pub fn getLongestPrefixIndex(self: Self, str: []const u8) ?usize {
+<a id="L237"></a>            if (self.kvs.len == 0)
+<a id="L238"></a>                return null;
+<a id="L239"></a>
+<a id="L240"></a>            if (str.len &lt; self.min_len)
+<a id="L241"></a>                return null;
+<a id="L242"></a>
+<a id="L243"></a>            var len = @min(self.max_len, str.len);
+<a id="L244"></a>            while (len &gt;= self.min_len) : (len -= 1) {
+<a id="L245"></a>                if (self.getIndex(str[0..len])) |i|
+<a id="L246"></a>                    return i;
+<a id="L247"></a>            }
+<a id="L248"></a>            return null;
+<a id="L249"></a>        }
+<a id="L250"></a>
+<a id="L251"></a>        pub fn keys(self: Self) []const []const u8 {
+<a id="L252"></a>            const kvs = self.kvs.*;
+<a id="L253"></a>            return kvs.keys[0..kvs.len];
+<a id="L254"></a>        }
+<a id="L255"></a>
+<a id="L256"></a>        pub fn values(self: Self) []const V {
+<a id="L257"></a>            const kvs = self.kvs.*;
+<a id="L258"></a>            return kvs.values[0..kvs.len];
+<a id="L259"></a>        }
+<a id="L260"></a>    };
+<a id="L261"></a>}
+<a id="L262"></a>
+<a id="L263"></a>const TestEnum = enum { A, B, C, D, E };
+<a id="L264"></a>const TestMap = StaticStringMap(TestEnum);
+<a id="L265"></a>const TestKV = struct { []const u8, TestEnum };
+<a id="L266"></a>const TestMapVoid = StaticStringMap(void);
+<a id="L267"></a>const TestKVVoid = struct { []const u8 };
+<a id="L268"></a>const TestMapWithEql = StaticStringMapWithEql(TestEnum, eqlAsciiIgnoreCase);
+<a id="L269"></a>const testing = std.testing;
+<a id="L270"></a>const test_alloc = testing.allocator;
+<a id="L271"></a>
+<a id="L272"></a>test "list literal of list literals" {
+<a id="L273"></a>    const slice: []const TestKV = &amp;.{
+<a id="L274"></a>        .{ "these", .D },
+<a id="L275"></a>        .{ "have", .A },
+<a id="L276"></a>        .{ "nothing", .B },
+<a id="L277"></a>        .{ "incommon", .C },
+<a id="L278"></a>        .{ "samelen", .E },
+<a id="L279"></a>    };
+<a id="L280"></a>
+<a id="L281"></a>    const map = TestMap.initComptime(slice);
+<a id="L282"></a>    try testMap(map);
+<a id="L283"></a>    // Default comparison is case sensitive
+<a id="L284"></a>    try testing.expect(null == map.get("NOTHING"));
+<a id="L285"></a>
+<a id="L286"></a>    // runtime init(), deinit()
+<a id="L287"></a>    const map_rt = try TestMap.init(slice, test_alloc);
+<a id="L288"></a>    defer map_rt.deinit(test_alloc);
+<a id="L289"></a>    try testMap(map_rt);
+<a id="L290"></a>    // Default comparison is case sensitive
+<a id="L291"></a>    try testing.expect(null == map_rt.get("NOTHING"));
+<a id="L292"></a>}
+<a id="L293"></a>
+<a id="L294"></a>test "array of structs" {
+<a id="L295"></a>    const slice = [_]TestKV{
+<a id="L296"></a>        .{ "these", .D },
+<a id="L297"></a>        .{ "have", .A },
+<a id="L298"></a>        .{ "nothing", .B },
+<a id="L299"></a>        .{ "incommon", .C },
+<a id="L300"></a>        .{ "samelen", .E },
+<a id="L301"></a>    };
+<a id="L302"></a>
+<a id="L303"></a>    try testMap(TestMap.initComptime(slice));
+<a id="L304"></a>}
+<a id="L305"></a>
+<a id="L306"></a>test "slice of structs" {
+<a id="L307"></a>    const slice = [_]TestKV{
+<a id="L308"></a>        .{ "these", .D },
+<a id="L309"></a>        .{ "have", .A },
+<a id="L310"></a>        .{ "nothing", .B },
+<a id="L311"></a>        .{ "incommon", .C },
+<a id="L312"></a>        .{ "samelen", .E },
+<a id="L313"></a>    };
+<a id="L314"></a>
+<a id="L315"></a>    try testMap(TestMap.initComptime(slice));
+<a id="L316"></a>}
+<a id="L317"></a>
+<a id="L318"></a>fn testMap(map: anytype) !void {
+<a id="L319"></a>    try testing.expectEqual(TestEnum.A, map.get("have").?);
+<a id="L320"></a>    try testing.expectEqual(TestEnum.B, map.get("nothing").?);
+<a id="L321"></a>    try testing.expect(null == map.get("missing"));
+<a id="L322"></a>    try testing.expectEqual(TestEnum.D, map.get("these").?);
+<a id="L323"></a>    try testing.expectEqual(TestEnum.E, map.get("samelen").?);
+<a id="L324"></a>
+<a id="L325"></a>    try testing.expect(!map.has("missing"));
+<a id="L326"></a>    try testing.expect(map.has("these"));
+<a id="L327"></a>
+<a id="L328"></a>    try testing.expect(null == map.get(""));
+<a id="L329"></a>    try testing.expect(null == map.get("averylongstringthathasnomatches"));
+<a id="L330"></a>}
+<a id="L331"></a>
+<a id="L332"></a>test "void value type, slice of structs" {
+<a id="L333"></a>    const slice = [_]TestKVVoid{
+<a id="L334"></a>        .{"these"},
+<a id="L335"></a>        .{"have"},
+<a id="L336"></a>        .{"nothing"},
+<a id="L337"></a>        .{"incommon"},
+<a id="L338"></a>        .{"samelen"},
+<a id="L339"></a>    };
+<a id="L340"></a>    const map = TestMapVoid.initComptime(slice);
+<a id="L341"></a>    try testSet(map);
+<a id="L342"></a>    // Default comparison is case sensitive
+<a id="L343"></a>    try testing.expect(null == map.get("NOTHING"));
+<a id="L344"></a>}
+<a id="L345"></a>
+<a id="L346"></a>test "void value type, list literal of list literals" {
+<a id="L347"></a>    const slice = [_]TestKVVoid{
+<a id="L348"></a>        .{"these"},
+<a id="L349"></a>        .{"have"},
+<a id="L350"></a>        .{"nothing"},
+<a id="L351"></a>        .{"incommon"},
+<a id="L352"></a>        .{"samelen"},
+<a id="L353"></a>    };
+<a id="L354"></a>
+<a id="L355"></a>    try testSet(TestMapVoid.initComptime(slice));
+<a id="L356"></a>}
+<a id="L357"></a>
+<a id="L358"></a>fn testSet(map: TestMapVoid) !void {
+<a id="L359"></a>    try testing.expectEqual({}, map.get("have").?);
+<a id="L360"></a>    try testing.expectEqual({}, map.get("nothing").?);
+<a id="L361"></a>    try testing.expect(null == map.get("missing"));
+<a id="L362"></a>    try testing.expectEqual({}, map.get("these").?);
+<a id="L363"></a>    try testing.expectEqual({}, map.get("samelen").?);
+<a id="L364"></a>
+<a id="L365"></a>    try testing.expect(!map.has("missing"));
+<a id="L366"></a>    try testing.expect(map.has("these"));
+<a id="L367"></a>
+<a id="L368"></a>    try testing.expect(null == map.get(""));
+<a id="L369"></a>    try testing.expect(null == map.get("averylongstringthathasnomatches"));
+<a id="L370"></a>}
+<a id="L371"></a>
+<a id="L372"></a>fn testStaticStringMapWithEql(map: TestMapWithEql) !void {
+<a id="L373"></a>    try testMap(map);
+<a id="L374"></a>    try testing.expectEqual(TestEnum.A, map.get("HAVE").?);
+<a id="L375"></a>    try testing.expectEqual(TestEnum.E, map.get("SameLen").?);
+<a id="L376"></a>    try testing.expect(null == map.get("SameLength"));
+<a id="L377"></a>    try testing.expect(map.has("ThESe"));
+<a id="L378"></a>}
+<a id="L379"></a>
+<a id="L380"></a>test "StaticStringMapWithEql" {
+<a id="L381"></a>    const slice = [_]TestKV{
+<a id="L382"></a>        .{ "these", .D },
+<a id="L383"></a>        .{ "have", .A },
+<a id="L384"></a>        .{ "nothing", .B },
+<a id="L385"></a>        .{ "incommon", .C },
+<a id="L386"></a>        .{ "samelen", .E },
+<a id="L387"></a>    };
+<a id="L388"></a>
+<a id="L389"></a>    try testStaticStringMapWithEql(TestMapWithEql.initComptime(slice));
+<a id="L390"></a>}
+<a id="L391"></a>
+<a id="L392"></a>test "empty" {
+<a id="L393"></a>    const m1 = StaticStringMap(usize).initComptime(.{});
+<a id="L394"></a>    try testing.expect(null == m1.get("anything"));
+<a id="L395"></a>
+<a id="L396"></a>    const m2 = StaticStringMapWithEql(usize, eqlAsciiIgnoreCase).initComptime(.{});
+<a id="L397"></a>    try testing.expect(null == m2.get("anything"));
+<a id="L398"></a>
+<a id="L399"></a>    const m3 = try StaticStringMap(usize).init(.{}, test_alloc);
+<a id="L400"></a>    try testing.expect(null == m3.get("anything"));
+<a id="L401"></a>
+<a id="L402"></a>    const m4 = try StaticStringMapWithEql(usize, eqlAsciiIgnoreCase).init(.{}, test_alloc);
+<a id="L403"></a>    try testing.expect(null == m4.get("anything"));
+<a id="L404"></a>}
+<a id="L405"></a>
+<a id="L406"></a>test "redundant entries" {
+<a id="L407"></a>    const slice = [_]TestKV{
+<a id="L408"></a>        .{ "redundant", .D },
+<a id="L409"></a>        .{ "theNeedle", .A },
+<a id="L410"></a>        .{ "redundant", .B },
+<a id="L411"></a>        .{ "re" ++ "dundant", .C },
+<a id="L412"></a>        .{ "redun" ++ "dant", .E },
+<a id="L413"></a>    };
+<a id="L414"></a>    const map = TestMap.initComptime(slice);
+<a id="L415"></a>
+<a id="L416"></a>    // No promises about which one you get:
+<a id="L417"></a>    try testing.expect(null != map.get("redundant"));
+<a id="L418"></a>
+<a id="L419"></a>    // Default map is not case sensitive:
+<a id="L420"></a>    try testing.expect(null == map.get("REDUNDANT"));
+<a id="L421"></a>
+<a id="L422"></a>    try testing.expectEqual(TestEnum.A, map.get("theNeedle").?);
+<a id="L423"></a>}
+<a id="L424"></a>
+<a id="L425"></a>test "redundant insensitive" {
+<a id="L426"></a>    const slice = [_]TestKV{
+<a id="L427"></a>        .{ "redundant", .D },
+<a id="L428"></a>        .{ "theNeedle", .A },
+<a id="L429"></a>        .{ "redundanT", .B },
+<a id="L430"></a>        .{ "RE" ++ "dundant", .C },
+<a id="L431"></a>        .{ "redun" ++ "DANT", .E },
+<a id="L432"></a>    };
+<a id="L433"></a>
+<a id="L434"></a>    const map = TestMapWithEql.initComptime(slice);
+<a id="L435"></a>
+<a id="L436"></a>    // No promises about which result you'll get ...
+<a id="L437"></a>    try testing.expect(null != map.get("REDUNDANT"));
+<a id="L438"></a>    try testing.expect(null != map.get("ReDuNdAnT"));
+<a id="L439"></a>    try testing.expectEqual(TestEnum.A, map.get("theNeedle").?);
+<a id="L440"></a>}
+<a id="L441"></a>
+<a id="L442"></a>test "comptime-only value" {
+<a id="L443"></a>    const map = StaticStringMap(type).initComptime(.{
+<a id="L444"></a>        .{ "a", struct {
+<a id="L445"></a>            pub const foo = 1;
+<a id="L446"></a>        } },
+<a id="L447"></a>        .{ "b", struct {
+<a id="L448"></a>            pub const foo = 2;
+<a id="L449"></a>        } },
+<a id="L450"></a>        .{ "c", struct {
+<a id="L451"></a>            pub const foo = 3;
+<a id="L452"></a>        } },
+<a id="L453"></a>    });
+<a id="L454"></a>
+<a id="L455"></a>    try testing.expect(map.get("a").?.foo == 1);
+<a id="L456"></a>    try testing.expect(map.get("b").?.foo == 2);
+<a id="L457"></a>    try testing.expect(map.get("c").?.foo == 3);
+<a id="L458"></a>    try testing.expect(map.get("d") == null);
+<a id="L459"></a>}
+<a id="L460"></a>
+<a id="L461"></a>test "getLongestPrefix" {
+<a id="L462"></a>    const slice = [_]TestKV{
+<a id="L463"></a>        .{ "a", .A },
+<a id="L464"></a>        .{ "aa", .B },
+<a id="L465"></a>        .{ "aaa", .C },
+<a id="L466"></a>        .{ "aaaa", .D },
+<a id="L467"></a>    };
+<a id="L468"></a>
+<a id="L469"></a>    const map = TestMap.initComptime(slice);
+<a id="L470"></a>
+<a id="L471"></a>    try testing.expectEqual(null, map.getLongestPrefix(""));
+<a id="L472"></a>    try testing.expectEqual(null, map.getLongestPrefix("bar"));
+<a id="L473"></a>    try testing.expectEqualStrings("aaaa", map.getLongestPrefix("aaaabar").?.key);
+<a id="L474"></a>    try testing.expectEqualStrings("aaa", map.getLongestPrefix("aaabar").?.key);
+<a id="L475"></a>}
+<a id="L476"></a>
+<a id="L477"></a>test "getLongestPrefix2" {
+<a id="L478"></a>    const slice = [_]struct { []const u8, u8 }{
+<a id="L479"></a>        .{ "one", 1 },
+<a id="L480"></a>        .{ "two", 2 },
+<a id="L481"></a>        .{ "three", 3 },
+<a id="L482"></a>        .{ "four", 4 },
+<a id="L483"></a>        .{ "five", 5 },
+<a id="L484"></a>        .{ "six", 6 },
+<a id="L485"></a>        .{ "seven", 7 },
+<a id="L486"></a>        .{ "eight", 8 },
+<a id="L487"></a>        .{ "nine", 9 },
+<a id="L488"></a>    };
+<a id="L489"></a>    const map = StaticStringMap(u8).initComptime(slice);
+<a id="L490"></a>
+<a id="L491"></a>    try testing.expectEqual(1, map.get("one"));
+<a id="L492"></a>    try testing.expectEqual(null, map.get("o"));
+<a id="L493"></a>    try testing.expectEqual(null, map.get("onexxx"));
+<a id="L494"></a>    try testing.expectEqual(9, map.get("nine"));
+<a id="L495"></a>    try testing.expectEqual(null, map.get("n"));
+<a id="L496"></a>    try testing.expectEqual(null, map.get("ninexxx"));
+<a id="L497"></a>    try testing.expectEqual(null, map.get("xxx"));
+<a id="L498"></a>
+<a id="L499"></a>    try testing.expectEqual(1, map.getLongestPrefix("one").?.value);
+<a id="L500"></a>    try testing.expectEqual(1, map.getLongestPrefix("onexxx").?.value);
+<a id="L501"></a>    try testing.expectEqual(null, map.getLongestPrefix("o"));
+<a id="L502"></a>    try testing.expectEqual(null, map.getLongestPrefix("on"));
+<a id="L503"></a>    try testing.expectEqual(9, map.getLongestPrefix("nine").?.value);
+<a id="L504"></a>    try testing.expectEqual(9, map.getLongestPrefix("ninexxx").?.value);
+<a id="L505"></a>    try testing.expectEqual(null, map.getLongestPrefix("n"));
+<a id="L506"></a>    try testing.expectEqual(null, map.getLongestPrefix("xxx"));
+<a id="L507"></a>}
+<a id="L508"></a>
+<a id="L509"></a>test "sorting kvs doesn't exceed eval branch quota" {
+<a id="L510"></a>    // from https://github.com/ziglang/zig/issues/19803
+<a id="L511"></a>    const TypeToByteSizeLUT = std.StaticStringMap(u32).initComptime(.{
+<a id="L512"></a>        .{ "bool", 0 },
+<a id="L513"></a>        .{ "c_int", 0 },
+<a id="L514"></a>        .{ "c_long", 0 },
+<a id="L515"></a>        .{ "c_longdouble", 0 },
+<a id="L516"></a>        .{ "t20", 0 },
+<a id="L517"></a>        .{ "t19", 0 },
+<a id="L518"></a>        .{ "t18", 0 },
+<a id="L519"></a>        .{ "t17", 0 },
+<a id="L520"></a>        .{ "t16", 0 },
+<a id="L521"></a>        .{ "t15", 0 },
+<a id="L522"></a>        .{ "t14", 0 },
+<a id="L523"></a>        .{ "t13", 0 },
+<a id="L524"></a>        .{ "t12", 0 },
+<a id="L525"></a>        .{ "t11", 0 },
+<a id="L526"></a>        .{ "t10", 0 },
+<a id="L527"></a>        .{ "t9", 0 },
+<a id="L528"></a>        .{ "t8", 0 },
+<a id="L529"></a>        .{ "t7", 0 },
+<a id="L530"></a>        .{ "t6", 0 },
+<a id="L531"></a>        .{ "t5", 0 },
+<a id="L532"></a>        .{ "t4", 0 },
+<a id="L533"></a>        .{ "t3", 0 },
+<a id="L534"></a>        .{ "t2", 0 },
+<a id="L535"></a>        .{ "t1", 1 },
+<a id="L536"></a>    });
+<a id="L537"></a>    try testing.expectEqual(1, TypeToByteSizeLUT.get("t1"));
+<a id="L538"></a>}
+</pre>
 </body>
 </html>

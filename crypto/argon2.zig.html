@@ -2,979 +2,982 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Source: zig-0.16.0-std/crypto/argon2.zig</title>
+    <title>Source: crypto/argon2.zig</title>
     <style>
         body { background: #1e1e1e; color: #d4d4d4; font-family: monospace; padding: 20px; }
         pre { white-space: pre-wrap; word-wrap: break-word; }
         .header { border-bottom: 1px solid #444; padding-bottom: 10px; margin-bottom: 20px; }
         a { color: #569cd6; }
+        a[id] { color: inherit; text-decoration: none; }
+        :target { background: #3a3a00; }
     </style>
 </head>
 <body>
     <div class="header">
-        <a href="/">Index</a> | <strong>File: zig-0.16.0-std/crypto/argon2.zig</strong>
+        <a href="/">Index</a> | <strong>File: crypto/argon2.zig</strong>
     </div>
-    <pre>// https://datatracker.ietf.org/doc/rfc9106
-// https://github.com/golang/crypto/tree/master/argon2
-// https://github.com/P-H-C/phc-winner-argon2
-
-const builtin = @import("builtin");
-
-const std = @import("std");
-const blake2 = crypto.hash.blake2;
-const crypto = std.crypto;
-const Io = std.Io;
-const math = std.math;
-const mem = std.mem;
-const phc_format = pwhash.phc_format;
-const pwhash = crypto.pwhash;
-const Blake2b512 = blake2.Blake2b512;
-const Blocks = std.array_list.AlignedManaged([block_length]u64, .@"16");
-const H0 = [Blake2b512.digest_length + 8]u8;
-
-const EncodingError = crypto.errors.EncodingError;
-const KdfError = pwhash.KdfError;
-const HasherError = pwhash.HasherError;
-const Error = pwhash.Error;
-
-const version = 0x13;
-const block_length = 128;
-const sync_points = 4;
-const max_int = 0xffff_ffff;
-
-const default_salt_len = 32;
-const default_hash_len = 32;
-const max_salt_len = 64;
-const max_hash_len = 64;
-
-/// Argon2 type
-pub const Mode = enum {
-    /// Argon2d is faster and uses data-depending memory access, which makes it highly resistant
-    /// against GPU cracking attacks and suitable for applications with no threats from side-channel
-    /// timing attacks (eg. cryptocurrencies).
-    argon2d,
-
-    /// Argon2i instead uses data-independent memory access, which is preferred for password
-    /// hashing and password-based key derivation, but it is slower as it makes more passes over
-    /// the memory to protect from tradeoff attacks.
-    argon2i,
-
-    /// Argon2id is a hybrid of Argon2i and Argon2d, using a combination of data-depending and
-    /// data-independent memory accesses, which gives some of Argon2i's resistance to side-channel
-    /// cache timing attacks and much of Argon2d's resistance to GPU cracking attacks.
-    argon2id,
-};
-
-/// Argon2 parameters
-pub const Params = struct {
-    const Self = @This();
-
-    /// Time cost, which defines the amount of computation realized and therefore the execution
-    /// time, given in number of iterations.
-    t: u32,
-
-    /// Memory cost, which defines the memory usage, given in kibibytes.
-    m: u32,
-
-    /// Parallelism degree, which defines the number of independent tasks,
-    /// to be multiplexed onto threads when possible.
-    p: u24,
-
-    /// The secret parameter, which is used for keyed hashing. This allows a secret key to be input
-    /// at hashing time (from some external location) and be folded into the value of the hash. This
-    /// means that even if your salts and hashes are compromised, an attacker cannot brute-force to
-    /// find the password without the key.
-    secret: ?[]const u8 = null,
-
-    /// The ad parameter, which is used to fold any additional data into the hash value. Functionally,
-    /// this behaves almost exactly like the secret or salt parameters; the ad parameter is folding
-    /// into the value of the hash. However, this parameter is used for different data. The salt
-    /// should be a random string stored alongside your password. The secret should be a random key
-    /// only usable at hashing time. The ad is for any other data.
-    ad: ?[]const u8 = null,
-
-    /// Baseline parameters for interactive logins using argon2i type
-    pub const interactive_2i = Self.fromLimits(4, 33554432);
-    /// Baseline parameters for normal usage using argon2i type
-    pub const moderate_2i = Self.fromLimits(6, 134217728);
-    /// Baseline parameters for offline usage using argon2i type
-    pub const sensitive_2i = Self.fromLimits(8, 536870912);
-
-    /// Baseline parameters for interactive logins using argon2id type
-    pub const interactive_2id = Self.fromLimits(2, 67108864);
-    /// Baseline parameters for normal usage using argon2id type
-    pub const moderate_2id = Self.fromLimits(3, 268435456);
-    /// Baseline parameters for offline usage using argon2id type
-    pub const sensitive_2id = Self.fromLimits(4, 1073741824);
-
-    /// Recommended parameters for argon2id type according to the
-    /// [OWASP cheat sheet](https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html).
-    pub const owasp_2id = Self{ .t = 2, .m = 19 * 1024, .p = 1 };
-
-    /// Create parameters from ops and mem limits, where mem_limit given in bytes
-    pub fn fromLimits(ops_limit: u32, mem_limit: usize) Self {
-        const m = mem_limit / 1024;
-        std.debug.assert(m &lt;= max_int);
-        return .{ .t = ops_limit, .m = @as(u32, @intCast(m)), .p = 1 };
-    }
-};
-
-fn initHash(
-    password: []const u8,
-    salt: []const u8,
-    params: Params,
-    dk_len: usize,
-    mode: Mode,
-) H0 {
-    var h0: H0 = undefined;
-    var parameters: [24]u8 = undefined;
-    var tmp: [4]u8 = undefined;
-    var b2 = Blake2b512.init(.{});
-    mem.writeInt(u32, parameters[0..4], params.p, .little);
-    mem.writeInt(u32, parameters[4..8], @as(u32, @intCast(dk_len)), .little);
-    mem.writeInt(u32, parameters[8..12], params.m, .little);
-    mem.writeInt(u32, parameters[12..16], params.t, .little);
-    mem.writeInt(u32, parameters[16..20], version, .little);
-    mem.writeInt(u32, parameters[20..24], @intFromEnum(mode), .little);
-    b2.update(&amp;parameters);
-    mem.writeInt(u32, &amp;tmp, @as(u32, @intCast(password.len)), .little);
-    b2.update(&amp;tmp);
-    b2.update(password);
-    mem.writeInt(u32, &amp;tmp, @as(u32, @intCast(salt.len)), .little);
-    b2.update(&amp;tmp);
-    b2.update(salt);
-    const secret = params.secret orelse "";
-    std.debug.assert(secret.len &lt;= max_int);
-    mem.writeInt(u32, &amp;tmp, @as(u32, @intCast(secret.len)), .little);
-    b2.update(&amp;tmp);
-    b2.update(secret);
-    const ad = params.ad orelse "";
-    std.debug.assert(ad.len &lt;= max_int);
-    mem.writeInt(u32, &amp;tmp, @as(u32, @intCast(ad.len)), .little);
-    b2.update(&amp;tmp);
-    b2.update(ad);
-    b2.final(h0[0..Blake2b512.digest_length]);
-    return h0;
-}
-
-fn blake2bLong(out: []u8, in: []const u8) void {
-    const H = Blake2b512;
-    var outlen_bytes: [4]u8 = undefined;
-    mem.writeInt(u32, &amp;outlen_bytes, @as(u32, @intCast(out.len)), .little);
-
-    var out_buf: [H.digest_length]u8 = undefined;
-
-    if (out.len &lt;= H.digest_length) {
-        var h = H.init(.{ .expected_out_bits = out.len * 8 });
-        h.update(&amp;outlen_bytes);
-        h.update(in);
-        h.final(&amp;out_buf);
-        @memcpy(out, out_buf[0..out.len]);
-        return;
-    }
-
-    var h = H.init(.{});
-    h.update(&amp;outlen_bytes);
-    h.update(in);
-    h.final(&amp;out_buf);
-    var out_slice = out;
-    out_slice[0 .. H.digest_length / 2].* = out_buf[0 .. H.digest_length / 2].*;
-    out_slice = out_slice[H.digest_length / 2 ..];
-
-    var in_buf: [H.digest_length]u8 = undefined;
-    while (out_slice.len &gt; H.digest_length) {
-        in_buf = out_buf;
-        H.hash(&amp;in_buf, &amp;out_buf, .{});
-        out_slice[0 .. H.digest_length / 2].* = out_buf[0 .. H.digest_length / 2].*;
-        out_slice = out_slice[H.digest_length / 2 ..];
-    }
-    in_buf = out_buf;
-    H.hash(&amp;in_buf, &amp;out_buf, .{ .expected_out_bits = out_slice.len * 8 });
-    @memcpy(out_slice, out_buf[0..out_slice.len]);
-}
-
-fn initBlocks(
-    blocks: *Blocks,
-    h0: *H0,
-    memory: u32,
-    threads: u24,
-) void {
-    var block0: [1024]u8 = undefined;
-    var lane: u24 = 0;
-    while (lane &lt; threads) : (lane += 1) {
-        const j = lane * (memory / threads);
-        mem.writeInt(u32, h0[Blake2b512.digest_length + 4 ..][0..4], lane, .little);
-
-        mem.writeInt(u32, h0[Blake2b512.digest_length..][0..4], 0, .little);
-        blake2bLong(&amp;block0, h0);
-        for (&amp;blocks.items[j + 0], 0..) |*v, i| {
-            v.* = mem.readInt(u64, block0[i * 8 ..][0..8], .little);
-        }
-
-        mem.writeInt(u32, h0[Blake2b512.digest_length..][0..4], 1, .little);
-        blake2bLong(&amp;block0, h0);
-        for (&amp;blocks.items[j + 1], 0..) |*v, i| {
-            v.* = mem.readInt(u64, block0[i * 8 ..][0..8], .little);
-        }
-    }
-}
-
-fn processBlocks(
-    blocks: *Blocks,
-    time: u32,
-    memory: u32,
-    threads: u24,
-    mode: Mode,
-    io: Io,
-) Io.Cancelable!void {
-    const lanes = memory / threads;
-    const segments = lanes / sync_points;
-
-    if (builtin.single_threaded or threads == 1) {
-        processBlocksSync(blocks, time, memory, threads, mode, lanes, segments);
-    } else {
-        try processBlocksAsync(blocks, time, memory, threads, mode, lanes, segments, io);
-    }
-}
-
-fn processBlocksSync(
-    blocks: *Blocks,
-    time: u32,
-    memory: u32,
-    threads: u24,
-    mode: Mode,
-    lanes: u32,
-    segments: u32,
-) void {
-    var n: u32 = 0;
-    while (n &lt; time) : (n += 1) {
-        var slice: u32 = 0;
-        while (slice &lt; sync_points) : (slice += 1) {
-            var lane: u24 = 0;
-            while (lane &lt; threads) : (lane += 1) {
-                processSegment(blocks, time, memory, threads, mode, lanes, segments, n, slice, lane);
-            }
-        }
-    }
-}
-
-fn processBlocksAsync(
-    blocks: *Blocks,
-    time: u32,
-    memory: u32,
-    threads: u24,
-    mode: Mode,
-    lanes: u32,
-    segments: u32,
-    io: Io,
-) Io.Cancelable!void {
-    var n: u32 = 0;
-    while (n &lt; time) : (n += 1) {
-        var slice: u32 = 0;
-        while (slice &lt; sync_points) : (slice += 1) {
-            var group: Io.Group = .init;
-            defer group.cancel(io);
-            var lane: u24 = 0;
-            while (lane &lt; threads) : (lane += 1) {
-                group.async(io, processSegment, .{
-                    blocks, time, memory, threads, mode, lanes, segments, n, slice, lane,
-                });
-            }
-            try group.await(io);
-        }
-    }
-}
-
-fn processSegment(
-    blocks: *Blocks,
-    passes: u32,
-    memory: u32,
-    threads: u24,
-    mode: Mode,
-    lanes: u32,
-    segments: u32,
-    n: u32,
-    slice: u32,
-    lane: u24,
-) void {
-    var addresses align(16) = [_]u64{0} ** block_length;
-    var in align(16) = [_]u64{0} ** block_length;
-    const zero align(16) = [_]u64{0} ** block_length;
-    if (mode == .argon2i or (mode == .argon2id and n == 0 and slice &lt; sync_points / 2)) {
-        in[0] = n;
-        in[1] = lane;
-        in[2] = slice;
-        in[3] = memory;
-        in[4] = passes;
-        in[5] = @intFromEnum(mode);
-    }
-    var index: u32 = 0;
-    if (n == 0 and slice == 0) {
-        index = 2;
-        if (mode == .argon2i or mode == .argon2id) {
-            in[6] += 1;
-            processBlock(&amp;addresses, &amp;in, &amp;zero);
-            processBlock(&amp;addresses, &amp;addresses, &amp;zero);
-        }
-    }
-    var offset = lane * lanes + slice * segments + index;
-    var random: u64 = 0;
-    while (index &lt; segments) : ({
-        index += 1;
-        offset += 1;
-    }) {
-        var prev = offset -% 1;
-        if (index == 0 and slice == 0) {
-            prev +%= lanes;
-        }
-        if (mode == .argon2i or (mode == .argon2id and n == 0 and slice &lt; sync_points / 2)) {
-            if (index % block_length == 0) {
-                in[6] += 1;
-                processBlock(&amp;addresses, &amp;in, &amp;zero);
-                processBlock(&amp;addresses, &amp;addresses, &amp;zero);
-            }
-            random = addresses[index % block_length];
-        } else {
-            random = blocks.items[prev][0];
-        }
-        const new_offset = indexAlpha(random, lanes, segments, threads, n, slice, lane, index);
-        processBlockXor(&amp;blocks.items[offset], &amp;blocks.items[prev], &amp;blocks.items[new_offset]);
-    }
-}
-
-fn processBlock(
-    out: *align(16) [block_length]u64,
-    in1: *align(16) const [block_length]u64,
-    in2: *align(16) const [block_length]u64,
-) void {
-    processBlockGeneric(out, in1, in2, false);
-}
-
-fn processBlockXor(
-    out: *[block_length]u64,
-    in1: *const [block_length]u64,
-    in2: *const [block_length]u64,
-) void {
-    processBlockGeneric(out, in1, in2, true);
-}
-
-fn processBlockGeneric(
-    out: *[block_length]u64,
-    in1: *const [block_length]u64,
-    in2: *const [block_length]u64,
-    comptime xor: bool,
-) void {
-    var t: [block_length]u64 = undefined;
-    for (&amp;t, 0..) |*v, i| {
-        v.* = in1[i] ^ in2[i];
-    }
-    var i: usize = 0;
-    while (i &lt; block_length) : (i += 16) {
-        blamkaGeneric(t[i..][0..16]);
-    }
-    i = 0;
-    var buffer: [16]u64 = undefined;
-    while (i &lt; block_length / 8) : (i += 2) {
-        var j: usize = 0;
-        while (j &lt; block_length / 8) : (j += 2) {
-            buffer[j] = t[j * 8 + i];
-            buffer[j + 1] = t[j * 8 + i + 1];
-        }
-        blamkaGeneric(&amp;buffer);
-        j = 0;
-        while (j &lt; block_length / 8) : (j += 2) {
-            t[j * 8 + i] = buffer[j];
-            t[j * 8 + i + 1] = buffer[j + 1];
-        }
-    }
-    if (xor) {
-        for (t, 0..) |v, j| {
-            out[j] ^= in1[j] ^ in2[j] ^ v;
-        }
-    } else {
-        for (t, 0..) |v, j| {
-            out[j] = in1[j] ^ in2[j] ^ v;
-        }
-    }
-}
-
-const QuarterRound = struct { a: usize, b: usize, c: usize, d: usize };
-
-fn Rp(a: usize, b: usize, c: usize, d: usize) QuarterRound {
-    return .{ .a = a, .b = b, .c = c, .d = d };
-}
-
-fn fBlaMka(x: u64, y: u64) u64 {
-    const xy = @as(u64, @as(u32, @truncate(x))) * @as(u64, @as(u32, @truncate(y)));
-    return x +% y +% 2 *% xy;
-}
-
-fn blamkaGeneric(x: *[16]u64) void {
-    const rounds = comptime [_]QuarterRound{
-        Rp(0, 4, 8, 12),
-        Rp(1, 5, 9, 13),
-        Rp(2, 6, 10, 14),
-        Rp(3, 7, 11, 15),
-        Rp(0, 5, 10, 15),
-        Rp(1, 6, 11, 12),
-        Rp(2, 7, 8, 13),
-        Rp(3, 4, 9, 14),
-    };
-    inline for (rounds) |r| {
-        x[r.a] = fBlaMka(x[r.a], x[r.b]);
-        x[r.d] = math.rotr(u64, x[r.d] ^ x[r.a], 32);
-        x[r.c] = fBlaMka(x[r.c], x[r.d]);
-        x[r.b] = math.rotr(u64, x[r.b] ^ x[r.c], 24);
-        x[r.a] = fBlaMka(x[r.a], x[r.b]);
-        x[r.d] = math.rotr(u64, x[r.d] ^ x[r.a], 16);
-        x[r.c] = fBlaMka(x[r.c], x[r.d]);
-        x[r.b] = math.rotr(u64, x[r.b] ^ x[r.c], 63);
-    }
-}
-
-fn finalize(
-    blocks: *Blocks,
-    memory: u32,
-    threads: u24,
-    out: []u8,
-) void {
-    const lanes = memory / threads;
-    var lane: u24 = 0;
-    while (lane &lt; threads - 1) : (lane += 1) {
-        for (blocks.items[(lane * lanes) + lanes - 1], 0..) |v, i| {
-            blocks.items[memory - 1][i] ^= v;
-        }
-    }
-    var block: [1024]u8 = undefined;
-    for (blocks.items[memory - 1], 0..) |v, i| {
-        mem.writeInt(u64, block[i * 8 ..][0..8], v, .little);
-    }
-    blake2bLong(out, &amp;block);
-}
-
-fn indexAlpha(
-    rand: u64,
-    lanes: u32,
-    segments: u32,
-    threads: u24,
-    n: u32,
-    slice: u32,
-    lane: u24,
-    index: u32,
-) u32 {
-    var ref_lane = @as(u32, @intCast(rand &gt;&gt; 32)) % threads;
-    if (n == 0 and slice == 0) {
-        ref_lane = lane;
-    }
-    var m = 3 * segments;
-    var s = ((slice + 1) % sync_points) * segments;
-    if (lane == ref_lane) {
-        m += index;
-    }
-    if (n == 0) {
-        m = slice * segments;
-        s = 0;
-        if (slice == 0 or lane == ref_lane) {
-            m += index;
-        }
-    }
-    if (index == 0 or lane == ref_lane) {
-        m -= 1;
-    }
-    var p = @as(u64, @as(u32, @truncate(rand)));
-    p = (p * p) &gt;&gt; 32;
-    p = (p * m) &gt;&gt; 32;
-    return ref_lane * lanes + @as(u32, @intCast(((s + m - (p + 1)) % lanes)));
-}
-
-/// Derives a key from the password, salt, and argon2 parameters.
-///
-/// Derived key has to be at least 4 bytes length.
-///
-/// Salt has to be at least 8 bytes length.
-pub fn kdf(
-    allocator: mem.Allocator,
-    derived_key: []u8,
-    password: []const u8,
-    salt: []const u8,
-    params: Params,
-    mode: Mode,
-    io: Io,
-) KdfError!void {
-    if (derived_key.len &lt; 4) return KdfError.WeakParameters;
-    if (derived_key.len &gt; max_int) return KdfError.OutputTooLong;
-
-    if (password.len &gt; max_int) return KdfError.WeakParameters;
-    if (salt.len &lt; 8 or salt.len &gt; max_int) return KdfError.WeakParameters;
-    if (params.t &lt; 1 or params.p &lt; 1) return KdfError.WeakParameters;
-    if (params.m / 8 &lt; params.p) return KdfError.WeakParameters;
-
-    var h0 = initHash(password, salt, params, derived_key.len, mode);
-    const memory = @max(
-        params.m / (sync_points * params.p) * (sync_points * params.p),
-        2 * sync_points * params.p,
-    );
-
-    var blocks = try Blocks.initCapacity(allocator, memory);
-    defer blocks.deinit();
-
-    blocks.appendNTimesAssumeCapacity(@splat(0), memory);
-
-    initBlocks(&amp;blocks, &amp;h0, memory, params.p);
-    try processBlocks(&amp;blocks, params.t, memory, params.p, mode, io);
-    finalize(&amp;blocks, memory, params.p, derived_key);
-}
-
-const PhcFormatHasher = struct {
-    const BinValue = phc_format.BinValue;
-
-    const HashResult = struct {
-        alg_id: []const u8,
-        alg_version: ?u32,
-        m: u32,
-        t: u32,
-        p: u24,
-        salt: BinValue(max_salt_len),
-        hash: BinValue(max_hash_len),
-    };
-
-    pub fn create(
-        allocator: mem.Allocator,
-        password: []const u8,
-        params: Params,
-        mode: Mode,
-        buf: []u8,
-        io: Io,
-    ) HasherError![]const u8 {
-        if (params.secret != null or params.ad != null) return HasherError.InvalidEncoding;
-
-        var salt: [default_salt_len]u8 = undefined;
-        io.random(&amp;salt);
-
-        var hash: [default_hash_len]u8 = undefined;
-        try kdf(allocator, &amp;hash, password, &amp;salt, params, mode, io);
-
-        return phc_format.serialize(HashResult{
-            .alg_id = @tagName(mode),
-            .alg_version = version,
-            .m = params.m,
-            .t = params.t,
-            .p = params.p,
-            .salt = try BinValue(max_salt_len).fromSlice(&amp;salt),
-            .hash = try BinValue(max_hash_len).fromSlice(&amp;hash),
-        }, buf);
-    }
-
-    pub fn verify(
-        allocator: mem.Allocator,
-        str: []const u8,
-        password: []const u8,
-        io: Io,
-    ) HasherError!void {
-        const hash_result = try phc_format.deserialize(HashResult, str);
-
-        const mode = std.meta.stringToEnum(Mode, hash_result.alg_id) orelse
-            return HasherError.PasswordVerificationFailed;
-        if (hash_result.alg_version) |v| {
-            if (v != version) return HasherError.InvalidEncoding;
-        }
-        const params = Params{ .t = hash_result.t, .m = hash_result.m, .p = hash_result.p };
-
-        const expected_hash = hash_result.hash.constSlice();
-        var hash_buf: [max_hash_len]u8 = undefined;
-        if (expected_hash.len &gt; hash_buf.len) return HasherError.InvalidEncoding;
-        const hash = hash_buf[0..expected_hash.len];
-
-        try kdf(allocator, hash, password, hash_result.salt.constSlice(), params, mode, io);
-        if (!mem.eql(u8, hash, expected_hash)) return HasherError.PasswordVerificationFailed;
-    }
-};
-
-/// Options for hashing a password.
-///
-/// Allocator is required for argon2.
-///
-/// Only phc encoding is supported.
-pub const HashOptions = struct {
-    allocator: ?mem.Allocator,
-    params: Params,
-    mode: Mode = .argon2id,
-    encoding: pwhash.Encoding = .phc,
-};
-
-/// Compute a hash of a password using the argon2 key derivation function.
-/// The function returns a string that includes all the parameters required for verification.
-pub fn strHash(
-    password: []const u8,
-    options: HashOptions,
-    out: []u8,
-    io: Io,
-) Error![]const u8 {
-    const allocator = options.allocator orelse return Error.AllocatorRequired;
-    switch (options.encoding) {
-        .phc =&gt; return PhcFormatHasher.create(
-            allocator,
-            password,
-            options.params,
-            options.mode,
-            out,
-            io,
-        ),
-        .crypt =&gt; return Error.InvalidEncoding,
-    }
-}
-
-/// Options for hash verification.
-///
-/// Allocator is required for argon2.
-pub const VerifyOptions = struct {
-    allocator: ?mem.Allocator,
-};
-
-/// Verify that a previously computed hash is valid for a given password.
-pub fn strVerify(
-    str: []const u8,
-    password: []const u8,
-    options: VerifyOptions,
-    io: Io,
-) Error!void {
-    const allocator = options.allocator orelse return Error.AllocatorRequired;
-    return PhcFormatHasher.verify(allocator, str, password, io);
-}
-
-test "argon2d" {
-    if (true) return error.SkipZigTest; // https://codeberg.org/ziglang/zig/issues/30074
-
-    const password = [_]u8{0x01} ** 32;
-    const salt = [_]u8{0x02} ** 16;
-    const secret = [_]u8{0x03} ** 8;
-    const ad = [_]u8{0x04} ** 12;
-
-    var dk: [32]u8 = undefined;
-    try kdf(
-        std.testing.allocator,
-        &amp;dk,
-        &amp;password,
-        &amp;salt,
-        .{ .t = 3, .m = 32, .p = 4, .secret = &amp;secret, .ad = &amp;ad },
-        .argon2d,
-        std.testing.io,
-    );
-
-    const want = [_]u8{
-        0x51, 0x2b, 0x39, 0x1b, 0x6f, 0x11, 0x62, 0x97,
-        0x53, 0x71, 0xd3, 0x09, 0x19, 0x73, 0x42, 0x94,
-        0xf8, 0x68, 0xe3, 0xbe, 0x39, 0x84, 0xf3, 0xc1,
-        0xa1, 0x3a, 0x4d, 0xb9, 0xfa, 0xbe, 0x4a, 0xcb,
-    };
-    try std.testing.expectEqualSlices(u8, &amp;dk, &amp;want);
-}
-
-test "argon2i" {
-    const password = [_]u8{0x01} ** 32;
-    const salt = [_]u8{0x02} ** 16;
-    const secret = [_]u8{0x03} ** 8;
-    const ad = [_]u8{0x04} ** 12;
-
-    var dk: [32]u8 = undefined;
-    try kdf(
-        std.testing.allocator,
-        &amp;dk,
-        &amp;password,
-        &amp;salt,
-        .{ .t = 3, .m = 32, .p = 4, .secret = &amp;secret, .ad = &amp;ad },
-        .argon2i,
-        std.testing.io,
-    );
-
-    const want = [_]u8{
-        0xc8, 0x14, 0xd9, 0xd1, 0xdc, 0x7f, 0x37, 0xaa,
-        0x13, 0xf0, 0xd7, 0x7f, 0x24, 0x94, 0xbd, 0xa1,
-        0xc8, 0xde, 0x6b, 0x01, 0x6d, 0xd3, 0x88, 0xd2,
-        0x99, 0x52, 0xa4, 0xc4, 0x67, 0x2b, 0x6c, 0xe8,
-    };
-    try std.testing.expectEqualSlices(u8, &amp;dk, &amp;want);
-}
-
-test "argon2id" {
-    const password = [_]u8{0x01} ** 32;
-    const salt = [_]u8{0x02} ** 16;
-    const secret = [_]u8{0x03} ** 8;
-    const ad = [_]u8{0x04} ** 12;
-
-    var dk: [32]u8 = undefined;
-    try kdf(
-        std.testing.allocator,
-        &amp;dk,
-        &amp;password,
-        &amp;salt,
-        .{ .t = 3, .m = 32, .p = 4, .secret = &amp;secret, .ad = &amp;ad },
-        .argon2id,
-        std.testing.io,
-    );
-
-    const want = [_]u8{
-        0x0d, 0x64, 0x0d, 0xf5, 0x8d, 0x78, 0x76, 0x6c,
-        0x08, 0xc0, 0x37, 0xa3, 0x4a, 0x8b, 0x53, 0xc9,
-        0xd0, 0x1e, 0xf0, 0x45, 0x2d, 0x75, 0xb6, 0x5e,
-        0xb5, 0x25, 0x20, 0xe9, 0x6b, 0x01, 0xe6, 0x59,
-    };
-    try std.testing.expectEqualSlices(u8, &amp;dk, &amp;want);
-}
-
-test "kdf" {
-    if (true) return error.SkipZigTest; // https://codeberg.org/ziglang/zig/issues/31402
-
-    const password = "password";
-    const salt = "somesalt";
-
-    const TestVector = struct {
-        mode: Mode,
-        time: u32,
-        memory: u32,
-        threads: u8,
-        hash: []const u8,
-    };
-    const test_vectors = [_]TestVector{
-        .{
-            .mode = .argon2i,
-            .time = 1,
-            .memory = 64,
-            .threads = 1,
-            .hash = "b9c401d1844a67d50eae3967dc28870b22e508092e861a37",
-        },
-        .{
-            .mode = .argon2d,
-            .time = 1,
-            .memory = 64,
-            .threads = 1,
-            .hash = "8727405fd07c32c78d64f547f24150d3f2e703a89f981a19",
-        },
-        .{
-            .mode = .argon2id,
-            .time = 1,
-            .memory = 64,
-            .threads = 1,
-            .hash = "655ad15eac652dc59f7170a7332bf49b8469be1fdb9c28bb",
-        },
-        .{
-            .mode = .argon2i,
-            .time = 2,
-            .memory = 64,
-            .threads = 1,
-            .hash = "8cf3d8f76a6617afe35fac48eb0b7433a9a670ca4a07ed64",
-        },
-        .{
-            .mode = .argon2d,
-            .time = 2,
-            .memory = 64,
-            .threads = 1,
-            .hash = "3be9ec79a69b75d3752acb59a1fbb8b295a46529c48fbb75",
-        },
-        .{
-            .mode = .argon2id,
-            .time = 2,
-            .memory = 64,
-            .threads = 1,
-            .hash = "068d62b26455936aa6ebe60060b0a65870dbfa3ddf8d41f7",
-        },
-        .{
-            .mode = .argon2i,
-            .time = 2,
-            .memory = 64,
-            .threads = 2,
-            .hash = "2089f3e78a799720f80af806553128f29b132cafe40d059f",
-        },
-        .{
-            .mode = .argon2d,
-            .time = 2,
-            .memory = 64,
-            .threads = 2,
-            .hash = "68e2462c98b8bc6bb60ec68db418ae2c9ed24fc6748a40e9",
-        },
-        .{
-            .mode = .argon2id,
-            .time = 2,
-            .memory = 64,
-            .threads = 2,
-            .hash = "350ac37222f436ccb5c0972f1ebd3bf6b958bf2071841362",
-        },
-        .{
-            .mode = .argon2i,
-            .time = 3,
-            .memory = 256,
-            .threads = 2,
-            .hash = "f5bbf5d4c3836af13193053155b73ec7476a6a2eb93fd5e6",
-        },
-        .{
-            .mode = .argon2d,
-            .time = 3,
-            .memory = 256,
-            .threads = 2,
-            .hash = "f4f0669218eaf3641f39cc97efb915721102f4b128211ef2",
-        },
-        .{
-            .mode = .argon2id,
-            .time = 3,
-            .memory = 256,
-            .threads = 2,
-            .hash = "4668d30ac4187e6878eedeacf0fd83c5a0a30db2cc16ef0b",
-        },
-        .{
-            .mode = .argon2i,
-            .time = 4,
-            .memory = 256,
-            .threads = 4,
-            .hash = "f7dbbacbf16999e3700817a7e06f65a8db2e9fa9504ede4c",
-        },
-        .{
-            .mode = .argon2d,
-            .time = 4,
-            .memory = 256,
-            .threads = 4,
-            .hash = "ea2970501cf49faa5ba1d2e6370204e9b57ca90a8fea937b",
-        },
-        .{
-            .mode = .argon2id,
-            .time = 4,
-            .memory = 256,
-            .threads = 4,
-            .hash = "fbd40d5a8cb92f88c20bda4b3cdb1f9d5af1efa937032410",
-        },
-        .{
-            .mode = .argon2i,
-            .time = 4,
-            .memory = 256,
-            .threads = 8,
-            .hash = "15d3c398364e53f68fd12d19baf3f21432d964254fe27467",
-        },
-        .{
-            .mode = .argon2d,
-            .time = 4,
-            .memory = 256,
-            .threads = 8,
-            .hash = "23c9adc06f06e21e4612c1466a1be02627690932b02c0df0",
-        },
-        .{
-            .mode = .argon2id,
-            .time = 4,
-            .memory = 256,
-            .threads = 8,
-            .hash = "f22802f8ca47be93f9954e4ce20c1e944e938fbd4a125d9d",
-        },
-        .{
-            .mode = .argon2i,
-            .time = 2,
-            .memory = 64,
-            .threads = 3,
-            .hash = "5cab452fe6b8479c8661def8cd703b611a3905a6d5477fe6",
-        },
-        .{
-            .mode = .argon2d,
-            .time = 2,
-            .memory = 64,
-            .threads = 3,
-            .hash = "22474a423bda2ccd36ec9afd5119e5c8949798cadf659f51",
-        },
-        .{
-            .mode = .argon2id,
-            .time = 2,
-            .memory = 64,
-            .threads = 3,
-            .hash = "4a15b31aec7c2590b87d1f520be7d96f56658172deaa3079",
-        },
-        .{
-            .mode = .argon2i,
-            .time = 3,
-            .memory = 256,
-            .threads = 6,
-            .hash = "ebc8f91964abd8ceab49a12963b0a9e57d635bfa2aad2884",
-        },
-        .{
-            .mode = .argon2d,
-            .time = 3,
-            .memory = 256,
-            .threads = 6,
-            .hash = "1dd7202fd68da6675f769f4034b7a1db30d8785331954117",
-        },
-        .{
-            .mode = .argon2id,
-            .time = 3,
-            .memory = 256,
-            .threads = 6,
-            .hash = "424436b6ee22a66b04b9d0cf78f190305c5c166bae8baa09",
-        },
-    };
-    for (test_vectors) |v| {
-        var want: [24]u8 = undefined;
-        _ = try std.fmt.hexToBytes(&amp;want, v.hash);
-
-        var dk: [24]u8 = undefined;
-        try kdf(
-            std.testing.allocator,
-            &amp;dk,
-            password,
-            salt,
-            .{ .t = v.time, .m = v.memory, .p = v.threads },
-            v.mode,
-            std.testing.io,
-        );
-
-        try std.testing.expectEqualSlices(u8, &amp;dk, &amp;want);
-    }
-}
-
-test "phc format hasher" {
-    const allocator = std.testing.allocator;
-    const password = "testpass";
-    const io = std.testing.io;
-
-    var buf: [128]u8 = undefined;
-    const hash = try PhcFormatHasher.create(
-        allocator,
-        password,
-        .{ .t = 3, .m = 32, .p = 4 },
-        .argon2id,
-        &amp;buf,
-        io,
-    );
-    try PhcFormatHasher.verify(allocator, hash, password, io);
-}
-
-test "password hash and password verify" {
-    const allocator = std.testing.allocator;
-    const password = "testpass";
-    const io = std.testing.io;
-
-    var buf: [128]u8 = undefined;
-    const hash = try strHash(
-        password,
-        .{ .allocator = allocator, .params = .{ .t = 3, .m = 32, .p = 4 } },
-        &amp;buf,
-        io,
-    );
-    try strVerify(hash, password, .{ .allocator = allocator }, io);
-}
-
-test "kdf derived key length" {
-    if (true) return error.SkipZigTest; // https://codeberg.org/ziglang/zig/issues/31504
-
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
-
-    const password = "testpass";
-    const salt = "saltsalt";
-    const params = Params{ .t = 3, .m = 32, .p = 4 };
-    const mode = Mode.argon2id;
-
-    var dk1: [11]u8 = undefined;
-    try kdf(allocator, &amp;dk1, password, salt, params, mode, io);
-
-    var dk2: [77]u8 = undefined;
-    try kdf(allocator, &amp;dk2, password, salt, params, mode, io);
-
-    var dk3: [111]u8 = undefined;
-    try kdf(allocator, &amp;dk3, password, salt, params, mode, io);
-}</pre>
+    <pre><a id="L1"></a>// https://datatracker.ietf.org/doc/rfc9106
+<a id="L2"></a>// https://github.com/golang/crypto/tree/master/argon2
+<a id="L3"></a>// https://github.com/P-H-C/phc-winner-argon2
+<a id="L4"></a>
+<a id="L5"></a>const builtin = @import("builtin");
+<a id="L6"></a>
+<a id="L7"></a>const std = @import("std");
+<a id="L8"></a>const blake2 = crypto.hash.blake2;
+<a id="L9"></a>const crypto = std.crypto;
+<a id="L10"></a>const Io = std.Io;
+<a id="L11"></a>const math = std.math;
+<a id="L12"></a>const mem = std.mem;
+<a id="L13"></a>const phc_format = pwhash.phc_format;
+<a id="L14"></a>const pwhash = crypto.pwhash;
+<a id="L15"></a>const Blake2b512 = blake2.Blake2b512;
+<a id="L16"></a>const Blocks = std.array_list.AlignedManaged([block_length]u64, .@"16");
+<a id="L17"></a>const H0 = [Blake2b512.digest_length + 8]u8;
+<a id="L18"></a>
+<a id="L19"></a>const EncodingError = crypto.errors.EncodingError;
+<a id="L20"></a>const KdfError = pwhash.KdfError;
+<a id="L21"></a>const HasherError = pwhash.HasherError;
+<a id="L22"></a>const Error = pwhash.Error;
+<a id="L23"></a>
+<a id="L24"></a>const version = 0x13;
+<a id="L25"></a>const block_length = 128;
+<a id="L26"></a>const sync_points = 4;
+<a id="L27"></a>const max_int = 0xffff_ffff;
+<a id="L28"></a>
+<a id="L29"></a>const default_salt_len = 32;
+<a id="L30"></a>const default_hash_len = 32;
+<a id="L31"></a>const max_salt_len = 64;
+<a id="L32"></a>const max_hash_len = 64;
+<a id="L33"></a>
+<a id="L34"></a>/// Argon2 type
+<a id="L35"></a>pub const Mode = enum {
+<a id="L36"></a>    /// Argon2d is faster and uses data-depending memory access, which makes it highly resistant
+<a id="L37"></a>    /// against GPU cracking attacks and suitable for applications with no threats from side-channel
+<a id="L38"></a>    /// timing attacks (eg. cryptocurrencies).
+<a id="L39"></a>    argon2d,
+<a id="L40"></a>
+<a id="L41"></a>    /// Argon2i instead uses data-independent memory access, which is preferred for password
+<a id="L42"></a>    /// hashing and password-based key derivation, but it is slower as it makes more passes over
+<a id="L43"></a>    /// the memory to protect from tradeoff attacks.
+<a id="L44"></a>    argon2i,
+<a id="L45"></a>
+<a id="L46"></a>    /// Argon2id is a hybrid of Argon2i and Argon2d, using a combination of data-depending and
+<a id="L47"></a>    /// data-independent memory accesses, which gives some of Argon2i's resistance to side-channel
+<a id="L48"></a>    /// cache timing attacks and much of Argon2d's resistance to GPU cracking attacks.
+<a id="L49"></a>    argon2id,
+<a id="L50"></a>};
+<a id="L51"></a>
+<a id="L52"></a>/// Argon2 parameters
+<a id="L53"></a>pub const Params = struct {
+<a id="L54"></a>    const Self = @This();
+<a id="L55"></a>
+<a id="L56"></a>    /// Time cost, which defines the amount of computation realized and therefore the execution
+<a id="L57"></a>    /// time, given in number of iterations.
+<a id="L58"></a>    t: u32,
+<a id="L59"></a>
+<a id="L60"></a>    /// Memory cost, which defines the memory usage, given in kibibytes.
+<a id="L61"></a>    m: u32,
+<a id="L62"></a>
+<a id="L63"></a>    /// Parallelism degree, which defines the number of independent tasks,
+<a id="L64"></a>    /// to be multiplexed onto threads when possible.
+<a id="L65"></a>    p: u24,
+<a id="L66"></a>
+<a id="L67"></a>    /// The secret parameter, which is used for keyed hashing. This allows a secret key to be input
+<a id="L68"></a>    /// at hashing time (from some external location) and be folded into the value of the hash. This
+<a id="L69"></a>    /// means that even if your salts and hashes are compromised, an attacker cannot brute-force to
+<a id="L70"></a>    /// find the password without the key.
+<a id="L71"></a>    secret: ?[]const u8 = null,
+<a id="L72"></a>
+<a id="L73"></a>    /// The ad parameter, which is used to fold any additional data into the hash value. Functionally,
+<a id="L74"></a>    /// this behaves almost exactly like the secret or salt parameters; the ad parameter is folding
+<a id="L75"></a>    /// into the value of the hash. However, this parameter is used for different data. The salt
+<a id="L76"></a>    /// should be a random string stored alongside your password. The secret should be a random key
+<a id="L77"></a>    /// only usable at hashing time. The ad is for any other data.
+<a id="L78"></a>    ad: ?[]const u8 = null,
+<a id="L79"></a>
+<a id="L80"></a>    /// Baseline parameters for interactive logins using argon2i type
+<a id="L81"></a>    pub const interactive_2i = Self.fromLimits(4, 33554432);
+<a id="L82"></a>    /// Baseline parameters for normal usage using argon2i type
+<a id="L83"></a>    pub const moderate_2i = Self.fromLimits(6, 134217728);
+<a id="L84"></a>    /// Baseline parameters for offline usage using argon2i type
+<a id="L85"></a>    pub const sensitive_2i = Self.fromLimits(8, 536870912);
+<a id="L86"></a>
+<a id="L87"></a>    /// Baseline parameters for interactive logins using argon2id type
+<a id="L88"></a>    pub const interactive_2id = Self.fromLimits(2, 67108864);
+<a id="L89"></a>    /// Baseline parameters for normal usage using argon2id type
+<a id="L90"></a>    pub const moderate_2id = Self.fromLimits(3, 268435456);
+<a id="L91"></a>    /// Baseline parameters for offline usage using argon2id type
+<a id="L92"></a>    pub const sensitive_2id = Self.fromLimits(4, 1073741824);
+<a id="L93"></a>
+<a id="L94"></a>    /// Recommended parameters for argon2id type according to the
+<a id="L95"></a>    /// [OWASP cheat sheet](https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html).
+<a id="L96"></a>    pub const owasp_2id = Self{ .t = 2, .m = 19 * 1024, .p = 1 };
+<a id="L97"></a>
+<a id="L98"></a>    /// Create parameters from ops and mem limits, where mem_limit given in bytes
+<a id="L99"></a>    pub fn fromLimits(ops_limit: u32, mem_limit: usize) Self {
+<a id="L100"></a>        const m = mem_limit / 1024;
+<a id="L101"></a>        std.debug.assert(m &lt;= max_int);
+<a id="L102"></a>        return .{ .t = ops_limit, .m = @as(u32, @intCast(m)), .p = 1 };
+<a id="L103"></a>    }
+<a id="L104"></a>};
+<a id="L105"></a>
+<a id="L106"></a>fn initHash(
+<a id="L107"></a>    password: []const u8,
+<a id="L108"></a>    salt: []const u8,
+<a id="L109"></a>    params: Params,
+<a id="L110"></a>    dk_len: usize,
+<a id="L111"></a>    mode: Mode,
+<a id="L112"></a>) H0 {
+<a id="L113"></a>    var h0: H0 = undefined;
+<a id="L114"></a>    var parameters: [24]u8 = undefined;
+<a id="L115"></a>    var tmp: [4]u8 = undefined;
+<a id="L116"></a>    var b2 = Blake2b512.init(.{});
+<a id="L117"></a>    mem.writeInt(u32, parameters[0..4], params.p, .little);
+<a id="L118"></a>    mem.writeInt(u32, parameters[4..8], @as(u32, @intCast(dk_len)), .little);
+<a id="L119"></a>    mem.writeInt(u32, parameters[8..12], params.m, .little);
+<a id="L120"></a>    mem.writeInt(u32, parameters[12..16], params.t, .little);
+<a id="L121"></a>    mem.writeInt(u32, parameters[16..20], version, .little);
+<a id="L122"></a>    mem.writeInt(u32, parameters[20..24], @intFromEnum(mode), .little);
+<a id="L123"></a>    b2.update(&amp;parameters);
+<a id="L124"></a>    mem.writeInt(u32, &amp;tmp, @as(u32, @intCast(password.len)), .little);
+<a id="L125"></a>    b2.update(&amp;tmp);
+<a id="L126"></a>    b2.update(password);
+<a id="L127"></a>    mem.writeInt(u32, &amp;tmp, @as(u32, @intCast(salt.len)), .little);
+<a id="L128"></a>    b2.update(&amp;tmp);
+<a id="L129"></a>    b2.update(salt);
+<a id="L130"></a>    const secret = params.secret orelse "";
+<a id="L131"></a>    std.debug.assert(secret.len &lt;= max_int);
+<a id="L132"></a>    mem.writeInt(u32, &amp;tmp, @as(u32, @intCast(secret.len)), .little);
+<a id="L133"></a>    b2.update(&amp;tmp);
+<a id="L134"></a>    b2.update(secret);
+<a id="L135"></a>    const ad = params.ad orelse "";
+<a id="L136"></a>    std.debug.assert(ad.len &lt;= max_int);
+<a id="L137"></a>    mem.writeInt(u32, &amp;tmp, @as(u32, @intCast(ad.len)), .little);
+<a id="L138"></a>    b2.update(&amp;tmp);
+<a id="L139"></a>    b2.update(ad);
+<a id="L140"></a>    b2.final(h0[0..Blake2b512.digest_length]);
+<a id="L141"></a>    return h0;
+<a id="L142"></a>}
+<a id="L143"></a>
+<a id="L144"></a>fn blake2bLong(out: []u8, in: []const u8) void {
+<a id="L145"></a>    const H = Blake2b512;
+<a id="L146"></a>    var outlen_bytes: [4]u8 = undefined;
+<a id="L147"></a>    mem.writeInt(u32, &amp;outlen_bytes, @as(u32, @intCast(out.len)), .little);
+<a id="L148"></a>
+<a id="L149"></a>    var out_buf: [H.digest_length]u8 = undefined;
+<a id="L150"></a>
+<a id="L151"></a>    if (out.len &lt;= H.digest_length) {
+<a id="L152"></a>        var h = H.init(.{ .expected_out_bits = out.len * 8 });
+<a id="L153"></a>        h.update(&amp;outlen_bytes);
+<a id="L154"></a>        h.update(in);
+<a id="L155"></a>        h.final(&amp;out_buf);
+<a id="L156"></a>        @memcpy(out, out_buf[0..out.len]);
+<a id="L157"></a>        return;
+<a id="L158"></a>    }
+<a id="L159"></a>
+<a id="L160"></a>    var h = H.init(.{});
+<a id="L161"></a>    h.update(&amp;outlen_bytes);
+<a id="L162"></a>    h.update(in);
+<a id="L163"></a>    h.final(&amp;out_buf);
+<a id="L164"></a>    var out_slice = out;
+<a id="L165"></a>    out_slice[0 .. H.digest_length / 2].* = out_buf[0 .. H.digest_length / 2].*;
+<a id="L166"></a>    out_slice = out_slice[H.digest_length / 2 ..];
+<a id="L167"></a>
+<a id="L168"></a>    var in_buf: [H.digest_length]u8 = undefined;
+<a id="L169"></a>    while (out_slice.len &gt; H.digest_length) {
+<a id="L170"></a>        in_buf = out_buf;
+<a id="L171"></a>        H.hash(&amp;in_buf, &amp;out_buf, .{});
+<a id="L172"></a>        out_slice[0 .. H.digest_length / 2].* = out_buf[0 .. H.digest_length / 2].*;
+<a id="L173"></a>        out_slice = out_slice[H.digest_length / 2 ..];
+<a id="L174"></a>    }
+<a id="L175"></a>    in_buf = out_buf;
+<a id="L176"></a>    H.hash(&amp;in_buf, &amp;out_buf, .{ .expected_out_bits = out_slice.len * 8 });
+<a id="L177"></a>    @memcpy(out_slice, out_buf[0..out_slice.len]);
+<a id="L178"></a>}
+<a id="L179"></a>
+<a id="L180"></a>fn initBlocks(
+<a id="L181"></a>    blocks: *Blocks,
+<a id="L182"></a>    h0: *H0,
+<a id="L183"></a>    memory: u32,
+<a id="L184"></a>    threads: u24,
+<a id="L185"></a>) void {
+<a id="L186"></a>    var block0: [1024]u8 = undefined;
+<a id="L187"></a>    var lane: u24 = 0;
+<a id="L188"></a>    while (lane &lt; threads) : (lane += 1) {
+<a id="L189"></a>        const j = lane * (memory / threads);
+<a id="L190"></a>        mem.writeInt(u32, h0[Blake2b512.digest_length + 4 ..][0..4], lane, .little);
+<a id="L191"></a>
+<a id="L192"></a>        mem.writeInt(u32, h0[Blake2b512.digest_length..][0..4], 0, .little);
+<a id="L193"></a>        blake2bLong(&amp;block0, h0);
+<a id="L194"></a>        for (&amp;blocks.items[j + 0], 0..) |*v, i| {
+<a id="L195"></a>            v.* = mem.readInt(u64, block0[i * 8 ..][0..8], .little);
+<a id="L196"></a>        }
+<a id="L197"></a>
+<a id="L198"></a>        mem.writeInt(u32, h0[Blake2b512.digest_length..][0..4], 1, .little);
+<a id="L199"></a>        blake2bLong(&amp;block0, h0);
+<a id="L200"></a>        for (&amp;blocks.items[j + 1], 0..) |*v, i| {
+<a id="L201"></a>            v.* = mem.readInt(u64, block0[i * 8 ..][0..8], .little);
+<a id="L202"></a>        }
+<a id="L203"></a>    }
+<a id="L204"></a>}
+<a id="L205"></a>
+<a id="L206"></a>fn processBlocks(
+<a id="L207"></a>    blocks: *Blocks,
+<a id="L208"></a>    time: u32,
+<a id="L209"></a>    memory: u32,
+<a id="L210"></a>    threads: u24,
+<a id="L211"></a>    mode: Mode,
+<a id="L212"></a>    io: Io,
+<a id="L213"></a>) Io.Cancelable!void {
+<a id="L214"></a>    const lanes = memory / threads;
+<a id="L215"></a>    const segments = lanes / sync_points;
+<a id="L216"></a>
+<a id="L217"></a>    if (builtin.single_threaded or threads == 1) {
+<a id="L218"></a>        processBlocksSync(blocks, time, memory, threads, mode, lanes, segments);
+<a id="L219"></a>    } else {
+<a id="L220"></a>        try processBlocksAsync(blocks, time, memory, threads, mode, lanes, segments, io);
+<a id="L221"></a>    }
+<a id="L222"></a>}
+<a id="L223"></a>
+<a id="L224"></a>fn processBlocksSync(
+<a id="L225"></a>    blocks: *Blocks,
+<a id="L226"></a>    time: u32,
+<a id="L227"></a>    memory: u32,
+<a id="L228"></a>    threads: u24,
+<a id="L229"></a>    mode: Mode,
+<a id="L230"></a>    lanes: u32,
+<a id="L231"></a>    segments: u32,
+<a id="L232"></a>) void {
+<a id="L233"></a>    var n: u32 = 0;
+<a id="L234"></a>    while (n &lt; time) : (n += 1) {
+<a id="L235"></a>        var slice: u32 = 0;
+<a id="L236"></a>        while (slice &lt; sync_points) : (slice += 1) {
+<a id="L237"></a>            var lane: u24 = 0;
+<a id="L238"></a>            while (lane &lt; threads) : (lane += 1) {
+<a id="L239"></a>                processSegment(blocks, time, memory, threads, mode, lanes, segments, n, slice, lane);
+<a id="L240"></a>            }
+<a id="L241"></a>        }
+<a id="L242"></a>    }
+<a id="L243"></a>}
+<a id="L244"></a>
+<a id="L245"></a>fn processBlocksAsync(
+<a id="L246"></a>    blocks: *Blocks,
+<a id="L247"></a>    time: u32,
+<a id="L248"></a>    memory: u32,
+<a id="L249"></a>    threads: u24,
+<a id="L250"></a>    mode: Mode,
+<a id="L251"></a>    lanes: u32,
+<a id="L252"></a>    segments: u32,
+<a id="L253"></a>    io: Io,
+<a id="L254"></a>) Io.Cancelable!void {
+<a id="L255"></a>    var n: u32 = 0;
+<a id="L256"></a>    while (n &lt; time) : (n += 1) {
+<a id="L257"></a>        var slice: u32 = 0;
+<a id="L258"></a>        while (slice &lt; sync_points) : (slice += 1) {
+<a id="L259"></a>            var group: Io.Group = .init;
+<a id="L260"></a>            defer group.cancel(io);
+<a id="L261"></a>            var lane: u24 = 0;
+<a id="L262"></a>            while (lane &lt; threads) : (lane += 1) {
+<a id="L263"></a>                group.async(io, processSegment, .{
+<a id="L264"></a>                    blocks, time, memory, threads, mode, lanes, segments, n, slice, lane,
+<a id="L265"></a>                });
+<a id="L266"></a>            }
+<a id="L267"></a>            try group.await(io);
+<a id="L268"></a>        }
+<a id="L269"></a>    }
+<a id="L270"></a>}
+<a id="L271"></a>
+<a id="L272"></a>fn processSegment(
+<a id="L273"></a>    blocks: *Blocks,
+<a id="L274"></a>    passes: u32,
+<a id="L275"></a>    memory: u32,
+<a id="L276"></a>    threads: u24,
+<a id="L277"></a>    mode: Mode,
+<a id="L278"></a>    lanes: u32,
+<a id="L279"></a>    segments: u32,
+<a id="L280"></a>    n: u32,
+<a id="L281"></a>    slice: u32,
+<a id="L282"></a>    lane: u24,
+<a id="L283"></a>) void {
+<a id="L284"></a>    var addresses align(16) = [_]u64{0} ** block_length;
+<a id="L285"></a>    var in align(16) = [_]u64{0} ** block_length;
+<a id="L286"></a>    const zero align(16) = [_]u64{0} ** block_length;
+<a id="L287"></a>    if (mode == .argon2i or (mode == .argon2id and n == 0 and slice &lt; sync_points / 2)) {
+<a id="L288"></a>        in[0] = n;
+<a id="L289"></a>        in[1] = lane;
+<a id="L290"></a>        in[2] = slice;
+<a id="L291"></a>        in[3] = memory;
+<a id="L292"></a>        in[4] = passes;
+<a id="L293"></a>        in[5] = @intFromEnum(mode);
+<a id="L294"></a>    }
+<a id="L295"></a>    var index: u32 = 0;
+<a id="L296"></a>    if (n == 0 and slice == 0) {
+<a id="L297"></a>        index = 2;
+<a id="L298"></a>        if (mode == .argon2i or mode == .argon2id) {
+<a id="L299"></a>            in[6] += 1;
+<a id="L300"></a>            processBlock(&amp;addresses, &amp;in, &amp;zero);
+<a id="L301"></a>            processBlock(&amp;addresses, &amp;addresses, &amp;zero);
+<a id="L302"></a>        }
+<a id="L303"></a>    }
+<a id="L304"></a>    var offset = lane * lanes + slice * segments + index;
+<a id="L305"></a>    var random: u64 = 0;
+<a id="L306"></a>    while (index &lt; segments) : ({
+<a id="L307"></a>        index += 1;
+<a id="L308"></a>        offset += 1;
+<a id="L309"></a>    }) {
+<a id="L310"></a>        var prev = offset -% 1;
+<a id="L311"></a>        if (index == 0 and slice == 0) {
+<a id="L312"></a>            prev +%= lanes;
+<a id="L313"></a>        }
+<a id="L314"></a>        if (mode == .argon2i or (mode == .argon2id and n == 0 and slice &lt; sync_points / 2)) {
+<a id="L315"></a>            if (index % block_length == 0) {
+<a id="L316"></a>                in[6] += 1;
+<a id="L317"></a>                processBlock(&amp;addresses, &amp;in, &amp;zero);
+<a id="L318"></a>                processBlock(&amp;addresses, &amp;addresses, &amp;zero);
+<a id="L319"></a>            }
+<a id="L320"></a>            random = addresses[index % block_length];
+<a id="L321"></a>        } else {
+<a id="L322"></a>            random = blocks.items[prev][0];
+<a id="L323"></a>        }
+<a id="L324"></a>        const new_offset = indexAlpha(random, lanes, segments, threads, n, slice, lane, index);
+<a id="L325"></a>        processBlockXor(&amp;blocks.items[offset], &amp;blocks.items[prev], &amp;blocks.items[new_offset]);
+<a id="L326"></a>    }
+<a id="L327"></a>}
+<a id="L328"></a>
+<a id="L329"></a>fn processBlock(
+<a id="L330"></a>    out: *align(16) [block_length]u64,
+<a id="L331"></a>    in1: *align(16) const [block_length]u64,
+<a id="L332"></a>    in2: *align(16) const [block_length]u64,
+<a id="L333"></a>) void {
+<a id="L334"></a>    processBlockGeneric(out, in1, in2, false);
+<a id="L335"></a>}
+<a id="L336"></a>
+<a id="L337"></a>fn processBlockXor(
+<a id="L338"></a>    out: *[block_length]u64,
+<a id="L339"></a>    in1: *const [block_length]u64,
+<a id="L340"></a>    in2: *const [block_length]u64,
+<a id="L341"></a>) void {
+<a id="L342"></a>    processBlockGeneric(out, in1, in2, true);
+<a id="L343"></a>}
+<a id="L344"></a>
+<a id="L345"></a>fn processBlockGeneric(
+<a id="L346"></a>    out: *[block_length]u64,
+<a id="L347"></a>    in1: *const [block_length]u64,
+<a id="L348"></a>    in2: *const [block_length]u64,
+<a id="L349"></a>    comptime xor: bool,
+<a id="L350"></a>) void {
+<a id="L351"></a>    var t: [block_length]u64 = undefined;
+<a id="L352"></a>    for (&amp;t, 0..) |*v, i| {
+<a id="L353"></a>        v.* = in1[i] ^ in2[i];
+<a id="L354"></a>    }
+<a id="L355"></a>    var i: usize = 0;
+<a id="L356"></a>    while (i &lt; block_length) : (i += 16) {
+<a id="L357"></a>        blamkaGeneric(t[i..][0..16]);
+<a id="L358"></a>    }
+<a id="L359"></a>    i = 0;
+<a id="L360"></a>    var buffer: [16]u64 = undefined;
+<a id="L361"></a>    while (i &lt; block_length / 8) : (i += 2) {
+<a id="L362"></a>        var j: usize = 0;
+<a id="L363"></a>        while (j &lt; block_length / 8) : (j += 2) {
+<a id="L364"></a>            buffer[j] = t[j * 8 + i];
+<a id="L365"></a>            buffer[j + 1] = t[j * 8 + i + 1];
+<a id="L366"></a>        }
+<a id="L367"></a>        blamkaGeneric(&amp;buffer);
+<a id="L368"></a>        j = 0;
+<a id="L369"></a>        while (j &lt; block_length / 8) : (j += 2) {
+<a id="L370"></a>            t[j * 8 + i] = buffer[j];
+<a id="L371"></a>            t[j * 8 + i + 1] = buffer[j + 1];
+<a id="L372"></a>        }
+<a id="L373"></a>    }
+<a id="L374"></a>    if (xor) {
+<a id="L375"></a>        for (t, 0..) |v, j| {
+<a id="L376"></a>            out[j] ^= in1[j] ^ in2[j] ^ v;
+<a id="L377"></a>        }
+<a id="L378"></a>    } else {
+<a id="L379"></a>        for (t, 0..) |v, j| {
+<a id="L380"></a>            out[j] = in1[j] ^ in2[j] ^ v;
+<a id="L381"></a>        }
+<a id="L382"></a>    }
+<a id="L383"></a>}
+<a id="L384"></a>
+<a id="L385"></a>const QuarterRound = struct { a: usize, b: usize, c: usize, d: usize };
+<a id="L386"></a>
+<a id="L387"></a>fn Rp(a: usize, b: usize, c: usize, d: usize) QuarterRound {
+<a id="L388"></a>    return .{ .a = a, .b = b, .c = c, .d = d };
+<a id="L389"></a>}
+<a id="L390"></a>
+<a id="L391"></a>fn fBlaMka(x: u64, y: u64) u64 {
+<a id="L392"></a>    const xy = @as(u64, @as(u32, @truncate(x))) * @as(u64, @as(u32, @truncate(y)));
+<a id="L393"></a>    return x +% y +% 2 *% xy;
+<a id="L394"></a>}
+<a id="L395"></a>
+<a id="L396"></a>fn blamkaGeneric(x: *[16]u64) void {
+<a id="L397"></a>    const rounds = comptime [_]QuarterRound{
+<a id="L398"></a>        Rp(0, 4, 8, 12),
+<a id="L399"></a>        Rp(1, 5, 9, 13),
+<a id="L400"></a>        Rp(2, 6, 10, 14),
+<a id="L401"></a>        Rp(3, 7, 11, 15),
+<a id="L402"></a>        Rp(0, 5, 10, 15),
+<a id="L403"></a>        Rp(1, 6, 11, 12),
+<a id="L404"></a>        Rp(2, 7, 8, 13),
+<a id="L405"></a>        Rp(3, 4, 9, 14),
+<a id="L406"></a>    };
+<a id="L407"></a>    inline for (rounds) |r| {
+<a id="L408"></a>        x[r.a] = fBlaMka(x[r.a], x[r.b]);
+<a id="L409"></a>        x[r.d] = math.rotr(u64, x[r.d] ^ x[r.a], 32);
+<a id="L410"></a>        x[r.c] = fBlaMka(x[r.c], x[r.d]);
+<a id="L411"></a>        x[r.b] = math.rotr(u64, x[r.b] ^ x[r.c], 24);
+<a id="L412"></a>        x[r.a] = fBlaMka(x[r.a], x[r.b]);
+<a id="L413"></a>        x[r.d] = math.rotr(u64, x[r.d] ^ x[r.a], 16);
+<a id="L414"></a>        x[r.c] = fBlaMka(x[r.c], x[r.d]);
+<a id="L415"></a>        x[r.b] = math.rotr(u64, x[r.b] ^ x[r.c], 63);
+<a id="L416"></a>    }
+<a id="L417"></a>}
+<a id="L418"></a>
+<a id="L419"></a>fn finalize(
+<a id="L420"></a>    blocks: *Blocks,
+<a id="L421"></a>    memory: u32,
+<a id="L422"></a>    threads: u24,
+<a id="L423"></a>    out: []u8,
+<a id="L424"></a>) void {
+<a id="L425"></a>    const lanes = memory / threads;
+<a id="L426"></a>    var lane: u24 = 0;
+<a id="L427"></a>    while (lane &lt; threads - 1) : (lane += 1) {
+<a id="L428"></a>        for (blocks.items[(lane * lanes) + lanes - 1], 0..) |v, i| {
+<a id="L429"></a>            blocks.items[memory - 1][i] ^= v;
+<a id="L430"></a>        }
+<a id="L431"></a>    }
+<a id="L432"></a>    var block: [1024]u8 = undefined;
+<a id="L433"></a>    for (blocks.items[memory - 1], 0..) |v, i| {
+<a id="L434"></a>        mem.writeInt(u64, block[i * 8 ..][0..8], v, .little);
+<a id="L435"></a>    }
+<a id="L436"></a>    blake2bLong(out, &amp;block);
+<a id="L437"></a>}
+<a id="L438"></a>
+<a id="L439"></a>fn indexAlpha(
+<a id="L440"></a>    rand: u64,
+<a id="L441"></a>    lanes: u32,
+<a id="L442"></a>    segments: u32,
+<a id="L443"></a>    threads: u24,
+<a id="L444"></a>    n: u32,
+<a id="L445"></a>    slice: u32,
+<a id="L446"></a>    lane: u24,
+<a id="L447"></a>    index: u32,
+<a id="L448"></a>) u32 {
+<a id="L449"></a>    var ref_lane = @as(u32, @intCast(rand &gt;&gt; 32)) % threads;
+<a id="L450"></a>    if (n == 0 and slice == 0) {
+<a id="L451"></a>        ref_lane = lane;
+<a id="L452"></a>    }
+<a id="L453"></a>    var m = 3 * segments;
+<a id="L454"></a>    var s = ((slice + 1) % sync_points) * segments;
+<a id="L455"></a>    if (lane == ref_lane) {
+<a id="L456"></a>        m += index;
+<a id="L457"></a>    }
+<a id="L458"></a>    if (n == 0) {
+<a id="L459"></a>        m = slice * segments;
+<a id="L460"></a>        s = 0;
+<a id="L461"></a>        if (slice == 0 or lane == ref_lane) {
+<a id="L462"></a>            m += index;
+<a id="L463"></a>        }
+<a id="L464"></a>    }
+<a id="L465"></a>    if (index == 0 or lane == ref_lane) {
+<a id="L466"></a>        m -= 1;
+<a id="L467"></a>    }
+<a id="L468"></a>    var p = @as(u64, @as(u32, @truncate(rand)));
+<a id="L469"></a>    p = (p * p) &gt;&gt; 32;
+<a id="L470"></a>    p = (p * m) &gt;&gt; 32;
+<a id="L471"></a>    return ref_lane * lanes + @as(u32, @intCast(((s + m - (p + 1)) % lanes)));
+<a id="L472"></a>}
+<a id="L473"></a>
+<a id="L474"></a>/// Derives a key from the password, salt, and argon2 parameters.
+<a id="L475"></a>///
+<a id="L476"></a>/// Derived key has to be at least 4 bytes length.
+<a id="L477"></a>///
+<a id="L478"></a>/// Salt has to be at least 8 bytes length.
+<a id="L479"></a>pub fn kdf(
+<a id="L480"></a>    allocator: mem.Allocator,
+<a id="L481"></a>    derived_key: []u8,
+<a id="L482"></a>    password: []const u8,
+<a id="L483"></a>    salt: []const u8,
+<a id="L484"></a>    params: Params,
+<a id="L485"></a>    mode: Mode,
+<a id="L486"></a>    io: Io,
+<a id="L487"></a>) KdfError!void {
+<a id="L488"></a>    if (derived_key.len &lt; 4) return KdfError.WeakParameters;
+<a id="L489"></a>    if (derived_key.len &gt; max_int) return KdfError.OutputTooLong;
+<a id="L490"></a>
+<a id="L491"></a>    if (password.len &gt; max_int) return KdfError.WeakParameters;
+<a id="L492"></a>    if (salt.len &lt; 8 or salt.len &gt; max_int) return KdfError.WeakParameters;
+<a id="L493"></a>    if (params.t &lt; 1 or params.p &lt; 1) return KdfError.WeakParameters;
+<a id="L494"></a>    if (params.m / 8 &lt; params.p) return KdfError.WeakParameters;
+<a id="L495"></a>
+<a id="L496"></a>    var h0 = initHash(password, salt, params, derived_key.len, mode);
+<a id="L497"></a>    const memory = @max(
+<a id="L498"></a>        params.m / (sync_points * params.p) * (sync_points * params.p),
+<a id="L499"></a>        2 * sync_points * params.p,
+<a id="L500"></a>    );
+<a id="L501"></a>
+<a id="L502"></a>    var blocks = try Blocks.initCapacity(allocator, memory);
+<a id="L503"></a>    defer blocks.deinit();
+<a id="L504"></a>
+<a id="L505"></a>    blocks.appendNTimesAssumeCapacity(@splat(0), memory);
+<a id="L506"></a>
+<a id="L507"></a>    initBlocks(&amp;blocks, &amp;h0, memory, params.p);
+<a id="L508"></a>    try processBlocks(&amp;blocks, params.t, memory, params.p, mode, io);
+<a id="L509"></a>    finalize(&amp;blocks, memory, params.p, derived_key);
+<a id="L510"></a>}
+<a id="L511"></a>
+<a id="L512"></a>const PhcFormatHasher = struct {
+<a id="L513"></a>    const BinValue = phc_format.BinValue;
+<a id="L514"></a>
+<a id="L515"></a>    const HashResult = struct {
+<a id="L516"></a>        alg_id: []const u8,
+<a id="L517"></a>        alg_version: ?u32,
+<a id="L518"></a>        m: u32,
+<a id="L519"></a>        t: u32,
+<a id="L520"></a>        p: u24,
+<a id="L521"></a>        salt: BinValue(max_salt_len),
+<a id="L522"></a>        hash: BinValue(max_hash_len),
+<a id="L523"></a>    };
+<a id="L524"></a>
+<a id="L525"></a>    pub fn create(
+<a id="L526"></a>        allocator: mem.Allocator,
+<a id="L527"></a>        password: []const u8,
+<a id="L528"></a>        params: Params,
+<a id="L529"></a>        mode: Mode,
+<a id="L530"></a>        buf: []u8,
+<a id="L531"></a>        io: Io,
+<a id="L532"></a>    ) HasherError![]const u8 {
+<a id="L533"></a>        if (params.secret != null or params.ad != null) return HasherError.InvalidEncoding;
+<a id="L534"></a>
+<a id="L535"></a>        var salt: [default_salt_len]u8 = undefined;
+<a id="L536"></a>        io.random(&amp;salt);
+<a id="L537"></a>
+<a id="L538"></a>        var hash: [default_hash_len]u8 = undefined;
+<a id="L539"></a>        try kdf(allocator, &amp;hash, password, &amp;salt, params, mode, io);
+<a id="L540"></a>
+<a id="L541"></a>        return phc_format.serialize(HashResult{
+<a id="L542"></a>            .alg_id = @tagName(mode),
+<a id="L543"></a>            .alg_version = version,
+<a id="L544"></a>            .m = params.m,
+<a id="L545"></a>            .t = params.t,
+<a id="L546"></a>            .p = params.p,
+<a id="L547"></a>            .salt = try BinValue(max_salt_len).fromSlice(&amp;salt),
+<a id="L548"></a>            .hash = try BinValue(max_hash_len).fromSlice(&amp;hash),
+<a id="L549"></a>        }, buf);
+<a id="L550"></a>    }
+<a id="L551"></a>
+<a id="L552"></a>    pub fn verify(
+<a id="L553"></a>        allocator: mem.Allocator,
+<a id="L554"></a>        str: []const u8,
+<a id="L555"></a>        password: []const u8,
+<a id="L556"></a>        io: Io,
+<a id="L557"></a>    ) HasherError!void {
+<a id="L558"></a>        const hash_result = try phc_format.deserialize(HashResult, str);
+<a id="L559"></a>
+<a id="L560"></a>        const mode = std.meta.stringToEnum(Mode, hash_result.alg_id) orelse
+<a id="L561"></a>            return HasherError.PasswordVerificationFailed;
+<a id="L562"></a>        if (hash_result.alg_version) |v| {
+<a id="L563"></a>            if (v != version) return HasherError.InvalidEncoding;
+<a id="L564"></a>        }
+<a id="L565"></a>        const params = Params{ .t = hash_result.t, .m = hash_result.m, .p = hash_result.p };
+<a id="L566"></a>
+<a id="L567"></a>        const expected_hash = hash_result.hash.constSlice();
+<a id="L568"></a>        var hash_buf: [max_hash_len]u8 = undefined;
+<a id="L569"></a>        if (expected_hash.len &gt; hash_buf.len) return HasherError.InvalidEncoding;
+<a id="L570"></a>        const hash = hash_buf[0..expected_hash.len];
+<a id="L571"></a>
+<a id="L572"></a>        try kdf(allocator, hash, password, hash_result.salt.constSlice(), params, mode, io);
+<a id="L573"></a>        if (!mem.eql(u8, hash, expected_hash)) return HasherError.PasswordVerificationFailed;
+<a id="L574"></a>    }
+<a id="L575"></a>};
+<a id="L576"></a>
+<a id="L577"></a>/// Options for hashing a password.
+<a id="L578"></a>///
+<a id="L579"></a>/// Allocator is required for argon2.
+<a id="L580"></a>///
+<a id="L581"></a>/// Only phc encoding is supported.
+<a id="L582"></a>pub const HashOptions = struct {
+<a id="L583"></a>    allocator: ?mem.Allocator,
+<a id="L584"></a>    params: Params,
+<a id="L585"></a>    mode: Mode = .argon2id,
+<a id="L586"></a>    encoding: pwhash.Encoding = .phc,
+<a id="L587"></a>};
+<a id="L588"></a>
+<a id="L589"></a>/// Compute a hash of a password using the argon2 key derivation function.
+<a id="L590"></a>/// The function returns a string that includes all the parameters required for verification.
+<a id="L591"></a>pub fn strHash(
+<a id="L592"></a>    password: []const u8,
+<a id="L593"></a>    options: HashOptions,
+<a id="L594"></a>    out: []u8,
+<a id="L595"></a>    io: Io,
+<a id="L596"></a>) Error![]const u8 {
+<a id="L597"></a>    const allocator = options.allocator orelse return Error.AllocatorRequired;
+<a id="L598"></a>    switch (options.encoding) {
+<a id="L599"></a>        .phc =&gt; return PhcFormatHasher.create(
+<a id="L600"></a>            allocator,
+<a id="L601"></a>            password,
+<a id="L602"></a>            options.params,
+<a id="L603"></a>            options.mode,
+<a id="L604"></a>            out,
+<a id="L605"></a>            io,
+<a id="L606"></a>        ),
+<a id="L607"></a>        .crypt =&gt; return Error.InvalidEncoding,
+<a id="L608"></a>    }
+<a id="L609"></a>}
+<a id="L610"></a>
+<a id="L611"></a>/// Options for hash verification.
+<a id="L612"></a>///
+<a id="L613"></a>/// Allocator is required for argon2.
+<a id="L614"></a>pub const VerifyOptions = struct {
+<a id="L615"></a>    allocator: ?mem.Allocator,
+<a id="L616"></a>};
+<a id="L617"></a>
+<a id="L618"></a>/// Verify that a previously computed hash is valid for a given password.
+<a id="L619"></a>pub fn strVerify(
+<a id="L620"></a>    str: []const u8,
+<a id="L621"></a>    password: []const u8,
+<a id="L622"></a>    options: VerifyOptions,
+<a id="L623"></a>    io: Io,
+<a id="L624"></a>) Error!void {
+<a id="L625"></a>    const allocator = options.allocator orelse return Error.AllocatorRequired;
+<a id="L626"></a>    return PhcFormatHasher.verify(allocator, str, password, io);
+<a id="L627"></a>}
+<a id="L628"></a>
+<a id="L629"></a>test "argon2d" {
+<a id="L630"></a>    if (true) return error.SkipZigTest; // https://codeberg.org/ziglang/zig/issues/30074
+<a id="L631"></a>
+<a id="L632"></a>    const password = [_]u8{0x01} ** 32;
+<a id="L633"></a>    const salt = [_]u8{0x02} ** 16;
+<a id="L634"></a>    const secret = [_]u8{0x03} ** 8;
+<a id="L635"></a>    const ad = [_]u8{0x04} ** 12;
+<a id="L636"></a>
+<a id="L637"></a>    var dk: [32]u8 = undefined;
+<a id="L638"></a>    try kdf(
+<a id="L639"></a>        std.testing.allocator,
+<a id="L640"></a>        &amp;dk,
+<a id="L641"></a>        &amp;password,
+<a id="L642"></a>        &amp;salt,
+<a id="L643"></a>        .{ .t = 3, .m = 32, .p = 4, .secret = &amp;secret, .ad = &amp;ad },
+<a id="L644"></a>        .argon2d,
+<a id="L645"></a>        std.testing.io,
+<a id="L646"></a>    );
+<a id="L647"></a>
+<a id="L648"></a>    const want = [_]u8{
+<a id="L649"></a>        0x51, 0x2b, 0x39, 0x1b, 0x6f, 0x11, 0x62, 0x97,
+<a id="L650"></a>        0x53, 0x71, 0xd3, 0x09, 0x19, 0x73, 0x42, 0x94,
+<a id="L651"></a>        0xf8, 0x68, 0xe3, 0xbe, 0x39, 0x84, 0xf3, 0xc1,
+<a id="L652"></a>        0xa1, 0x3a, 0x4d, 0xb9, 0xfa, 0xbe, 0x4a, 0xcb,
+<a id="L653"></a>    };
+<a id="L654"></a>    try std.testing.expectEqualSlices(u8, &amp;dk, &amp;want);
+<a id="L655"></a>}
+<a id="L656"></a>
+<a id="L657"></a>test "argon2i" {
+<a id="L658"></a>    const password = [_]u8{0x01} ** 32;
+<a id="L659"></a>    const salt = [_]u8{0x02} ** 16;
+<a id="L660"></a>    const secret = [_]u8{0x03} ** 8;
+<a id="L661"></a>    const ad = [_]u8{0x04} ** 12;
+<a id="L662"></a>
+<a id="L663"></a>    var dk: [32]u8 = undefined;
+<a id="L664"></a>    try kdf(
+<a id="L665"></a>        std.testing.allocator,
+<a id="L666"></a>        &amp;dk,
+<a id="L667"></a>        &amp;password,
+<a id="L668"></a>        &amp;salt,
+<a id="L669"></a>        .{ .t = 3, .m = 32, .p = 4, .secret = &amp;secret, .ad = &amp;ad },
+<a id="L670"></a>        .argon2i,
+<a id="L671"></a>        std.testing.io,
+<a id="L672"></a>    );
+<a id="L673"></a>
+<a id="L674"></a>    const want = [_]u8{
+<a id="L675"></a>        0xc8, 0x14, 0xd9, 0xd1, 0xdc, 0x7f, 0x37, 0xaa,
+<a id="L676"></a>        0x13, 0xf0, 0xd7, 0x7f, 0x24, 0x94, 0xbd, 0xa1,
+<a id="L677"></a>        0xc8, 0xde, 0x6b, 0x01, 0x6d, 0xd3, 0x88, 0xd2,
+<a id="L678"></a>        0x99, 0x52, 0xa4, 0xc4, 0x67, 0x2b, 0x6c, 0xe8,
+<a id="L679"></a>    };
+<a id="L680"></a>    try std.testing.expectEqualSlices(u8, &amp;dk, &amp;want);
+<a id="L681"></a>}
+<a id="L682"></a>
+<a id="L683"></a>test "argon2id" {
+<a id="L684"></a>    const password = [_]u8{0x01} ** 32;
+<a id="L685"></a>    const salt = [_]u8{0x02} ** 16;
+<a id="L686"></a>    const secret = [_]u8{0x03} ** 8;
+<a id="L687"></a>    const ad = [_]u8{0x04} ** 12;
+<a id="L688"></a>
+<a id="L689"></a>    var dk: [32]u8 = undefined;
+<a id="L690"></a>    try kdf(
+<a id="L691"></a>        std.testing.allocator,
+<a id="L692"></a>        &amp;dk,
+<a id="L693"></a>        &amp;password,
+<a id="L694"></a>        &amp;salt,
+<a id="L695"></a>        .{ .t = 3, .m = 32, .p = 4, .secret = &amp;secret, .ad = &amp;ad },
+<a id="L696"></a>        .argon2id,
+<a id="L697"></a>        std.testing.io,
+<a id="L698"></a>    );
+<a id="L699"></a>
+<a id="L700"></a>    const want = [_]u8{
+<a id="L701"></a>        0x0d, 0x64, 0x0d, 0xf5, 0x8d, 0x78, 0x76, 0x6c,
+<a id="L702"></a>        0x08, 0xc0, 0x37, 0xa3, 0x4a, 0x8b, 0x53, 0xc9,
+<a id="L703"></a>        0xd0, 0x1e, 0xf0, 0x45, 0x2d, 0x75, 0xb6, 0x5e,
+<a id="L704"></a>        0xb5, 0x25, 0x20, 0xe9, 0x6b, 0x01, 0xe6, 0x59,
+<a id="L705"></a>    };
+<a id="L706"></a>    try std.testing.expectEqualSlices(u8, &amp;dk, &amp;want);
+<a id="L707"></a>}
+<a id="L708"></a>
+<a id="L709"></a>test "kdf" {
+<a id="L710"></a>    if (true) return error.SkipZigTest; // https://codeberg.org/ziglang/zig/issues/31402
+<a id="L711"></a>
+<a id="L712"></a>    const password = "password";
+<a id="L713"></a>    const salt = "somesalt";
+<a id="L714"></a>
+<a id="L715"></a>    const TestVector = struct {
+<a id="L716"></a>        mode: Mode,
+<a id="L717"></a>        time: u32,
+<a id="L718"></a>        memory: u32,
+<a id="L719"></a>        threads: u8,
+<a id="L720"></a>        hash: []const u8,
+<a id="L721"></a>    };
+<a id="L722"></a>    const test_vectors = [_]TestVector{
+<a id="L723"></a>        .{
+<a id="L724"></a>            .mode = .argon2i,
+<a id="L725"></a>            .time = 1,
+<a id="L726"></a>            .memory = 64,
+<a id="L727"></a>            .threads = 1,
+<a id="L728"></a>            .hash = "b9c401d1844a67d50eae3967dc28870b22e508092e861a37",
+<a id="L729"></a>        },
+<a id="L730"></a>        .{
+<a id="L731"></a>            .mode = .argon2d,
+<a id="L732"></a>            .time = 1,
+<a id="L733"></a>            .memory = 64,
+<a id="L734"></a>            .threads = 1,
+<a id="L735"></a>            .hash = "8727405fd07c32c78d64f547f24150d3f2e703a89f981a19",
+<a id="L736"></a>        },
+<a id="L737"></a>        .{
+<a id="L738"></a>            .mode = .argon2id,
+<a id="L739"></a>            .time = 1,
+<a id="L740"></a>            .memory = 64,
+<a id="L741"></a>            .threads = 1,
+<a id="L742"></a>            .hash = "655ad15eac652dc59f7170a7332bf49b8469be1fdb9c28bb",
+<a id="L743"></a>        },
+<a id="L744"></a>        .{
+<a id="L745"></a>            .mode = .argon2i,
+<a id="L746"></a>            .time = 2,
+<a id="L747"></a>            .memory = 64,
+<a id="L748"></a>            .threads = 1,
+<a id="L749"></a>            .hash = "8cf3d8f76a6617afe35fac48eb0b7433a9a670ca4a07ed64",
+<a id="L750"></a>        },
+<a id="L751"></a>        .{
+<a id="L752"></a>            .mode = .argon2d,
+<a id="L753"></a>            .time = 2,
+<a id="L754"></a>            .memory = 64,
+<a id="L755"></a>            .threads = 1,
+<a id="L756"></a>            .hash = "3be9ec79a69b75d3752acb59a1fbb8b295a46529c48fbb75",
+<a id="L757"></a>        },
+<a id="L758"></a>        .{
+<a id="L759"></a>            .mode = .argon2id,
+<a id="L760"></a>            .time = 2,
+<a id="L761"></a>            .memory = 64,
+<a id="L762"></a>            .threads = 1,
+<a id="L763"></a>            .hash = "068d62b26455936aa6ebe60060b0a65870dbfa3ddf8d41f7",
+<a id="L764"></a>        },
+<a id="L765"></a>        .{
+<a id="L766"></a>            .mode = .argon2i,
+<a id="L767"></a>            .time = 2,
+<a id="L768"></a>            .memory = 64,
+<a id="L769"></a>            .threads = 2,
+<a id="L770"></a>            .hash = "2089f3e78a799720f80af806553128f29b132cafe40d059f",
+<a id="L771"></a>        },
+<a id="L772"></a>        .{
+<a id="L773"></a>            .mode = .argon2d,
+<a id="L774"></a>            .time = 2,
+<a id="L775"></a>            .memory = 64,
+<a id="L776"></a>            .threads = 2,
+<a id="L777"></a>            .hash = "68e2462c98b8bc6bb60ec68db418ae2c9ed24fc6748a40e9",
+<a id="L778"></a>        },
+<a id="L779"></a>        .{
+<a id="L780"></a>            .mode = .argon2id,
+<a id="L781"></a>            .time = 2,
+<a id="L782"></a>            .memory = 64,
+<a id="L783"></a>            .threads = 2,
+<a id="L784"></a>            .hash = "350ac37222f436ccb5c0972f1ebd3bf6b958bf2071841362",
+<a id="L785"></a>        },
+<a id="L786"></a>        .{
+<a id="L787"></a>            .mode = .argon2i,
+<a id="L788"></a>            .time = 3,
+<a id="L789"></a>            .memory = 256,
+<a id="L790"></a>            .threads = 2,
+<a id="L791"></a>            .hash = "f5bbf5d4c3836af13193053155b73ec7476a6a2eb93fd5e6",
+<a id="L792"></a>        },
+<a id="L793"></a>        .{
+<a id="L794"></a>            .mode = .argon2d,
+<a id="L795"></a>            .time = 3,
+<a id="L796"></a>            .memory = 256,
+<a id="L797"></a>            .threads = 2,
+<a id="L798"></a>            .hash = "f4f0669218eaf3641f39cc97efb915721102f4b128211ef2",
+<a id="L799"></a>        },
+<a id="L800"></a>        .{
+<a id="L801"></a>            .mode = .argon2id,
+<a id="L802"></a>            .time = 3,
+<a id="L803"></a>            .memory = 256,
+<a id="L804"></a>            .threads = 2,
+<a id="L805"></a>            .hash = "4668d30ac4187e6878eedeacf0fd83c5a0a30db2cc16ef0b",
+<a id="L806"></a>        },
+<a id="L807"></a>        .{
+<a id="L808"></a>            .mode = .argon2i,
+<a id="L809"></a>            .time = 4,
+<a id="L810"></a>            .memory = 256,
+<a id="L811"></a>            .threads = 4,
+<a id="L812"></a>            .hash = "f7dbbacbf16999e3700817a7e06f65a8db2e9fa9504ede4c",
+<a id="L813"></a>        },
+<a id="L814"></a>        .{
+<a id="L815"></a>            .mode = .argon2d,
+<a id="L816"></a>            .time = 4,
+<a id="L817"></a>            .memory = 256,
+<a id="L818"></a>            .threads = 4,
+<a id="L819"></a>            .hash = "ea2970501cf49faa5ba1d2e6370204e9b57ca90a8fea937b",
+<a id="L820"></a>        },
+<a id="L821"></a>        .{
+<a id="L822"></a>            .mode = .argon2id,
+<a id="L823"></a>            .time = 4,
+<a id="L824"></a>            .memory = 256,
+<a id="L825"></a>            .threads = 4,
+<a id="L826"></a>            .hash = "fbd40d5a8cb92f88c20bda4b3cdb1f9d5af1efa937032410",
+<a id="L827"></a>        },
+<a id="L828"></a>        .{
+<a id="L829"></a>            .mode = .argon2i,
+<a id="L830"></a>            .time = 4,
+<a id="L831"></a>            .memory = 256,
+<a id="L832"></a>            .threads = 8,
+<a id="L833"></a>            .hash = "15d3c398364e53f68fd12d19baf3f21432d964254fe27467",
+<a id="L834"></a>        },
+<a id="L835"></a>        .{
+<a id="L836"></a>            .mode = .argon2d,
+<a id="L837"></a>            .time = 4,
+<a id="L838"></a>            .memory = 256,
+<a id="L839"></a>            .threads = 8,
+<a id="L840"></a>            .hash = "23c9adc06f06e21e4612c1466a1be02627690932b02c0df0",
+<a id="L841"></a>        },
+<a id="L842"></a>        .{
+<a id="L843"></a>            .mode = .argon2id,
+<a id="L844"></a>            .time = 4,
+<a id="L845"></a>            .memory = 256,
+<a id="L846"></a>            .threads = 8,
+<a id="L847"></a>            .hash = "f22802f8ca47be93f9954e4ce20c1e944e938fbd4a125d9d",
+<a id="L848"></a>        },
+<a id="L849"></a>        .{
+<a id="L850"></a>            .mode = .argon2i,
+<a id="L851"></a>            .time = 2,
+<a id="L852"></a>            .memory = 64,
+<a id="L853"></a>            .threads = 3,
+<a id="L854"></a>            .hash = "5cab452fe6b8479c8661def8cd703b611a3905a6d5477fe6",
+<a id="L855"></a>        },
+<a id="L856"></a>        .{
+<a id="L857"></a>            .mode = .argon2d,
+<a id="L858"></a>            .time = 2,
+<a id="L859"></a>            .memory = 64,
+<a id="L860"></a>            .threads = 3,
+<a id="L861"></a>            .hash = "22474a423bda2ccd36ec9afd5119e5c8949798cadf659f51",
+<a id="L862"></a>        },
+<a id="L863"></a>        .{
+<a id="L864"></a>            .mode = .argon2id,
+<a id="L865"></a>            .time = 2,
+<a id="L866"></a>            .memory = 64,
+<a id="L867"></a>            .threads = 3,
+<a id="L868"></a>            .hash = "4a15b31aec7c2590b87d1f520be7d96f56658172deaa3079",
+<a id="L869"></a>        },
+<a id="L870"></a>        .{
+<a id="L871"></a>            .mode = .argon2i,
+<a id="L872"></a>            .time = 3,
+<a id="L873"></a>            .memory = 256,
+<a id="L874"></a>            .threads = 6,
+<a id="L875"></a>            .hash = "ebc8f91964abd8ceab49a12963b0a9e57d635bfa2aad2884",
+<a id="L876"></a>        },
+<a id="L877"></a>        .{
+<a id="L878"></a>            .mode = .argon2d,
+<a id="L879"></a>            .time = 3,
+<a id="L880"></a>            .memory = 256,
+<a id="L881"></a>            .threads = 6,
+<a id="L882"></a>            .hash = "1dd7202fd68da6675f769f4034b7a1db30d8785331954117",
+<a id="L883"></a>        },
+<a id="L884"></a>        .{
+<a id="L885"></a>            .mode = .argon2id,
+<a id="L886"></a>            .time = 3,
+<a id="L887"></a>            .memory = 256,
+<a id="L888"></a>            .threads = 6,
+<a id="L889"></a>            .hash = "424436b6ee22a66b04b9d0cf78f190305c5c166bae8baa09",
+<a id="L890"></a>        },
+<a id="L891"></a>    };
+<a id="L892"></a>    for (test_vectors) |v| {
+<a id="L893"></a>        var want: [24]u8 = undefined;
+<a id="L894"></a>        _ = try std.fmt.hexToBytes(&amp;want, v.hash);
+<a id="L895"></a>
+<a id="L896"></a>        var dk: [24]u8 = undefined;
+<a id="L897"></a>        try kdf(
+<a id="L898"></a>            std.testing.allocator,
+<a id="L899"></a>            &amp;dk,
+<a id="L900"></a>            password,
+<a id="L901"></a>            salt,
+<a id="L902"></a>            .{ .t = v.time, .m = v.memory, .p = v.threads },
+<a id="L903"></a>            v.mode,
+<a id="L904"></a>            std.testing.io,
+<a id="L905"></a>        );
+<a id="L906"></a>
+<a id="L907"></a>        try std.testing.expectEqualSlices(u8, &amp;dk, &amp;want);
+<a id="L908"></a>    }
+<a id="L909"></a>}
+<a id="L910"></a>
+<a id="L911"></a>test "phc format hasher" {
+<a id="L912"></a>    const allocator = std.testing.allocator;
+<a id="L913"></a>    const password = "testpass";
+<a id="L914"></a>    const io = std.testing.io;
+<a id="L915"></a>
+<a id="L916"></a>    var buf: [128]u8 = undefined;
+<a id="L917"></a>    const hash = try PhcFormatHasher.create(
+<a id="L918"></a>        allocator,
+<a id="L919"></a>        password,
+<a id="L920"></a>        .{ .t = 3, .m = 32, .p = 4 },
+<a id="L921"></a>        .argon2id,
+<a id="L922"></a>        &amp;buf,
+<a id="L923"></a>        io,
+<a id="L924"></a>    );
+<a id="L925"></a>    try PhcFormatHasher.verify(allocator, hash, password, io);
+<a id="L926"></a>}
+<a id="L927"></a>
+<a id="L928"></a>test "password hash and password verify" {
+<a id="L929"></a>    const allocator = std.testing.allocator;
+<a id="L930"></a>    const password = "testpass";
+<a id="L931"></a>    const io = std.testing.io;
+<a id="L932"></a>
+<a id="L933"></a>    var buf: [128]u8 = undefined;
+<a id="L934"></a>    const hash = try strHash(
+<a id="L935"></a>        password,
+<a id="L936"></a>        .{ .allocator = allocator, .params = .{ .t = 3, .m = 32, .p = 4 } },
+<a id="L937"></a>        &amp;buf,
+<a id="L938"></a>        io,
+<a id="L939"></a>    );
+<a id="L940"></a>    try strVerify(hash, password, .{ .allocator = allocator }, io);
+<a id="L941"></a>}
+<a id="L942"></a>
+<a id="L943"></a>test "kdf derived key length" {
+<a id="L944"></a>    if (true) return error.SkipZigTest; // https://codeberg.org/ziglang/zig/issues/31504
+<a id="L945"></a>
+<a id="L946"></a>    const allocator = std.testing.allocator;
+<a id="L947"></a>    const io = std.testing.io;
+<a id="L948"></a>
+<a id="L949"></a>    const password = "testpass";
+<a id="L950"></a>    const salt = "saltsalt";
+<a id="L951"></a>    const params = Params{ .t = 3, .m = 32, .p = 4 };
+<a id="L952"></a>    const mode = Mode.argon2id;
+<a id="L953"></a>
+<a id="L954"></a>    var dk1: [11]u8 = undefined;
+<a id="L955"></a>    try kdf(allocator, &amp;dk1, password, salt, params, mode, io);
+<a id="L956"></a>
+<a id="L957"></a>    var dk2: [77]u8 = undefined;
+<a id="L958"></a>    try kdf(allocator, &amp;dk2, password, salt, params, mode, io);
+<a id="L959"></a>
+<a id="L960"></a>    var dk3: [111]u8 = undefined;
+<a id="L961"></a>    try kdf(allocator, &amp;dk3, password, salt, params, mode, io);
+<a id="L962"></a>}
+</pre>
 </body>
 </html>

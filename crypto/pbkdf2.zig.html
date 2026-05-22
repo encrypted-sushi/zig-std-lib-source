@@ -2,280 +2,283 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Source: zig-0.16.0-std/crypto/pbkdf2.zig</title>
+    <title>Source: crypto/pbkdf2.zig</title>
     <style>
         body { background: #1e1e1e; color: #d4d4d4; font-family: monospace; padding: 20px; }
         pre { white-space: pre-wrap; word-wrap: break-word; }
         .header { border-bottom: 1px solid #444; padding-bottom: 10px; margin-bottom: 20px; }
         a { color: #569cd6; }
+        a[id] { color: inherit; text-decoration: none; }
+        :target { background: #3a3a00; }
     </style>
 </head>
 <body>
     <div class="header">
-        <a href="/">Index</a> | <strong>File: zig-0.16.0-std/crypto/pbkdf2.zig</strong>
+        <a href="/">Index</a> | <strong>File: crypto/pbkdf2.zig</strong>
     </div>
-    <pre>const std = @import("std");
-const mem = std.mem;
-const maxInt = std.math.maxInt;
-const OutputTooLongError = std.crypto.errors.OutputTooLongError;
-const WeakParametersError = std.crypto.errors.WeakParametersError;
-
-// RFC 2898 Section 5.2
-//
-// FromSpec:
-//
-// PBKDF2 applies a pseudorandom function (see Appendix B.1 for an
-// example) to derive keys. The length of the derived key is essentially
-// unbounded. (However, the maximum effective search space for the
-// derived key may be limited by the structure of the underlying
-// pseudorandom function. See Appendix B.1 for further discussion.)
-// PBKDF2 is recommended for new applications.
-//
-// PBKDF2 (P, S, c, dk_len)
-//
-// Options:        PRF        underlying pseudorandom function (h_len
-//                            denotes the length in octets of the
-//                            pseudorandom function output)
-//
-// Input:          P          password, an octet string
-//                 S          salt, an octet string
-//                 c          iteration count, a positive integer
-//                 dk_len      intended length in octets of the derived
-//                            key, a positive integer, at most
-//                            (2^32 - 1) * h_len
-//
-// Output:         DK         derived key, a dk_len-octet string
-
-// Based on Apple's CommonKeyDerivation, based originally on code by Damien Bergamini.
-
-/// Apply PBKDF2 to generate a key from a password.
-///
-/// PBKDF2 is defined in RFC 2898, and is a recommendation of NIST SP 800-132.
-///
-/// dk: Slice of appropriate size for generated key. Generally 16 or 32 bytes in length.
-///             May be uninitialized. All bytes will be overwritten.
-///             Maximum size is `maxInt(u32) * Hash.digest_length`
-///             It is a programming error to pass buffer longer than the maximum size.
-///
-/// password: Arbitrary sequence of bytes of any length, including empty.
-///
-/// salt: Arbitrary sequence of bytes of any length, including empty. A common length is 8 bytes.
-///
-/// rounds: Iteration count. Must be greater than 0. Common values range from 1,000 to 100,000.
-///         Larger iteration counts improve security by increasing the time required to compute
-///         the dk. It is common to tune this parameter to achieve approximately 100ms.
-///
-/// Prf: Pseudo-random function to use. A common choice is `std.crypto.auth.hmac.sha2.HmacSha256`.
-pub fn pbkdf2(dk: []u8, password: []const u8, salt: []const u8, rounds: u32, comptime Prf: type) (WeakParametersError || OutputTooLongError)!void {
-    if (rounds &lt; 1) return error.WeakParameters;
-
-    const dk_len = dk.len;
-    const h_len = Prf.mac_length;
-    comptime std.debug.assert(h_len &gt;= 1);
-
-    // FromSpec:
-    //
-    //   1. If dk_len &gt; maxInt(u32) * h_len, output "derived key too long" and
-    //      stop.
-    //
-    if (dk_len / h_len &gt;= maxInt(u32)) {
-        // Counter starts at 1 and is 32 bit, so if we have to return more blocks, we would overflow
-        return error.OutputTooLong;
-    }
-
-    // FromSpec:
-    //
-    //   2. Let l be the number of h_len-long blocks of bytes in the derived key,
-    //      rounding up, and let r be the number of bytes in the last
-    //      block
-    //
-
-    const blocks_count = @as(u32, @intCast(std.math.divCeil(usize, dk_len, h_len) catch unreachable));
-    var r = dk_len % h_len;
-    if (r == 0) {
-        r = h_len;
-    }
-
-    // FromSpec:
-    //
-    //   3. For each block of the derived key apply the function F defined
-    //      below to the password P, the salt S, the iteration count c, and
-    //      the block index to compute the block:
-    //
-    //                T_1 = F (P, S, c, 1) ,
-    //                T_2 = F (P, S, c, 2) ,
-    //                ...
-    //                T_l = F (P, S, c, l) ,
-    //
-    //      where the function F is defined as the exclusive-or sum of the
-    //      first c iterates of the underlying pseudorandom function PRF
-    //      applied to the password P and the concatenation of the salt S
-    //      and the block index i:
-    //
-    //                F (P, S, c, i) = U_1 \xor U_2 \xor ... \xor U_c
-    //
-    //  where
-    //
-    //            U_1 = PRF (P, S || INT (i)) ,
-    //            U_2 = PRF (P, U_1) ,
-    //            ...
-    //            U_c = PRF (P, U_{c-1}) .
-    //
-    //  Here, INT (i) is a four-octet encoding of the integer i, most
-    //  significant octet first.
-    //
-    //  4. Concatenate the blocks and extract the first dk_len octets to
-    //  produce a derived key DK:
-    //
-    //            DK = T_1 || T_2 ||  ...  || T_l&lt;0..r-1&gt;
-
-    var block: u32 = 0;
-    while (block &lt; blocks_count) : (block += 1) {
-        var prev_block: [h_len]u8 = undefined;
-        var new_block: [h_len]u8 = undefined;
-
-        // U_1 = PRF (P, S || INT (i))
-        const block_index = mem.toBytes(mem.nativeToBig(u32, block + 1)); // Block index starts at 0001
-        var ctx = Prf.init(password);
-        ctx.update(salt);
-        ctx.update(block_index[0..]);
-        ctx.final(prev_block[0..]);
-
-        // Choose portion of DK to write into (T_n) and initialize
-        const offset = block * h_len;
-        const block_len = if (block != blocks_count - 1) h_len else r;
-        const dk_block: []u8 = dk[offset..][0..block_len];
-        @memcpy(dk_block, prev_block[0..dk_block.len]);
-
-        var i: u32 = 1;
-        while (i &lt; rounds) : (i += 1) {
-            // U_c = PRF (P, U_{c-1})
-            Prf.create(&amp;new_block, prev_block[0..], password);
-            prev_block = new_block;
-
-            // F (P, S, c, i) = U_1 \xor U_2 \xor ... \xor U_c
-            for (dk_block, 0..) |_, j| {
-                dk_block[j] ^= new_block[j];
-            }
-        }
-    }
-}
-
-const htest = @import("test.zig");
-const HmacSha1 = std.crypto.auth.hmac.HmacSha1;
-
-// RFC 6070 PBKDF2 HMAC-SHA1 Test Vectors
-
-test "RFC 6070 one iteration" {
-    const p = "password";
-    const s = "salt";
-    const c = 1;
-    const dk_len = 20;
-
-    var dk: [dk_len]u8 = undefined;
-
-    try pbkdf2(&amp;dk, p, s, c, HmacSha1);
-
-    const expected = "0c60c80f961f0e71f3a9b524af6012062fe037a6";
-
-    try htest.assertEqual(expected, dk[0..]);
-}
-
-test "RFC 6070 two iterations" {
-    const p = "password";
-    const s = "salt";
-    const c = 2;
-    const dk_len = 20;
-
-    var dk: [dk_len]u8 = undefined;
-
-    try pbkdf2(&amp;dk, p, s, c, HmacSha1);
-
-    const expected = "ea6c014dc72d6f8ccd1ed92ace1d41f0d8de8957";
-
-    try htest.assertEqual(expected, dk[0..]);
-}
-
-test "RFC 6070 4096 iterations" {
-    const p = "password";
-    const s = "salt";
-    const c = 4096;
-    const dk_len = 20;
-
-    var dk: [dk_len]u8 = undefined;
-
-    try pbkdf2(&amp;dk, p, s, c, HmacSha1);
-
-    const expected = "4b007901b765489abead49d926f721d065a429c1";
-
-    try htest.assertEqual(expected, dk[0..]);
-}
-
-test "RFC 6070 16,777,216 iterations" {
-    // These iteration tests are slow so we always skip them. Results have been verified.
-    if (true) {
-        return error.SkipZigTest;
-    }
-
-    const p = "password";
-    const s = "salt";
-    const c = 16777216;
-    const dk_len = 20;
-
-    var dk = [_]u8{0} ** dk_len;
-
-    try pbkdf2(&amp;dk, p, s, c, HmacSha1);
-
-    const expected = "eefe3d61cd4da4e4e9945b3d6ba2158c2634e984";
-
-    try htest.assertEqual(expected, dk[0..]);
-}
-
-test "RFC 6070 multi-block salt and password" {
-    const p = "passwordPASSWORDpassword";
-    const s = "saltSALTsaltSALTsaltSALTsaltSALTsalt";
-    const c = 4096;
-    const dk_len = 25;
-
-    var dk: [dk_len]u8 = undefined;
-
-    try pbkdf2(&amp;dk, p, s, c, HmacSha1);
-
-    const expected = "3d2eec4fe41c849b80c8d83662c0e44a8b291a964cf2f07038";
-
-    try htest.assertEqual(expected, dk[0..]);
-}
-
-test "RFC 6070 embedded NUL" {
-    const p = "pass\x00word";
-    const s = "sa\x00lt";
-    const c = 4096;
-    const dk_len = 16;
-
-    var dk: [dk_len]u8 = undefined;
-
-    try pbkdf2(&amp;dk, p, s, c, HmacSha1);
-
-    const expected = "56fa6aa75548099dcc37d7f03425e0c3";
-
-    try htest.assertEqual(expected, dk[0..]);
-}
-
-test "Very large dk_len" {
-    // This test allocates 8GB of memory and is expected to take several hours to run.
-    if (true) {
-        return error.SkipZigTest;
-    }
-    const p = "password";
-    const s = "salt";
-    const c = 1;
-    const dk_len = 1 &lt;&lt; 33;
-
-    const dk = try std.testing.allocator.alloc(u8, dk_len);
-    defer std.testing.allocator.free(dk);
-
-    // Just verify this doesn't crash with an overflow
-    try pbkdf2(dk, p, s, c, HmacSha1);
-}</pre>
+    <pre><a id="L1"></a>const std = @import("std");
+<a id="L2"></a>const mem = std.mem;
+<a id="L3"></a>const maxInt = std.math.maxInt;
+<a id="L4"></a>const OutputTooLongError = std.crypto.errors.OutputTooLongError;
+<a id="L5"></a>const WeakParametersError = std.crypto.errors.WeakParametersError;
+<a id="L6"></a>
+<a id="L7"></a>// RFC 2898 Section 5.2
+<a id="L8"></a>//
+<a id="L9"></a>// FromSpec:
+<a id="L10"></a>//
+<a id="L11"></a>// PBKDF2 applies a pseudorandom function (see Appendix B.1 for an
+<a id="L12"></a>// example) to derive keys. The length of the derived key is essentially
+<a id="L13"></a>// unbounded. (However, the maximum effective search space for the
+<a id="L14"></a>// derived key may be limited by the structure of the underlying
+<a id="L15"></a>// pseudorandom function. See Appendix B.1 for further discussion.)
+<a id="L16"></a>// PBKDF2 is recommended for new applications.
+<a id="L17"></a>//
+<a id="L18"></a>// PBKDF2 (P, S, c, dk_len)
+<a id="L19"></a>//
+<a id="L20"></a>// Options:        PRF        underlying pseudorandom function (h_len
+<a id="L21"></a>//                            denotes the length in octets of the
+<a id="L22"></a>//                            pseudorandom function output)
+<a id="L23"></a>//
+<a id="L24"></a>// Input:          P          password, an octet string
+<a id="L25"></a>//                 S          salt, an octet string
+<a id="L26"></a>//                 c          iteration count, a positive integer
+<a id="L27"></a>//                 dk_len      intended length in octets of the derived
+<a id="L28"></a>//                            key, a positive integer, at most
+<a id="L29"></a>//                            (2^32 - 1) * h_len
+<a id="L30"></a>//
+<a id="L31"></a>// Output:         DK         derived key, a dk_len-octet string
+<a id="L32"></a>
+<a id="L33"></a>// Based on Apple's CommonKeyDerivation, based originally on code by Damien Bergamini.
+<a id="L34"></a>
+<a id="L35"></a>/// Apply PBKDF2 to generate a key from a password.
+<a id="L36"></a>///
+<a id="L37"></a>/// PBKDF2 is defined in RFC 2898, and is a recommendation of NIST SP 800-132.
+<a id="L38"></a>///
+<a id="L39"></a>/// dk: Slice of appropriate size for generated key. Generally 16 or 32 bytes in length.
+<a id="L40"></a>///             May be uninitialized. All bytes will be overwritten.
+<a id="L41"></a>///             Maximum size is `maxInt(u32) * Hash.digest_length`
+<a id="L42"></a>///             It is a programming error to pass buffer longer than the maximum size.
+<a id="L43"></a>///
+<a id="L44"></a>/// password: Arbitrary sequence of bytes of any length, including empty.
+<a id="L45"></a>///
+<a id="L46"></a>/// salt: Arbitrary sequence of bytes of any length, including empty. A common length is 8 bytes.
+<a id="L47"></a>///
+<a id="L48"></a>/// rounds: Iteration count. Must be greater than 0. Common values range from 1,000 to 100,000.
+<a id="L49"></a>///         Larger iteration counts improve security by increasing the time required to compute
+<a id="L50"></a>///         the dk. It is common to tune this parameter to achieve approximately 100ms.
+<a id="L51"></a>///
+<a id="L52"></a>/// Prf: Pseudo-random function to use. A common choice is `std.crypto.auth.hmac.sha2.HmacSha256`.
+<a id="L53"></a>pub fn pbkdf2(dk: []u8, password: []const u8, salt: []const u8, rounds: u32, comptime Prf: type) (WeakParametersError || OutputTooLongError)!void {
+<a id="L54"></a>    if (rounds &lt; 1) return error.WeakParameters;
+<a id="L55"></a>
+<a id="L56"></a>    const dk_len = dk.len;
+<a id="L57"></a>    const h_len = Prf.mac_length;
+<a id="L58"></a>    comptime std.debug.assert(h_len &gt;= 1);
+<a id="L59"></a>
+<a id="L60"></a>    // FromSpec:
+<a id="L61"></a>    //
+<a id="L62"></a>    //   1. If dk_len &gt; maxInt(u32) * h_len, output "derived key too long" and
+<a id="L63"></a>    //      stop.
+<a id="L64"></a>    //
+<a id="L65"></a>    if (dk_len / h_len &gt;= maxInt(u32)) {
+<a id="L66"></a>        // Counter starts at 1 and is 32 bit, so if we have to return more blocks, we would overflow
+<a id="L67"></a>        return error.OutputTooLong;
+<a id="L68"></a>    }
+<a id="L69"></a>
+<a id="L70"></a>    // FromSpec:
+<a id="L71"></a>    //
+<a id="L72"></a>    //   2. Let l be the number of h_len-long blocks of bytes in the derived key,
+<a id="L73"></a>    //      rounding up, and let r be the number of bytes in the last
+<a id="L74"></a>    //      block
+<a id="L75"></a>    //
+<a id="L76"></a>
+<a id="L77"></a>    const blocks_count = @as(u32, @intCast(std.math.divCeil(usize, dk_len, h_len) catch unreachable));
+<a id="L78"></a>    var r = dk_len % h_len;
+<a id="L79"></a>    if (r == 0) {
+<a id="L80"></a>        r = h_len;
+<a id="L81"></a>    }
+<a id="L82"></a>
+<a id="L83"></a>    // FromSpec:
+<a id="L84"></a>    //
+<a id="L85"></a>    //   3. For each block of the derived key apply the function F defined
+<a id="L86"></a>    //      below to the password P, the salt S, the iteration count c, and
+<a id="L87"></a>    //      the block index to compute the block:
+<a id="L88"></a>    //
+<a id="L89"></a>    //                T_1 = F (P, S, c, 1) ,
+<a id="L90"></a>    //                T_2 = F (P, S, c, 2) ,
+<a id="L91"></a>    //                ...
+<a id="L92"></a>    //                T_l = F (P, S, c, l) ,
+<a id="L93"></a>    //
+<a id="L94"></a>    //      where the function F is defined as the exclusive-or sum of the
+<a id="L95"></a>    //      first c iterates of the underlying pseudorandom function PRF
+<a id="L96"></a>    //      applied to the password P and the concatenation of the salt S
+<a id="L97"></a>    //      and the block index i:
+<a id="L98"></a>    //
+<a id="L99"></a>    //                F (P, S, c, i) = U_1 \xor U_2 \xor ... \xor U_c
+<a id="L100"></a>    //
+<a id="L101"></a>    //  where
+<a id="L102"></a>    //
+<a id="L103"></a>    //            U_1 = PRF (P, S || INT (i)) ,
+<a id="L104"></a>    //            U_2 = PRF (P, U_1) ,
+<a id="L105"></a>    //            ...
+<a id="L106"></a>    //            U_c = PRF (P, U_{c-1}) .
+<a id="L107"></a>    //
+<a id="L108"></a>    //  Here, INT (i) is a four-octet encoding of the integer i, most
+<a id="L109"></a>    //  significant octet first.
+<a id="L110"></a>    //
+<a id="L111"></a>    //  4. Concatenate the blocks and extract the first dk_len octets to
+<a id="L112"></a>    //  produce a derived key DK:
+<a id="L113"></a>    //
+<a id="L114"></a>    //            DK = T_1 || T_2 ||  ...  || T_l&lt;0..r-1&gt;
+<a id="L115"></a>
+<a id="L116"></a>    var block: u32 = 0;
+<a id="L117"></a>    while (block &lt; blocks_count) : (block += 1) {
+<a id="L118"></a>        var prev_block: [h_len]u8 = undefined;
+<a id="L119"></a>        var new_block: [h_len]u8 = undefined;
+<a id="L120"></a>
+<a id="L121"></a>        // U_1 = PRF (P, S || INT (i))
+<a id="L122"></a>        const block_index = mem.toBytes(mem.nativeToBig(u32, block + 1)); // Block index starts at 0001
+<a id="L123"></a>        var ctx = Prf.init(password);
+<a id="L124"></a>        ctx.update(salt);
+<a id="L125"></a>        ctx.update(block_index[0..]);
+<a id="L126"></a>        ctx.final(prev_block[0..]);
+<a id="L127"></a>
+<a id="L128"></a>        // Choose portion of DK to write into (T_n) and initialize
+<a id="L129"></a>        const offset = block * h_len;
+<a id="L130"></a>        const block_len = if (block != blocks_count - 1) h_len else r;
+<a id="L131"></a>        const dk_block: []u8 = dk[offset..][0..block_len];
+<a id="L132"></a>        @memcpy(dk_block, prev_block[0..dk_block.len]);
+<a id="L133"></a>
+<a id="L134"></a>        var i: u32 = 1;
+<a id="L135"></a>        while (i &lt; rounds) : (i += 1) {
+<a id="L136"></a>            // U_c = PRF (P, U_{c-1})
+<a id="L137"></a>            Prf.create(&amp;new_block, prev_block[0..], password);
+<a id="L138"></a>            prev_block = new_block;
+<a id="L139"></a>
+<a id="L140"></a>            // F (P, S, c, i) = U_1 \xor U_2 \xor ... \xor U_c
+<a id="L141"></a>            for (dk_block, 0..) |_, j| {
+<a id="L142"></a>                dk_block[j] ^= new_block[j];
+<a id="L143"></a>            }
+<a id="L144"></a>        }
+<a id="L145"></a>    }
+<a id="L146"></a>}
+<a id="L147"></a>
+<a id="L148"></a>const htest = @import("test.zig");
+<a id="L149"></a>const HmacSha1 = std.crypto.auth.hmac.HmacSha1;
+<a id="L150"></a>
+<a id="L151"></a>// RFC 6070 PBKDF2 HMAC-SHA1 Test Vectors
+<a id="L152"></a>
+<a id="L153"></a>test "RFC 6070 one iteration" {
+<a id="L154"></a>    const p = "password";
+<a id="L155"></a>    const s = "salt";
+<a id="L156"></a>    const c = 1;
+<a id="L157"></a>    const dk_len = 20;
+<a id="L158"></a>
+<a id="L159"></a>    var dk: [dk_len]u8 = undefined;
+<a id="L160"></a>
+<a id="L161"></a>    try pbkdf2(&amp;dk, p, s, c, HmacSha1);
+<a id="L162"></a>
+<a id="L163"></a>    const expected = "0c60c80f961f0e71f3a9b524af6012062fe037a6";
+<a id="L164"></a>
+<a id="L165"></a>    try htest.assertEqual(expected, dk[0..]);
+<a id="L166"></a>}
+<a id="L167"></a>
+<a id="L168"></a>test "RFC 6070 two iterations" {
+<a id="L169"></a>    const p = "password";
+<a id="L170"></a>    const s = "salt";
+<a id="L171"></a>    const c = 2;
+<a id="L172"></a>    const dk_len = 20;
+<a id="L173"></a>
+<a id="L174"></a>    var dk: [dk_len]u8 = undefined;
+<a id="L175"></a>
+<a id="L176"></a>    try pbkdf2(&amp;dk, p, s, c, HmacSha1);
+<a id="L177"></a>
+<a id="L178"></a>    const expected = "ea6c014dc72d6f8ccd1ed92ace1d41f0d8de8957";
+<a id="L179"></a>
+<a id="L180"></a>    try htest.assertEqual(expected, dk[0..]);
+<a id="L181"></a>}
+<a id="L182"></a>
+<a id="L183"></a>test "RFC 6070 4096 iterations" {
+<a id="L184"></a>    const p = "password";
+<a id="L185"></a>    const s = "salt";
+<a id="L186"></a>    const c = 4096;
+<a id="L187"></a>    const dk_len = 20;
+<a id="L188"></a>
+<a id="L189"></a>    var dk: [dk_len]u8 = undefined;
+<a id="L190"></a>
+<a id="L191"></a>    try pbkdf2(&amp;dk, p, s, c, HmacSha1);
+<a id="L192"></a>
+<a id="L193"></a>    const expected = "4b007901b765489abead49d926f721d065a429c1";
+<a id="L194"></a>
+<a id="L195"></a>    try htest.assertEqual(expected, dk[0..]);
+<a id="L196"></a>}
+<a id="L197"></a>
+<a id="L198"></a>test "RFC 6070 16,777,216 iterations" {
+<a id="L199"></a>    // These iteration tests are slow so we always skip them. Results have been verified.
+<a id="L200"></a>    if (true) {
+<a id="L201"></a>        return error.SkipZigTest;
+<a id="L202"></a>    }
+<a id="L203"></a>
+<a id="L204"></a>    const p = "password";
+<a id="L205"></a>    const s = "salt";
+<a id="L206"></a>    const c = 16777216;
+<a id="L207"></a>    const dk_len = 20;
+<a id="L208"></a>
+<a id="L209"></a>    var dk = [_]u8{0} ** dk_len;
+<a id="L210"></a>
+<a id="L211"></a>    try pbkdf2(&amp;dk, p, s, c, HmacSha1);
+<a id="L212"></a>
+<a id="L213"></a>    const expected = "eefe3d61cd4da4e4e9945b3d6ba2158c2634e984";
+<a id="L214"></a>
+<a id="L215"></a>    try htest.assertEqual(expected, dk[0..]);
+<a id="L216"></a>}
+<a id="L217"></a>
+<a id="L218"></a>test "RFC 6070 multi-block salt and password" {
+<a id="L219"></a>    const p = "passwordPASSWORDpassword";
+<a id="L220"></a>    const s = "saltSALTsaltSALTsaltSALTsaltSALTsalt";
+<a id="L221"></a>    const c = 4096;
+<a id="L222"></a>    const dk_len = 25;
+<a id="L223"></a>
+<a id="L224"></a>    var dk: [dk_len]u8 = undefined;
+<a id="L225"></a>
+<a id="L226"></a>    try pbkdf2(&amp;dk, p, s, c, HmacSha1);
+<a id="L227"></a>
+<a id="L228"></a>    const expected = "3d2eec4fe41c849b80c8d83662c0e44a8b291a964cf2f07038";
+<a id="L229"></a>
+<a id="L230"></a>    try htest.assertEqual(expected, dk[0..]);
+<a id="L231"></a>}
+<a id="L232"></a>
+<a id="L233"></a>test "RFC 6070 embedded NUL" {
+<a id="L234"></a>    const p = "pass\x00word";
+<a id="L235"></a>    const s = "sa\x00lt";
+<a id="L236"></a>    const c = 4096;
+<a id="L237"></a>    const dk_len = 16;
+<a id="L238"></a>
+<a id="L239"></a>    var dk: [dk_len]u8 = undefined;
+<a id="L240"></a>
+<a id="L241"></a>    try pbkdf2(&amp;dk, p, s, c, HmacSha1);
+<a id="L242"></a>
+<a id="L243"></a>    const expected = "56fa6aa75548099dcc37d7f03425e0c3";
+<a id="L244"></a>
+<a id="L245"></a>    try htest.assertEqual(expected, dk[0..]);
+<a id="L246"></a>}
+<a id="L247"></a>
+<a id="L248"></a>test "Very large dk_len" {
+<a id="L249"></a>    // This test allocates 8GB of memory and is expected to take several hours to run.
+<a id="L250"></a>    if (true) {
+<a id="L251"></a>        return error.SkipZigTest;
+<a id="L252"></a>    }
+<a id="L253"></a>    const p = "password";
+<a id="L254"></a>    const s = "salt";
+<a id="L255"></a>    const c = 1;
+<a id="L256"></a>    const dk_len = 1 &lt;&lt; 33;
+<a id="L257"></a>
+<a id="L258"></a>    const dk = try std.testing.allocator.alloc(u8, dk_len);
+<a id="L259"></a>    defer std.testing.allocator.free(dk);
+<a id="L260"></a>
+<a id="L261"></a>    // Just verify this doesn't crash with an overflow
+<a id="L262"></a>    try pbkdf2(dk, p, s, c, HmacSha1);
+<a id="L263"></a>}
+</pre>
 </body>
 </html>

@@ -2,1191 +2,1194 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Source: zig-0.16.0-std/compress/flate/Decompress.zig</title>
+    <title>Source: compress/flate/Decompress.zig</title>
     <style>
         body { background: #1e1e1e; color: #d4d4d4; font-family: monospace; padding: 20px; }
         pre { white-space: pre-wrap; word-wrap: break-word; }
         .header { border-bottom: 1px solid #444; padding-bottom: 10px; margin-bottom: 20px; }
         a { color: #569cd6; }
+        a[id] { color: inherit; text-decoration: none; }
+        :target { background: #3a3a00; }
     </style>
 </head>
 <body>
     <div class="header">
-        <a href="/">Index</a> | <strong>File: zig-0.16.0-std/compress/flate/Decompress.zig</strong>
+        <a href="/">Index</a> | <strong>File: compress/flate/Decompress.zig</strong>
     </div>
-    <pre>const std = @import("../../std.zig");
-const assert = std.debug.assert;
-const flate = std.compress.flate;
-const testing = std.testing;
-const Writer = std.Io.Writer;
-const Reader = std.Io.Reader;
-const Container = flate.Container;
-
-const Decompress = @This();
-const token = @import("token.zig");
-
-input: *Reader,
-consumed_bits: u3,
-
-reader: Reader,
-
-container_metadata: Container.Metadata,
-
-lit_dec: LiteralDecoder,
-dst_dec: DistanceDecoder,
-
-final_block: bool,
-state: State,
-
-err: ?Error,
-
-const BlockType = enum(u2) {
-    stored = 0,
-    fixed = 1,
-    dynamic = 2,
-    invalid = 3,
-};
-
-const State = union(enum) {
-    protocol_header,
-    block_header,
-    stored_block: u16,
-    fixed_block,
-    fixed_block_literal: u8,
-    fixed_block_match: u16,
-    dynamic_block,
-    dynamic_block_literal: u8,
-    dynamic_block_match: u16,
-    protocol_footer,
-    end,
-};
-
-pub const Error = Container.Error || error{
-    InvalidCode,
-    InvalidMatch,
-    WrongStoredBlockNlen,
-    InvalidBlockType,
-    InvalidDynamicBlockHeader,
-    ReadFailed,
-    OversubscribedHuffmanTree,
-    IncompleteHuffmanTree,
-    MissingEndOfBlockCode,
-    EndOfStream,
-};
-
-const direct_vtable: Reader.VTable = .{
-    .stream = streamDirect,
-    .rebase = rebaseFallible,
-    .discard = discardDirect,
-    .readVec = readVec,
-};
-
-const indirect_vtable: Reader.VTable = .{
-    .stream = streamIndirect,
-    .rebase = rebaseFallible,
-    .discard = discardIndirect,
-    .readVec = readVec,
-};
-
-/// `input` buffer is asserted to be at least 10 bytes, or EOF before then.
-///
-/// If `buffer` is provided then asserted to have `flate.max_window_len`
-/// capacity.
-pub fn init(input: *Reader, container: Container, buffer: []u8) Decompress {
-    if (buffer.len != 0) assert(buffer.len &gt;= flate.max_window_len);
-    return .{
-        .reader = .{
-            .vtable = if (buffer.len == 0) &amp;direct_vtable else &amp;indirect_vtable,
-            .buffer = buffer,
-            .seek = 0,
-            .end = 0,
-        },
-        .input = input,
-        .consumed_bits = 0,
-        .container_metadata = .init(container),
-        .lit_dec = .{},
-        .dst_dec = .{},
-        .final_block = false,
-        .state = .protocol_header,
-        .err = null,
-    };
-}
-
-fn rebaseFallible(r: *Reader, capacity: usize) Reader.RebaseError!void {
-    rebase(r, capacity);
-}
-
-fn rebase(r: *Reader, capacity: usize) void {
-    assert(capacity &lt;= r.buffer.len - flate.history_len);
-    assert(r.end + capacity &gt; r.buffer.len);
-    const discard_n = @min(r.seek, r.end - flate.history_len);
-    const keep = r.buffer[discard_n..r.end];
-    @memmove(r.buffer[0..keep.len], keep);
-    r.end = keep.len;
-    r.seek -= discard_n;
-}
-
-/// This could be improved so that when an amount is discarded that includes an
-/// entire frame, skip decoding that frame.
-fn discardDirect(r: *Reader, limit: std.Io.Limit) Reader.Error!usize {
-    if (r.end + flate.history_len &gt; r.buffer.len) rebase(r, flate.history_len);
-    var writer: Writer = .{
-        .vtable = &amp;.{
-            .drain = std.Io.Writer.Discarding.drain,
-            .sendFile = std.Io.Writer.Discarding.sendFile,
-        },
-        .buffer = r.buffer,
-        .end = r.end,
-    };
-    defer {
-        assert(writer.end != 0);
-        r.end = writer.end;
-        r.seek = r.end;
-    }
-    const n = r.stream(&amp;writer, limit) catch |err| switch (err) {
-        error.WriteFailed =&gt; unreachable,
-        error.ReadFailed =&gt; return error.ReadFailed,
-        error.EndOfStream =&gt; return error.EndOfStream,
-    };
-    assert(n &lt;= @intFromEnum(limit));
-    return n;
-}
-
-fn discardIndirect(r: *Reader, limit: std.Io.Limit) Reader.Error!usize {
-    const d: *Decompress = @alignCast(@fieldParentPtr("reader", r));
-    if (r.end + flate.history_len &gt; r.buffer.len) rebase(r, flate.history_len);
-    var writer: Writer = .{
-        .buffer = r.buffer,
-        .end = r.end,
-        .vtable = &amp;.{ .drain = Writer.unreachableDrain },
-    };
-    {
-        defer r.end = writer.end;
-        _ = streamFallible(d, &amp;writer, .limited(writer.buffer.len - writer.end)) catch |err| switch (err) {
-            error.WriteFailed =&gt; unreachable,
-            else =&gt; |e| return e,
-        };
-    }
-    const n = limit.minInt(r.end - r.seek);
-    r.seek += n;
-    return n;
-}
-
-fn readVec(r: *Reader, data: [][]u8) Reader.Error!usize {
-    _ = data;
-    const d: *Decompress = @alignCast(@fieldParentPtr("reader", r));
-    return streamIndirectInner(d);
-}
-
-fn streamIndirectInner(d: *Decompress) Reader.Error!usize {
-    const r = &amp;d.reader;
-    if (r.buffer.len - r.end &lt; flate.history_len) rebase(r, flate.history_len);
-    var writer: Writer = .{
-        .buffer = r.buffer,
-        .end = r.end,
-        .vtable = &amp;.{
-            .drain = Writer.unreachableDrain,
-            .rebase = Writer.unreachableRebase,
-        },
-    };
-    defer r.end = writer.end;
-    _ = streamFallible(d, &amp;writer, .limited(writer.buffer.len - writer.end)) catch |err| switch (err) {
-        error.WriteFailed =&gt; unreachable,
-        else =&gt; |e| return e,
-    };
-    return 0;
-}
-
-fn decodeLength(self: *Decompress, code_int: u5) !u16 {
-    if (code_int &gt; 28) return error.InvalidCode;
-    const l: token.LenCode = .fromInt(code_int);
-    const base = l.base();
-    const extra = l.extraBits();
-    return token.min_length + (base | try self.takeBits(extra));
-}
-
-fn decodeDistance(self: *Decompress, code_int: u5) !u16 {
-    if (code_int &gt; 29) return error.InvalidCode;
-    const d: token.DistCode = .fromInt(code_int);
-    const base = d.base();
-    const extra = d.extraBits();
-    return token.min_distance + (base | try self.takeBits(extra));
-}
-
-/// Decode code length symbol to code length. Writes decoded length into
-/// lens slice starting at position pos. Returns number of positions
-/// advanced.
-fn dynamicCodeLength(self: *Decompress, code: u16, lens: []u4, pos: usize) !usize {
-    if (pos &gt;= lens.len)
-        return error.InvalidDynamicBlockHeader;
-
-    switch (code) {
-        0...15 =&gt; {
-            // Represent code lengths of 0 - 15
-            lens[pos] = @intCast(code);
-            return 1;
-        },
-        16 =&gt; {
-            // Copy the previous code length 3 - 6 times.
-            // The next 2 bits indicate repeat length
-            const n: u8 = @as(u8, try self.takeIntBits(u2)) + 3;
-            if (pos == 0 or pos + n &gt; lens.len)
-                return error.InvalidDynamicBlockHeader;
-            for (0..n) |i| {
-                lens[pos + i] = lens[pos + i - 1];
-            }
-            return n;
-        },
-        // Repeat a code length of 0 for 3 - 10 times. (3 bits of length)
-        17 =&gt; return @as(u8, try self.takeIntBits(u3)) + 3,
-        // Repeat a code length of 0 for 11 - 138 times (7 bits of length)
-        18 =&gt; return @as(u8, try self.takeIntBits(u7)) + 11,
-        else =&gt; return error.InvalidDynamicBlockHeader,
-    }
-}
-
-fn decodeSymbol(self: *Decompress, decoder: anytype) !u16 {
-    // Maximum code len is 15 bits.
-    const sym = try decoder.find(try self.peekIntBitsShort(u15));
-    try self.tossBitsShort(sym.code_bits);
-    return sym.value;
-}
-
-fn streamDirect(r: *Reader, w: *Writer, limit: std.Io.Limit) Reader.StreamError!usize {
-    const d: *Decompress = @alignCast(@fieldParentPtr("reader", r));
-    return streamFallible(d, w, limit);
-}
-
-fn streamIndirect(r: *Reader, w: *Writer, limit: std.Io.Limit) Reader.StreamError!usize {
-    const d: *Decompress = @alignCast(@fieldParentPtr("reader", r));
-    _ = limit;
-    _ = w;
-    return streamIndirectInner(d);
-}
-
-fn streamFallible(d: *Decompress, w: *Writer, limit: std.Io.Limit) Reader.StreamError!usize {
-    return streamInner(d, w, limit) catch |err| switch (err) {
-        error.EndOfStream =&gt; {
-            if (d.state == .end) {
-                return error.EndOfStream;
-            } else {
-                d.err = error.EndOfStream;
-                return error.ReadFailed;
-            }
-        },
-        error.WriteFailed =&gt; return error.WriteFailed,
-        else =&gt; |e| {
-            // In the event of an error, state is unmodified so that it can be
-            // better used to diagnose the failure.
-            d.err = e;
-            return error.ReadFailed;
-        },
-    };
-}
-
-fn streamInner(d: *Decompress, w: *Writer, limit: std.Io.Limit) (Error || Reader.StreamError)!usize {
-    var remaining = @intFromEnum(limit);
-    const in = d.input;
-    sw: switch (d.state) {
-        .protocol_header =&gt; switch (d.container_metadata.container()) {
-            .gzip =&gt; {
-                const Header = extern struct {
-                    magic: u16 align(1),
-                    method: u8,
-                    flags: packed struct(u8) {
-                        text: bool,
-                        hcrc: bool,
-                        extra: bool,
-                        name: bool,
-                        comment: bool,
-                        reserved: u3,
-                    },
-                    mtime: u32 align(1),
-                    xfl: u8,
-                    os: u8,
-                };
-                const header = try in.takeStruct(Header, .little);
-                if (header.magic != 0x8b1f or header.method != 0x08)
-                    return error.BadGzipHeader;
-                if (header.flags.extra) {
-                    const extra_len = try in.takeInt(u16, .little);
-                    try in.discardAll(extra_len);
-                }
-                if (header.flags.name) {
-                    _ = try in.discardDelimiterInclusive(0);
-                }
-                if (header.flags.comment) {
-                    _ = try in.discardDelimiterInclusive(0);
-                }
-                if (header.flags.hcrc) {
-                    try in.discardAll(2);
-                }
-                continue :sw .block_header;
-            },
-            .zlib =&gt; {
-                const header = try in.takeArray(2);
-                const cmf: packed struct(u8) { cm: u4, cinfo: u4 } = @bitCast(header[0]);
-                if (cmf.cm != 8 or cmf.cinfo &gt; 7) return error.BadZlibHeader;
-                continue :sw .block_header;
-            },
-            .raw =&gt; continue :sw .block_header,
-        },
-        .block_header =&gt; {
-            d.final_block = (try d.takeIntBits(u1)) != 0;
-            const block_type: BlockType = @enumFromInt(try d.takeIntBits(u2));
-            switch (block_type) {
-                .stored =&gt; {
-                    d.alignBitsForward();
-                    // everything after this is byte aligned in stored block
-                    const len = try in.takeInt(u16, .little);
-                    const nlen = try in.takeInt(u16, .little);
-                    if (len != ~nlen) return error.WrongStoredBlockNlen;
-                    continue :sw .{ .stored_block = len };
-                },
-                .fixed =&gt; continue :sw .fixed_block,
-                .dynamic =&gt; {
-                    const hlit: u16 = @as(u16, try d.takeIntBits(u5)) + 257; // number of ll code entries present - 257
-                    const hdist: u16 = @as(u16, try d.takeIntBits(u5)) + 1; // number of distance code entries - 1
-                    const hclen: u8 = @as(u8, try d.takeIntBits(u4)) + 4; // hclen + 4 code lengths are encoded
-
-                    if (hlit &gt; 286 or hdist &gt; 30)
-                        return error.InvalidDynamicBlockHeader;
-
-                    // lengths for code lengths
-                    var cl_lens: [19]u4 = @splat(0);
-                    for (token.codegen_order[0..hclen]) |i| {
-                        cl_lens[i] = try d.takeIntBits(u3);
-                    }
-                    var cl_dec: CodegenDecoder = .{};
-                    try cl_dec.generate(&amp;cl_lens);
-
-                    // decoded code lengths
-                    var dec_lens: [286 + 30]u4 = @splat(0);
-                    var pos: usize = 0;
-                    while (pos &lt; hlit + hdist) {
-                        const peeked = try d.peekIntBitsShort(u7);
-                        const sym = try cl_dec.find(peeked);
-                        try d.tossBitsShort(sym.code_bits);
-                        pos += try d.dynamicCodeLength(sym.value, &amp;dec_lens, pos);
-                    }
-                    if (pos &gt; hlit + hdist) {
-                        return error.InvalidDynamicBlockHeader;
-                    }
-
-                    // literal code lengths to literal decoder
-                    try d.lit_dec.generate(dec_lens[0..hlit]);
-
-                    // distance code lengths to distance decoder
-                    try d.dst_dec.generate(dec_lens[hlit..][0..hdist]);
-
-                    continue :sw .dynamic_block;
-                },
-                .invalid =&gt; return error.InvalidBlockType,
-            }
-        },
-        .stored_block =&gt; |remaining_len| {
-            const out: []u8 = if (remaining != 0)
-                try w.writableSliceGreedyPreserve(flate.history_len, 1)
-            else
-                &amp;.{};
-            var limited_out: [1][]u8 = .{limit.min(.limited(remaining_len)).slice(out)};
-            const n = try in.readVec(&amp;limited_out);
-            if (remaining_len - n == 0) {
-                d.state = if (d.final_block) .protocol_footer else .block_header;
-            } else {
-                d.state = .{ .stored_block = @intCast(remaining_len - n) };
-            }
-            w.advance(n);
-            return @intFromEnum(limit) - remaining + n;
-        },
-        .fixed_block =&gt; while (true) {
-            // Consume bytes
-            const sym = try d.readFixedCode();
-
-            if (sym &gt;= 256) {
-                @branchHint(.unlikely);
-
-                if (sym == 256) {
-                    @branchHint(.unlikely);
-                    // End
-                    d.state = if (d.final_block) .protocol_footer else .block_header;
-                    continue :sw d.state;
-                }
-
-                // Match
-                const length = try d.decodeLength(@intCast(sym - 257));
-                continue :sw .{ .fixed_block_match = length };
-            }
-
-            const byte: u8 = @intCast(sym);
-            if (remaining != 0) {
-                @branchHint(.likely);
-                remaining -= 1;
-                try w.writeBytePreserve(flate.history_len, byte);
-            } else {
-                d.state = .{ .fixed_block_literal = byte };
-                return @intFromEnum(limit) - remaining;
-            }
-        },
-        .fixed_block_literal =&gt; |symbol| {
-            assert(remaining != 0);
-            remaining -= 1;
-            try w.writeBytePreserve(flate.history_len, symbol);
-            continue :sw .fixed_block;
-        },
-        .fixed_block_match =&gt; |length| {
-            if (remaining &gt;= length) {
-                @branchHint(.likely);
-                const distance = try d.decodeDistance(@bitReverse(try d.takeIntBits(u5)));
-                try writeMatch(w, length, distance);
-                remaining -= length;
-                continue :sw .fixed_block;
-            } else {
-                d.state = .{ .fixed_block_match = length };
-                return @intFromEnum(limit) - remaining;
-            }
-        },
-        // In larger archives most blocks are usually dynamic, so
-        // decompression performance depends on this logic.
-        .dynamic_block =&gt; while (true) {
-            // Consume bytes
-            const sym = try d.decodeSymbol(&amp;d.lit_dec);
-
-            if (sym &gt;= 256) {
-                @branchHint(.unlikely);
-
-                if (sym == 256) {
-                    @branchHint(.unlikely);
-                    // End
-                    d.state = if (d.final_block) .protocol_footer else .block_header;
-                    continue :sw d.state;
-                }
-
-                // Match
-                const length = try d.decodeLength(@intCast(sym - 257));
-                continue :sw .{ .dynamic_block_match = length };
-            }
-
-            const byte: u8 = @intCast(sym);
-            if (remaining != 0) {
-                @branchHint(.likely);
-                remaining -= 1;
-                try w.writeBytePreserve(flate.history_len, byte);
-            } else {
-                d.state = .{ .dynamic_block_literal = byte };
-                return @intFromEnum(limit) - remaining;
-            }
-        },
-        .dynamic_block_literal =&gt; |symbol| {
-            assert(remaining != 0);
-            remaining -= 1;
-            try w.writeBytePreserve(flate.history_len, symbol);
-            continue :sw .dynamic_block;
-        },
-        .dynamic_block_match =&gt; |length| {
-            if (remaining &gt;= length) {
-                @branchHint(.likely);
-                remaining -= length;
-                const dsm = try d.decodeSymbol(&amp;d.dst_dec);
-                const distance = try d.decodeDistance(@intCast(dsm));
-                try writeMatch(w, length, distance);
-                continue :sw .dynamic_block;
-            } else {
-                d.state = .{ .dynamic_block_match = length };
-                return @intFromEnum(limit) - remaining;
-            }
-        },
-        .protocol_footer =&gt; {
-            d.alignBitsForward();
-            switch (d.container_metadata) {
-                .gzip =&gt; |*gzip| {
-                    gzip.crc = try in.takeInt(u32, .little);
-                    gzip.count = try in.takeInt(u32, .little);
-                },
-                .zlib =&gt; |*zlib| {
-                    zlib.adler = try in.takeInt(u32, .big);
-                },
-                .raw =&gt; {},
-            }
-            d.state = .end;
-            return @intFromEnum(limit) - remaining;
-        },
-        .end =&gt; return error.EndOfStream,
-    }
-}
-
-/// Write match (back-reference to the same data slice) starting at `distance`
-/// back from current write position, and `length` of bytes.
-fn writeMatch(w: *Writer, length: u16, distance: u16) !void {
-    if (w.end &lt; distance) return error.InvalidMatch;
-    assert(length &gt;= token.min_length);
-    assert(length &lt;= token.max_length);
-    assert(distance &gt;= token.min_distance);
-    assert(distance &lt;= token.max_distance);
-
-    // This is not a @memmove; it intentionally repeats patterns caused by
-    // iterating one byte at a time.
-    const dest = try w.writableSlicePreserve(flate.history_len, length);
-    const end = dest.ptr - w.buffer.ptr;
-    const src = w.buffer[end - distance ..][0..length];
-    if (distance &gt;= length) {
-        @memcpy(dest, src);
-    } else if (distance == 1) {
-        // Repeating copy of single byte
-        @memset(dest, src[0]);
-    } else {
-        // Repeating copy of multiple bytes
-        for (dest, src) |*d, s| d.* = s;
-    }
-}
-
-fn peekBits(d: *Decompress, n: u4) !u16 {
-    const bits = d.input.peekInt(u32, .little) catch |e| return switch (e) {
-        error.ReadFailed =&gt; error.ReadFailed,
-        error.EndOfStream =&gt; d.peekBitsEnding(n),
-    };
-    const mask = @shlExact(@as(u16, 1), n) - 1;
-    return @intCast((bits &gt;&gt; d.consumed_bits) &amp; mask);
-}
-
-fn peekBitsEnding(d: *Decompress, n: u4) !u16 {
-    @branchHint(.unlikely);
-
-    const left = d.input.buffered();
-    if (left.len * 8 - d.consumed_bits &lt; n) return error.EndOfStream;
-    const bits = std.mem.readVarInt(u32, left, .little);
-    const mask = @shlExact(@as(u16, 1), n) - 1;
-    return @intCast((bits &gt;&gt; d.consumed_bits) &amp; mask);
-}
-
-/// Safe only after `peekBits` has been called with a greater or equal `n` value.
-fn tossBits(d: *Decompress, n: u4) void {
-    d.input.toss((@as(u8, n) + d.consumed_bits) / 8);
-    d.consumed_bits +%= @truncate(n);
-}
-
-fn takeBits(d: *Decompress, n: u4) !u16 {
-    const bits = try d.peekBits(n);
-    d.tossBits(n);
-    return bits;
-}
-
-fn alignBitsForward(d: *Decompress) void {
-    d.input.toss(@intFromBool(d.consumed_bits != 0));
-    d.consumed_bits = 0;
-}
-
-fn peekBitsShort(d: *Decompress, n: u4) !u16 {
-    const bits = d.input.peekInt(u32, .little) catch |e| return switch (e) {
-        error.ReadFailed =&gt; error.ReadFailed,
-        error.EndOfStream =&gt; d.peekBitsShortEnding(n),
-    };
-    const mask = @shlExact(@as(u16, 1), n) - 1;
-    return @intCast((bits &gt;&gt; d.consumed_bits) &amp; mask);
-}
-
-fn peekBitsShortEnding(d: *Decompress, n: u4) !u16 {
-    @branchHint(.unlikely);
-
-    const left = d.input.buffered();
-    const bits = std.mem.readVarInt(u32, left, .little);
-    const mask = @shlExact(@as(u16, 1), n) - 1;
-    return @intCast((bits &gt;&gt; d.consumed_bits) &amp; mask);
-}
-
-fn tossBitsShort(d: *Decompress, n: u4) !void {
-    if (d.input.bufferedLen() * 8 + d.consumed_bits &lt; n) return error.EndOfStream;
-    d.tossBits(n);
-}
-
-fn takeIntBits(d: *Decompress, T: type) !T {
-    return @intCast(try d.takeBits(@bitSizeOf(T)));
-}
-
-fn peekIntBitsShort(d: *Decompress, T: type) !T {
-    return @intCast(try d.peekBitsShort(@bitSizeOf(T)));
-}
-
-/// Reads first 7 bits, and then maybe 1 or 2 more to get full 7,8 or 9 bit code.
-/// ref: https://datatracker.ietf.org/doc/html/rfc1951#page-12
-///         Lit Value    Bits        Codes
-///          ---------    ----        -----
-///            0 - 143     8          00110000 through
-///                                   10111111
-///          144 - 255     9          110010000 through
-///                                   111111111
-///          256 - 279     7          0000000 through
-///                                   0010111
-///          280 - 287     8          11000000 through
-///                                   11000111
-fn readFixedCode(d: *Decompress) !u16 {
-    const code7 = @bitReverse(try d.takeIntBits(u7));
-    return switch (code7) {
-        0...0b0010_111 =&gt; @as(u16, code7) + 256,
-        0b0010_111 + 1...0b1011_111 =&gt; (@as(u16, code7) &lt;&lt; 1) + @as(u16, try d.takeIntBits(u1)) - 0b0011_0000,
-        0b1011_111 + 1...0b1100_011 =&gt; (@as(u16, code7 - 0b1100000) &lt;&lt; 1) + try d.takeIntBits(u1) + 280,
-        else =&gt; (@as(u16, code7 - 0b1100_100) &lt;&lt; 2) + @as(u16, @bitReverse(try d.takeIntBits(u2))) + 144,
-    };
-}
-
-pub const Symbol = packed struct(u16) {
-    value: u12 = 0,
-    code_bits: u4 = 0, // number of bits in code 0-15
-};
-
-pub const LiteralDecoder = HuffmanDecoder(286, 15, 9);
-pub const DistanceDecoder = HuffmanDecoder(30, 15, 9);
-pub const CodegenDecoder = HuffmanDecoder(19, 7, 7);
-
-/// Creates huffman tree codes from list of code lengths (in `build`).
-///
-/// `find` then finds symbol for code bits. Code can be any length between 1 and
-/// 15 bits. When calling `find` we don't know how many bits will be used to
-/// find symbol. When symbol is returned it has code_bits field which defines
-/// how much we should advance in bit stream.
-///
-/// Lookup table is used to map 15 bit int to symbol. Same symbol is written
-/// many times in this table; 32K places for 286 (at most) symbols.
-/// Small lookup table is optimization for faster search.
-/// It is variation of the algorithm explained in [zlib](https://github.com/madler/zlib/blob/643e17b7498d12ab8d15565662880579692f769d/doc/algorithm.txt#L92)
-/// with difference that we here use statically allocated arrays.
-fn HuffmanDecoder(
-    comptime alphabet_size: u16,
-    comptime max_code_bits: u4,
-    comptime lookup_bits: u4,
-) type {
-    const lookup_shift = max_code_bits - lookup_bits;
-    const lookup_mask = (1 &lt;&lt; lookup_bits) - 1;
-
-    return struct {
-        // lookup table code -&gt; symbol
-        // for values with code_bits == 0, symbol is the index of the first node in linked
-        // if the index of the first node is 0xfff, it is an invalid code
-        lookup: [1 &lt;&lt; lookup_bits]Symbol = undefined,
-        linked: if (lookup_bits == max_code_bits) void else [alphabet_size]struct {
-            // sym.value is the next index in linked where the current index ends the chain
-            // the actual symbol is this nodes's index
-            sym: Symbol,
-            code: u16,
-        } = undefined,
-
-        const Self = @This();
-
-        fn reverseIdx(idx: usize) u16 {
-            return @bitReverse(@as(@Int(.unsigned, lookup_bits), @intCast(idx)));
-        }
-
-        /// Generates symbols and lookup tables from list of code lens for each symbol.
-        pub fn generate(self: *Self, lens: []const u4) !void {
-            try checkCompleteness(lens);
-
-            var buckets: [1 + @as(usize, max_code_bits)][alphabet_size]Symbol = undefined;
-            var bucket_len: [buckets.len]u16 = @splat(0);
-            for (0.., lens) |symbol, bits| {
-                buckets[bits][bucket_len[bits]] = .{
-                    .value = @intCast(symbol),
-                    .code_bits = bits,
-                };
-                bucket_len[bits] += 1;
-            }
-
-            var code: u16 = 0;
-            var idx: u16 = 0;
-            for (1..lookup_bits + 1) |bits| {
-                const inc = @as(u16, 1) &lt;&lt; @intCast(max_code_bits - bits);
-                for (buckets[bits][0..bucket_len[bits]]) |lookup_sym| {
-                    const next_code = code + inc;
-                    const next_idx = next_code &gt;&gt; lookup_shift;
-                    for (idx..next_idx) |i| {
-                        self.lookup[reverseIdx(i)] = lookup_sym;
-                    }
-                    code = next_code;
-                    idx = next_idx;
-                }
-            }
-            for (lookup_bits + 1..buckets.len) |bits| {
-                const inc = @as(u16, 1) &lt;&lt; @intCast(max_code_bits - bits);
-                for (buckets[bits][0..bucket_len[bits]]) |linked_sym| {
-                    const next_code = code + inc;
-                    const next_idx = next_code &gt;&gt; lookup_shift;
-
-                    const ri = reverseIdx(idx);
-                    const next: Symbol = .{
-                        .value = self.lookup[ri].value,
-                        .code_bits = linked_sym.code_bits,
-                    };
-                    self.linked[linked_sym.value] = .{
-                        .sym = next,
-                        .code = @bitReverse(@as(@Int(.unsigned, max_code_bits), @intCast(code))),
-                    };
-                    self.lookup[ri] = .{ .value = linked_sym.value, .code_bits = 0 };
-
-                    code = next_code;
-                    idx = next_idx;
-                }
-            }
-
-            // Invalid codes
-            for (idx..self.lookup.len) |i| {
-                self.lookup[reverseIdx(i)] = .{ .value = 0xfff, .code_bits = 0 };
-            }
-        }
-
-        /// Given the list of code lengths check that it represents a canonical
-        /// Huffman code for n symbols.
-        ///
-        /// Reference: https://github.com/madler/zlib/blob/5c42a230b7b468dff011f444161c0145b5efae59/contrib/puff/puff.c#L340
-        fn checkCompleteness(lens: []const u4) !void {
-            if (alphabet_size == 286)
-                if (lens[256] == 0) return error.MissingEndOfBlockCode;
-
-            var count = [_]u16{0} ** (@as(usize, max_code_bits) + 1);
-            var max: usize = 0;
-            for (lens) |n| {
-                if (n == 0) continue;
-                if (n &gt; max) max = n;
-                count[n] += 1;
-            }
-            if (max == 0) // empty tree
-                return;
-
-            // check for an over-subscribed or incomplete set of lengths
-            var left: usize = 1; // one possible code of zero length
-            for (1..count.len) |len| {
-                left &lt;&lt;= 1; // one more bit, double codes left
-                if (count[len] &gt; left)
-                    return error.OversubscribedHuffmanTree;
-                left -= count[len]; // deduct count from possible codes
-            }
-            if (left &gt; 0) { // left &gt; 0 means incomplete
-                // incomplete code ok only for single length 1 code
-                if (max_code_bits &gt; 7 and max == count[0] + count[1]) return;
-                return error.IncompleteHuffmanTree;
-            }
-        }
-
-        /// Finds symbol for lookup table code.
-        pub fn find(self: *Self, code: u16) !Symbol {
-            // try to find in lookup table
-            const idx = code &amp; lookup_mask;
-            const sym = self.lookup[idx];
-            if (sym.code_bits != 0) return sym;
-            // if not use linked list of symbols with same prefix
-            return self.findLinked(code, sym.value);
-        }
-
-        fn findLinked(self: *Self, code: u16, start: u16) !Symbol {
-            if (start == 0xfff) return error.InvalidCode;
-            if (lookup_bits == max_code_bits) unreachable;
-            var pos = start;
-            while (true) {
-                const node = self.linked[pos];
-                const shift = -%node.sym.code_bits;
-                // compare code_bits number of upper bits
-                if ((code ^ node.code) &lt;&lt; shift == 0)
-                    return .{ .value = @intCast(pos), .code_bits = node.sym.code_bits };
-                pos = node.sym.value;
-            }
-        }
-    };
-}
-
-test "init/find" {
-    // example data from: https://youtu.be/SJPvNi4HrWQ?t=8423
-    const code_lens = [_]u4{ 4, 3, 0, 2, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 3, 2 };
-    var h: CodegenDecoder = .{};
-    try h.generate(&amp;code_lens);
-
-    // All possible codes for each symbol.
-    // Lookup table has 126 elements, to cover all possible 7 bit codes.
-    for (0b0000_000..0b0100_000) |c| // 0..32 (32)
-        try testing.expectEqual(
-            Symbol{ .value = 3, .code_bits = 2 },
-            try h.find(@bitReverse(@as(u7, @intCast(c)))),
-        );
-
-    for (0b0100_000..0b1000_000) |c| // 32..64 (32)
-        try testing.expectEqual(
-            Symbol{ .value = 18, .code_bits = 2 },
-            try h.find(@bitReverse(@as(u7, @intCast(c)))),
-        );
-
-    for (0b1000_000..0b1010_000) |c| // 64..80 (16)
-        try testing.expectEqual(
-            Symbol{ .value = 1, .code_bits = 3 },
-            try h.find(@bitReverse(@as(u7, @intCast(c)))),
-        );
-
-    for (0b1010_000..0b1100_000) |c| // 80..96 (16)
-        try testing.expectEqual(
-            Symbol{ .value = 4, .code_bits = 3 },
-            try h.find(@bitReverse(@as(u7, @intCast(c)))),
-        );
-
-    for (0b1100_000..0b1110_000) |c| // 96..112 (16)
-        try testing.expectEqual(
-            Symbol{ .value = 17, .code_bits = 3 },
-            try h.find(@bitReverse(@as(u7, @intCast(c)))),
-        );
-
-    for (0b1110_000..0b1111_000) |c| // 112..120 (8)
-        try testing.expectEqual(
-            Symbol{ .value = 0, .code_bits = 4 },
-            try h.find(@bitReverse(@as(u7, @intCast(c)))),
-        );
-
-    for (0b1111_000..0b1_0000_000) |c| // 120...128 (8)
-        try testing.expectEqual(
-            Symbol{ .value = 16, .code_bits = 4 },
-            try h.find(@bitReverse(@as(u7, @intCast(c)))),
-        );
-}
-
-test "encode/decode literals" {
-    // Check that the example in RFC 1951 section 3.2.2 works (plus some zeroes)
-    const max_bits = 5;
-    var decoder: HuffmanDecoder(16, max_bits, 3) = .{};
-    try decoder.generate(&amp;.{ 3, 3, 3, 3, 0, 0, 3, 2, 4, 4 });
-
-    inline for (0.., .{
-        @as(u3, 0b010),
-        @as(u3, 0b011),
-        @as(u3, 0b100),
-        @as(u3, 0b101),
-        @as(u0, 0),
-        @as(u0, 0),
-        @as(u3, 0b110),
-        @as(u2, 0b00),
-        @as(u4, 0b1110),
-        @as(u4, 0b1111),
-    }) |i, code| {
-        const bits = @bitSizeOf(@TypeOf(code));
-        if (bits == 0) continue;
-        for (0..1 &lt;&lt; (max_bits - bits)) |extra| {
-            const full = (@as(u16, code) &lt;&lt; (max_bits - bits)) | @as(u16, @intCast(extra));
-            const symbol = try decoder.find(@bitReverse(@as(u5, @intCast(full))));
-            try testing.expectEqual(i, symbol.value);
-            try testing.expectEqual(bits, symbol.code_bits);
-        }
-    }
-}
-
-test "non compressed block (type 0)" {
-    try testDecompress(.raw, &amp;[_]u8{
-        0b0000_0001, 0b0000_1100, 0x00, 0b1111_0011, 0xff, // deflate fixed buffer header len, nlen
-        'H', 'e', 'l', 'l', 'o', ' ', 'w', 'o', 'r', 'l', 'd', 0x0a, // non compressed data
-    }, "Hello world\n");
-}
-
-test "fixed code block (type 1)" {
-    try testDecompress(.raw, &amp;[_]u8{
-        0xf3, 0x48, 0xcd, 0xc9, 0xc9, 0x57, 0x28, 0xcf, // deflate data block type 1
-        0x2f, 0xca, 0x49, 0xe1, 0x02, 0x00,
-    }, "Hello world\n");
-}
-
-test "dynamic block (type 2)" {
-    try testDecompress(.raw, &amp;[_]u8{
-        0x3d, 0xc6, 0x39, 0x11, 0x00, 0x00, 0x0c, 0x02, // deflate data block type 2
-        0x30, 0x2b, 0xb5, 0x52, 0x1e, 0xff, 0x96, 0x38,
-        0x16, 0x96, 0x5c, 0x1e, 0x94, 0xcb, 0x6d, 0x01,
-    }, "ABCDEABCD ABCDEABCD");
-}
-
-test "gzip non compressed block (type 0)" {
-    try testDecompress(.gzip, &amp;[_]u8{
-        0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, // gzip header (10 bytes)
-        0b0000_0001, 0b0000_1100, 0x00, 0b1111_0011, 0xff, // deflate fixed buffer header len, nlen
-        'H', 'e', 'l', 'l', 'o', ' ', 'w', 'o', 'r', 'l', 'd', 0x0a, // non compressed data
-        0xd5, 0xe0, 0x39, 0xb7, // gzip footer: checksum
-        0x0c, 0x00, 0x00, 0x00, // gzip footer: size
-    }, "Hello world\n");
-}
-
-test "gzip fixed code block (type 1)" {
-    try testDecompress(.gzip, &amp;[_]u8{
-        0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x03, // gzip header (10 bytes)
-        0xf3, 0x48, 0xcd, 0xc9, 0xc9, 0x57, 0x28, 0xcf, // deflate data block type 1
-        0x2f, 0xca, 0x49, 0xe1, 0x02, 0x00,
-        0xd5, 0xe0, 0x39, 0xb7, 0x0c, 0x00, 0x00, 0x00, // gzip footer (chksum, len)
-    }, "Hello world\n");
-}
-
-test "gzip dynamic block (type 2)" {
-    try testDecompress(.gzip, &amp;[_]u8{
-        0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, // gzip header (10 bytes)
-        0x3d, 0xc6, 0x39, 0x11, 0x00, 0x00, 0x0c, 0x02, // deflate data block type 2
-        0x30, 0x2b, 0xb5, 0x52, 0x1e, 0xff, 0x96, 0x38,
-        0x16, 0x96, 0x5c, 0x1e, 0x94, 0xcb, 0x6d, 0x01,
-        0x17, 0x1c, 0x39, 0xb4, 0x13, 0x00, 0x00, 0x00, // gzip footer (chksum, len)
-    }, "ABCDEABCD ABCDEABCD");
-}
-
-test "gzip header with name" {
-    try testDecompress(.gzip, &amp;[_]u8{
-        0x1f, 0x8b, 0x08, 0x08, 0xe5, 0x70, 0xb1, 0x65, 0x00, 0x03, 0x68, 0x65, 0x6c, 0x6c, 0x6f, 0x2e,
-        0x74, 0x78, 0x74, 0x00, 0xf3, 0x48, 0xcd, 0xc9, 0xc9, 0x57, 0x28, 0xcf, 0x2f, 0xca, 0x49, 0xe1,
-        0x02, 0x00, 0xd5, 0xe0, 0x39, 0xb7, 0x0c, 0x00, 0x00, 0x00,
-    }, "Hello world\n");
-}
-
-test "zlib decompress non compressed block (type 0)" {
-    try testDecompress(.zlib, &amp;[_]u8{
-        0x78, 0b10_0_11100, // zlib header (2 bytes)
-        0b0000_0001, 0b0000_1100, 0x00, 0b1111_0011, 0xff, // deflate fixed buffer header len, nlen
-        'H', 'e', 'l', 'l', 'o', ' ', 'w', 'o', 'r', 'l', 'd', 0x0a, // non compressed data
-        0x1c, 0xf2, 0x04, 0x47, // zlib footer: checksum
-    }, "Hello world\n");
-}
-
-test "failing end-of-stream" {
-    try testFailure(.raw, @embedFile("testdata/fuzz/end-of-stream.input"), error.EndOfStream);
-}
-test "failing invalid-distance" {
-    try testFailure(.raw, @embedFile("testdata/fuzz/invalid-distance.input"), error.InvalidMatch);
-}
-test "failing invalid-tree01" {
-    try testFailure(.raw, @embedFile("testdata/fuzz/invalid-tree01.input"), error.IncompleteHuffmanTree);
-}
-test "failing invalid-tree02" {
-    try testFailure(.raw, @embedFile("testdata/fuzz/invalid-tree02.input"), error.IncompleteHuffmanTree);
-}
-test "failing invalid-tree03" {
-    try testFailure(.raw, @embedFile("testdata/fuzz/invalid-tree03.input"), error.IncompleteHuffmanTree);
-}
-test "failing lengths-overflow" {
-    try testFailure(.raw, @embedFile("testdata/fuzz/lengths-overflow.input"), error.InvalidDynamicBlockHeader);
-}
-test "failing out-of-codes" {
-    try testFailure(.raw, @embedFile("testdata/fuzz/out-of-codes.input"), error.InvalidCode);
-}
-test "failing puff01" {
-    try testFailure(.raw, @embedFile("testdata/fuzz/puff01.input"), error.WrongStoredBlockNlen);
-}
-test "failing puff02" {
-    try testFailure(.raw, @embedFile("testdata/fuzz/puff02.input"), error.EndOfStream);
-}
-test "failing puff04" {
-    try testFailure(.raw, @embedFile("testdata/fuzz/puff04.input"), error.InvalidCode);
-}
-test "failing puff05" {
-    try testFailure(.raw, @embedFile("testdata/fuzz/puff05.input"), error.EndOfStream);
-}
-test "failing puff06" {
-    try testFailure(.raw, @embedFile("testdata/fuzz/puff06.input"), error.EndOfStream);
-}
-test "failing puff08" {
-    try testFailure(.raw, @embedFile("testdata/fuzz/puff08.input"), error.InvalidCode);
-}
-test "failing puff10" {
-    try testFailure(.raw, @embedFile("testdata/fuzz/puff10.input"), error.InvalidCode);
-}
-test "failing puff11" {
-    try testFailure(.raw, @embedFile("testdata/fuzz/puff11.input"), error.InvalidMatch);
-}
-test "failing puff12" {
-    try testFailure(.raw, @embedFile("testdata/fuzz/puff12.input"), error.InvalidDynamicBlockHeader);
-}
-test "failing puff13" {
-    try testFailure(.raw, @embedFile("testdata/fuzz/puff13.input"), error.IncompleteHuffmanTree);
-}
-test "failing puff14" {
-    try testFailure(.raw, @embedFile("testdata/fuzz/puff14.input"), error.EndOfStream);
-}
-test "failing puff15" {
-    try testFailure(.raw, @embedFile("testdata/fuzz/puff15.input"), error.IncompleteHuffmanTree);
-}
-test "failing puff16" {
-    try testFailure(.raw, @embedFile("testdata/fuzz/puff16.input"), error.InvalidDynamicBlockHeader);
-}
-test "failing puff17" {
-    try testFailure(.raw, @embedFile("testdata/fuzz/puff17.input"), error.MissingEndOfBlockCode);
-}
-test "failing fuzz1" {
-    try testFailure(.raw, @embedFile("testdata/fuzz/fuzz1.input"), error.InvalidDynamicBlockHeader);
-}
-test "failing fuzz2" {
-    try testFailure(.raw, @embedFile("testdata/fuzz/fuzz2.input"), error.InvalidDynamicBlockHeader);
-}
-test "failing fuzz3" {
-    try testFailure(.raw, @embedFile("testdata/fuzz/fuzz3.input"), error.InvalidMatch);
-}
-test "failing fuzz4" {
-    try testFailure(.raw, @embedFile("testdata/fuzz/fuzz4.input"), error.OversubscribedHuffmanTree);
-}
-test "failing puff18" {
-    try testFailure(.raw, @embedFile("testdata/fuzz/puff18.input"), error.OversubscribedHuffmanTree);
-}
-test "failing puff19" {
-    try testFailure(.raw, @embedFile("testdata/fuzz/puff19.input"), error.OversubscribedHuffmanTree);
-}
-test "failing puff20" {
-    try testFailure(.raw, @embedFile("testdata/fuzz/puff20.input"), error.OversubscribedHuffmanTree);
-}
-test "failing puff21" {
-    try testFailure(.raw, @embedFile("testdata/fuzz/puff21.input"), error.OversubscribedHuffmanTree);
-}
-test "failing puff22" {
-    try testFailure(.raw, @embedFile("testdata/fuzz/puff22.input"), error.OversubscribedHuffmanTree);
-}
-test "failing puff23" {
-    try testFailure(.raw, @embedFile("testdata/fuzz/puff23.input"), error.OversubscribedHuffmanTree);
-}
-test "failing puff24" {
-    try testFailure(.raw, @embedFile("testdata/fuzz/puff24.input"), error.IncompleteHuffmanTree);
-}
-test "failing puff25" {
-    try testFailure(.raw, @embedFile("testdata/fuzz/puff25.input"), error.OversubscribedHuffmanTree);
-}
-test "failing puff26" {
-    try testFailure(.raw, @embedFile("testdata/fuzz/puff26.input"), error.InvalidDynamicBlockHeader);
-}
-test "failing puff27" {
-    try testFailure(.raw, @embedFile("testdata/fuzz/puff27.input"), error.InvalidDynamicBlockHeader);
-}
-
-test "deflate-stream" {
-    try testDecompress(
-        .raw,
-        @embedFile("testdata/fuzz/deflate-stream.input"),
-        @embedFile("testdata/fuzz/deflate-stream.expect"),
-    );
-}
-
-test "empty-distance-alphabet01" {
-    try testDecompress(.raw, @embedFile("testdata/fuzz/empty-distance-alphabet01.input"), "");
-}
-
-test "empty-distance-alphabet02" {
-    try testDecompress(.raw, @embedFile("testdata/fuzz/empty-distance-alphabet02.input"), "");
-}
-
-test "puff03" {
-    try testDecompress(.raw, @embedFile("testdata/fuzz/puff03.input"), &amp;.{0xa});
-}
-
-test "puff09" {
-    try testDecompress(.raw, @embedFile("testdata/fuzz/puff09.input"), "P");
-}
-
-test "invalid block type" {
-    try testFailure(.raw, &amp;[_]u8{0b110}, error.InvalidBlockType);
-}
-
-test "bug 18966" {
-    try testDecompress(
-        .gzip,
-        @embedFile("testdata/fuzz/bug_18966.input"),
-        @embedFile("testdata/fuzz/bug_18966.expect"),
-    );
-}
-
-test "reading into empty buffer" {
-    // Inspired by https://github.com/ziglang/zig/issues/19895
-    const input = &amp;[_]u8{
-        0b0000_0001, 0b0000_1100, 0x00, 0b1111_0011, 0xff, // deflate fixed buffer header len, nlen
-        'H', 'e', 'l', 'l', 'o', ' ', 'w', 'o', 'r', 'l', 'd', 0x0a, // non compressed data
-    };
-    var in: Reader = .fixed(input);
-    var decomp: Decompress = .init(&amp;in, .raw, &amp;.{});
-    const r = &amp;decomp.reader;
-    var bufs: [1][]u8 = .{&amp;.{}};
-    try testing.expectEqual(0, try r.readVec(&amp;bufs));
-}
-
-test "zlib header" {
-    // Truncated header
-    try testFailure(.zlib, &amp;[_]u8{0x78}, error.EndOfStream);
-
-    // Wrong CM
-    try testFailure(.zlib, &amp;[_]u8{ 0x79, 0x94 }, error.BadZlibHeader);
-
-    // Wrong CINFO
-    try testFailure(.zlib, &amp;[_]u8{ 0x88, 0x98 }, error.BadZlibHeader);
-
-    // Truncated checksum
-    try testFailure(.zlib, &amp;[_]u8{ 0x78, 0xda, 0x03, 0x00, 0x00 }, error.EndOfStream);
-}
-
-test "gzip header" {
-    // Truncated header
-    try testFailure(.gzip, &amp;[_]u8{ 0x1f, 0x8B }, error.EndOfStream);
-
-    // Wrong CM
-    try testFailure(.gzip, &amp;[_]u8{
-        0x1f, 0x8b, 0x09, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x03,
-    }, error.BadGzipHeader);
-
-    // Truncated checksum
-    try testFailure(.gzip, &amp;[_]u8{
-        0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x03, 0x03, 0x00, 0x00, 0x00, 0x00,
-    }, error.EndOfStream);
-
-    // Truncated initial size field
-    try testFailure(.gzip, &amp;[_]u8{
-        0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x03, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00,
-    }, error.EndOfStream);
-
-    try testDecompress(.gzip, &amp;[_]u8{
-        // GZIP header
-        0x1f, 0x8b, 0x08, 0x12, 0x00, 0x09, 0x6e, 0x88, 0x00, 0xff, 0x48, 0x65, 0x6c, 0x6c, 0x6f, 0x00,
-        // header.FHCRC (should cover entire header)
-        0x99, 0xd6,
-        // GZIP data
-        0x01, 0x00, 0x00, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    }, "");
-}
-
-test "zlib should not overshoot" {
-    // Compressed zlib data with extra 4 bytes at the end.
-    const data = [_]u8{
-        0x78, 0x9c, 0x73, 0xce, 0x2f, 0xa8, 0x2c, 0xca, 0x4c, 0xcf, 0x28, 0x51, 0x08, 0xcf, 0xcc, 0xc9,
-        0x49, 0xcd, 0x55, 0x28, 0x4b, 0xcc, 0x53, 0x08, 0x4e, 0xce, 0x48, 0xcc, 0xcc, 0xd6, 0x51, 0x08,
-        0xce, 0xcc, 0x4b, 0x4f, 0x2c, 0xc8, 0x2f, 0x4a, 0x55, 0x30, 0xb4, 0xb4, 0x34, 0xd5, 0xb5, 0x34,
-        0x03, 0x00, 0x8b, 0x61, 0x0f, 0xa4, 0x52, 0x5a, 0x94, 0x12,
-    };
-
-    var reader: std.Io.Reader = .fixed(&amp;data);
-
-    var decompress_buffer: [flate.max_window_len]u8 = undefined;
-    var decompress: Decompress = .init(&amp;reader, .zlib, &amp;decompress_buffer);
-    var out: [128]u8 = undefined;
-
-    {
-        const n = try decompress.reader.readSliceShort(&amp;out);
-        try std.testing.expectEqual(46, n);
-        try std.testing.expectEqualStrings("Copyright Willem van Schaik, Singapore 1995-96", out[0..n]);
-    }
-
-    // 4 bytes after compressed chunk are available in reader.
-    const n = try reader.readSliceShort(&amp;out);
-    try std.testing.expectEqual(n, 4);
-    try std.testing.expectEqualSlices(u8, data[data.len - 4 .. data.len], out[0..n]);
-}
-
-fn testFailure(container: Container, in: []const u8, expected_err: anyerror) !void {
-    var reader: Reader = .fixed(in);
-    var aw: Writer.Allocating = .init(testing.allocator);
-    defer aw.deinit();
-
-    var decompress: Decompress = .init(&amp;reader, container, &amp;.{});
-    try testing.expectError(error.ReadFailed, decompress.reader.streamRemaining(&amp;aw.writer));
-    try testing.expectEqual(expected_err, decompress.err orelse return error.TestFailed);
-}
-
-fn testDecompress(container: Container, compressed: []const u8, expected_plain: []const u8) !void {
-    var in: std.Io.Reader = .fixed(compressed);
-    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
-    defer aw.deinit();
-
-    var decompress: Decompress = .init(&amp;in, container, &amp;.{});
-    const decompressed_len = try decompress.reader.streamRemaining(&amp;aw.writer);
-    try testing.expectEqual(expected_plain.len, decompressed_len);
-    try testing.expectEqualSlices(u8, expected_plain, aw.written());
-}</pre>
+    <pre><a id="L1"></a>const std = @import("../../std.zig");
+<a id="L2"></a>const assert = std.debug.assert;
+<a id="L3"></a>const flate = std.compress.flate;
+<a id="L4"></a>const testing = std.testing;
+<a id="L5"></a>const Writer = std.Io.Writer;
+<a id="L6"></a>const Reader = std.Io.Reader;
+<a id="L7"></a>const Container = flate.Container;
+<a id="L8"></a>
+<a id="L9"></a>const Decompress = @This();
+<a id="L10"></a>const token = @import("token.zig");
+<a id="L11"></a>
+<a id="L12"></a>input: *Reader,
+<a id="L13"></a>consumed_bits: u3,
+<a id="L14"></a>
+<a id="L15"></a>reader: Reader,
+<a id="L16"></a>
+<a id="L17"></a>container_metadata: Container.Metadata,
+<a id="L18"></a>
+<a id="L19"></a>lit_dec: LiteralDecoder,
+<a id="L20"></a>dst_dec: DistanceDecoder,
+<a id="L21"></a>
+<a id="L22"></a>final_block: bool,
+<a id="L23"></a>state: State,
+<a id="L24"></a>
+<a id="L25"></a>err: ?Error,
+<a id="L26"></a>
+<a id="L27"></a>const BlockType = enum(u2) {
+<a id="L28"></a>    stored = 0,
+<a id="L29"></a>    fixed = 1,
+<a id="L30"></a>    dynamic = 2,
+<a id="L31"></a>    invalid = 3,
+<a id="L32"></a>};
+<a id="L33"></a>
+<a id="L34"></a>const State = union(enum) {
+<a id="L35"></a>    protocol_header,
+<a id="L36"></a>    block_header,
+<a id="L37"></a>    stored_block: u16,
+<a id="L38"></a>    fixed_block,
+<a id="L39"></a>    fixed_block_literal: u8,
+<a id="L40"></a>    fixed_block_match: u16,
+<a id="L41"></a>    dynamic_block,
+<a id="L42"></a>    dynamic_block_literal: u8,
+<a id="L43"></a>    dynamic_block_match: u16,
+<a id="L44"></a>    protocol_footer,
+<a id="L45"></a>    end,
+<a id="L46"></a>};
+<a id="L47"></a>
+<a id="L48"></a>pub const Error = Container.Error || error{
+<a id="L49"></a>    InvalidCode,
+<a id="L50"></a>    InvalidMatch,
+<a id="L51"></a>    WrongStoredBlockNlen,
+<a id="L52"></a>    InvalidBlockType,
+<a id="L53"></a>    InvalidDynamicBlockHeader,
+<a id="L54"></a>    ReadFailed,
+<a id="L55"></a>    OversubscribedHuffmanTree,
+<a id="L56"></a>    IncompleteHuffmanTree,
+<a id="L57"></a>    MissingEndOfBlockCode,
+<a id="L58"></a>    EndOfStream,
+<a id="L59"></a>};
+<a id="L60"></a>
+<a id="L61"></a>const direct_vtable: Reader.VTable = .{
+<a id="L62"></a>    .stream = streamDirect,
+<a id="L63"></a>    .rebase = rebaseFallible,
+<a id="L64"></a>    .discard = discardDirect,
+<a id="L65"></a>    .readVec = readVec,
+<a id="L66"></a>};
+<a id="L67"></a>
+<a id="L68"></a>const indirect_vtable: Reader.VTable = .{
+<a id="L69"></a>    .stream = streamIndirect,
+<a id="L70"></a>    .rebase = rebaseFallible,
+<a id="L71"></a>    .discard = discardIndirect,
+<a id="L72"></a>    .readVec = readVec,
+<a id="L73"></a>};
+<a id="L74"></a>
+<a id="L75"></a>/// `input` buffer is asserted to be at least 10 bytes, or EOF before then.
+<a id="L76"></a>///
+<a id="L77"></a>/// If `buffer` is provided then asserted to have `flate.max_window_len`
+<a id="L78"></a>/// capacity.
+<a id="L79"></a>pub fn init(input: *Reader, container: Container, buffer: []u8) Decompress {
+<a id="L80"></a>    if (buffer.len != 0) assert(buffer.len &gt;= flate.max_window_len);
+<a id="L81"></a>    return .{
+<a id="L82"></a>        .reader = .{
+<a id="L83"></a>            .vtable = if (buffer.len == 0) &amp;direct_vtable else &amp;indirect_vtable,
+<a id="L84"></a>            .buffer = buffer,
+<a id="L85"></a>            .seek = 0,
+<a id="L86"></a>            .end = 0,
+<a id="L87"></a>        },
+<a id="L88"></a>        .input = input,
+<a id="L89"></a>        .consumed_bits = 0,
+<a id="L90"></a>        .container_metadata = .init(container),
+<a id="L91"></a>        .lit_dec = .{},
+<a id="L92"></a>        .dst_dec = .{},
+<a id="L93"></a>        .final_block = false,
+<a id="L94"></a>        .state = .protocol_header,
+<a id="L95"></a>        .err = null,
+<a id="L96"></a>    };
+<a id="L97"></a>}
+<a id="L98"></a>
+<a id="L99"></a>fn rebaseFallible(r: *Reader, capacity: usize) Reader.RebaseError!void {
+<a id="L100"></a>    rebase(r, capacity);
+<a id="L101"></a>}
+<a id="L102"></a>
+<a id="L103"></a>fn rebase(r: *Reader, capacity: usize) void {
+<a id="L104"></a>    assert(capacity &lt;= r.buffer.len - flate.history_len);
+<a id="L105"></a>    assert(r.end + capacity &gt; r.buffer.len);
+<a id="L106"></a>    const discard_n = @min(r.seek, r.end - flate.history_len);
+<a id="L107"></a>    const keep = r.buffer[discard_n..r.end];
+<a id="L108"></a>    @memmove(r.buffer[0..keep.len], keep);
+<a id="L109"></a>    r.end = keep.len;
+<a id="L110"></a>    r.seek -= discard_n;
+<a id="L111"></a>}
+<a id="L112"></a>
+<a id="L113"></a>/// This could be improved so that when an amount is discarded that includes an
+<a id="L114"></a>/// entire frame, skip decoding that frame.
+<a id="L115"></a>fn discardDirect(r: *Reader, limit: std.Io.Limit) Reader.Error!usize {
+<a id="L116"></a>    if (r.end + flate.history_len &gt; r.buffer.len) rebase(r, flate.history_len);
+<a id="L117"></a>    var writer: Writer = .{
+<a id="L118"></a>        .vtable = &amp;.{
+<a id="L119"></a>            .drain = std.Io.Writer.Discarding.drain,
+<a id="L120"></a>            .sendFile = std.Io.Writer.Discarding.sendFile,
+<a id="L121"></a>        },
+<a id="L122"></a>        .buffer = r.buffer,
+<a id="L123"></a>        .end = r.end,
+<a id="L124"></a>    };
+<a id="L125"></a>    defer {
+<a id="L126"></a>        assert(writer.end != 0);
+<a id="L127"></a>        r.end = writer.end;
+<a id="L128"></a>        r.seek = r.end;
+<a id="L129"></a>    }
+<a id="L130"></a>    const n = r.stream(&amp;writer, limit) catch |err| switch (err) {
+<a id="L131"></a>        error.WriteFailed =&gt; unreachable,
+<a id="L132"></a>        error.ReadFailed =&gt; return error.ReadFailed,
+<a id="L133"></a>        error.EndOfStream =&gt; return error.EndOfStream,
+<a id="L134"></a>    };
+<a id="L135"></a>    assert(n &lt;= @intFromEnum(limit));
+<a id="L136"></a>    return n;
+<a id="L137"></a>}
+<a id="L138"></a>
+<a id="L139"></a>fn discardIndirect(r: *Reader, limit: std.Io.Limit) Reader.Error!usize {
+<a id="L140"></a>    const d: *Decompress = @alignCast(@fieldParentPtr("reader", r));
+<a id="L141"></a>    if (r.end + flate.history_len &gt; r.buffer.len) rebase(r, flate.history_len);
+<a id="L142"></a>    var writer: Writer = .{
+<a id="L143"></a>        .buffer = r.buffer,
+<a id="L144"></a>        .end = r.end,
+<a id="L145"></a>        .vtable = &amp;.{ .drain = Writer.unreachableDrain },
+<a id="L146"></a>    };
+<a id="L147"></a>    {
+<a id="L148"></a>        defer r.end = writer.end;
+<a id="L149"></a>        _ = streamFallible(d, &amp;writer, .limited(writer.buffer.len - writer.end)) catch |err| switch (err) {
+<a id="L150"></a>            error.WriteFailed =&gt; unreachable,
+<a id="L151"></a>            else =&gt; |e| return e,
+<a id="L152"></a>        };
+<a id="L153"></a>    }
+<a id="L154"></a>    const n = limit.minInt(r.end - r.seek);
+<a id="L155"></a>    r.seek += n;
+<a id="L156"></a>    return n;
+<a id="L157"></a>}
+<a id="L158"></a>
+<a id="L159"></a>fn readVec(r: *Reader, data: [][]u8) Reader.Error!usize {
+<a id="L160"></a>    _ = data;
+<a id="L161"></a>    const d: *Decompress = @alignCast(@fieldParentPtr("reader", r));
+<a id="L162"></a>    return streamIndirectInner(d);
+<a id="L163"></a>}
+<a id="L164"></a>
+<a id="L165"></a>fn streamIndirectInner(d: *Decompress) Reader.Error!usize {
+<a id="L166"></a>    const r = &amp;d.reader;
+<a id="L167"></a>    if (r.buffer.len - r.end &lt; flate.history_len) rebase(r, flate.history_len);
+<a id="L168"></a>    var writer: Writer = .{
+<a id="L169"></a>        .buffer = r.buffer,
+<a id="L170"></a>        .end = r.end,
+<a id="L171"></a>        .vtable = &amp;.{
+<a id="L172"></a>            .drain = Writer.unreachableDrain,
+<a id="L173"></a>            .rebase = Writer.unreachableRebase,
+<a id="L174"></a>        },
+<a id="L175"></a>    };
+<a id="L176"></a>    defer r.end = writer.end;
+<a id="L177"></a>    _ = streamFallible(d, &amp;writer, .limited(writer.buffer.len - writer.end)) catch |err| switch (err) {
+<a id="L178"></a>        error.WriteFailed =&gt; unreachable,
+<a id="L179"></a>        else =&gt; |e| return e,
+<a id="L180"></a>    };
+<a id="L181"></a>    return 0;
+<a id="L182"></a>}
+<a id="L183"></a>
+<a id="L184"></a>fn decodeLength(self: *Decompress, code_int: u5) !u16 {
+<a id="L185"></a>    if (code_int &gt; 28) return error.InvalidCode;
+<a id="L186"></a>    const l: token.LenCode = .fromInt(code_int);
+<a id="L187"></a>    const base = l.base();
+<a id="L188"></a>    const extra = l.extraBits();
+<a id="L189"></a>    return token.min_length + (base | try self.takeBits(extra));
+<a id="L190"></a>}
+<a id="L191"></a>
+<a id="L192"></a>fn decodeDistance(self: *Decompress, code_int: u5) !u16 {
+<a id="L193"></a>    if (code_int &gt; 29) return error.InvalidCode;
+<a id="L194"></a>    const d: token.DistCode = .fromInt(code_int);
+<a id="L195"></a>    const base = d.base();
+<a id="L196"></a>    const extra = d.extraBits();
+<a id="L197"></a>    return token.min_distance + (base | try self.takeBits(extra));
+<a id="L198"></a>}
+<a id="L199"></a>
+<a id="L200"></a>/// Decode code length symbol to code length. Writes decoded length into
+<a id="L201"></a>/// lens slice starting at position pos. Returns number of positions
+<a id="L202"></a>/// advanced.
+<a id="L203"></a>fn dynamicCodeLength(self: *Decompress, code: u16, lens: []u4, pos: usize) !usize {
+<a id="L204"></a>    if (pos &gt;= lens.len)
+<a id="L205"></a>        return error.InvalidDynamicBlockHeader;
+<a id="L206"></a>
+<a id="L207"></a>    switch (code) {
+<a id="L208"></a>        0...15 =&gt; {
+<a id="L209"></a>            // Represent code lengths of 0 - 15
+<a id="L210"></a>            lens[pos] = @intCast(code);
+<a id="L211"></a>            return 1;
+<a id="L212"></a>        },
+<a id="L213"></a>        16 =&gt; {
+<a id="L214"></a>            // Copy the previous code length 3 - 6 times.
+<a id="L215"></a>            // The next 2 bits indicate repeat length
+<a id="L216"></a>            const n: u8 = @as(u8, try self.takeIntBits(u2)) + 3;
+<a id="L217"></a>            if (pos == 0 or pos + n &gt; lens.len)
+<a id="L218"></a>                return error.InvalidDynamicBlockHeader;
+<a id="L219"></a>            for (0..n) |i| {
+<a id="L220"></a>                lens[pos + i] = lens[pos + i - 1];
+<a id="L221"></a>            }
+<a id="L222"></a>            return n;
+<a id="L223"></a>        },
+<a id="L224"></a>        // Repeat a code length of 0 for 3 - 10 times. (3 bits of length)
+<a id="L225"></a>        17 =&gt; return @as(u8, try self.takeIntBits(u3)) + 3,
+<a id="L226"></a>        // Repeat a code length of 0 for 11 - 138 times (7 bits of length)
+<a id="L227"></a>        18 =&gt; return @as(u8, try self.takeIntBits(u7)) + 11,
+<a id="L228"></a>        else =&gt; return error.InvalidDynamicBlockHeader,
+<a id="L229"></a>    }
+<a id="L230"></a>}
+<a id="L231"></a>
+<a id="L232"></a>fn decodeSymbol(self: *Decompress, decoder: anytype) !u16 {
+<a id="L233"></a>    // Maximum code len is 15 bits.
+<a id="L234"></a>    const sym = try decoder.find(try self.peekIntBitsShort(u15));
+<a id="L235"></a>    try self.tossBitsShort(sym.code_bits);
+<a id="L236"></a>    return sym.value;
+<a id="L237"></a>}
+<a id="L238"></a>
+<a id="L239"></a>fn streamDirect(r: *Reader, w: *Writer, limit: std.Io.Limit) Reader.StreamError!usize {
+<a id="L240"></a>    const d: *Decompress = @alignCast(@fieldParentPtr("reader", r));
+<a id="L241"></a>    return streamFallible(d, w, limit);
+<a id="L242"></a>}
+<a id="L243"></a>
+<a id="L244"></a>fn streamIndirect(r: *Reader, w: *Writer, limit: std.Io.Limit) Reader.StreamError!usize {
+<a id="L245"></a>    const d: *Decompress = @alignCast(@fieldParentPtr("reader", r));
+<a id="L246"></a>    _ = limit;
+<a id="L247"></a>    _ = w;
+<a id="L248"></a>    return streamIndirectInner(d);
+<a id="L249"></a>}
+<a id="L250"></a>
+<a id="L251"></a>fn streamFallible(d: *Decompress, w: *Writer, limit: std.Io.Limit) Reader.StreamError!usize {
+<a id="L252"></a>    return streamInner(d, w, limit) catch |err| switch (err) {
+<a id="L253"></a>        error.EndOfStream =&gt; {
+<a id="L254"></a>            if (d.state == .end) {
+<a id="L255"></a>                return error.EndOfStream;
+<a id="L256"></a>            } else {
+<a id="L257"></a>                d.err = error.EndOfStream;
+<a id="L258"></a>                return error.ReadFailed;
+<a id="L259"></a>            }
+<a id="L260"></a>        },
+<a id="L261"></a>        error.WriteFailed =&gt; return error.WriteFailed,
+<a id="L262"></a>        else =&gt; |e| {
+<a id="L263"></a>            // In the event of an error, state is unmodified so that it can be
+<a id="L264"></a>            // better used to diagnose the failure.
+<a id="L265"></a>            d.err = e;
+<a id="L266"></a>            return error.ReadFailed;
+<a id="L267"></a>        },
+<a id="L268"></a>    };
+<a id="L269"></a>}
+<a id="L270"></a>
+<a id="L271"></a>fn streamInner(d: *Decompress, w: *Writer, limit: std.Io.Limit) (Error || Reader.StreamError)!usize {
+<a id="L272"></a>    var remaining = @intFromEnum(limit);
+<a id="L273"></a>    const in = d.input;
+<a id="L274"></a>    sw: switch (d.state) {
+<a id="L275"></a>        .protocol_header =&gt; switch (d.container_metadata.container()) {
+<a id="L276"></a>            .gzip =&gt; {
+<a id="L277"></a>                const Header = extern struct {
+<a id="L278"></a>                    magic: u16 align(1),
+<a id="L279"></a>                    method: u8,
+<a id="L280"></a>                    flags: packed struct(u8) {
+<a id="L281"></a>                        text: bool,
+<a id="L282"></a>                        hcrc: bool,
+<a id="L283"></a>                        extra: bool,
+<a id="L284"></a>                        name: bool,
+<a id="L285"></a>                        comment: bool,
+<a id="L286"></a>                        reserved: u3,
+<a id="L287"></a>                    },
+<a id="L288"></a>                    mtime: u32 align(1),
+<a id="L289"></a>                    xfl: u8,
+<a id="L290"></a>                    os: u8,
+<a id="L291"></a>                };
+<a id="L292"></a>                const header = try in.takeStruct(Header, .little);
+<a id="L293"></a>                if (header.magic != 0x8b1f or header.method != 0x08)
+<a id="L294"></a>                    return error.BadGzipHeader;
+<a id="L295"></a>                if (header.flags.extra) {
+<a id="L296"></a>                    const extra_len = try in.takeInt(u16, .little);
+<a id="L297"></a>                    try in.discardAll(extra_len);
+<a id="L298"></a>                }
+<a id="L299"></a>                if (header.flags.name) {
+<a id="L300"></a>                    _ = try in.discardDelimiterInclusive(0);
+<a id="L301"></a>                }
+<a id="L302"></a>                if (header.flags.comment) {
+<a id="L303"></a>                    _ = try in.discardDelimiterInclusive(0);
+<a id="L304"></a>                }
+<a id="L305"></a>                if (header.flags.hcrc) {
+<a id="L306"></a>                    try in.discardAll(2);
+<a id="L307"></a>                }
+<a id="L308"></a>                continue :sw .block_header;
+<a id="L309"></a>            },
+<a id="L310"></a>            .zlib =&gt; {
+<a id="L311"></a>                const header = try in.takeArray(2);
+<a id="L312"></a>                const cmf: packed struct(u8) { cm: u4, cinfo: u4 } = @bitCast(header[0]);
+<a id="L313"></a>                if (cmf.cm != 8 or cmf.cinfo &gt; 7) return error.BadZlibHeader;
+<a id="L314"></a>                continue :sw .block_header;
+<a id="L315"></a>            },
+<a id="L316"></a>            .raw =&gt; continue :sw .block_header,
+<a id="L317"></a>        },
+<a id="L318"></a>        .block_header =&gt; {
+<a id="L319"></a>            d.final_block = (try d.takeIntBits(u1)) != 0;
+<a id="L320"></a>            const block_type: BlockType = @enumFromInt(try d.takeIntBits(u2));
+<a id="L321"></a>            switch (block_type) {
+<a id="L322"></a>                .stored =&gt; {
+<a id="L323"></a>                    d.alignBitsForward();
+<a id="L324"></a>                    // everything after this is byte aligned in stored block
+<a id="L325"></a>                    const len = try in.takeInt(u16, .little);
+<a id="L326"></a>                    const nlen = try in.takeInt(u16, .little);
+<a id="L327"></a>                    if (len != ~nlen) return error.WrongStoredBlockNlen;
+<a id="L328"></a>                    continue :sw .{ .stored_block = len };
+<a id="L329"></a>                },
+<a id="L330"></a>                .fixed =&gt; continue :sw .fixed_block,
+<a id="L331"></a>                .dynamic =&gt; {
+<a id="L332"></a>                    const hlit: u16 = @as(u16, try d.takeIntBits(u5)) + 257; // number of ll code entries present - 257
+<a id="L333"></a>                    const hdist: u16 = @as(u16, try d.takeIntBits(u5)) + 1; // number of distance code entries - 1
+<a id="L334"></a>                    const hclen: u8 = @as(u8, try d.takeIntBits(u4)) + 4; // hclen + 4 code lengths are encoded
+<a id="L335"></a>
+<a id="L336"></a>                    if (hlit &gt; 286 or hdist &gt; 30)
+<a id="L337"></a>                        return error.InvalidDynamicBlockHeader;
+<a id="L338"></a>
+<a id="L339"></a>                    // lengths for code lengths
+<a id="L340"></a>                    var cl_lens: [19]u4 = @splat(0);
+<a id="L341"></a>                    for (token.codegen_order[0..hclen]) |i| {
+<a id="L342"></a>                        cl_lens[i] = try d.takeIntBits(u3);
+<a id="L343"></a>                    }
+<a id="L344"></a>                    var cl_dec: CodegenDecoder = .{};
+<a id="L345"></a>                    try cl_dec.generate(&amp;cl_lens);
+<a id="L346"></a>
+<a id="L347"></a>                    // decoded code lengths
+<a id="L348"></a>                    var dec_lens: [286 + 30]u4 = @splat(0);
+<a id="L349"></a>                    var pos: usize = 0;
+<a id="L350"></a>                    while (pos &lt; hlit + hdist) {
+<a id="L351"></a>                        const peeked = try d.peekIntBitsShort(u7);
+<a id="L352"></a>                        const sym = try cl_dec.find(peeked);
+<a id="L353"></a>                        try d.tossBitsShort(sym.code_bits);
+<a id="L354"></a>                        pos += try d.dynamicCodeLength(sym.value, &amp;dec_lens, pos);
+<a id="L355"></a>                    }
+<a id="L356"></a>                    if (pos &gt; hlit + hdist) {
+<a id="L357"></a>                        return error.InvalidDynamicBlockHeader;
+<a id="L358"></a>                    }
+<a id="L359"></a>
+<a id="L360"></a>                    // literal code lengths to literal decoder
+<a id="L361"></a>                    try d.lit_dec.generate(dec_lens[0..hlit]);
+<a id="L362"></a>
+<a id="L363"></a>                    // distance code lengths to distance decoder
+<a id="L364"></a>                    try d.dst_dec.generate(dec_lens[hlit..][0..hdist]);
+<a id="L365"></a>
+<a id="L366"></a>                    continue :sw .dynamic_block;
+<a id="L367"></a>                },
+<a id="L368"></a>                .invalid =&gt; return error.InvalidBlockType,
+<a id="L369"></a>            }
+<a id="L370"></a>        },
+<a id="L371"></a>        .stored_block =&gt; |remaining_len| {
+<a id="L372"></a>            const out: []u8 = if (remaining != 0)
+<a id="L373"></a>                try w.writableSliceGreedyPreserve(flate.history_len, 1)
+<a id="L374"></a>            else
+<a id="L375"></a>                &amp;.{};
+<a id="L376"></a>            var limited_out: [1][]u8 = .{limit.min(.limited(remaining_len)).slice(out)};
+<a id="L377"></a>            const n = try in.readVec(&amp;limited_out);
+<a id="L378"></a>            if (remaining_len - n == 0) {
+<a id="L379"></a>                d.state = if (d.final_block) .protocol_footer else .block_header;
+<a id="L380"></a>            } else {
+<a id="L381"></a>                d.state = .{ .stored_block = @intCast(remaining_len - n) };
+<a id="L382"></a>            }
+<a id="L383"></a>            w.advance(n);
+<a id="L384"></a>            return @intFromEnum(limit) - remaining + n;
+<a id="L385"></a>        },
+<a id="L386"></a>        .fixed_block =&gt; while (true) {
+<a id="L387"></a>            // Consume bytes
+<a id="L388"></a>            const sym = try d.readFixedCode();
+<a id="L389"></a>
+<a id="L390"></a>            if (sym &gt;= 256) {
+<a id="L391"></a>                @branchHint(.unlikely);
+<a id="L392"></a>
+<a id="L393"></a>                if (sym == 256) {
+<a id="L394"></a>                    @branchHint(.unlikely);
+<a id="L395"></a>                    // End
+<a id="L396"></a>                    d.state = if (d.final_block) .protocol_footer else .block_header;
+<a id="L397"></a>                    continue :sw d.state;
+<a id="L398"></a>                }
+<a id="L399"></a>
+<a id="L400"></a>                // Match
+<a id="L401"></a>                const length = try d.decodeLength(@intCast(sym - 257));
+<a id="L402"></a>                continue :sw .{ .fixed_block_match = length };
+<a id="L403"></a>            }
+<a id="L404"></a>
+<a id="L405"></a>            const byte: u8 = @intCast(sym);
+<a id="L406"></a>            if (remaining != 0) {
+<a id="L407"></a>                @branchHint(.likely);
+<a id="L408"></a>                remaining -= 1;
+<a id="L409"></a>                try w.writeBytePreserve(flate.history_len, byte);
+<a id="L410"></a>            } else {
+<a id="L411"></a>                d.state = .{ .fixed_block_literal = byte };
+<a id="L412"></a>                return @intFromEnum(limit) - remaining;
+<a id="L413"></a>            }
+<a id="L414"></a>        },
+<a id="L415"></a>        .fixed_block_literal =&gt; |symbol| {
+<a id="L416"></a>            assert(remaining != 0);
+<a id="L417"></a>            remaining -= 1;
+<a id="L418"></a>            try w.writeBytePreserve(flate.history_len, symbol);
+<a id="L419"></a>            continue :sw .fixed_block;
+<a id="L420"></a>        },
+<a id="L421"></a>        .fixed_block_match =&gt; |length| {
+<a id="L422"></a>            if (remaining &gt;= length) {
+<a id="L423"></a>                @branchHint(.likely);
+<a id="L424"></a>                const distance = try d.decodeDistance(@bitReverse(try d.takeIntBits(u5)));
+<a id="L425"></a>                try writeMatch(w, length, distance);
+<a id="L426"></a>                remaining -= length;
+<a id="L427"></a>                continue :sw .fixed_block;
+<a id="L428"></a>            } else {
+<a id="L429"></a>                d.state = .{ .fixed_block_match = length };
+<a id="L430"></a>                return @intFromEnum(limit) - remaining;
+<a id="L431"></a>            }
+<a id="L432"></a>        },
+<a id="L433"></a>        // In larger archives most blocks are usually dynamic, so
+<a id="L434"></a>        // decompression performance depends on this logic.
+<a id="L435"></a>        .dynamic_block =&gt; while (true) {
+<a id="L436"></a>            // Consume bytes
+<a id="L437"></a>            const sym = try d.decodeSymbol(&amp;d.lit_dec);
+<a id="L438"></a>
+<a id="L439"></a>            if (sym &gt;= 256) {
+<a id="L440"></a>                @branchHint(.unlikely);
+<a id="L441"></a>
+<a id="L442"></a>                if (sym == 256) {
+<a id="L443"></a>                    @branchHint(.unlikely);
+<a id="L444"></a>                    // End
+<a id="L445"></a>                    d.state = if (d.final_block) .protocol_footer else .block_header;
+<a id="L446"></a>                    continue :sw d.state;
+<a id="L447"></a>                }
+<a id="L448"></a>
+<a id="L449"></a>                // Match
+<a id="L450"></a>                const length = try d.decodeLength(@intCast(sym - 257));
+<a id="L451"></a>                continue :sw .{ .dynamic_block_match = length };
+<a id="L452"></a>            }
+<a id="L453"></a>
+<a id="L454"></a>            const byte: u8 = @intCast(sym);
+<a id="L455"></a>            if (remaining != 0) {
+<a id="L456"></a>                @branchHint(.likely);
+<a id="L457"></a>                remaining -= 1;
+<a id="L458"></a>                try w.writeBytePreserve(flate.history_len, byte);
+<a id="L459"></a>            } else {
+<a id="L460"></a>                d.state = .{ .dynamic_block_literal = byte };
+<a id="L461"></a>                return @intFromEnum(limit) - remaining;
+<a id="L462"></a>            }
+<a id="L463"></a>        },
+<a id="L464"></a>        .dynamic_block_literal =&gt; |symbol| {
+<a id="L465"></a>            assert(remaining != 0);
+<a id="L466"></a>            remaining -= 1;
+<a id="L467"></a>            try w.writeBytePreserve(flate.history_len, symbol);
+<a id="L468"></a>            continue :sw .dynamic_block;
+<a id="L469"></a>        },
+<a id="L470"></a>        .dynamic_block_match =&gt; |length| {
+<a id="L471"></a>            if (remaining &gt;= length) {
+<a id="L472"></a>                @branchHint(.likely);
+<a id="L473"></a>                remaining -= length;
+<a id="L474"></a>                const dsm = try d.decodeSymbol(&amp;d.dst_dec);
+<a id="L475"></a>                const distance = try d.decodeDistance(@intCast(dsm));
+<a id="L476"></a>                try writeMatch(w, length, distance);
+<a id="L477"></a>                continue :sw .dynamic_block;
+<a id="L478"></a>            } else {
+<a id="L479"></a>                d.state = .{ .dynamic_block_match = length };
+<a id="L480"></a>                return @intFromEnum(limit) - remaining;
+<a id="L481"></a>            }
+<a id="L482"></a>        },
+<a id="L483"></a>        .protocol_footer =&gt; {
+<a id="L484"></a>            d.alignBitsForward();
+<a id="L485"></a>            switch (d.container_metadata) {
+<a id="L486"></a>                .gzip =&gt; |*gzip| {
+<a id="L487"></a>                    gzip.crc = try in.takeInt(u32, .little);
+<a id="L488"></a>                    gzip.count = try in.takeInt(u32, .little);
+<a id="L489"></a>                },
+<a id="L490"></a>                .zlib =&gt; |*zlib| {
+<a id="L491"></a>                    zlib.adler = try in.takeInt(u32, .big);
+<a id="L492"></a>                },
+<a id="L493"></a>                .raw =&gt; {},
+<a id="L494"></a>            }
+<a id="L495"></a>            d.state = .end;
+<a id="L496"></a>            return @intFromEnum(limit) - remaining;
+<a id="L497"></a>        },
+<a id="L498"></a>        .end =&gt; return error.EndOfStream,
+<a id="L499"></a>    }
+<a id="L500"></a>}
+<a id="L501"></a>
+<a id="L502"></a>/// Write match (back-reference to the same data slice) starting at `distance`
+<a id="L503"></a>/// back from current write position, and `length` of bytes.
+<a id="L504"></a>fn writeMatch(w: *Writer, length: u16, distance: u16) !void {
+<a id="L505"></a>    if (w.end &lt; distance) return error.InvalidMatch;
+<a id="L506"></a>    assert(length &gt;= token.min_length);
+<a id="L507"></a>    assert(length &lt;= token.max_length);
+<a id="L508"></a>    assert(distance &gt;= token.min_distance);
+<a id="L509"></a>    assert(distance &lt;= token.max_distance);
+<a id="L510"></a>
+<a id="L511"></a>    // This is not a @memmove; it intentionally repeats patterns caused by
+<a id="L512"></a>    // iterating one byte at a time.
+<a id="L513"></a>    const dest = try w.writableSlicePreserve(flate.history_len, length);
+<a id="L514"></a>    const end = dest.ptr - w.buffer.ptr;
+<a id="L515"></a>    const src = w.buffer[end - distance ..][0..length];
+<a id="L516"></a>    if (distance &gt;= length) {
+<a id="L517"></a>        @memcpy(dest, src);
+<a id="L518"></a>    } else if (distance == 1) {
+<a id="L519"></a>        // Repeating copy of single byte
+<a id="L520"></a>        @memset(dest, src[0]);
+<a id="L521"></a>    } else {
+<a id="L522"></a>        // Repeating copy of multiple bytes
+<a id="L523"></a>        for (dest, src) |*d, s| d.* = s;
+<a id="L524"></a>    }
+<a id="L525"></a>}
+<a id="L526"></a>
+<a id="L527"></a>fn peekBits(d: *Decompress, n: u4) !u16 {
+<a id="L528"></a>    const bits = d.input.peekInt(u32, .little) catch |e| return switch (e) {
+<a id="L529"></a>        error.ReadFailed =&gt; error.ReadFailed,
+<a id="L530"></a>        error.EndOfStream =&gt; d.peekBitsEnding(n),
+<a id="L531"></a>    };
+<a id="L532"></a>    const mask = @shlExact(@as(u16, 1), n) - 1;
+<a id="L533"></a>    return @intCast((bits &gt;&gt; d.consumed_bits) &amp; mask);
+<a id="L534"></a>}
+<a id="L535"></a>
+<a id="L536"></a>fn peekBitsEnding(d: *Decompress, n: u4) !u16 {
+<a id="L537"></a>    @branchHint(.unlikely);
+<a id="L538"></a>
+<a id="L539"></a>    const left = d.input.buffered();
+<a id="L540"></a>    if (left.len * 8 - d.consumed_bits &lt; n) return error.EndOfStream;
+<a id="L541"></a>    const bits = std.mem.readVarInt(u32, left, .little);
+<a id="L542"></a>    const mask = @shlExact(@as(u16, 1), n) - 1;
+<a id="L543"></a>    return @intCast((bits &gt;&gt; d.consumed_bits) &amp; mask);
+<a id="L544"></a>}
+<a id="L545"></a>
+<a id="L546"></a>/// Safe only after `peekBits` has been called with a greater or equal `n` value.
+<a id="L547"></a>fn tossBits(d: *Decompress, n: u4) void {
+<a id="L548"></a>    d.input.toss((@as(u8, n) + d.consumed_bits) / 8);
+<a id="L549"></a>    d.consumed_bits +%= @truncate(n);
+<a id="L550"></a>}
+<a id="L551"></a>
+<a id="L552"></a>fn takeBits(d: *Decompress, n: u4) !u16 {
+<a id="L553"></a>    const bits = try d.peekBits(n);
+<a id="L554"></a>    d.tossBits(n);
+<a id="L555"></a>    return bits;
+<a id="L556"></a>}
+<a id="L557"></a>
+<a id="L558"></a>fn alignBitsForward(d: *Decompress) void {
+<a id="L559"></a>    d.input.toss(@intFromBool(d.consumed_bits != 0));
+<a id="L560"></a>    d.consumed_bits = 0;
+<a id="L561"></a>}
+<a id="L562"></a>
+<a id="L563"></a>fn peekBitsShort(d: *Decompress, n: u4) !u16 {
+<a id="L564"></a>    const bits = d.input.peekInt(u32, .little) catch |e| return switch (e) {
+<a id="L565"></a>        error.ReadFailed =&gt; error.ReadFailed,
+<a id="L566"></a>        error.EndOfStream =&gt; d.peekBitsShortEnding(n),
+<a id="L567"></a>    };
+<a id="L568"></a>    const mask = @shlExact(@as(u16, 1), n) - 1;
+<a id="L569"></a>    return @intCast((bits &gt;&gt; d.consumed_bits) &amp; mask);
+<a id="L570"></a>}
+<a id="L571"></a>
+<a id="L572"></a>fn peekBitsShortEnding(d: *Decompress, n: u4) !u16 {
+<a id="L573"></a>    @branchHint(.unlikely);
+<a id="L574"></a>
+<a id="L575"></a>    const left = d.input.buffered();
+<a id="L576"></a>    const bits = std.mem.readVarInt(u32, left, .little);
+<a id="L577"></a>    const mask = @shlExact(@as(u16, 1), n) - 1;
+<a id="L578"></a>    return @intCast((bits &gt;&gt; d.consumed_bits) &amp; mask);
+<a id="L579"></a>}
+<a id="L580"></a>
+<a id="L581"></a>fn tossBitsShort(d: *Decompress, n: u4) !void {
+<a id="L582"></a>    if (d.input.bufferedLen() * 8 + d.consumed_bits &lt; n) return error.EndOfStream;
+<a id="L583"></a>    d.tossBits(n);
+<a id="L584"></a>}
+<a id="L585"></a>
+<a id="L586"></a>fn takeIntBits(d: *Decompress, T: type) !T {
+<a id="L587"></a>    return @intCast(try d.takeBits(@bitSizeOf(T)));
+<a id="L588"></a>}
+<a id="L589"></a>
+<a id="L590"></a>fn peekIntBitsShort(d: *Decompress, T: type) !T {
+<a id="L591"></a>    return @intCast(try d.peekBitsShort(@bitSizeOf(T)));
+<a id="L592"></a>}
+<a id="L593"></a>
+<a id="L594"></a>/// Reads first 7 bits, and then maybe 1 or 2 more to get full 7,8 or 9 bit code.
+<a id="L595"></a>/// ref: https://datatracker.ietf.org/doc/html/rfc1951#page-12
+<a id="L596"></a>///         Lit Value    Bits        Codes
+<a id="L597"></a>///          ---------    ----        -----
+<a id="L598"></a>///            0 - 143     8          00110000 through
+<a id="L599"></a>///                                   10111111
+<a id="L600"></a>///          144 - 255     9          110010000 through
+<a id="L601"></a>///                                   111111111
+<a id="L602"></a>///          256 - 279     7          0000000 through
+<a id="L603"></a>///                                   0010111
+<a id="L604"></a>///          280 - 287     8          11000000 through
+<a id="L605"></a>///                                   11000111
+<a id="L606"></a>fn readFixedCode(d: *Decompress) !u16 {
+<a id="L607"></a>    const code7 = @bitReverse(try d.takeIntBits(u7));
+<a id="L608"></a>    return switch (code7) {
+<a id="L609"></a>        0...0b0010_111 =&gt; @as(u16, code7) + 256,
+<a id="L610"></a>        0b0010_111 + 1...0b1011_111 =&gt; (@as(u16, code7) &lt;&lt; 1) + @as(u16, try d.takeIntBits(u1)) - 0b0011_0000,
+<a id="L611"></a>        0b1011_111 + 1...0b1100_011 =&gt; (@as(u16, code7 - 0b1100000) &lt;&lt; 1) + try d.takeIntBits(u1) + 280,
+<a id="L612"></a>        else =&gt; (@as(u16, code7 - 0b1100_100) &lt;&lt; 2) + @as(u16, @bitReverse(try d.takeIntBits(u2))) + 144,
+<a id="L613"></a>    };
+<a id="L614"></a>}
+<a id="L615"></a>
+<a id="L616"></a>pub const Symbol = packed struct(u16) {
+<a id="L617"></a>    value: u12 = 0,
+<a id="L618"></a>    code_bits: u4 = 0, // number of bits in code 0-15
+<a id="L619"></a>};
+<a id="L620"></a>
+<a id="L621"></a>pub const LiteralDecoder = HuffmanDecoder(286, 15, 9);
+<a id="L622"></a>pub const DistanceDecoder = HuffmanDecoder(30, 15, 9);
+<a id="L623"></a>pub const CodegenDecoder = HuffmanDecoder(19, 7, 7);
+<a id="L624"></a>
+<a id="L625"></a>/// Creates huffman tree codes from list of code lengths (in `build`).
+<a id="L626"></a>///
+<a id="L627"></a>/// `find` then finds symbol for code bits. Code can be any length between 1 and
+<a id="L628"></a>/// 15 bits. When calling `find` we don't know how many bits will be used to
+<a id="L629"></a>/// find symbol. When symbol is returned it has code_bits field which defines
+<a id="L630"></a>/// how much we should advance in bit stream.
+<a id="L631"></a>///
+<a id="L632"></a>/// Lookup table is used to map 15 bit int to symbol. Same symbol is written
+<a id="L633"></a>/// many times in this table; 32K places for 286 (at most) symbols.
+<a id="L634"></a>/// Small lookup table is optimization for faster search.
+<a id="L635"></a>/// It is variation of the algorithm explained in [zlib](https://github.com/madler/zlib/blob/643e17b7498d12ab8d15565662880579692f769d/doc/algorithm.txt#L92)
+<a id="L636"></a>/// with difference that we here use statically allocated arrays.
+<a id="L637"></a>fn HuffmanDecoder(
+<a id="L638"></a>    comptime alphabet_size: u16,
+<a id="L639"></a>    comptime max_code_bits: u4,
+<a id="L640"></a>    comptime lookup_bits: u4,
+<a id="L641"></a>) type {
+<a id="L642"></a>    const lookup_shift = max_code_bits - lookup_bits;
+<a id="L643"></a>    const lookup_mask = (1 &lt;&lt; lookup_bits) - 1;
+<a id="L644"></a>
+<a id="L645"></a>    return struct {
+<a id="L646"></a>        // lookup table code -&gt; symbol
+<a id="L647"></a>        // for values with code_bits == 0, symbol is the index of the first node in linked
+<a id="L648"></a>        // if the index of the first node is 0xfff, it is an invalid code
+<a id="L649"></a>        lookup: [1 &lt;&lt; lookup_bits]Symbol = undefined,
+<a id="L650"></a>        linked: if (lookup_bits == max_code_bits) void else [alphabet_size]struct {
+<a id="L651"></a>            // sym.value is the next index in linked where the current index ends the chain
+<a id="L652"></a>            // the actual symbol is this nodes's index
+<a id="L653"></a>            sym: Symbol,
+<a id="L654"></a>            code: u16,
+<a id="L655"></a>        } = undefined,
+<a id="L656"></a>
+<a id="L657"></a>        const Self = @This();
+<a id="L658"></a>
+<a id="L659"></a>        fn reverseIdx(idx: usize) u16 {
+<a id="L660"></a>            return @bitReverse(@as(@Int(.unsigned, lookup_bits), @intCast(idx)));
+<a id="L661"></a>        }
+<a id="L662"></a>
+<a id="L663"></a>        /// Generates symbols and lookup tables from list of code lens for each symbol.
+<a id="L664"></a>        pub fn generate(self: *Self, lens: []const u4) !void {
+<a id="L665"></a>            try checkCompleteness(lens);
+<a id="L666"></a>
+<a id="L667"></a>            var buckets: [1 + @as(usize, max_code_bits)][alphabet_size]Symbol = undefined;
+<a id="L668"></a>            var bucket_len: [buckets.len]u16 = @splat(0);
+<a id="L669"></a>            for (0.., lens) |symbol, bits| {
+<a id="L670"></a>                buckets[bits][bucket_len[bits]] = .{
+<a id="L671"></a>                    .value = @intCast(symbol),
+<a id="L672"></a>                    .code_bits = bits,
+<a id="L673"></a>                };
+<a id="L674"></a>                bucket_len[bits] += 1;
+<a id="L675"></a>            }
+<a id="L676"></a>
+<a id="L677"></a>            var code: u16 = 0;
+<a id="L678"></a>            var idx: u16 = 0;
+<a id="L679"></a>            for (1..lookup_bits + 1) |bits| {
+<a id="L680"></a>                const inc = @as(u16, 1) &lt;&lt; @intCast(max_code_bits - bits);
+<a id="L681"></a>                for (buckets[bits][0..bucket_len[bits]]) |lookup_sym| {
+<a id="L682"></a>                    const next_code = code + inc;
+<a id="L683"></a>                    const next_idx = next_code &gt;&gt; lookup_shift;
+<a id="L684"></a>                    for (idx..next_idx) |i| {
+<a id="L685"></a>                        self.lookup[reverseIdx(i)] = lookup_sym;
+<a id="L686"></a>                    }
+<a id="L687"></a>                    code = next_code;
+<a id="L688"></a>                    idx = next_idx;
+<a id="L689"></a>                }
+<a id="L690"></a>            }
+<a id="L691"></a>            for (lookup_bits + 1..buckets.len) |bits| {
+<a id="L692"></a>                const inc = @as(u16, 1) &lt;&lt; @intCast(max_code_bits - bits);
+<a id="L693"></a>                for (buckets[bits][0..bucket_len[bits]]) |linked_sym| {
+<a id="L694"></a>                    const next_code = code + inc;
+<a id="L695"></a>                    const next_idx = next_code &gt;&gt; lookup_shift;
+<a id="L696"></a>
+<a id="L697"></a>                    const ri = reverseIdx(idx);
+<a id="L698"></a>                    const next: Symbol = .{
+<a id="L699"></a>                        .value = self.lookup[ri].value,
+<a id="L700"></a>                        .code_bits = linked_sym.code_bits,
+<a id="L701"></a>                    };
+<a id="L702"></a>                    self.linked[linked_sym.value] = .{
+<a id="L703"></a>                        .sym = next,
+<a id="L704"></a>                        .code = @bitReverse(@as(@Int(.unsigned, max_code_bits), @intCast(code))),
+<a id="L705"></a>                    };
+<a id="L706"></a>                    self.lookup[ri] = .{ .value = linked_sym.value, .code_bits = 0 };
+<a id="L707"></a>
+<a id="L708"></a>                    code = next_code;
+<a id="L709"></a>                    idx = next_idx;
+<a id="L710"></a>                }
+<a id="L711"></a>            }
+<a id="L712"></a>
+<a id="L713"></a>            // Invalid codes
+<a id="L714"></a>            for (idx..self.lookup.len) |i| {
+<a id="L715"></a>                self.lookup[reverseIdx(i)] = .{ .value = 0xfff, .code_bits = 0 };
+<a id="L716"></a>            }
+<a id="L717"></a>        }
+<a id="L718"></a>
+<a id="L719"></a>        /// Given the list of code lengths check that it represents a canonical
+<a id="L720"></a>        /// Huffman code for n symbols.
+<a id="L721"></a>        ///
+<a id="L722"></a>        /// Reference: https://github.com/madler/zlib/blob/5c42a230b7b468dff011f444161c0145b5efae59/contrib/puff/puff.c#L340
+<a id="L723"></a>        fn checkCompleteness(lens: []const u4) !void {
+<a id="L724"></a>            if (alphabet_size == 286)
+<a id="L725"></a>                if (lens[256] == 0) return error.MissingEndOfBlockCode;
+<a id="L726"></a>
+<a id="L727"></a>            var count = [_]u16{0} ** (@as(usize, max_code_bits) + 1);
+<a id="L728"></a>            var max: usize = 0;
+<a id="L729"></a>            for (lens) |n| {
+<a id="L730"></a>                if (n == 0) continue;
+<a id="L731"></a>                if (n &gt; max) max = n;
+<a id="L732"></a>                count[n] += 1;
+<a id="L733"></a>            }
+<a id="L734"></a>            if (max == 0) // empty tree
+<a id="L735"></a>                return;
+<a id="L736"></a>
+<a id="L737"></a>            // check for an over-subscribed or incomplete set of lengths
+<a id="L738"></a>            var left: usize = 1; // one possible code of zero length
+<a id="L739"></a>            for (1..count.len) |len| {
+<a id="L740"></a>                left &lt;&lt;= 1; // one more bit, double codes left
+<a id="L741"></a>                if (count[len] &gt; left)
+<a id="L742"></a>                    return error.OversubscribedHuffmanTree;
+<a id="L743"></a>                left -= count[len]; // deduct count from possible codes
+<a id="L744"></a>            }
+<a id="L745"></a>            if (left &gt; 0) { // left &gt; 0 means incomplete
+<a id="L746"></a>                // incomplete code ok only for single length 1 code
+<a id="L747"></a>                if (max_code_bits &gt; 7 and max == count[0] + count[1]) return;
+<a id="L748"></a>                return error.IncompleteHuffmanTree;
+<a id="L749"></a>            }
+<a id="L750"></a>        }
+<a id="L751"></a>
+<a id="L752"></a>        /// Finds symbol for lookup table code.
+<a id="L753"></a>        pub fn find(self: *Self, code: u16) !Symbol {
+<a id="L754"></a>            // try to find in lookup table
+<a id="L755"></a>            const idx = code &amp; lookup_mask;
+<a id="L756"></a>            const sym = self.lookup[idx];
+<a id="L757"></a>            if (sym.code_bits != 0) return sym;
+<a id="L758"></a>            // if not use linked list of symbols with same prefix
+<a id="L759"></a>            return self.findLinked(code, sym.value);
+<a id="L760"></a>        }
+<a id="L761"></a>
+<a id="L762"></a>        fn findLinked(self: *Self, code: u16, start: u16) !Symbol {
+<a id="L763"></a>            if (start == 0xfff) return error.InvalidCode;
+<a id="L764"></a>            if (lookup_bits == max_code_bits) unreachable;
+<a id="L765"></a>            var pos = start;
+<a id="L766"></a>            while (true) {
+<a id="L767"></a>                const node = self.linked[pos];
+<a id="L768"></a>                const shift = -%node.sym.code_bits;
+<a id="L769"></a>                // compare code_bits number of upper bits
+<a id="L770"></a>                if ((code ^ node.code) &lt;&lt; shift == 0)
+<a id="L771"></a>                    return .{ .value = @intCast(pos), .code_bits = node.sym.code_bits };
+<a id="L772"></a>                pos = node.sym.value;
+<a id="L773"></a>            }
+<a id="L774"></a>        }
+<a id="L775"></a>    };
+<a id="L776"></a>}
+<a id="L777"></a>
+<a id="L778"></a>test "init/find" {
+<a id="L779"></a>    // example data from: https://youtu.be/SJPvNi4HrWQ?t=8423
+<a id="L780"></a>    const code_lens = [_]u4{ 4, 3, 0, 2, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 3, 2 };
+<a id="L781"></a>    var h: CodegenDecoder = .{};
+<a id="L782"></a>    try h.generate(&amp;code_lens);
+<a id="L783"></a>
+<a id="L784"></a>    // All possible codes for each symbol.
+<a id="L785"></a>    // Lookup table has 126 elements, to cover all possible 7 bit codes.
+<a id="L786"></a>    for (0b0000_000..0b0100_000) |c| // 0..32 (32)
+<a id="L787"></a>        try testing.expectEqual(
+<a id="L788"></a>            Symbol{ .value = 3, .code_bits = 2 },
+<a id="L789"></a>            try h.find(@bitReverse(@as(u7, @intCast(c)))),
+<a id="L790"></a>        );
+<a id="L791"></a>
+<a id="L792"></a>    for (0b0100_000..0b1000_000) |c| // 32..64 (32)
+<a id="L793"></a>        try testing.expectEqual(
+<a id="L794"></a>            Symbol{ .value = 18, .code_bits = 2 },
+<a id="L795"></a>            try h.find(@bitReverse(@as(u7, @intCast(c)))),
+<a id="L796"></a>        );
+<a id="L797"></a>
+<a id="L798"></a>    for (0b1000_000..0b1010_000) |c| // 64..80 (16)
+<a id="L799"></a>        try testing.expectEqual(
+<a id="L800"></a>            Symbol{ .value = 1, .code_bits = 3 },
+<a id="L801"></a>            try h.find(@bitReverse(@as(u7, @intCast(c)))),
+<a id="L802"></a>        );
+<a id="L803"></a>
+<a id="L804"></a>    for (0b1010_000..0b1100_000) |c| // 80..96 (16)
+<a id="L805"></a>        try testing.expectEqual(
+<a id="L806"></a>            Symbol{ .value = 4, .code_bits = 3 },
+<a id="L807"></a>            try h.find(@bitReverse(@as(u7, @intCast(c)))),
+<a id="L808"></a>        );
+<a id="L809"></a>
+<a id="L810"></a>    for (0b1100_000..0b1110_000) |c| // 96..112 (16)
+<a id="L811"></a>        try testing.expectEqual(
+<a id="L812"></a>            Symbol{ .value = 17, .code_bits = 3 },
+<a id="L813"></a>            try h.find(@bitReverse(@as(u7, @intCast(c)))),
+<a id="L814"></a>        );
+<a id="L815"></a>
+<a id="L816"></a>    for (0b1110_000..0b1111_000) |c| // 112..120 (8)
+<a id="L817"></a>        try testing.expectEqual(
+<a id="L818"></a>            Symbol{ .value = 0, .code_bits = 4 },
+<a id="L819"></a>            try h.find(@bitReverse(@as(u7, @intCast(c)))),
+<a id="L820"></a>        );
+<a id="L821"></a>
+<a id="L822"></a>    for (0b1111_000..0b1_0000_000) |c| // 120...128 (8)
+<a id="L823"></a>        try testing.expectEqual(
+<a id="L824"></a>            Symbol{ .value = 16, .code_bits = 4 },
+<a id="L825"></a>            try h.find(@bitReverse(@as(u7, @intCast(c)))),
+<a id="L826"></a>        );
+<a id="L827"></a>}
+<a id="L828"></a>
+<a id="L829"></a>test "encode/decode literals" {
+<a id="L830"></a>    // Check that the example in RFC 1951 section 3.2.2 works (plus some zeroes)
+<a id="L831"></a>    const max_bits = 5;
+<a id="L832"></a>    var decoder: HuffmanDecoder(16, max_bits, 3) = .{};
+<a id="L833"></a>    try decoder.generate(&amp;.{ 3, 3, 3, 3, 0, 0, 3, 2, 4, 4 });
+<a id="L834"></a>
+<a id="L835"></a>    inline for (0.., .{
+<a id="L836"></a>        @as(u3, 0b010),
+<a id="L837"></a>        @as(u3, 0b011),
+<a id="L838"></a>        @as(u3, 0b100),
+<a id="L839"></a>        @as(u3, 0b101),
+<a id="L840"></a>        @as(u0, 0),
+<a id="L841"></a>        @as(u0, 0),
+<a id="L842"></a>        @as(u3, 0b110),
+<a id="L843"></a>        @as(u2, 0b00),
+<a id="L844"></a>        @as(u4, 0b1110),
+<a id="L845"></a>        @as(u4, 0b1111),
+<a id="L846"></a>    }) |i, code| {
+<a id="L847"></a>        const bits = @bitSizeOf(@TypeOf(code));
+<a id="L848"></a>        if (bits == 0) continue;
+<a id="L849"></a>        for (0..1 &lt;&lt; (max_bits - bits)) |extra| {
+<a id="L850"></a>            const full = (@as(u16, code) &lt;&lt; (max_bits - bits)) | @as(u16, @intCast(extra));
+<a id="L851"></a>            const symbol = try decoder.find(@bitReverse(@as(u5, @intCast(full))));
+<a id="L852"></a>            try testing.expectEqual(i, symbol.value);
+<a id="L853"></a>            try testing.expectEqual(bits, symbol.code_bits);
+<a id="L854"></a>        }
+<a id="L855"></a>    }
+<a id="L856"></a>}
+<a id="L857"></a>
+<a id="L858"></a>test "non compressed block (type 0)" {
+<a id="L859"></a>    try testDecompress(.raw, &amp;[_]u8{
+<a id="L860"></a>        0b0000_0001, 0b0000_1100, 0x00, 0b1111_0011, 0xff, // deflate fixed buffer header len, nlen
+<a id="L861"></a>        'H', 'e', 'l', 'l', 'o', ' ', 'w', 'o', 'r', 'l', 'd', 0x0a, // non compressed data
+<a id="L862"></a>    }, "Hello world\n");
+<a id="L863"></a>}
+<a id="L864"></a>
+<a id="L865"></a>test "fixed code block (type 1)" {
+<a id="L866"></a>    try testDecompress(.raw, &amp;[_]u8{
+<a id="L867"></a>        0xf3, 0x48, 0xcd, 0xc9, 0xc9, 0x57, 0x28, 0xcf, // deflate data block type 1
+<a id="L868"></a>        0x2f, 0xca, 0x49, 0xe1, 0x02, 0x00,
+<a id="L869"></a>    }, "Hello world\n");
+<a id="L870"></a>}
+<a id="L871"></a>
+<a id="L872"></a>test "dynamic block (type 2)" {
+<a id="L873"></a>    try testDecompress(.raw, &amp;[_]u8{
+<a id="L874"></a>        0x3d, 0xc6, 0x39, 0x11, 0x00, 0x00, 0x0c, 0x02, // deflate data block type 2
+<a id="L875"></a>        0x30, 0x2b, 0xb5, 0x52, 0x1e, 0xff, 0x96, 0x38,
+<a id="L876"></a>        0x16, 0x96, 0x5c, 0x1e, 0x94, 0xcb, 0x6d, 0x01,
+<a id="L877"></a>    }, "ABCDEABCD ABCDEABCD");
+<a id="L878"></a>}
+<a id="L879"></a>
+<a id="L880"></a>test "gzip non compressed block (type 0)" {
+<a id="L881"></a>    try testDecompress(.gzip, &amp;[_]u8{
+<a id="L882"></a>        0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, // gzip header (10 bytes)
+<a id="L883"></a>        0b0000_0001, 0b0000_1100, 0x00, 0b1111_0011, 0xff, // deflate fixed buffer header len, nlen
+<a id="L884"></a>        'H', 'e', 'l', 'l', 'o', ' ', 'w', 'o', 'r', 'l', 'd', 0x0a, // non compressed data
+<a id="L885"></a>        0xd5, 0xe0, 0x39, 0xb7, // gzip footer: checksum
+<a id="L886"></a>        0x0c, 0x00, 0x00, 0x00, // gzip footer: size
+<a id="L887"></a>    }, "Hello world\n");
+<a id="L888"></a>}
+<a id="L889"></a>
+<a id="L890"></a>test "gzip fixed code block (type 1)" {
+<a id="L891"></a>    try testDecompress(.gzip, &amp;[_]u8{
+<a id="L892"></a>        0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x03, // gzip header (10 bytes)
+<a id="L893"></a>        0xf3, 0x48, 0xcd, 0xc9, 0xc9, 0x57, 0x28, 0xcf, // deflate data block type 1
+<a id="L894"></a>        0x2f, 0xca, 0x49, 0xe1, 0x02, 0x00,
+<a id="L895"></a>        0xd5, 0xe0, 0x39, 0xb7, 0x0c, 0x00, 0x00, 0x00, // gzip footer (chksum, len)
+<a id="L896"></a>    }, "Hello world\n");
+<a id="L897"></a>}
+<a id="L898"></a>
+<a id="L899"></a>test "gzip dynamic block (type 2)" {
+<a id="L900"></a>    try testDecompress(.gzip, &amp;[_]u8{
+<a id="L901"></a>        0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, // gzip header (10 bytes)
+<a id="L902"></a>        0x3d, 0xc6, 0x39, 0x11, 0x00, 0x00, 0x0c, 0x02, // deflate data block type 2
+<a id="L903"></a>        0x30, 0x2b, 0xb5, 0x52, 0x1e, 0xff, 0x96, 0x38,
+<a id="L904"></a>        0x16, 0x96, 0x5c, 0x1e, 0x94, 0xcb, 0x6d, 0x01,
+<a id="L905"></a>        0x17, 0x1c, 0x39, 0xb4, 0x13, 0x00, 0x00, 0x00, // gzip footer (chksum, len)
+<a id="L906"></a>    }, "ABCDEABCD ABCDEABCD");
+<a id="L907"></a>}
+<a id="L908"></a>
+<a id="L909"></a>test "gzip header with name" {
+<a id="L910"></a>    try testDecompress(.gzip, &amp;[_]u8{
+<a id="L911"></a>        0x1f, 0x8b, 0x08, 0x08, 0xe5, 0x70, 0xb1, 0x65, 0x00, 0x03, 0x68, 0x65, 0x6c, 0x6c, 0x6f, 0x2e,
+<a id="L912"></a>        0x74, 0x78, 0x74, 0x00, 0xf3, 0x48, 0xcd, 0xc9, 0xc9, 0x57, 0x28, 0xcf, 0x2f, 0xca, 0x49, 0xe1,
+<a id="L913"></a>        0x02, 0x00, 0xd5, 0xe0, 0x39, 0xb7, 0x0c, 0x00, 0x00, 0x00,
+<a id="L914"></a>    }, "Hello world\n");
+<a id="L915"></a>}
+<a id="L916"></a>
+<a id="L917"></a>test "zlib decompress non compressed block (type 0)" {
+<a id="L918"></a>    try testDecompress(.zlib, &amp;[_]u8{
+<a id="L919"></a>        0x78, 0b10_0_11100, // zlib header (2 bytes)
+<a id="L920"></a>        0b0000_0001, 0b0000_1100, 0x00, 0b1111_0011, 0xff, // deflate fixed buffer header len, nlen
+<a id="L921"></a>        'H', 'e', 'l', 'l', 'o', ' ', 'w', 'o', 'r', 'l', 'd', 0x0a, // non compressed data
+<a id="L922"></a>        0x1c, 0xf2, 0x04, 0x47, // zlib footer: checksum
+<a id="L923"></a>    }, "Hello world\n");
+<a id="L924"></a>}
+<a id="L925"></a>
+<a id="L926"></a>test "failing end-of-stream" {
+<a id="L927"></a>    try testFailure(.raw, @embedFile("testdata/fuzz/end-of-stream.input"), error.EndOfStream);
+<a id="L928"></a>}
+<a id="L929"></a>test "failing invalid-distance" {
+<a id="L930"></a>    try testFailure(.raw, @embedFile("testdata/fuzz/invalid-distance.input"), error.InvalidMatch);
+<a id="L931"></a>}
+<a id="L932"></a>test "failing invalid-tree01" {
+<a id="L933"></a>    try testFailure(.raw, @embedFile("testdata/fuzz/invalid-tree01.input"), error.IncompleteHuffmanTree);
+<a id="L934"></a>}
+<a id="L935"></a>test "failing invalid-tree02" {
+<a id="L936"></a>    try testFailure(.raw, @embedFile("testdata/fuzz/invalid-tree02.input"), error.IncompleteHuffmanTree);
+<a id="L937"></a>}
+<a id="L938"></a>test "failing invalid-tree03" {
+<a id="L939"></a>    try testFailure(.raw, @embedFile("testdata/fuzz/invalid-tree03.input"), error.IncompleteHuffmanTree);
+<a id="L940"></a>}
+<a id="L941"></a>test "failing lengths-overflow" {
+<a id="L942"></a>    try testFailure(.raw, @embedFile("testdata/fuzz/lengths-overflow.input"), error.InvalidDynamicBlockHeader);
+<a id="L943"></a>}
+<a id="L944"></a>test "failing out-of-codes" {
+<a id="L945"></a>    try testFailure(.raw, @embedFile("testdata/fuzz/out-of-codes.input"), error.InvalidCode);
+<a id="L946"></a>}
+<a id="L947"></a>test "failing puff01" {
+<a id="L948"></a>    try testFailure(.raw, @embedFile("testdata/fuzz/puff01.input"), error.WrongStoredBlockNlen);
+<a id="L949"></a>}
+<a id="L950"></a>test "failing puff02" {
+<a id="L951"></a>    try testFailure(.raw, @embedFile("testdata/fuzz/puff02.input"), error.EndOfStream);
+<a id="L952"></a>}
+<a id="L953"></a>test "failing puff04" {
+<a id="L954"></a>    try testFailure(.raw, @embedFile("testdata/fuzz/puff04.input"), error.InvalidCode);
+<a id="L955"></a>}
+<a id="L956"></a>test "failing puff05" {
+<a id="L957"></a>    try testFailure(.raw, @embedFile("testdata/fuzz/puff05.input"), error.EndOfStream);
+<a id="L958"></a>}
+<a id="L959"></a>test "failing puff06" {
+<a id="L960"></a>    try testFailure(.raw, @embedFile("testdata/fuzz/puff06.input"), error.EndOfStream);
+<a id="L961"></a>}
+<a id="L962"></a>test "failing puff08" {
+<a id="L963"></a>    try testFailure(.raw, @embedFile("testdata/fuzz/puff08.input"), error.InvalidCode);
+<a id="L964"></a>}
+<a id="L965"></a>test "failing puff10" {
+<a id="L966"></a>    try testFailure(.raw, @embedFile("testdata/fuzz/puff10.input"), error.InvalidCode);
+<a id="L967"></a>}
+<a id="L968"></a>test "failing puff11" {
+<a id="L969"></a>    try testFailure(.raw, @embedFile("testdata/fuzz/puff11.input"), error.InvalidMatch);
+<a id="L970"></a>}
+<a id="L971"></a>test "failing puff12" {
+<a id="L972"></a>    try testFailure(.raw, @embedFile("testdata/fuzz/puff12.input"), error.InvalidDynamicBlockHeader);
+<a id="L973"></a>}
+<a id="L974"></a>test "failing puff13" {
+<a id="L975"></a>    try testFailure(.raw, @embedFile("testdata/fuzz/puff13.input"), error.IncompleteHuffmanTree);
+<a id="L976"></a>}
+<a id="L977"></a>test "failing puff14" {
+<a id="L978"></a>    try testFailure(.raw, @embedFile("testdata/fuzz/puff14.input"), error.EndOfStream);
+<a id="L979"></a>}
+<a id="L980"></a>test "failing puff15" {
+<a id="L981"></a>    try testFailure(.raw, @embedFile("testdata/fuzz/puff15.input"), error.IncompleteHuffmanTree);
+<a id="L982"></a>}
+<a id="L983"></a>test "failing puff16" {
+<a id="L984"></a>    try testFailure(.raw, @embedFile("testdata/fuzz/puff16.input"), error.InvalidDynamicBlockHeader);
+<a id="L985"></a>}
+<a id="L986"></a>test "failing puff17" {
+<a id="L987"></a>    try testFailure(.raw, @embedFile("testdata/fuzz/puff17.input"), error.MissingEndOfBlockCode);
+<a id="L988"></a>}
+<a id="L989"></a>test "failing fuzz1" {
+<a id="L990"></a>    try testFailure(.raw, @embedFile("testdata/fuzz/fuzz1.input"), error.InvalidDynamicBlockHeader);
+<a id="L991"></a>}
+<a id="L992"></a>test "failing fuzz2" {
+<a id="L993"></a>    try testFailure(.raw, @embedFile("testdata/fuzz/fuzz2.input"), error.InvalidDynamicBlockHeader);
+<a id="L994"></a>}
+<a id="L995"></a>test "failing fuzz3" {
+<a id="L996"></a>    try testFailure(.raw, @embedFile("testdata/fuzz/fuzz3.input"), error.InvalidMatch);
+<a id="L997"></a>}
+<a id="L998"></a>test "failing fuzz4" {
+<a id="L999"></a>    try testFailure(.raw, @embedFile("testdata/fuzz/fuzz4.input"), error.OversubscribedHuffmanTree);
+<a id="L1000"></a>}
+<a id="L1001"></a>test "failing puff18" {
+<a id="L1002"></a>    try testFailure(.raw, @embedFile("testdata/fuzz/puff18.input"), error.OversubscribedHuffmanTree);
+<a id="L1003"></a>}
+<a id="L1004"></a>test "failing puff19" {
+<a id="L1005"></a>    try testFailure(.raw, @embedFile("testdata/fuzz/puff19.input"), error.OversubscribedHuffmanTree);
+<a id="L1006"></a>}
+<a id="L1007"></a>test "failing puff20" {
+<a id="L1008"></a>    try testFailure(.raw, @embedFile("testdata/fuzz/puff20.input"), error.OversubscribedHuffmanTree);
+<a id="L1009"></a>}
+<a id="L1010"></a>test "failing puff21" {
+<a id="L1011"></a>    try testFailure(.raw, @embedFile("testdata/fuzz/puff21.input"), error.OversubscribedHuffmanTree);
+<a id="L1012"></a>}
+<a id="L1013"></a>test "failing puff22" {
+<a id="L1014"></a>    try testFailure(.raw, @embedFile("testdata/fuzz/puff22.input"), error.OversubscribedHuffmanTree);
+<a id="L1015"></a>}
+<a id="L1016"></a>test "failing puff23" {
+<a id="L1017"></a>    try testFailure(.raw, @embedFile("testdata/fuzz/puff23.input"), error.OversubscribedHuffmanTree);
+<a id="L1018"></a>}
+<a id="L1019"></a>test "failing puff24" {
+<a id="L1020"></a>    try testFailure(.raw, @embedFile("testdata/fuzz/puff24.input"), error.IncompleteHuffmanTree);
+<a id="L1021"></a>}
+<a id="L1022"></a>test "failing puff25" {
+<a id="L1023"></a>    try testFailure(.raw, @embedFile("testdata/fuzz/puff25.input"), error.OversubscribedHuffmanTree);
+<a id="L1024"></a>}
+<a id="L1025"></a>test "failing puff26" {
+<a id="L1026"></a>    try testFailure(.raw, @embedFile("testdata/fuzz/puff26.input"), error.InvalidDynamicBlockHeader);
+<a id="L1027"></a>}
+<a id="L1028"></a>test "failing puff27" {
+<a id="L1029"></a>    try testFailure(.raw, @embedFile("testdata/fuzz/puff27.input"), error.InvalidDynamicBlockHeader);
+<a id="L1030"></a>}
+<a id="L1031"></a>
+<a id="L1032"></a>test "deflate-stream" {
+<a id="L1033"></a>    try testDecompress(
+<a id="L1034"></a>        .raw,
+<a id="L1035"></a>        @embedFile("testdata/fuzz/deflate-stream.input"),
+<a id="L1036"></a>        @embedFile("testdata/fuzz/deflate-stream.expect"),
+<a id="L1037"></a>    );
+<a id="L1038"></a>}
+<a id="L1039"></a>
+<a id="L1040"></a>test "empty-distance-alphabet01" {
+<a id="L1041"></a>    try testDecompress(.raw, @embedFile("testdata/fuzz/empty-distance-alphabet01.input"), "");
+<a id="L1042"></a>}
+<a id="L1043"></a>
+<a id="L1044"></a>test "empty-distance-alphabet02" {
+<a id="L1045"></a>    try testDecompress(.raw, @embedFile("testdata/fuzz/empty-distance-alphabet02.input"), "");
+<a id="L1046"></a>}
+<a id="L1047"></a>
+<a id="L1048"></a>test "puff03" {
+<a id="L1049"></a>    try testDecompress(.raw, @embedFile("testdata/fuzz/puff03.input"), &amp;.{0xa});
+<a id="L1050"></a>}
+<a id="L1051"></a>
+<a id="L1052"></a>test "puff09" {
+<a id="L1053"></a>    try testDecompress(.raw, @embedFile("testdata/fuzz/puff09.input"), "P");
+<a id="L1054"></a>}
+<a id="L1055"></a>
+<a id="L1056"></a>test "invalid block type" {
+<a id="L1057"></a>    try testFailure(.raw, &amp;[_]u8{0b110}, error.InvalidBlockType);
+<a id="L1058"></a>}
+<a id="L1059"></a>
+<a id="L1060"></a>test "bug 18966" {
+<a id="L1061"></a>    try testDecompress(
+<a id="L1062"></a>        .gzip,
+<a id="L1063"></a>        @embedFile("testdata/fuzz/bug_18966.input"),
+<a id="L1064"></a>        @embedFile("testdata/fuzz/bug_18966.expect"),
+<a id="L1065"></a>    );
+<a id="L1066"></a>}
+<a id="L1067"></a>
+<a id="L1068"></a>test "reading into empty buffer" {
+<a id="L1069"></a>    // Inspired by https://github.com/ziglang/zig/issues/19895
+<a id="L1070"></a>    const input = &amp;[_]u8{
+<a id="L1071"></a>        0b0000_0001, 0b0000_1100, 0x00, 0b1111_0011, 0xff, // deflate fixed buffer header len, nlen
+<a id="L1072"></a>        'H', 'e', 'l', 'l', 'o', ' ', 'w', 'o', 'r', 'l', 'd', 0x0a, // non compressed data
+<a id="L1073"></a>    };
+<a id="L1074"></a>    var in: Reader = .fixed(input);
+<a id="L1075"></a>    var decomp: Decompress = .init(&amp;in, .raw, &amp;.{});
+<a id="L1076"></a>    const r = &amp;decomp.reader;
+<a id="L1077"></a>    var bufs: [1][]u8 = .{&amp;.{}};
+<a id="L1078"></a>    try testing.expectEqual(0, try r.readVec(&amp;bufs));
+<a id="L1079"></a>}
+<a id="L1080"></a>
+<a id="L1081"></a>test "zlib header" {
+<a id="L1082"></a>    // Truncated header
+<a id="L1083"></a>    try testFailure(.zlib, &amp;[_]u8{0x78}, error.EndOfStream);
+<a id="L1084"></a>
+<a id="L1085"></a>    // Wrong CM
+<a id="L1086"></a>    try testFailure(.zlib, &amp;[_]u8{ 0x79, 0x94 }, error.BadZlibHeader);
+<a id="L1087"></a>
+<a id="L1088"></a>    // Wrong CINFO
+<a id="L1089"></a>    try testFailure(.zlib, &amp;[_]u8{ 0x88, 0x98 }, error.BadZlibHeader);
+<a id="L1090"></a>
+<a id="L1091"></a>    // Truncated checksum
+<a id="L1092"></a>    try testFailure(.zlib, &amp;[_]u8{ 0x78, 0xda, 0x03, 0x00, 0x00 }, error.EndOfStream);
+<a id="L1093"></a>}
+<a id="L1094"></a>
+<a id="L1095"></a>test "gzip header" {
+<a id="L1096"></a>    // Truncated header
+<a id="L1097"></a>    try testFailure(.gzip, &amp;[_]u8{ 0x1f, 0x8B }, error.EndOfStream);
+<a id="L1098"></a>
+<a id="L1099"></a>    // Wrong CM
+<a id="L1100"></a>    try testFailure(.gzip, &amp;[_]u8{
+<a id="L1101"></a>        0x1f, 0x8b, 0x09, 0x00, 0x00, 0x00, 0x00, 0x00,
+<a id="L1102"></a>        0x00, 0x03,
+<a id="L1103"></a>    }, error.BadGzipHeader);
+<a id="L1104"></a>
+<a id="L1105"></a>    // Truncated checksum
+<a id="L1106"></a>    try testFailure(.gzip, &amp;[_]u8{
+<a id="L1107"></a>        0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00,
+<a id="L1108"></a>        0x00, 0x03, 0x03, 0x00, 0x00, 0x00, 0x00,
+<a id="L1109"></a>    }, error.EndOfStream);
+<a id="L1110"></a>
+<a id="L1111"></a>    // Truncated initial size field
+<a id="L1112"></a>    try testFailure(.gzip, &amp;[_]u8{
+<a id="L1113"></a>        0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00,
+<a id="L1114"></a>        0x00, 0x03, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00,
+<a id="L1115"></a>        0x00, 0x00, 0x00,
+<a id="L1116"></a>    }, error.EndOfStream);
+<a id="L1117"></a>
+<a id="L1118"></a>    try testDecompress(.gzip, &amp;[_]u8{
+<a id="L1119"></a>        // GZIP header
+<a id="L1120"></a>        0x1f, 0x8b, 0x08, 0x12, 0x00, 0x09, 0x6e, 0x88, 0x00, 0xff, 0x48, 0x65, 0x6c, 0x6c, 0x6f, 0x00,
+<a id="L1121"></a>        // header.FHCRC (should cover entire header)
+<a id="L1122"></a>        0x99, 0xd6,
+<a id="L1123"></a>        // GZIP data
+<a id="L1124"></a>        0x01, 0x00, 0x00, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+<a id="L1125"></a>    }, "");
+<a id="L1126"></a>}
+<a id="L1127"></a>
+<a id="L1128"></a>test "zlib should not overshoot" {
+<a id="L1129"></a>    // Compressed zlib data with extra 4 bytes at the end.
+<a id="L1130"></a>    const data = [_]u8{
+<a id="L1131"></a>        0x78, 0x9c, 0x73, 0xce, 0x2f, 0xa8, 0x2c, 0xca, 0x4c, 0xcf, 0x28, 0x51, 0x08, 0xcf, 0xcc, 0xc9,
+<a id="L1132"></a>        0x49, 0xcd, 0x55, 0x28, 0x4b, 0xcc, 0x53, 0x08, 0x4e, 0xce, 0x48, 0xcc, 0xcc, 0xd6, 0x51, 0x08,
+<a id="L1133"></a>        0xce, 0xcc, 0x4b, 0x4f, 0x2c, 0xc8, 0x2f, 0x4a, 0x55, 0x30, 0xb4, 0xb4, 0x34, 0xd5, 0xb5, 0x34,
+<a id="L1134"></a>        0x03, 0x00, 0x8b, 0x61, 0x0f, 0xa4, 0x52, 0x5a, 0x94, 0x12,
+<a id="L1135"></a>    };
+<a id="L1136"></a>
+<a id="L1137"></a>    var reader: std.Io.Reader = .fixed(&amp;data);
+<a id="L1138"></a>
+<a id="L1139"></a>    var decompress_buffer: [flate.max_window_len]u8 = undefined;
+<a id="L1140"></a>    var decompress: Decompress = .init(&amp;reader, .zlib, &amp;decompress_buffer);
+<a id="L1141"></a>    var out: [128]u8 = undefined;
+<a id="L1142"></a>
+<a id="L1143"></a>    {
+<a id="L1144"></a>        const n = try decompress.reader.readSliceShort(&amp;out);
+<a id="L1145"></a>        try std.testing.expectEqual(46, n);
+<a id="L1146"></a>        try std.testing.expectEqualStrings("Copyright Willem van Schaik, Singapore 1995-96", out[0..n]);
+<a id="L1147"></a>    }
+<a id="L1148"></a>
+<a id="L1149"></a>    // 4 bytes after compressed chunk are available in reader.
+<a id="L1150"></a>    const n = try reader.readSliceShort(&amp;out);
+<a id="L1151"></a>    try std.testing.expectEqual(n, 4);
+<a id="L1152"></a>    try std.testing.expectEqualSlices(u8, data[data.len - 4 .. data.len], out[0..n]);
+<a id="L1153"></a>}
+<a id="L1154"></a>
+<a id="L1155"></a>fn testFailure(container: Container, in: []const u8, expected_err: anyerror) !void {
+<a id="L1156"></a>    var reader: Reader = .fixed(in);
+<a id="L1157"></a>    var aw: Writer.Allocating = .init(testing.allocator);
+<a id="L1158"></a>    defer aw.deinit();
+<a id="L1159"></a>
+<a id="L1160"></a>    var decompress: Decompress = .init(&amp;reader, container, &amp;.{});
+<a id="L1161"></a>    try testing.expectError(error.ReadFailed, decompress.reader.streamRemaining(&amp;aw.writer));
+<a id="L1162"></a>    try testing.expectEqual(expected_err, decompress.err orelse return error.TestFailed);
+<a id="L1163"></a>}
+<a id="L1164"></a>
+<a id="L1165"></a>fn testDecompress(container: Container, compressed: []const u8, expected_plain: []const u8) !void {
+<a id="L1166"></a>    var in: std.Io.Reader = .fixed(compressed);
+<a id="L1167"></a>    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+<a id="L1168"></a>    defer aw.deinit();
+<a id="L1169"></a>
+<a id="L1170"></a>    var decompress: Decompress = .init(&amp;in, container, &amp;.{});
+<a id="L1171"></a>    const decompressed_len = try decompress.reader.streamRemaining(&amp;aw.writer);
+<a id="L1172"></a>    try testing.expectEqual(expected_plain.len, decompressed_len);
+<a id="L1173"></a>    try testing.expectEqualSlices(u8, expected_plain, aw.written());
+<a id="L1174"></a>}
+</pre>
 </body>
 </html>

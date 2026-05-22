@@ -2,548 +2,551 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Source: zig-0.16.0-std/Build/abi.zig</title>
+    <title>Source: Build/abi.zig</title>
     <style>
         body { background: #1e1e1e; color: #d4d4d4; font-family: monospace; padding: 20px; }
         pre { white-space: pre-wrap; word-wrap: break-word; }
         .header { border-bottom: 1px solid #444; padding-bottom: 10px; margin-bottom: 20px; }
         a { color: #569cd6; }
+        a[id] { color: inherit; text-decoration: none; }
+        :target { background: #3a3a00; }
     </style>
 </head>
 <body>
     <div class="header">
-        <a href="/">Index</a> | <strong>File: zig-0.16.0-std/Build/abi.zig</strong>
+        <a href="/">Index</a> | <strong>File: Build/abi.zig</strong>
     </div>
-    <pre>//! This file is shared among Zig code running in wildly different contexts:
-//! * The build runner, running on the host computer
-//! * The build system web interface Wasm code, running in the browser
-//! * `libfuzzer`, compiled alongside unit tests
-//!
-//! All of these components interface to some degree via an ABI:
-//! * The build runner communicates with the web interface over a WebSocket connection
-//! * The build runner communicates with `libfuzzer` over a shared memory-mapped file
-const std = @import("std");
-
-// Check that no WebSocket message type has implicit padding bits. This ensures we never send any
-// undefined bits over the wire, and also helps validate that the layout doesn't differ between, for
-// instance, the web server in `std.Build` and the Wasm client.
-comptime {
-    const check = struct {
-        fn check(comptime T: type) void {
-            std.debug.assert(@typeInfo(T) == .@"struct");
-            std.debug.assert(@typeInfo(T).@"struct".layout == .@"extern");
-            std.debug.assert(std.meta.hasUniqueRepresentation(T));
-        }
-    }.check;
-
-    // server-&gt;client
-    check(Hello);
-    check(StatusUpdate);
-    check(StepUpdate);
-    check(fuzz.SourceIndexHeader);
-    check(fuzz.CoverageUpdateHeader);
-    check(fuzz.EntryPointHeader);
-    check(time_report.GenericResult);
-    check(time_report.CompileResult);
-
-    // client-&gt;server
-    check(Rebuild);
-}
-
-/// All WebSocket messages sent by the server to the client begin with a `ToClientTag` byte. This
-/// enum is non-exhaustive only to avoid Illegal Behavior when malformed messages are sent over the
-/// socket; unnamed tags are an error condition and should terminate the connection.
-///
-/// Every tag has a curresponding `extern struct` representing the full message (or a header of the
-/// message if it is variable-length). For instance, `.hello` corresponds to `Hello`.
-///
-/// When introducing a tag, make sure to add a corresponding `extern struct` whose first field is
-/// this enum, and `check` its layout in the `comptime` block above.
-pub const ToClientTag = enum(u8) {
-    hello,
-    status_update,
-    step_update,
-
-    // `--fuzz`
-    fuzz_source_index,
-    fuzz_coverage_update,
-    fuzz_entry_points,
-
-    // `--time-report`
-    time_report_generic_result,
-    time_report_compile_result,
-    time_report_run_test_result,
-
-    _,
-};
-
-/// Like `ToClientTag`, but for messages sent by the client to the server.
-pub const ToServerTag = enum(u8) {
-    rebuild,
-
-    _,
-};
-
-/// The current overall status of the build runner.
-/// Keep in sync with indices in web UI `main.js:updateBuildStatus`.
-pub const BuildStatus = enum(u8) {
-    idle,
-    watching,
-    running,
-    fuzz_init,
-};
-
-/// WebSocket server-&gt;client.
-///
-/// Sent by the server as the first message after a WebSocket connection opens to provide basic
-/// information about the server, the build graph, etc.
-///
-/// Trailing:
-/// * `step_name_len: u32` for each `steps_len`
-/// * `step_name: [step_name_len]u8` for each `step_name_len`
-/// * `step_status: u8` for every 4 `steps_len`; every 2 bits is a `StepUpdate.Status`, LSBs first
-pub const Hello = extern struct {
-    tag: ToClientTag = .hello,
-
-    status: BuildStatus,
-    flags: Flags,
-
-    /// Any message containing a timestamp represents it as a number of nanoseconds relative to when
-    /// the build began. This field is the current timestamp, represented in that form.
-    timestamp: i64 align(4),
-
-    /// The number of steps in the build graph which are reachable from the top-level step[s] being
-    /// run; in other words, the number of steps which will be executed by this build. The name of
-    /// each step trails this message.
-    steps_len: u32 align(1),
-
-    pub const Flags = packed struct(u16) {
-        /// Whether time reporting is enabled.
-        time_report: bool,
-        _: u15 = 0,
-    };
-};
-/// WebSocket server-&gt;client.
-///
-/// Indicates that the build status has changed.
-pub const StatusUpdate = extern struct {
-    tag: ToClientTag = .status_update,
-    new: BuildStatus,
-};
-/// WebSocket server-&gt;client.
-///
-/// Indicates a change in a step's status.
-pub const StepUpdate = extern struct {
-    tag: ToClientTag = .step_update,
-    step_idx: u32 align(1),
-    bits: packed struct(u8) {
-        status: Status,
-        _: u6 = 0,
-    },
-    /// Keep in sync with indices in web UI `main.js:updateStepStatus`.
-    pub const Status = enum(u2) {
-        pending,
-        wip,
-        success,
-        failure,
-    };
-};
-
-pub const Rebuild = extern struct {
-    tag: ToServerTag = .rebuild,
-};
-
-/// ABI bits specifically relating to the fuzzer interface.
-pub const fuzz = struct {
-    /// Returns if `error.SkipZigTest` was indicated
-    pub const TestOne = *const fn () callconv(.c) bool;
-
-    /// A unique value to identify the related requests across runs
-    pub const Uid = packed struct(u32) {
-        kind: enum(u1) { int, bytes },
-        hash: u31,
-
-        pub const hashmap_ctx = struct {
-            pub fn hash(_: @This(), u: Uid) u32 {
-                // We can ignore `kind` since `hash` should be unique regardless
-                return u.hash;
-            }
-
-            pub fn eql(_: @This(), a: Uid, b: Uid, _: usize) bool {
-                return a == b;
-            }
-        };
-    };
-
-    pub extern fn fuzzer_init(cache_dir_path: Slice) void;
-    /// `fuzzer_init` must be called first.
-    pub extern fn fuzzer_coverage() Coverage;
-    pub extern fn fuzzer_unslide_address(addr: usize) usize;
-
-    /// Performs all the fuzzing work and selects tests to run
-    ///
-    /// `fuzzer_init` must be called first.
-    pub extern fn fuzzer_main(
-        n_tests: u32,
-        seed: u32,
-        limit_kind: LimitKind,
-        amount_or_instance: u64,
-    ) void;
-    pub extern fn runner_test_run(i: u32) void;
-    pub extern fn runner_test_name(i: u32) Slice;
-    // Since the runner owns the `std.zig.Server` instance, it also controls the
-    // concurrent Io instance so reads can be canceled. As such, the fuzzer has
-    // to call into the runner for any zig server / concurrent operation.
-    pub extern fn runner_start_input_poller() void;
-    pub extern fn runner_stop_input_poller() void;
-    /// Returns if cancelation has been indicated.
-    pub extern fn runner_futex_wait(*const u32, expected: u32) bool;
-    pub extern fn runner_futex_wake(*const u32, waiters: u32) void;
-    pub extern fn runner_broadcast_input(test_i: u32, bytes: Slice) void;
-    /// `fuzzer_main` must be called first.
-    ///
-    /// Called concurrently with `fuzzer_main`. Returns if cancelation has been indicated.
-    pub extern fn fuzzer_receive_input(test_i: u32, bytes: Slice) bool;
-
-    /// Must be called from inside a test function
-    pub extern fn fuzzer_set_test(test_one: TestOne) void;
-    /// Must be called from inside a test function where `fuzzer_set_test` has been called first.
-    pub extern fn fuzzer_new_input(bytes: Slice) void;
-    /// Must be called from inside a test function where `fuzzer_set_test` has been called first.
-    pub extern fn fuzzer_start_test() void;
-
-    pub extern fn fuzzer_int(uid: Uid, weights: Weights) u64;
-    pub extern fn fuzzer_eos(uid: Uid, weights: Weights) bool;
-    pub extern fn fuzzer_bytes(uid: Uid, out: MutSlice, weights: Weights) void;
-    pub extern fn fuzzer_slice(
-        uid: Uid,
-        buf: MutSlice,
-        len_weights: Weights,
-        byte_weights: Weights,
-    ) u32;
-
-    pub const Slice = extern struct {
-        ptr: [*]const u8,
-        len: usize,
-
-        pub fn toSlice(s: Slice) []const u8 {
-            return s.ptr[0..s.len];
-        }
-
-        pub fn fromSlice(s: []const u8) Slice {
-            return .{ .ptr = s.ptr, .len = s.len };
-        }
-    };
-
-    pub const MutSlice = extern struct {
-        ptr: [*]u8,
-        len: usize,
-
-        pub fn toSlice(s: MutSlice) []u8 {
-            return s.ptr[0..s.len];
-        }
-
-        pub fn fromSlice(s: []u8) MutSlice {
-            return .{ .ptr = s.ptr, .len = s.len };
-        }
-    };
-
-    pub const Weights = extern struct {
-        ptr: [*]const Weight,
-        len: usize,
-
-        pub fn toSlice(s: Weights) []const Weight {
-            return s.ptr[0..s.len];
-        }
-
-        pub fn fromSlice(s: []const Weight) Weights {
-            return .{ .ptr = s.ptr, .len = s.len };
-        }
-    };
-
-    /// Increases the probability of values being selected by the fuzzer.
-    ///
-    /// `weight` applies to each value in the range (i.e. not evenly across
-    /// the range) and must be nonzero.
-    ///
-    /// In a set of weights, the total weight must not exceed 2^64 and be
-    /// nonzero.
-    pub const Weight = extern struct {
-        /// Inclusive
-        min: u64,
-        /// Inclusive
-        max: u64,
-        weight: u64,
-
-        /// `inline` to propogate comptimeness
-        inline fn intFromValue(x: anytype) u64 {
-            const T = @TypeOf(x);
-            return switch (@typeInfo(T)) {
-                .comptime_int =&gt; x,
-                .bool =&gt; @intFromBool(x),
-                .@"enum" =&gt; @intFromEnum(x),
-                else =&gt; @as(std.meta.Int(.unsigned, @bitSizeOf(T)), @bitCast(x)),
-
-                .int =&gt; |i| x: {
-                    comptime {
-                        if (i.signedness == .signed) {
-                            @compileError("type does not have a continous range: " ++ @typeName(T));
-                        }
-                        // Reject types that don't have a fixed bitsize (esp. usize)
-                        // since they are not gauraunteed to fit in a u64 across targets.
-                        //
-                        // std.mem.indexOfScalar is not used to avoid backward branches
-                        // and preserve the eval branch quota.
-                        if (T == usize or T == c_char or T == c_ushort or
-                            T == c_uint or T == c_ulong or T == c_ulonglong)
-                        {
-                            @compileError("type does not have a fixed bitsize: " ++ @typeName(T));
-                        }
-                    }
-                    break :x x;
-                },
-
-                .comptime_float,
-                .float,
-                =&gt; @compileError("type does not have a continous range: " ++ @typeName(T)),
-                .pointer =&gt; @compileError("type does not have a fixed bitsize: " ++ @typeName(T)),
-            };
-        }
-
-        /// `inline` to propogate comptimeness
-        pub inline fn value(T: type, x: T, weight: u64) Weight {
-            return .{ .min = intFromValue(x), .max = intFromValue(x), .weight = weight };
-        }
-
-        /// `inline` to propogate comptimeness
-        pub inline fn rangeAtMost(T: type, at_least: T, at_most: T, weight: u64) Weight {
-            std.debug.assert(intFromValue(at_least) &lt;= intFromValue(at_most));
-            return .{
-                .min = intFromValue(at_least),
-                .max = intFromValue(at_most),
-                .weight = weight,
-            };
-        }
-
-        /// `inline` to propogate comptimeness
-        pub inline fn rangeLessThan(T: type, at_least: T, less_than: T, weight: u64) Weight {
-            std.debug.assert(intFromValue(at_least) &lt; intFromValue(less_than));
-            return .{
-                .min = intFromValue(at_least),
-                .max = intFromValue(less_than) - 1,
-                .weight = weight,
-            };
-        }
-    };
-
-    pub const LimitKind = enum(u8) { forever, iterations };
-
-    /// libfuzzer uses this and its usize is the one that counts. To match the ABI,
-    /// make the ints be the size of the target used with libfuzzer.
-    ///
-    /// Trailing:
-    /// * 1 bit per pc_addr, usize elements
-    /// * pc_addr: usize for each pcs_len
-    pub const SeenPcsHeader = extern struct {
-        n_runs: usize,
-        unique_runs: usize,
-        pcs_len: usize,
-
-        /// Used for comptime assertions. Provides a mechanism for strategically
-        /// causing compile errors.
-        pub const trailing = .{
-            .pc_bits_usize,
-            .pc_addr,
-        };
-
-        pub fn headerEnd(header: *const SeenPcsHeader) []const usize {
-            const ptr: [*]align(@alignOf(usize)) const u8 = @ptrCast(header);
-            const header_end_ptr: [*]const usize = @ptrCast(ptr + @sizeOf(SeenPcsHeader));
-            const pcs_len = header.pcs_len;
-            return header_end_ptr[0 .. pcs_len + seenElemsLen(pcs_len)];
-        }
-
-        pub fn seenBits(header: *const SeenPcsHeader) []const usize {
-            return header.headerEnd()[0..seenElemsLen(header.pcs_len)];
-        }
-
-        pub fn seenElemsLen(pcs_len: usize) usize {
-            return (pcs_len + @bitSizeOf(usize) - 1) / @bitSizeOf(usize);
-        }
-
-        pub fn pcAddrs(header: *const SeenPcsHeader) []const usize {
-            const pcs_len = header.pcs_len;
-            return header.headerEnd()[seenElemsLen(pcs_len)..][0..pcs_len];
-        }
-    };
-
-    /// Fields are little-endian
-    pub const MmapInputHeader = extern struct {
-        pc_digest: u64 align(4), // aligned so header does not have padding
-        instance_id: u32,
-        test_i: u32,
-        len: u32,
-    };
-
-    /// WebSocket server-&gt;client.
-    ///
-    /// Sent once, when fuzzing starts, to indicate the available coverage data.
-    ///
-    /// Trailing:
-    /// * std.debug.Coverage.String for each directories_len
-    /// * std.debug.Coverage.File for each files_len
-    /// * std.debug.Coverage.SourceLocation for each source_locations_len
-    /// * u8 for each string_bytes_len
-    pub const SourceIndexHeader = extern struct {
-        tag: ToClientTag = .fuzz_source_index,
-        _: [3]u8 = @splat(0),
-        directories_len: u32,
-        files_len: u32,
-        source_locations_len: u32,
-        string_bytes_len: u32,
-        /// When, according to the server, fuzzing started.
-        start_timestamp: i64 align(4),
-        start_n_runs: u64 align(4),
-    };
-
-    /// WebSocket server-&gt;client.
-    ///
-    /// Sent whenever the set of covered source locations is updated.
-    ///
-    /// Trailing:
-    /// * one bit per source_locations_len, contained in u64 elements
-    pub const CoverageUpdateHeader = extern struct {
-        tag: ToClientTag = .fuzz_coverage_update,
-        _: [7]u8 = @splat(0),
-        n_runs: u64,
-        unique_runs: u64,
-
-        pub const trailing = .{
-            .pc_bits_usize,
-        };
-    };
-
-    /// WebSocket server-&gt;client.
-    ///
-    /// Sent whenever the set of entry points is updated.
-    ///
-    /// Trailing:
-    /// * one u32 index of source_locations per locsLen()
-    pub const EntryPointHeader = extern struct {
-        tag: ToClientTag = .fuzz_entry_points,
-        locs_len_raw: [3]u8,
-
-        pub fn locsLen(hdr: EntryPointHeader) u24 {
-            return @bitCast(hdr.locs_len_raw);
-        }
-        pub fn init(locs_len: u24) EntryPointHeader {
-            return .{ .locs_len_raw = @bitCast(locs_len) };
-        }
-    };
-
-    /// Sent by lib/fuzzer to test_runner to obtain information about the
-    /// active memory mapped input file and cumulative stats about previous
-    /// fuzzing runs.
-    pub const Coverage = extern struct {
-        id: u64,
-        runs: u64,
-        unique: u64,
-        seen: u64,
-    };
-};
-
-/// ABI bits specifically relating to the time report interface.
-pub const time_report = struct {
-    /// WebSocket server-&gt;client.
-    ///
-    /// Sent after a `Step` finishes, providing the time taken to execute the step.
-    pub const GenericResult = extern struct {
-        tag: ToClientTag = .time_report_generic_result,
-        step_idx: u32 align(1),
-        ns_total: u64 align(1),
-    };
-
-    /// WebSocket server-&gt;client.
-    ///
-    /// Sent after a `Step.Compile` finishes, providing the step's time report.
-    ///
-    /// Trailing:
-    /// * `llvm_pass_timings: [llvm_pass_timings_len]u8` (ASCII-encoded)
-    /// * for each `files_len`:
-    ///   * `name` (null-terminated UTF-8 string)
-    /// * for each `decls_len`:
-    ///   * `name` (null-terminated UTF-8 string)
-    ///   * `file: u32` (index of file this decl is in)
-    ///   * `sema_ns: u64` (nanoseconds spent semantically analyzing this decl)
-    ///   * `codegen_ns: u64` (nanoseconds spent semantically analyzing this decl)
-    ///   * `link_ns: u64` (nanoseconds spent semantically analyzing this decl)
-    pub const CompileResult = extern struct {
-        tag: ToClientTag = .time_report_compile_result,
-
-        step_idx: u32 align(1),
-
-        flags: Flags,
-        stats: Stats align(1),
-        ns_total: u64 align(1),
-
-        llvm_pass_timings_len: u32 align(1),
-        files_len: u32 align(1),
-        decls_len: u32 align(1),
-
-        pub const Flags = packed struct(u8) {
-            use_llvm: bool,
-            _: u7 = 0,
-        };
-
-        pub const Stats = extern struct {
-            n_reachable_files: u32,
-            n_imported_files: u32,
-            n_generic_instances: u32,
-            n_inline_calls: u32,
-
-            cpu_ns_parse: u64,
-            cpu_ns_astgen: u64,
-            cpu_ns_sema: u64,
-            cpu_ns_codegen: u64,
-            cpu_ns_link: u64,
-
-            real_ns_files: u64,
-            real_ns_decls: u64,
-            real_ns_llvm_emit: u64,
-            real_ns_link_flush: u64,
-
-            pub const init: Stats = .{
-                .n_reachable_files = 0,
-                .n_imported_files = 0,
-                .n_generic_instances = 0,
-                .n_inline_calls = 0,
-                .cpu_ns_parse = 0,
-                .cpu_ns_astgen = 0,
-                .cpu_ns_sema = 0,
-                .cpu_ns_codegen = 0,
-                .cpu_ns_link = 0,
-                .real_ns_files = 0,
-                .real_ns_decls = 0,
-                .real_ns_llvm_emit = 0,
-                .real_ns_link_flush = 0,
-            };
-        };
-    };
-
-    /// WebSocket server-&gt;client.
-    ///
-    /// Sent after a `Step.Run` for a Zig test executable finishes, providing the test's time report.
-    ///
-    /// Trailing:
-    /// * for each `tests_len`:
-    ///   * `test_ns: u64` (nanoseconds spent running this test)
-    /// * for each `tests_len`:
-    ///   * `name` (null-terminated UTF-8 string)
-    pub const RunTestResult = extern struct {
-        tag: ToClientTag = .time_report_run_test_result,
-        step_idx: u32 align(1),
-        tests_len: u32 align(1),
-    };
-};</pre>
+    <pre><a id="L1"></a>//! This file is shared among Zig code running in wildly different contexts:
+<a id="L2"></a>//! * The build runner, running on the host computer
+<a id="L3"></a>//! * The build system web interface Wasm code, running in the browser
+<a id="L4"></a>//! * `libfuzzer`, compiled alongside unit tests
+<a id="L5"></a>//!
+<a id="L6"></a>//! All of these components interface to some degree via an ABI:
+<a id="L7"></a>//! * The build runner communicates with the web interface over a WebSocket connection
+<a id="L8"></a>//! * The build runner communicates with `libfuzzer` over a shared memory-mapped file
+<a id="L9"></a>const std = @import("std");
+<a id="L10"></a>
+<a id="L11"></a>// Check that no WebSocket message type has implicit padding bits. This ensures we never send any
+<a id="L12"></a>// undefined bits over the wire, and also helps validate that the layout doesn't differ between, for
+<a id="L13"></a>// instance, the web server in `std.Build` and the Wasm client.
+<a id="L14"></a>comptime {
+<a id="L15"></a>    const check = struct {
+<a id="L16"></a>        fn check(comptime T: type) void {
+<a id="L17"></a>            std.debug.assert(@typeInfo(T) == .@"struct");
+<a id="L18"></a>            std.debug.assert(@typeInfo(T).@"struct".layout == .@"extern");
+<a id="L19"></a>            std.debug.assert(std.meta.hasUniqueRepresentation(T));
+<a id="L20"></a>        }
+<a id="L21"></a>    }.check;
+<a id="L22"></a>
+<a id="L23"></a>    // server-&gt;client
+<a id="L24"></a>    check(Hello);
+<a id="L25"></a>    check(StatusUpdate);
+<a id="L26"></a>    check(StepUpdate);
+<a id="L27"></a>    check(fuzz.SourceIndexHeader);
+<a id="L28"></a>    check(fuzz.CoverageUpdateHeader);
+<a id="L29"></a>    check(fuzz.EntryPointHeader);
+<a id="L30"></a>    check(time_report.GenericResult);
+<a id="L31"></a>    check(time_report.CompileResult);
+<a id="L32"></a>
+<a id="L33"></a>    // client-&gt;server
+<a id="L34"></a>    check(Rebuild);
+<a id="L35"></a>}
+<a id="L36"></a>
+<a id="L37"></a>/// All WebSocket messages sent by the server to the client begin with a `ToClientTag` byte. This
+<a id="L38"></a>/// enum is non-exhaustive only to avoid Illegal Behavior when malformed messages are sent over the
+<a id="L39"></a>/// socket; unnamed tags are an error condition and should terminate the connection.
+<a id="L40"></a>///
+<a id="L41"></a>/// Every tag has a curresponding `extern struct` representing the full message (or a header of the
+<a id="L42"></a>/// message if it is variable-length). For instance, `.hello` corresponds to `Hello`.
+<a id="L43"></a>///
+<a id="L44"></a>/// When introducing a tag, make sure to add a corresponding `extern struct` whose first field is
+<a id="L45"></a>/// this enum, and `check` its layout in the `comptime` block above.
+<a id="L46"></a>pub const ToClientTag = enum(u8) {
+<a id="L47"></a>    hello,
+<a id="L48"></a>    status_update,
+<a id="L49"></a>    step_update,
+<a id="L50"></a>
+<a id="L51"></a>    // `--fuzz`
+<a id="L52"></a>    fuzz_source_index,
+<a id="L53"></a>    fuzz_coverage_update,
+<a id="L54"></a>    fuzz_entry_points,
+<a id="L55"></a>
+<a id="L56"></a>    // `--time-report`
+<a id="L57"></a>    time_report_generic_result,
+<a id="L58"></a>    time_report_compile_result,
+<a id="L59"></a>    time_report_run_test_result,
+<a id="L60"></a>
+<a id="L61"></a>    _,
+<a id="L62"></a>};
+<a id="L63"></a>
+<a id="L64"></a>/// Like `ToClientTag`, but for messages sent by the client to the server.
+<a id="L65"></a>pub const ToServerTag = enum(u8) {
+<a id="L66"></a>    rebuild,
+<a id="L67"></a>
+<a id="L68"></a>    _,
+<a id="L69"></a>};
+<a id="L70"></a>
+<a id="L71"></a>/// The current overall status of the build runner.
+<a id="L72"></a>/// Keep in sync with indices in web UI `main.js:updateBuildStatus`.
+<a id="L73"></a>pub const BuildStatus = enum(u8) {
+<a id="L74"></a>    idle,
+<a id="L75"></a>    watching,
+<a id="L76"></a>    running,
+<a id="L77"></a>    fuzz_init,
+<a id="L78"></a>};
+<a id="L79"></a>
+<a id="L80"></a>/// WebSocket server-&gt;client.
+<a id="L81"></a>///
+<a id="L82"></a>/// Sent by the server as the first message after a WebSocket connection opens to provide basic
+<a id="L83"></a>/// information about the server, the build graph, etc.
+<a id="L84"></a>///
+<a id="L85"></a>/// Trailing:
+<a id="L86"></a>/// * `step_name_len: u32` for each `steps_len`
+<a id="L87"></a>/// * `step_name: [step_name_len]u8` for each `step_name_len`
+<a id="L88"></a>/// * `step_status: u8` for every 4 `steps_len`; every 2 bits is a `StepUpdate.Status`, LSBs first
+<a id="L89"></a>pub const Hello = extern struct {
+<a id="L90"></a>    tag: ToClientTag = .hello,
+<a id="L91"></a>
+<a id="L92"></a>    status: BuildStatus,
+<a id="L93"></a>    flags: Flags,
+<a id="L94"></a>
+<a id="L95"></a>    /// Any message containing a timestamp represents it as a number of nanoseconds relative to when
+<a id="L96"></a>    /// the build began. This field is the current timestamp, represented in that form.
+<a id="L97"></a>    timestamp: i64 align(4),
+<a id="L98"></a>
+<a id="L99"></a>    /// The number of steps in the build graph which are reachable from the top-level step[s] being
+<a id="L100"></a>    /// run; in other words, the number of steps which will be executed by this build. The name of
+<a id="L101"></a>    /// each step trails this message.
+<a id="L102"></a>    steps_len: u32 align(1),
+<a id="L103"></a>
+<a id="L104"></a>    pub const Flags = packed struct(u16) {
+<a id="L105"></a>        /// Whether time reporting is enabled.
+<a id="L106"></a>        time_report: bool,
+<a id="L107"></a>        _: u15 = 0,
+<a id="L108"></a>    };
+<a id="L109"></a>};
+<a id="L110"></a>/// WebSocket server-&gt;client.
+<a id="L111"></a>///
+<a id="L112"></a>/// Indicates that the build status has changed.
+<a id="L113"></a>pub const StatusUpdate = extern struct {
+<a id="L114"></a>    tag: ToClientTag = .status_update,
+<a id="L115"></a>    new: BuildStatus,
+<a id="L116"></a>};
+<a id="L117"></a>/// WebSocket server-&gt;client.
+<a id="L118"></a>///
+<a id="L119"></a>/// Indicates a change in a step's status.
+<a id="L120"></a>pub const StepUpdate = extern struct {
+<a id="L121"></a>    tag: ToClientTag = .step_update,
+<a id="L122"></a>    step_idx: u32 align(1),
+<a id="L123"></a>    bits: packed struct(u8) {
+<a id="L124"></a>        status: Status,
+<a id="L125"></a>        _: u6 = 0,
+<a id="L126"></a>    },
+<a id="L127"></a>    /// Keep in sync with indices in web UI `main.js:updateStepStatus`.
+<a id="L128"></a>    pub const Status = enum(u2) {
+<a id="L129"></a>        pending,
+<a id="L130"></a>        wip,
+<a id="L131"></a>        success,
+<a id="L132"></a>        failure,
+<a id="L133"></a>    };
+<a id="L134"></a>};
+<a id="L135"></a>
+<a id="L136"></a>pub const Rebuild = extern struct {
+<a id="L137"></a>    tag: ToServerTag = .rebuild,
+<a id="L138"></a>};
+<a id="L139"></a>
+<a id="L140"></a>/// ABI bits specifically relating to the fuzzer interface.
+<a id="L141"></a>pub const fuzz = struct {
+<a id="L142"></a>    /// Returns if `error.SkipZigTest` was indicated
+<a id="L143"></a>    pub const TestOne = *const fn () callconv(.c) bool;
+<a id="L144"></a>
+<a id="L145"></a>    /// A unique value to identify the related requests across runs
+<a id="L146"></a>    pub const Uid = packed struct(u32) {
+<a id="L147"></a>        kind: enum(u1) { int, bytes },
+<a id="L148"></a>        hash: u31,
+<a id="L149"></a>
+<a id="L150"></a>        pub const hashmap_ctx = struct {
+<a id="L151"></a>            pub fn hash(_: @This(), u: Uid) u32 {
+<a id="L152"></a>                // We can ignore `kind` since `hash` should be unique regardless
+<a id="L153"></a>                return u.hash;
+<a id="L154"></a>            }
+<a id="L155"></a>
+<a id="L156"></a>            pub fn eql(_: @This(), a: Uid, b: Uid, _: usize) bool {
+<a id="L157"></a>                return a == b;
+<a id="L158"></a>            }
+<a id="L159"></a>        };
+<a id="L160"></a>    };
+<a id="L161"></a>
+<a id="L162"></a>    pub extern fn fuzzer_init(cache_dir_path: Slice) void;
+<a id="L163"></a>    /// `fuzzer_init` must be called first.
+<a id="L164"></a>    pub extern fn fuzzer_coverage() Coverage;
+<a id="L165"></a>    pub extern fn fuzzer_unslide_address(addr: usize) usize;
+<a id="L166"></a>
+<a id="L167"></a>    /// Performs all the fuzzing work and selects tests to run
+<a id="L168"></a>    ///
+<a id="L169"></a>    /// `fuzzer_init` must be called first.
+<a id="L170"></a>    pub extern fn fuzzer_main(
+<a id="L171"></a>        n_tests: u32,
+<a id="L172"></a>        seed: u32,
+<a id="L173"></a>        limit_kind: LimitKind,
+<a id="L174"></a>        amount_or_instance: u64,
+<a id="L175"></a>    ) void;
+<a id="L176"></a>    pub extern fn runner_test_run(i: u32) void;
+<a id="L177"></a>    pub extern fn runner_test_name(i: u32) Slice;
+<a id="L178"></a>    // Since the runner owns the `std.zig.Server` instance, it also controls the
+<a id="L179"></a>    // concurrent Io instance so reads can be canceled. As such, the fuzzer has
+<a id="L180"></a>    // to call into the runner for any zig server / concurrent operation.
+<a id="L181"></a>    pub extern fn runner_start_input_poller() void;
+<a id="L182"></a>    pub extern fn runner_stop_input_poller() void;
+<a id="L183"></a>    /// Returns if cancelation has been indicated.
+<a id="L184"></a>    pub extern fn runner_futex_wait(*const u32, expected: u32) bool;
+<a id="L185"></a>    pub extern fn runner_futex_wake(*const u32, waiters: u32) void;
+<a id="L186"></a>    pub extern fn runner_broadcast_input(test_i: u32, bytes: Slice) void;
+<a id="L187"></a>    /// `fuzzer_main` must be called first.
+<a id="L188"></a>    ///
+<a id="L189"></a>    /// Called concurrently with `fuzzer_main`. Returns if cancelation has been indicated.
+<a id="L190"></a>    pub extern fn fuzzer_receive_input(test_i: u32, bytes: Slice) bool;
+<a id="L191"></a>
+<a id="L192"></a>    /// Must be called from inside a test function
+<a id="L193"></a>    pub extern fn fuzzer_set_test(test_one: TestOne) void;
+<a id="L194"></a>    /// Must be called from inside a test function where `fuzzer_set_test` has been called first.
+<a id="L195"></a>    pub extern fn fuzzer_new_input(bytes: Slice) void;
+<a id="L196"></a>    /// Must be called from inside a test function where `fuzzer_set_test` has been called first.
+<a id="L197"></a>    pub extern fn fuzzer_start_test() void;
+<a id="L198"></a>
+<a id="L199"></a>    pub extern fn fuzzer_int(uid: Uid, weights: Weights) u64;
+<a id="L200"></a>    pub extern fn fuzzer_eos(uid: Uid, weights: Weights) bool;
+<a id="L201"></a>    pub extern fn fuzzer_bytes(uid: Uid, out: MutSlice, weights: Weights) void;
+<a id="L202"></a>    pub extern fn fuzzer_slice(
+<a id="L203"></a>        uid: Uid,
+<a id="L204"></a>        buf: MutSlice,
+<a id="L205"></a>        len_weights: Weights,
+<a id="L206"></a>        byte_weights: Weights,
+<a id="L207"></a>    ) u32;
+<a id="L208"></a>
+<a id="L209"></a>    pub const Slice = extern struct {
+<a id="L210"></a>        ptr: [*]const u8,
+<a id="L211"></a>        len: usize,
+<a id="L212"></a>
+<a id="L213"></a>        pub fn toSlice(s: Slice) []const u8 {
+<a id="L214"></a>            return s.ptr[0..s.len];
+<a id="L215"></a>        }
+<a id="L216"></a>
+<a id="L217"></a>        pub fn fromSlice(s: []const u8) Slice {
+<a id="L218"></a>            return .{ .ptr = s.ptr, .len = s.len };
+<a id="L219"></a>        }
+<a id="L220"></a>    };
+<a id="L221"></a>
+<a id="L222"></a>    pub const MutSlice = extern struct {
+<a id="L223"></a>        ptr: [*]u8,
+<a id="L224"></a>        len: usize,
+<a id="L225"></a>
+<a id="L226"></a>        pub fn toSlice(s: MutSlice) []u8 {
+<a id="L227"></a>            return s.ptr[0..s.len];
+<a id="L228"></a>        }
+<a id="L229"></a>
+<a id="L230"></a>        pub fn fromSlice(s: []u8) MutSlice {
+<a id="L231"></a>            return .{ .ptr = s.ptr, .len = s.len };
+<a id="L232"></a>        }
+<a id="L233"></a>    };
+<a id="L234"></a>
+<a id="L235"></a>    pub const Weights = extern struct {
+<a id="L236"></a>        ptr: [*]const Weight,
+<a id="L237"></a>        len: usize,
+<a id="L238"></a>
+<a id="L239"></a>        pub fn toSlice(s: Weights) []const Weight {
+<a id="L240"></a>            return s.ptr[0..s.len];
+<a id="L241"></a>        }
+<a id="L242"></a>
+<a id="L243"></a>        pub fn fromSlice(s: []const Weight) Weights {
+<a id="L244"></a>            return .{ .ptr = s.ptr, .len = s.len };
+<a id="L245"></a>        }
+<a id="L246"></a>    };
+<a id="L247"></a>
+<a id="L248"></a>    /// Increases the probability of values being selected by the fuzzer.
+<a id="L249"></a>    ///
+<a id="L250"></a>    /// `weight` applies to each value in the range (i.e. not evenly across
+<a id="L251"></a>    /// the range) and must be nonzero.
+<a id="L252"></a>    ///
+<a id="L253"></a>    /// In a set of weights, the total weight must not exceed 2^64 and be
+<a id="L254"></a>    /// nonzero.
+<a id="L255"></a>    pub const Weight = extern struct {
+<a id="L256"></a>        /// Inclusive
+<a id="L257"></a>        min: u64,
+<a id="L258"></a>        /// Inclusive
+<a id="L259"></a>        max: u64,
+<a id="L260"></a>        weight: u64,
+<a id="L261"></a>
+<a id="L262"></a>        /// `inline` to propogate comptimeness
+<a id="L263"></a>        inline fn intFromValue(x: anytype) u64 {
+<a id="L264"></a>            const T = @TypeOf(x);
+<a id="L265"></a>            return switch (@typeInfo(T)) {
+<a id="L266"></a>                .comptime_int =&gt; x,
+<a id="L267"></a>                .bool =&gt; @intFromBool(x),
+<a id="L268"></a>                .@"enum" =&gt; @intFromEnum(x),
+<a id="L269"></a>                else =&gt; @as(std.meta.Int(.unsigned, @bitSizeOf(T)), @bitCast(x)),
+<a id="L270"></a>
+<a id="L271"></a>                .int =&gt; |i| x: {
+<a id="L272"></a>                    comptime {
+<a id="L273"></a>                        if (i.signedness == .signed) {
+<a id="L274"></a>                            @compileError("type does not have a continous range: " ++ @typeName(T));
+<a id="L275"></a>                        }
+<a id="L276"></a>                        // Reject types that don't have a fixed bitsize (esp. usize)
+<a id="L277"></a>                        // since they are not gauraunteed to fit in a u64 across targets.
+<a id="L278"></a>                        //
+<a id="L279"></a>                        // std.mem.indexOfScalar is not used to avoid backward branches
+<a id="L280"></a>                        // and preserve the eval branch quota.
+<a id="L281"></a>                        if (T == usize or T == c_char or T == c_ushort or
+<a id="L282"></a>                            T == c_uint or T == c_ulong or T == c_ulonglong)
+<a id="L283"></a>                        {
+<a id="L284"></a>                            @compileError("type does not have a fixed bitsize: " ++ @typeName(T));
+<a id="L285"></a>                        }
+<a id="L286"></a>                    }
+<a id="L287"></a>                    break :x x;
+<a id="L288"></a>                },
+<a id="L289"></a>
+<a id="L290"></a>                .comptime_float,
+<a id="L291"></a>                .float,
+<a id="L292"></a>                =&gt; @compileError("type does not have a continous range: " ++ @typeName(T)),
+<a id="L293"></a>                .pointer =&gt; @compileError("type does not have a fixed bitsize: " ++ @typeName(T)),
+<a id="L294"></a>            };
+<a id="L295"></a>        }
+<a id="L296"></a>
+<a id="L297"></a>        /// `inline` to propogate comptimeness
+<a id="L298"></a>        pub inline fn value(T: type, x: T, weight: u64) Weight {
+<a id="L299"></a>            return .{ .min = intFromValue(x), .max = intFromValue(x), .weight = weight };
+<a id="L300"></a>        }
+<a id="L301"></a>
+<a id="L302"></a>        /// `inline` to propogate comptimeness
+<a id="L303"></a>        pub inline fn rangeAtMost(T: type, at_least: T, at_most: T, weight: u64) Weight {
+<a id="L304"></a>            std.debug.assert(intFromValue(at_least) &lt;= intFromValue(at_most));
+<a id="L305"></a>            return .{
+<a id="L306"></a>                .min = intFromValue(at_least),
+<a id="L307"></a>                .max = intFromValue(at_most),
+<a id="L308"></a>                .weight = weight,
+<a id="L309"></a>            };
+<a id="L310"></a>        }
+<a id="L311"></a>
+<a id="L312"></a>        /// `inline` to propogate comptimeness
+<a id="L313"></a>        pub inline fn rangeLessThan(T: type, at_least: T, less_than: T, weight: u64) Weight {
+<a id="L314"></a>            std.debug.assert(intFromValue(at_least) &lt; intFromValue(less_than));
+<a id="L315"></a>            return .{
+<a id="L316"></a>                .min = intFromValue(at_least),
+<a id="L317"></a>                .max = intFromValue(less_than) - 1,
+<a id="L318"></a>                .weight = weight,
+<a id="L319"></a>            };
+<a id="L320"></a>        }
+<a id="L321"></a>    };
+<a id="L322"></a>
+<a id="L323"></a>    pub const LimitKind = enum(u8) { forever, iterations };
+<a id="L324"></a>
+<a id="L325"></a>    /// libfuzzer uses this and its usize is the one that counts. To match the ABI,
+<a id="L326"></a>    /// make the ints be the size of the target used with libfuzzer.
+<a id="L327"></a>    ///
+<a id="L328"></a>    /// Trailing:
+<a id="L329"></a>    /// * 1 bit per pc_addr, usize elements
+<a id="L330"></a>    /// * pc_addr: usize for each pcs_len
+<a id="L331"></a>    pub const SeenPcsHeader = extern struct {
+<a id="L332"></a>        n_runs: usize,
+<a id="L333"></a>        unique_runs: usize,
+<a id="L334"></a>        pcs_len: usize,
+<a id="L335"></a>
+<a id="L336"></a>        /// Used for comptime assertions. Provides a mechanism for strategically
+<a id="L337"></a>        /// causing compile errors.
+<a id="L338"></a>        pub const trailing = .{
+<a id="L339"></a>            .pc_bits_usize,
+<a id="L340"></a>            .pc_addr,
+<a id="L341"></a>        };
+<a id="L342"></a>
+<a id="L343"></a>        pub fn headerEnd(header: *const SeenPcsHeader) []const usize {
+<a id="L344"></a>            const ptr: [*]align(@alignOf(usize)) const u8 = @ptrCast(header);
+<a id="L345"></a>            const header_end_ptr: [*]const usize = @ptrCast(ptr + @sizeOf(SeenPcsHeader));
+<a id="L346"></a>            const pcs_len = header.pcs_len;
+<a id="L347"></a>            return header_end_ptr[0 .. pcs_len + seenElemsLen(pcs_len)];
+<a id="L348"></a>        }
+<a id="L349"></a>
+<a id="L350"></a>        pub fn seenBits(header: *const SeenPcsHeader) []const usize {
+<a id="L351"></a>            return header.headerEnd()[0..seenElemsLen(header.pcs_len)];
+<a id="L352"></a>        }
+<a id="L353"></a>
+<a id="L354"></a>        pub fn seenElemsLen(pcs_len: usize) usize {
+<a id="L355"></a>            return (pcs_len + @bitSizeOf(usize) - 1) / @bitSizeOf(usize);
+<a id="L356"></a>        }
+<a id="L357"></a>
+<a id="L358"></a>        pub fn pcAddrs(header: *const SeenPcsHeader) []const usize {
+<a id="L359"></a>            const pcs_len = header.pcs_len;
+<a id="L360"></a>            return header.headerEnd()[seenElemsLen(pcs_len)..][0..pcs_len];
+<a id="L361"></a>        }
+<a id="L362"></a>    };
+<a id="L363"></a>
+<a id="L364"></a>    /// Fields are little-endian
+<a id="L365"></a>    pub const MmapInputHeader = extern struct {
+<a id="L366"></a>        pc_digest: u64 align(4), // aligned so header does not have padding
+<a id="L367"></a>        instance_id: u32,
+<a id="L368"></a>        test_i: u32,
+<a id="L369"></a>        len: u32,
+<a id="L370"></a>    };
+<a id="L371"></a>
+<a id="L372"></a>    /// WebSocket server-&gt;client.
+<a id="L373"></a>    ///
+<a id="L374"></a>    /// Sent once, when fuzzing starts, to indicate the available coverage data.
+<a id="L375"></a>    ///
+<a id="L376"></a>    /// Trailing:
+<a id="L377"></a>    /// * std.debug.Coverage.String for each directories_len
+<a id="L378"></a>    /// * std.debug.Coverage.File for each files_len
+<a id="L379"></a>    /// * std.debug.Coverage.SourceLocation for each source_locations_len
+<a id="L380"></a>    /// * u8 for each string_bytes_len
+<a id="L381"></a>    pub const SourceIndexHeader = extern struct {
+<a id="L382"></a>        tag: ToClientTag = .fuzz_source_index,
+<a id="L383"></a>        _: [3]u8 = @splat(0),
+<a id="L384"></a>        directories_len: u32,
+<a id="L385"></a>        files_len: u32,
+<a id="L386"></a>        source_locations_len: u32,
+<a id="L387"></a>        string_bytes_len: u32,
+<a id="L388"></a>        /// When, according to the server, fuzzing started.
+<a id="L389"></a>        start_timestamp: i64 align(4),
+<a id="L390"></a>        start_n_runs: u64 align(4),
+<a id="L391"></a>    };
+<a id="L392"></a>
+<a id="L393"></a>    /// WebSocket server-&gt;client.
+<a id="L394"></a>    ///
+<a id="L395"></a>    /// Sent whenever the set of covered source locations is updated.
+<a id="L396"></a>    ///
+<a id="L397"></a>    /// Trailing:
+<a id="L398"></a>    /// * one bit per source_locations_len, contained in u64 elements
+<a id="L399"></a>    pub const CoverageUpdateHeader = extern struct {
+<a id="L400"></a>        tag: ToClientTag = .fuzz_coverage_update,
+<a id="L401"></a>        _: [7]u8 = @splat(0),
+<a id="L402"></a>        n_runs: u64,
+<a id="L403"></a>        unique_runs: u64,
+<a id="L404"></a>
+<a id="L405"></a>        pub const trailing = .{
+<a id="L406"></a>            .pc_bits_usize,
+<a id="L407"></a>        };
+<a id="L408"></a>    };
+<a id="L409"></a>
+<a id="L410"></a>    /// WebSocket server-&gt;client.
+<a id="L411"></a>    ///
+<a id="L412"></a>    /// Sent whenever the set of entry points is updated.
+<a id="L413"></a>    ///
+<a id="L414"></a>    /// Trailing:
+<a id="L415"></a>    /// * one u32 index of source_locations per locsLen()
+<a id="L416"></a>    pub const EntryPointHeader = extern struct {
+<a id="L417"></a>        tag: ToClientTag = .fuzz_entry_points,
+<a id="L418"></a>        locs_len_raw: [3]u8,
+<a id="L419"></a>
+<a id="L420"></a>        pub fn locsLen(hdr: EntryPointHeader) u24 {
+<a id="L421"></a>            return @bitCast(hdr.locs_len_raw);
+<a id="L422"></a>        }
+<a id="L423"></a>        pub fn init(locs_len: u24) EntryPointHeader {
+<a id="L424"></a>            return .{ .locs_len_raw = @bitCast(locs_len) };
+<a id="L425"></a>        }
+<a id="L426"></a>    };
+<a id="L427"></a>
+<a id="L428"></a>    /// Sent by lib/fuzzer to test_runner to obtain information about the
+<a id="L429"></a>    /// active memory mapped input file and cumulative stats about previous
+<a id="L430"></a>    /// fuzzing runs.
+<a id="L431"></a>    pub const Coverage = extern struct {
+<a id="L432"></a>        id: u64,
+<a id="L433"></a>        runs: u64,
+<a id="L434"></a>        unique: u64,
+<a id="L435"></a>        seen: u64,
+<a id="L436"></a>    };
+<a id="L437"></a>};
+<a id="L438"></a>
+<a id="L439"></a>/// ABI bits specifically relating to the time report interface.
+<a id="L440"></a>pub const time_report = struct {
+<a id="L441"></a>    /// WebSocket server-&gt;client.
+<a id="L442"></a>    ///
+<a id="L443"></a>    /// Sent after a `Step` finishes, providing the time taken to execute the step.
+<a id="L444"></a>    pub const GenericResult = extern struct {
+<a id="L445"></a>        tag: ToClientTag = .time_report_generic_result,
+<a id="L446"></a>        step_idx: u32 align(1),
+<a id="L447"></a>        ns_total: u64 align(1),
+<a id="L448"></a>    };
+<a id="L449"></a>
+<a id="L450"></a>    /// WebSocket server-&gt;client.
+<a id="L451"></a>    ///
+<a id="L452"></a>    /// Sent after a `Step.Compile` finishes, providing the step's time report.
+<a id="L453"></a>    ///
+<a id="L454"></a>    /// Trailing:
+<a id="L455"></a>    /// * `llvm_pass_timings: [llvm_pass_timings_len]u8` (ASCII-encoded)
+<a id="L456"></a>    /// * for each `files_len`:
+<a id="L457"></a>    ///   * `name` (null-terminated UTF-8 string)
+<a id="L458"></a>    /// * for each `decls_len`:
+<a id="L459"></a>    ///   * `name` (null-terminated UTF-8 string)
+<a id="L460"></a>    ///   * `file: u32` (index of file this decl is in)
+<a id="L461"></a>    ///   * `sema_ns: u64` (nanoseconds spent semantically analyzing this decl)
+<a id="L462"></a>    ///   * `codegen_ns: u64` (nanoseconds spent semantically analyzing this decl)
+<a id="L463"></a>    ///   * `link_ns: u64` (nanoseconds spent semantically analyzing this decl)
+<a id="L464"></a>    pub const CompileResult = extern struct {
+<a id="L465"></a>        tag: ToClientTag = .time_report_compile_result,
+<a id="L466"></a>
+<a id="L467"></a>        step_idx: u32 align(1),
+<a id="L468"></a>
+<a id="L469"></a>        flags: Flags,
+<a id="L470"></a>        stats: Stats align(1),
+<a id="L471"></a>        ns_total: u64 align(1),
+<a id="L472"></a>
+<a id="L473"></a>        llvm_pass_timings_len: u32 align(1),
+<a id="L474"></a>        files_len: u32 align(1),
+<a id="L475"></a>        decls_len: u32 align(1),
+<a id="L476"></a>
+<a id="L477"></a>        pub const Flags = packed struct(u8) {
+<a id="L478"></a>            use_llvm: bool,
+<a id="L479"></a>            _: u7 = 0,
+<a id="L480"></a>        };
+<a id="L481"></a>
+<a id="L482"></a>        pub const Stats = extern struct {
+<a id="L483"></a>            n_reachable_files: u32,
+<a id="L484"></a>            n_imported_files: u32,
+<a id="L485"></a>            n_generic_instances: u32,
+<a id="L486"></a>            n_inline_calls: u32,
+<a id="L487"></a>
+<a id="L488"></a>            cpu_ns_parse: u64,
+<a id="L489"></a>            cpu_ns_astgen: u64,
+<a id="L490"></a>            cpu_ns_sema: u64,
+<a id="L491"></a>            cpu_ns_codegen: u64,
+<a id="L492"></a>            cpu_ns_link: u64,
+<a id="L493"></a>
+<a id="L494"></a>            real_ns_files: u64,
+<a id="L495"></a>            real_ns_decls: u64,
+<a id="L496"></a>            real_ns_llvm_emit: u64,
+<a id="L497"></a>            real_ns_link_flush: u64,
+<a id="L498"></a>
+<a id="L499"></a>            pub const init: Stats = .{
+<a id="L500"></a>                .n_reachable_files = 0,
+<a id="L501"></a>                .n_imported_files = 0,
+<a id="L502"></a>                .n_generic_instances = 0,
+<a id="L503"></a>                .n_inline_calls = 0,
+<a id="L504"></a>                .cpu_ns_parse = 0,
+<a id="L505"></a>                .cpu_ns_astgen = 0,
+<a id="L506"></a>                .cpu_ns_sema = 0,
+<a id="L507"></a>                .cpu_ns_codegen = 0,
+<a id="L508"></a>                .cpu_ns_link = 0,
+<a id="L509"></a>                .real_ns_files = 0,
+<a id="L510"></a>                .real_ns_decls = 0,
+<a id="L511"></a>                .real_ns_llvm_emit = 0,
+<a id="L512"></a>                .real_ns_link_flush = 0,
+<a id="L513"></a>            };
+<a id="L514"></a>        };
+<a id="L515"></a>    };
+<a id="L516"></a>
+<a id="L517"></a>    /// WebSocket server-&gt;client.
+<a id="L518"></a>    ///
+<a id="L519"></a>    /// Sent after a `Step.Run` for a Zig test executable finishes, providing the test's time report.
+<a id="L520"></a>    ///
+<a id="L521"></a>    /// Trailing:
+<a id="L522"></a>    /// * for each `tests_len`:
+<a id="L523"></a>    ///   * `test_ns: u64` (nanoseconds spent running this test)
+<a id="L524"></a>    /// * for each `tests_len`:
+<a id="L525"></a>    ///   * `name` (null-terminated UTF-8 string)
+<a id="L526"></a>    pub const RunTestResult = extern struct {
+<a id="L527"></a>        tag: ToClientTag = .time_report_run_test_result,
+<a id="L528"></a>        step_idx: u32 align(1),
+<a id="L529"></a>        tests_len: u32 align(1),
+<a id="L530"></a>    };
+<a id="L531"></a>};
+</pre>
 </body>
 </html>

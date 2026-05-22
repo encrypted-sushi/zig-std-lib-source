@@ -2,1329 +2,1332 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Source: zig-0.16.0-std/crypto/ascon.zig</title>
+    <title>Source: crypto/ascon.zig</title>
     <style>
         body { background: #1e1e1e; color: #d4d4d4; font-family: monospace; padding: 20px; }
         pre { white-space: pre-wrap; word-wrap: break-word; }
         .header { border-bottom: 1px solid #444; padding-bottom: 10px; margin-bottom: 20px; }
         a { color: #569cd6; }
+        a[id] { color: inherit; text-decoration: none; }
+        :target { background: #3a3a00; }
     </style>
 </head>
 <body>
     <div class="header">
-        <a href="/">Index</a> | <strong>File: zig-0.16.0-std/crypto/ascon.zig</strong>
+        <a href="/">Index</a> | <strong>File: crypto/ascon.zig</strong>
     </div>
-    <pre>//! Ascon is a 320-bit permutation, selected as new standard for lightweight cryptography
-//! in the NIST Lightweight Cryptography competition (2019–2023).
-//! https://csrc.nist.gov/pubs/sp/800/232/ipd
-//!
-//! The permutation is compact, and optimized for timing and side channel resistance,
-//! making it a good choice for embedded applications.
-//!
-//! It is not meant to be used directly, but as a building block for symmetric cryptography.
-
-const std = @import("std");
-const builtin = @import("builtin");
-const crypto = std.crypto;
-const debug = std.debug;
-const mem = std.mem;
-const testing = std.testing;
-const rotr = std.math.rotr;
-const native_endian = builtin.cpu.arch.endian();
-
-/// An Ascon state.
-///
-/// The state is represented as 5 64-bit words.
-///
-/// The original NIST submission (v1.2) serializes these words as big-endian,
-/// but NIST SP 800-232 switched to a little-endian representation.
-/// Software implementations are free to use native endianness with no security degradation.
-pub fn State(comptime endian: std.builtin.Endian) type {
-    return struct {
-        const Self = @This();
-
-        /// Number of bytes in the state.
-        pub const block_bytes = 40;
-
-        const Block = [5]u64;
-
-        st: Block,
-
-        /// Initialize the state from a slice of bytes.
-        ///
-        /// Parameters:
-        ///   - initial_state: A 40-byte array to initialize the state
-        ///
-        /// Returns: A new State initialized with the provided bytes
-        pub fn init(initial_state: [block_bytes]u8) Self {
-            var state = Self{ .st = undefined };
-            @memcpy(state.asBytes(), &amp;initial_state);
-            state.endianSwap();
-            return state;
-        }
-
-        /// Initialize the state from u64 words in native endianness.
-        ///
-        /// Parameters:
-        ///   - initial_state: An array of 5 u64 words in native endianness
-        ///
-        /// Returns: A new State with the provided words
-        pub fn initFromWords(initial_state: [5]u64) Self {
-            return .{ .st = initial_state };
-        }
-
-        /// Initialize the state for Ascon XOF.
-        ///
-        /// Returns: A new State initialized with the Ascon XOF initialization vector
-        pub fn initXof() Self {
-            return Self{ .st = Block{
-                0xb57e273b814cd416,
-                0x2b51042562ae2420,
-                0x66a3a7768ddf2218,
-                0x5aad0a7a8153650c,
-                0x4f3e0e32539493b6,
-            } };
-        }
-
-        /// Initialize the state for Ascon XOFa.
-        ///
-        /// Returns: A new State initialized with the Ascon XOFa initialization vector
-        pub fn initXofA() Self {
-            return Self{ .st = Block{
-                0x44906568b77b9832,
-                0xcd8d6cae53455532,
-                0xf7b5212756422129,
-                0x246885e1de0d225b,
-                0xa8cb5ce33449973f,
-            } };
-        }
-
-        /// A representation of the state as bytes. The byte order is architecture-dependent.
-        ///
-        /// Returns: A pointer to the state's internal byte representation
-        pub fn asBytes(self: *Self) *[block_bytes]u8 {
-            return mem.asBytes(&amp;self.st);
-        }
-
-        /// Byte-swap the entire state if the architecture doesn't match the required endianness.
-        ///
-        /// This ensures the state is in the correct endianness for the current platform.
-        pub fn endianSwap(self: *Self) void {
-            for (&amp;self.st) |*w| {
-                w.* = mem.toNative(u64, w.*, endian);
-            }
-        }
-
-        /// Set bytes starting at the beginning of the state.
-        ///
-        /// Parameters:
-        ///   - bytes: Slice of bytes to write into the state (up to 40 bytes)
-        ///
-        /// Note: If bytes.len &lt; 40, remaining state words are zero-padded
-        pub fn setBytes(self: *Self, bytes: []const u8) void {
-            var i: usize = 0;
-            while (i + 8 &lt;= bytes.len) : (i += 8) {
-                self.st[i / 8] = mem.readInt(u64, bytes[i..][0..8], endian);
-            }
-            if (i &lt; bytes.len) {
-                var padded: [8]u8 = @splat(0);
-                @memcpy(padded[0 .. bytes.len - i], bytes[i..]);
-                self.st[i / 8] = mem.readInt(u64, padded[0..], endian);
-            }
-        }
-
-        /// XOR a byte into the state at a given offset.
-        ///
-        /// Parameters:
-        ///   - byte: The byte to XOR into the state
-        ///   - offset: The byte offset in the state (0-39)
-        pub fn addByte(self: *Self, byte: u8, offset: usize) void {
-            const z = switch (endian) {
-                .big =&gt; 64 - 8 - 8 * @as(u6, @truncate(offset % 8)),
-                .little =&gt; 8 * @as(u6, @truncate(offset % 8)),
-            };
-            self.st[offset / 8] ^= @as(u64, byte) &lt;&lt; z;
-        }
-
-        /// XOR bytes into the beginning of the state.
-        ///
-        /// Parameters:
-        ///   - bytes: Slice of bytes to XOR into the state (up to 40 bytes)
-        ///
-        /// Note: Handles partial blocks with zero-padding
-        pub fn addBytes(self: *Self, bytes: []const u8) void {
-            var i: usize = 0;
-            while (i + 8 &lt;= bytes.len) : (i += 8) {
-                self.st[i / 8] ^= mem.readInt(u64, bytes[i..][0..8], endian);
-            }
-            if (i &lt; bytes.len) {
-                var padded: [8]u8 = @splat(0);
-                @memcpy(padded[0 .. bytes.len - i], bytes[i..]);
-                self.st[i / 8] ^= mem.readInt(u64, padded[0..], endian);
-            }
-        }
-
-        /// Extract the first bytes of the state.
-        ///
-        /// Parameters:
-        ///   - out: Output buffer to receive the extracted bytes
-        ///
-        /// Note: Extracts up to out.len bytes from the beginning of the state
-        pub fn extractBytes(self: *Self, out: []u8) void {
-            var i: usize = 0;
-            while (i + 8 &lt;= out.len) : (i += 8) {
-                mem.writeInt(u64, out[i..][0..8], self.st[i / 8], endian);
-            }
-            if (i &lt; out.len) {
-                var padded: [8]u8 = @splat(0);
-                mem.writeInt(u64, padded[0..], self.st[i / 8], endian);
-                @memcpy(out[i..], padded[0 .. out.len - i]);
-            }
-        }
-
-        /// XOR the first bytes of the state into a slice of bytes.
-        ///
-        /// Parameters:
-        ///   - out: Output buffer for the XORed result
-        ///   - in: Input bytes to XOR with the state
-        ///
-        /// Requires: out.len == in.len
-        pub fn xorBytes(self: *Self, out: []u8, in: []const u8) void {
-            debug.assert(out.len == in.len);
-
-            var i: usize = 0;
-            while (i + 8 &lt;= in.len) : (i += 8) {
-                const x = mem.readInt(u64, in[i..][0..8], native_endian) ^ mem.nativeTo(u64, self.st[i / 8], endian);
-                mem.writeInt(u64, out[i..][0..8], x, native_endian);
-            }
-            if (i &lt; in.len) {
-                var padded: [8]u8 = @splat(0);
-                @memcpy(padded[0 .. in.len - i], in[i..]);
-                const x = mem.readInt(u64, &amp;padded, native_endian) ^ mem.nativeTo(u64, self.st[i / 8], endian);
-                mem.writeInt(u64, &amp;padded, x, native_endian);
-                @memcpy(out[i..], padded[0 .. in.len - i]);
-            }
-        }
-
-        /// Set the words storing the bytes of a given range to zero.
-        ///
-        /// Parameters:
-        ///   - from: Starting byte offset (inclusive)
-        ///   - to: Ending byte offset (inclusive)
-        ///
-        /// Note: Clears complete words that contain the specified byte range
-        pub fn clear(self: *Self, from: usize, to: usize) void {
-            @memset(self.st[from / 8 .. (to + 7) / 8], 0);
-        }
-
-        /// Clear the entire state, disabling compiler optimizations.
-        ///
-        /// Uses secure zeroing to prevent the compiler from optimizing away
-        /// the clearing operation. Use for sensitive data cleanup.
-        pub fn secureZero(self: *Self) void {
-            crypto.secureZero(u64, &amp;self.st);
-        }
-
-        /// Apply a reduced-round permutation to the state.
-        ///
-        /// Parameters:
-        ///   - rounds: Number of rounds to apply (1-12)
-        ///
-        /// Note: Uses the last `rounds` round constants from the full set
-        pub fn permuteR(state: *Self, comptime rounds: u4) void {
-            const rks = [16]u64{ 0x3c, 0x2d, 0x1e, 0x0f, 0xf0, 0xe1, 0xd2, 0xc3, 0xb4, 0xa5, 0x96, 0x87, 0x78, 0x69, 0x5a, 0x4b };
-            inline for (rks[rks.len - rounds ..]) |rk| {
-                state.round(rk);
-            }
-        }
-
-        /// Apply a full-round permutation to the state.
-        ///
-        /// Applies the standard 12-round Ascon permutation.
-        pub fn permute(state: *Self) void {
-            state.permuteR(12);
-        }
-
-        /// Apply a permutation to the state and prevent backtracking.
-        ///
-        /// Parameters:
-        ///   - rounds: Number of permutation rounds to apply
-        ///   - rate: Rate in bytes (must be multiple of 8, &lt; 40)
-        ///
-        /// The capacity portion is XORed before and after permutation to
-        /// provide forward security (ratcheting).
-        pub fn permuteRatchet(state: *Self, comptime rounds: u4, comptime rate: u6) void {
-            const capacity = block_bytes - rate;
-            debug.assert(capacity &gt; 0 and capacity % 8 == 0); // capacity must be a multiple of 64 bits
-            var mask: [capacity / 8]u64 = undefined;
-            inline for (&amp;mask, state.st[state.st.len - mask.len ..]) |*m, x| m.* = x;
-            state.permuteR(rounds);
-            inline for (mask, state.st[state.st.len - mask.len ..]) |m, *x| x.* ^= m;
-        }
-
-        /// Core Ascon permutation round function.
-        ///
-        /// Parameters:
-        ///   - rk: Round constant for this round
-        ///
-        /// Implements one round of the Ascon permutation with S-box and linear layer.
-        fn round(state: *Self, rk: u64) void {
-            const x = &amp;state.st;
-            x[2] ^= rk;
-
-            x[0] ^= x[4];
-            x[4] ^= x[3];
-            x[2] ^= x[1];
-            var t: Block = .{
-                x[0] ^ (~x[1] &amp; x[2]),
-                x[1] ^ (~x[2] &amp; x[3]),
-                x[2] ^ (~x[3] &amp; x[4]),
-                x[3] ^ (~x[4] &amp; x[0]),
-                x[4] ^ (~x[0] &amp; x[1]),
-            };
-            t[1] ^= t[0];
-            t[3] ^= t[2];
-            t[0] ^= t[4];
-
-            x[2] = t[2] ^ rotr(u64, t[2], 6 - 1);
-            x[3] = t[3] ^ rotr(u64, t[3], 17 - 10);
-            x[4] = t[4] ^ rotr(u64, t[4], 41 - 7);
-            x[0] = t[0] ^ rotr(u64, t[0], 28 - 19);
-            x[1] = t[1] ^ rotr(u64, t[1], 61 - 39);
-            x[2] = t[2] ^ rotr(u64, x[2], 1);
-            x[3] = t[3] ^ rotr(u64, x[3], 10);
-            x[4] = t[4] ^ rotr(u64, x[4], 7);
-            x[0] = t[0] ^ rotr(u64, x[0], 19);
-            x[1] = t[1] ^ rotr(u64, x[1], 39);
-            x[2] = ~x[2];
-        }
-    };
-}
-
-test "ascon" {
-    const Ascon = State(.big);
-    var bytes: [Ascon.block_bytes]u8 = undefined;
-    @memset(&amp;bytes, 1);
-    var st = Ascon.init(bytes);
-    var out: [Ascon.block_bytes]u8 = undefined;
-    st.permute();
-    st.extractBytes(&amp;out);
-    const expected1 = [_]u8{ 148, 147, 49, 226, 218, 221, 208, 113, 186, 94, 96, 10, 183, 219, 119, 150, 169, 206, 65, 18, 215, 97, 78, 106, 118, 81, 211, 150, 52, 17, 117, 64, 216, 45, 148, 240, 65, 181, 90, 180 };
-    try testing.expectEqualSlices(u8, &amp;expected1, &amp;out);
-    st.clear(0, 10);
-    st.extractBytes(&amp;out);
-    const expected2 = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 169, 206, 65, 18, 215, 97, 78, 106, 118, 81, 211, 150, 52, 17, 117, 64, 216, 45, 148, 240, 65, 181, 90, 180 };
-    try testing.expectEqualSlices(u8, &amp;expected2, &amp;out);
-    st.addByte(1, 5);
-    st.addByte(2, 5);
-    st.extractBytes(&amp;out);
-    const expected3 = [_]u8{ 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 169, 206, 65, 18, 215, 97, 78, 106, 118, 81, 211, 150, 52, 17, 117, 64, 216, 45, 148, 240, 65, 181, 90, 180 };
-    try testing.expectEqualSlices(u8, &amp;expected3, &amp;out);
-    st.addBytes(&amp;bytes);
-    st.extractBytes(&amp;out);
-    const expected4 = [_]u8{ 1, 1, 1, 1, 1, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 168, 207, 64, 19, 214, 96, 79, 107, 119, 80, 210, 151, 53, 16, 116, 65, 217, 44, 149, 241, 64, 180, 91, 181 };
-    try testing.expectEqualSlices(u8, &amp;expected4, &amp;out);
-}
-
-const AsconState = State(.little);
-const AuthenticationError = crypto.errors.AuthenticationError;
-
-/// Ascon-AEAD128 as specified in NIST SP 800-232 Section 4
-pub const AsconAead128 = struct {
-    pub const tag_length = 16;
-    pub const nonce_length = 16;
-    pub const key_length = 16;
-    pub const block_length = 16;
-
-    const AeadState = struct {
-        st: AsconState,
-        k0: u64,
-        k1: u64,
-
-        /// Initialize AEAD state with key and nonce.
-        ///
-        /// Parameters:
-        ///   - key: 16-byte secret key
-        ///   - nonce: 16-byte nonce
-        ///
-        /// Returns: Initialized AEAD state ready for processing
-        fn init(key: [16]u8, nonce: [16]u8) AeadState {
-            const k0 = mem.readInt(u64, key[0..8], .little);
-            const k1 = mem.readInt(u64, key[8..16], .little);
-            const n0 = mem.readInt(u64, nonce[0..8], .little);
-            const n1 = mem.readInt(u64, nonce[8..16], .little);
-
-            // IV for Ascon-AEAD128 (Ascon-128a)
-            const iv: u64 = 0x00001000808C0001;
-            const words: [5]u64 = .{ iv, k0, k1, n0, n1 };
-
-            var st = AsconState.initFromWords(words);
-            st.permuteR(12);
-
-            st.st[3] ^= k0;
-            st.st[4] ^= k1;
-
-            return AeadState{ .st = st, .k0 = k0, .k1 = k1 };
-        }
-
-        /// Process associated data for authentication.
-        ///
-        /// Parameters:
-        ///   - ad: Associated data to authenticate
-        ///
-        /// Updates the state to include AD in authentication tag computation.
-        fn processAd(self: *AeadState, ad: []const u8) void {
-            if (ad.len == 0) return;
-
-            var i: usize = 0;
-            // Process full 128-bit blocks
-            while (i + 16 &lt;= ad.len) : (i += 16) {
-                self.st.addBytes(ad[i..][0..16]);
-                self.st.permuteR(8);
-            }
-
-            // Process final partial AD block
-            const adrem = ad.len - i;
-            if (adrem &gt; 0) {
-                if (adrem &gt;= 8) {
-                    var buf: [8]u8 = @splat(0);
-                    @memcpy(buf[0..8], ad[i..][0..8]);
-                    self.st.st[0] ^= mem.readInt(u64, &amp;buf, .little);
-
-                    buf = @splat(0);
-                    @memcpy(buf[0 .. adrem - 8], ad[i + 8 ..]);
-                    buf[adrem - 8] = 0x01;
-                    self.st.st[1] ^= mem.readInt(u64, &amp;buf, .little);
-                } else {
-                    var buf: [8]u8 = @splat(0);
-                    @memcpy(buf[0..adrem], ad[i..]);
-                    buf[adrem] = 0x01;
-                    self.st.st[0] ^= mem.readInt(u64, &amp;buf, .little);
-                }
-                self.st.permuteR(8);
-            }
-        }
-
-        /// Finalize the AEAD operation and prepare tag.
-        ///
-        /// Applies final permutation and XORs key for tag generation.
-        fn finalize(self: *AeadState) void {
-            // XOR key before final permutation
-            self.st.st[2] ^= self.k0;
-            self.st.st[3] ^= self.k1;
-            self.st.permuteR(12);
-
-            // XOR key again for tag generation
-            self.st.st[3] ^= self.k0;
-            self.st.st[4] ^= self.k1;
-        }
-    };
-
-    /// Encrypt a message with Ascon-AEAD128.
-    ///
-    /// Parameters:
-    ///   - c: Output buffer for ciphertext (must be same length as m)
-    ///   - tag: Output buffer for authentication tag (16 bytes)
-    ///   - m: Plaintext message to encrypt
-    ///   - ad: Associated data to authenticate but not encrypt
-    ///   - npub: Public nonce (16 bytes, must be unique per message)
-    ///   - k: Secret key (16 bytes)
-    ///
-    /// Note: The ciphertext and tag must be transmitted together for decryption
-    pub fn encrypt(c: []u8, tag: *[tag_length]u8, m: []const u8, ad: []const u8, npub: [nonce_length]u8, k: [key_length]u8) void {
-        debug.assert(c.len == m.len);
-
-        var state = AeadState.init(k, npub);
-
-        // Process associated data
-        state.processAd(ad);
-
-        // Domain separation (DSEP = 0x80 at byte 7 in little-endian)
-        state.st.st[4] ^= 0x8000000000000000;
-
-        // Process plaintext
-        var i: usize = 0;
-        while (i + 16 &lt;= m.len) : (i += 16) {
-            state.st.addBytes(m[i..][0..16]);
-            state.st.extractBytes(c[i..][0..16]);
-            state.st.permuteR(8);
-        }
-
-        // Process final partial block
-        const remaining = m.len - i;
-        if (remaining &gt; 8) {
-            // Split between two words
-            state.st.addBytes(m[i..][0..8]);
-            state.st.extractBytes(c[i..][0..8]);
-
-            var buf: [8]u8 = @splat(0);
-            @memcpy(buf[0 .. remaining - 8], m[i + 8 ..]);
-            const m1 = mem.readInt(u64, &amp;buf, .little);
-            state.st.st[1] ^= m1;
-            mem.writeInt(u64, buf[0..], state.st.st[1], .little);
-            @memcpy(c[i + 8 ..], buf[0 .. remaining - 8]);
-
-            // Add padding
-            state.st.st[1] ^= @as(u64, 0x01) &lt;&lt; @intCast((remaining - 8) * 8);
-        } else if (remaining == 8) {
-            // Exactly 8 bytes - all in word 0, padding in word 1
-            state.st.addBytes(m[i..][0..8]);
-            state.st.extractBytes(c[i..][0..8]);
-
-            // Add padding to word 1 at position 0
-            state.st.st[1] ^= 0x01;
-        } else if (remaining &gt; 0) {
-            // All in first word
-            var temp: [8]u8 = @splat(0);
-            @memcpy(temp[0..remaining], m[i..]);
-            state.st.addBytes(&amp;temp);
-            state.st.extractBytes(c[i..][0..remaining]);
-            // Add padding
-            temp = @splat(0);
-            temp[remaining] = 0x01;
-            state.st.addBytes(&amp;temp);
-            // Second word stays zero
-        } else {
-            // Empty message or exact multiple - add padding block
-            var padded: [16]u8 = @splat(0);
-            padded[0] = 0x01;
-            state.st.addBytes(&amp;padded);
-        }
-
-        // Finalization
-        state.finalize();
-
-        // Extract tag
-        mem.writeInt(u64, tag[0..8], state.st.st[3], .little);
-        mem.writeInt(u64, tag[8..16], state.st.st[4], .little);
-    }
-
-    /// Decrypt a message with Ascon-AEAD128.
-    ///
-    /// Parameters:
-    ///   - m: Output buffer for plaintext (must be same length as c)
-    ///   - c: Ciphertext to decrypt
-    ///   - tag: Authentication tag (16 bytes)
-    ///   - ad: Associated data that was authenticated
-    ///   - npub: Public nonce used during encryption (16 bytes)
-    ///   - k: Secret key (16 bytes)
-    ///
-    /// Returns: AuthenticationError if tag verification fails
-    ///
-    /// Note: On authentication failure, the output buffer is securely zeroed
-    pub fn decrypt(m: []u8, c: []const u8, tag: [tag_length]u8, ad: []const u8, npub: [nonce_length]u8, k: [key_length]u8) AuthenticationError!void {
-        debug.assert(m.len == c.len);
-
-        var state = AeadState.init(k, npub);
-
-        // Process associated data
-        state.processAd(ad);
-
-        // Domain separation (DSEP = 0x80 at byte 7 in little-endian)
-        state.st.st[4] ^= 0x8000000000000000;
-
-        // Process ciphertext
-        var i: usize = 0;
-        while (i + 16 &lt;= c.len) : (i += 16) {
-            const ct_block = c[i..][0..16].*; // Save ciphertext block for in-place operation support
-            state.st.xorBytes(m[i..][0..16], &amp;ct_block);
-            state.st.setBytes(&amp;ct_block);
-            state.st.permuteR(8);
-        }
-
-        // Final partial ciphertext block
-        const crem = c.len - i;
-        if (crem &gt; 8) {
-            // Save ciphertext for in-place operation support
-            var saved_ct: [16]u8 = undefined;
-            @memcpy(saved_ct[0..crem], c[i..]);
-
-            const c0 = mem.readInt(u64, saved_ct[0..8], .little);
-            state.st.st[0] ^= c0;
-            mem.writeInt(u64, m[i..][0..8], state.st.st[0], .little);
-            state.st.st[0] = c0;
-
-            var buf: [8]u8 = @splat(0);
-            @memcpy(buf[0 .. crem - 8], saved_ct[8..][0 .. crem - 8]);
-            const c1 = mem.readInt(u64, &amp;buf, .little);
-            const m1 = state.st.st[1] ^ c1;
-            mem.writeInt(u64, buf[0..], m1, .little);
-            @memcpy(m[i + 8 ..], buf[0 .. crem - 8]);
-
-            // Replace only the bytes we've read, keeping upper bytes intact
-            const mask = (@as(u64, 1) &lt;&lt; @intCast((crem - 8) * 8)) - 1;
-            state.st.st[1] = (state.st.st[1] &amp; ~mask) | (c1 &amp; mask);
-
-            state.st.st[1] ^= @as(u64, 0x01) &lt;&lt; @intCast((crem - 8) * 8);
-        } else if (crem == 8) {
-            // Exactly 8 bytes - process only word 0, add padding to word 1
-            const saved_ct = c[i..][0..8].*;
-
-            const c0 = mem.readInt(u64, &amp;saved_ct, .little);
-            state.st.st[0] ^= c0;
-            mem.writeInt(u64, m[i..][0..8], state.st.st[0], .little);
-            state.st.st[0] = c0;
-
-            // Add padding to word 1 at position 0
-            state.st.st[1] ^= 0x01;
-        } else if (crem &gt; 0) {
-            var buf: [8]u8 = @splat(0);
-            @memcpy(buf[0..crem], c[i..]);
-            const c0 = mem.readInt(u64, &amp;buf, .little);
-            const m0 = state.st.st[0] ^ c0;
-            mem.writeInt(u64, buf[0..], m0, .little);
-            @memcpy(m[i..], buf[0..crem]);
-
-            // Replace only the bytes we've read, keeping upper bytes intact
-            const mask = (@as(u64, 1) &lt;&lt; @intCast(crem * 8)) - 1;
-            state.st.st[0] = (state.st.st[0] &amp; ~mask) | (c0 &amp; mask);
-
-            state.st.st[0] ^= @as(u64, 0x01) &lt;&lt; @intCast(crem * 8);
-        } else {
-            state.st.st[0] ^= 0x01;
-        }
-
-        // Finalization
-        state.finalize();
-
-        // Verify tag
-        var computed_tag: [tag_length]u8 = undefined;
-        mem.writeInt(u64, computed_tag[0..8], state.st.st[3], .little);
-        mem.writeInt(u64, computed_tag[8..16], state.st.st[4], .little);
-
-        if (!crypto.timing_safe.eql([tag_length]u8, tag, computed_tag)) {
-            crypto.secureZero(u8, m);
-            return error.AuthenticationFailed;
-        }
-    }
-};
-
-/// Ascon-Hash256 as specified in NIST SP 800-232 Section 5
-pub const AsconHash256 = struct {
-    pub const digest_length = 32;
-    pub const block_length = 8;
-
-    st: AsconState,
-
-    pub const Options = struct {};
-
-    /// Initialize a new Ascon-Hash256 hasher.
-    ///
-    /// Parameters:
-    ///   - options: Configuration options (currently unused)
-    ///
-    /// Returns: An initialized AsconHash256 hasher
-    pub fn init(options: Options) AsconHash256 {
-        _ = options;
-
-        // IV for Ascon-Hash256: 0x0000080100cc0002
-        const iv: u64 = 0x0000080100cc0002;
-        const words: [5]u64 = .{ iv, 0, 0, 0, 0 };
-        var st = AsconState.initFromWords(words);
-        st.permuteR(12);
-        return AsconHash256{ .st = st };
-    }
-
-    /// Compute Ascon-Hash256 hash of input data in one call.
-    ///
-    /// Parameters:
-    ///   - b: Input data to hash
-    ///   - out: Output buffer for 32-byte hash digest
-    ///   - options: Configuration options (currently unused)
-    pub fn hash(b: []const u8, out: *[digest_length]u8, options: Options) void {
-        var h = init(options);
-        h.update(b);
-        h.final(out);
-    }
-
-    /// Update the hash state with additional data.
-    ///
-    /// Parameters:
-    ///   - b: Data to add to the hash
-    ///
-    /// Note: Can be called multiple times before final()
-    pub fn update(self: *AsconHash256, b: []const u8) void {
-        var i: usize = 0;
-
-        // Process full 64-bit blocks
-        while (i + 8 &lt;= b.len) : (i += 8) {
-            self.st.addBytes(b[i..][0..8]);
-            self.st.permuteR(12);
-        }
-
-        // Store partial block for finalization
-        if (i &lt; b.len) {
-            var padded: [8]u8 = @splat(0);
-            const remaining = b.len - i;
-            @memcpy(padded[0..remaining], b[i..]);
-            padded[remaining] = 0x01;
-            self.st.addBytes(&amp;padded);
-        } else {
-            // Add padding block
-            var padded: [8]u8 = @splat(0);
-            padded[0] = 0x01;
-            self.st.addBytes(&amp;padded);
-        }
-    }
-
-    /// Finalize the hash and output the digest.
-    ///
-    /// Parameters:
-    ///   - out: Output buffer for 32-byte hash digest
-    ///
-    /// Note: After calling final(), the hasher should not be used again
-    pub fn final(self: *AsconHash256, out: *[digest_length]u8) void {
-        // Final permutation after padding
-        self.st.permuteR(12);
-
-        // Extract hash output (4 × 64 bits = 256 bits)
-        var h: [4]u64 = undefined;
-        for (0..4) |i| {
-            h[i] = self.st.st[0];
-            self.st.permuteR(12);
-        }
-
-        // Write output
-        for (0..4) |i| {
-            mem.writeInt(u64, out[i * 8 ..][0..8], h[i], .little);
-        }
-    }
-};
-
-/// Ascon-XOF128 as specified in NIST SP 800-232 Section 5
-pub const AsconXof128 = struct {
-    pub const block_length = 8;
-
-    st: AsconState,
-    squeezed: bool,
-
-    pub const Options = struct {};
-
-    /// Initialize a new Ascon-XOF128 extendable output function.
-    ///
-    /// Parameters:
-    ///   - options: Configuration options (currently unused)
-    ///
-    /// Returns: An initialized AsconXof128 instance
-    pub fn init(options: Options) AsconXof128 {
-        _ = options;
-
-        // IV for Ascon-XOF128: 0x0000080000cc0003
-        const iv: u64 = 0x0000080000cc0003;
-        const words: [5]u64 = .{ iv, 0, 0, 0, 0 };
-        var st = AsconState.initFromWords(words);
-        st.permuteR(12);
-        return AsconXof128{ .st = st, .squeezed = false };
-    }
-
-    /// Hash a slice of bytes with variable-length output.
-    ///
-    /// Parameters:
-    ///   - bytes: Input data to hash
-    ///   - out: Output buffer (can be any length)
-    ///   - options: Configuration options (currently unused)
-    ///
-    /// Note: Convenience function that combines init, update, and squeeze
-    pub fn hash(bytes: []const u8, out: []u8, options: Options) void {
-        var st = init(options);
-        st.update(bytes);
-        st.squeeze(out);
-    }
-
-    /// Update the XOF state with additional data.
-    ///
-    /// Parameters:
-    ///   - b: Data to absorb into the XOF state
-    ///
-    /// Note: Cannot be called after squeeze() has been called
-    pub fn update(self: *AsconXof128, b: []const u8) void {
-        debug.assert(!self.squeezed); // Cannot update after squeezing
-
-        var i: usize = 0;
-
-        // Process full 64-bit blocks
-        while (i + 8 &lt;= b.len) : (i += 8) {
-            self.st.addBytes(b[i..][0..8]);
-            self.st.permuteR(12);
-        }
-
-        // Store partial block for finalization
-        if (i &lt; b.len) {
-            var padded: [8]u8 = @splat(0);
-            const remaining = b.len - i;
-            @memcpy(padded[0..remaining], b[i..]);
-            padded[remaining] = 0x01;
-            self.st.addBytes(&amp;padded);
-        } else {
-            // Add padding block
-            var padded: [8]u8 = @splat(0);
-            padded[0] = 0x01;
-            self.st.addBytes(&amp;padded);
-        }
-    }
-
-    /// Squeeze output bytes from the XOF.
-    ///
-    /// Parameters:
-    ///   - out: Output buffer to fill with pseudorandom bytes
-    ///
-    /// Note: Can be called multiple times to generate more output.
-    /// After first call, no more data can be absorbed with update().
-    pub fn squeeze(self: *AsconXof128, out: []u8) void {
-        if (!self.squeezed) {
-            // First squeeze - apply final permutation
-            self.st.permuteR(12);
-            self.squeezed = true;
-        }
-
-        var i: usize = 0;
-        while (i &lt; out.len) {
-            const to_copy = @min(8, out.len - i);
-            var block: [8]u8 = undefined;
-            mem.writeInt(u64, &amp;block, self.st.st[0], .little);
-            @memcpy(out[i..][0..to_copy], block[0..to_copy]);
-            i += to_copy;
-
-            if (i &lt; out.len) {
-                self.st.permuteR(12);
-            }
-        }
-    }
-};
-
-/// Ascon-CXOF128 as specified in NIST SP 800-232 Section 5
-pub const AsconCxof128 = struct {
-    pub const block_length = 8;
-    pub const max_custom_length = 256; // 2048 bits
-
-    st: AsconState,
-    squeezed: bool,
-
-    pub const Options = struct { custom: []const u8 = "" };
-
-    /// Initialize a new Ascon-CXOF128 customizable XOF.
-    ///
-    /// Parameters:
-    ///   - options: Configuration with optional customization string
-    ///     - custom: Customization string (max 256 bytes)
-    ///
-    /// Returns: An initialized AsconCxof128 instance
-    ///
-    /// Note: Different customization strings produce independent XOF instances
-    pub fn init(options: Options) AsconCxof128 {
-        debug.assert(options.custom.len &lt;= max_custom_length);
-
-        // IV for Ascon-CXOF128: 0x0000080000cc0004
-        const iv: u64 = 0x0000080000cc0004;
-        const words: [5]u64 = .{ iv, 0, 0, 0, 0 };
-        var st = AsconState.initFromWords(words);
-        st.permuteR(12);
-
-        var self = AsconCxof128{ .st = st, .squeezed = false };
-
-        // Process customization string - always process length and padding
-        // First block: length of customization string
-        const len_block = @as(u64, options.custom.len * 8); // Length in bits
-        self.st.st[0] ^= len_block;
-        self.st.permuteR(12);
-
-        if (options.custom.len &gt; 0) {
-            // Process customization string blocks
-            var i: usize = 0;
-            while (i + 8 &lt;= options.custom.len) : (i += 8) {
-                self.st.addBytes(options.custom[i..][0..8]);
-                self.st.permuteR(12);
-            }
-
-            // Process final partial block with padding
-            if (i &lt; options.custom.len) {
-                var padded: [8]u8 = @splat(0);
-                const remaining = options.custom.len - i;
-                @memcpy(padded[0..remaining], options.custom[i..]);
-                padded[remaining] = 0x01;
-                self.st.addBytes(&amp;padded);
-                self.st.permuteR(12);
-            } else {
-                // Add padding block
-                var padded: [8]u8 = @splat(0);
-                padded[0] = 0x01;
-                self.st.addBytes(&amp;padded);
-                self.st.permuteR(12);
-            }
-        } else {
-            // Empty customization still needs padding
-            var padded: [8]u8 = @splat(0);
-            padded[0] = 0x01;
-            self.st.addBytes(&amp;padded);
-            self.st.permuteR(12);
-        }
-
-        return self;
-    }
-
-    /// Hash a slice of bytes with customization and variable-length output.
-    ///
-    /// Parameters:
-    ///   - bytes: Input data to hash
-    ///   - out: Output buffer (can be any length)
-    ///   - options: Configuration with optional customization string
-    ///
-    /// Note: Convenience function that combines init, update, and squeeze
-    pub fn hash(bytes: []const u8, out: []u8, options: Options) void {
-        var st = init(options);
-        st.update(bytes);
-        st.squeeze(out);
-    }
-
-    /// Update the CXOF state with additional data.
-    ///
-    /// Parameters:
-    ///   - b: Data to absorb into the CXOF state
-    ///
-    /// Note: Cannot be called after squeeze() has been called
-    pub fn update(self: *AsconCxof128, b: []const u8) void {
-        debug.assert(!self.squeezed);
-
-        var i: usize = 0;
-
-        // Process full 64-bit blocks
-        while (i + 8 &lt;= b.len) : (i += 8) {
-            self.st.addBytes(b[i..][0..8]);
-            self.st.permuteR(12);
-        }
-
-        // Store partial block for finalization
-        if (i &lt; b.len) {
-            var padded: [8]u8 = @splat(0);
-            const remaining = b.len - i;
-            @memcpy(padded[0..remaining], b[i..]);
-            padded[remaining] = 0x01;
-            self.st.addBytes(&amp;padded);
-        } else {
-            // Add padding block
-            var padded: [8]u8 = @splat(0);
-            padded[0] = 0x01;
-            self.st.addBytes(&amp;padded);
-        }
-    }
-
-    /// Squeeze output bytes from the customizable XOF.
-    ///
-    /// Parameters:
-    ///   - out: Output buffer to fill with pseudorandom bytes
-    ///
-    /// Note: Can be called multiple times to generate more output.
-    /// After first call, no more data can be absorbed with update().
-    pub fn squeeze(self: *AsconCxof128, out: []u8) void {
-        if (!self.squeezed) {
-            // First squeeze - apply final permutation
-            self.st.permuteR(12);
-            self.squeezed = true;
-        }
-
-        var i: usize = 0;
-        while (i &lt; out.len) {
-            const to_copy = @min(8, out.len - i);
-            var block: [8]u8 = undefined;
-            mem.writeInt(u64, &amp;block, self.st.st[0], .little);
-            @memcpy(out[i..][0..to_copy], block[0..to_copy]);
-            i += to_copy;
-
-            if (i &lt; out.len) {
-                self.st.permuteR(12);
-            }
-        }
-    }
-};
-
-test "Ascon-Hash256 basic test" {
-    const message = "The quick brown fox jumps over the lazy dog";
-    var hash: [32]u8 = undefined;
-
-    AsconHash256.hash(message, &amp;hash, .{});
-
-    // Verify hash is generated (exact value depends on test vectors)
-    try testing.expect(hash.len == 32);
-}
-
-test "Ascon-XOF128 basic test" {
-    var xof = AsconXof128.init(.{});
-    xof.update("Hello, ");
-    xof.update("World!");
-
-    var out1: [16]u8 = undefined;
-    xof.squeeze(&amp;out1);
-
-    var out2: [32]u8 = undefined;
-    xof.squeeze(&amp;out2);
-
-    // XOF outputs should be continuous - out2 should NOT match out1
-    // Each squeeze produces new output
-    try testing.expect(!mem.eql(u8, &amp;out1, out2[0..16]));
-}
-
-test "Ascon-CXOF128 with customization" {
-    const custom = "MyCustomString";
-    var xof = AsconCxof128.init(.{ .custom = custom });
-    xof.update("Test message");
-
-    var out: [32]u8 = undefined;
-    xof.squeeze(&amp;out);
-
-    // Different customization should give different output
-    var xof2 = AsconCxof128.init(.{ .custom = "DifferentCustom" });
-    xof2.update("Test message");
-
-    var out2: [32]u8 = undefined;
-    xof2.squeeze(&amp;out2);
-
-    try testing.expect(!mem.eql(u8, &amp;out, &amp;out2));
-}
-
-test "Ascon-AEAD128 round trip with various data sizes" {
-    if (builtin.cpu.has(.riscv, .v) and builtin.zig_backend == .stage2_llvm) return error.SkipZigTest;
-
-    const key = [_]u8{ 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF, 0xFE, 0xDC, 0xBA, 0x98, 0x76, 0x54, 0x32, 0x10 };
-    const nonce = [_]u8{ 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF };
-
-    // Test with empty plaintext
-    {
-        const plaintext = "";
-        const ad = "metadata";
-        var ciphertext: [plaintext.len]u8 = undefined;
-        var tag: [16]u8 = undefined;
-
-        AsconAead128.encrypt(&amp;ciphertext, &amp;tag, plaintext, ad, nonce, key);
-
-        var decrypted: [plaintext.len]u8 = undefined;
-        try AsconAead128.decrypt(&amp;decrypted, &amp;ciphertext, tag, ad, nonce, key);
-        try testing.expectEqualStrings(plaintext, &amp;decrypted);
-    }
-
-    // Test with small plaintext
-    {
-        const plaintext = "Short";
-        const ad = "";
-        var ciphertext: [plaintext.len]u8 = undefined;
-        var tag: [16]u8 = undefined;
-
-        AsconAead128.encrypt(&amp;ciphertext, &amp;tag, plaintext, ad, nonce, key);
-
-        var decrypted: [plaintext.len]u8 = undefined;
-        try AsconAead128.decrypt(&amp;decrypted, &amp;ciphertext, tag, ad, nonce, key);
-        try testing.expectEqualStrings(plaintext, &amp;decrypted);
-    }
-
-    // Test with longer plaintext and associated data
-    {
-        const plaintext = "This is a longer message to test the round trip encryption and decryption process";
-        const ad = "Additional authenticated data that is not encrypted but is authenticated";
-        var ciphertext: [plaintext.len]u8 = undefined;
-        var tag: [16]u8 = undefined;
-
-        AsconAead128.encrypt(&amp;ciphertext, &amp;tag, plaintext, ad, nonce, key);
-
-        var decrypted: [plaintext.len]u8 = undefined;
-        try AsconAead128.decrypt(&amp;decrypted, &amp;ciphertext, tag, ad, nonce, key);
-        try testing.expectEqualStrings(plaintext, &amp;decrypted);
-    }
-
-    // Test authentication failure with tampered ciphertext
-    {
-        const plaintext = "Tamper test";
-        const ad = "metadata";
-        var ciphertext: [plaintext.len]u8 = undefined;
-        var tag: [16]u8 = undefined;
-
-        AsconAead128.encrypt(&amp;ciphertext, &amp;tag, plaintext, ad, nonce, key);
-
-        // Tamper with ciphertext
-        ciphertext[0] ^= 0xFF;
-
-        var decrypted: [plaintext.len]u8 = undefined;
-        const result = AsconAead128.decrypt(&amp;decrypted, &amp;ciphertext, tag, ad, nonce, key);
-        try testing.expectError(error.AuthenticationFailed, result);
-    }
-
-    // Test authentication failure with wrong tag
-    {
-        const plaintext = "Tag test";
-        const ad = "metadata";
-        var ciphertext: [plaintext.len]u8 = undefined;
-        var tag: [16]u8 = undefined;
-
-        AsconAead128.encrypt(&amp;ciphertext, &amp;tag, plaintext, ad, nonce, key);
-
-        // Tamper with tag
-        var wrong_tag = tag;
-        wrong_tag[0] ^= 0xFF;
-
-        var decrypted: [plaintext.len]u8 = undefined;
-        const result = AsconAead128.decrypt(&amp;decrypted, &amp;ciphertext, wrong_tag, ad, nonce, key);
-        try testing.expectError(error.AuthenticationFailed, result);
-    }
-
-    // Test authentication failure with wrong associated data
-    {
-        const plaintext = "AD test";
-        const ad = "original";
-        var ciphertext: [plaintext.len]u8 = undefined;
-        var tag: [16]u8 = undefined;
-
-        AsconAead128.encrypt(&amp;ciphertext, &amp;tag, plaintext, ad, nonce, key);
-
-        var decrypted: [plaintext.len]u8 = undefined;
-        const wrong_ad = "modified";
-        const result = AsconAead128.decrypt(&amp;decrypted, &amp;ciphertext, tag, wrong_ad, nonce, key);
-        try testing.expectError(error.AuthenticationFailed, result);
-    }
-}
-
-// Test vectors from NIST SP 800-232 / ascon-c reference implementation
-test "Ascon-AEAD128 official test vectors" {
-
-    // Test vector 1: Empty PT, Empty AD
-    {
-        var key: [16]u8 = undefined;
-        var nonce: [16]u8 = undefined;
-        _ = std.fmt.hexToBytes(&amp;key, "000102030405060708090A0B0C0D0E0F") catch unreachable;
-        _ = std.fmt.hexToBytes(&amp;nonce, "101112131415161718191A1B1C1D1E1F") catch unreachable;
-
-        const plaintext = "";
-        const ad = "";
-        var ciphertext: [plaintext.len]u8 = undefined;
-        var tag: [16]u8 = undefined;
-
-        AsconAead128.encrypt(&amp;ciphertext, &amp;tag, plaintext, ad, nonce, key);
-
-        var expected_tag: [16]u8 = undefined;
-        _ = std.fmt.hexToBytes(&amp;expected_tag, "4F9C278211BEC9316BF68F46EE8B2EC6") catch unreachable;
-        try testing.expectEqualSlices(u8, &amp;expected_tag, &amp;tag);
-    }
-
-    // Test vector 2: Empty PT, AD = "30"
-    {
-        var key: [16]u8 = undefined;
-        var nonce: [16]u8 = undefined;
-        _ = std.fmt.hexToBytes(&amp;key, "000102030405060708090A0B0C0D0E0F") catch unreachable;
-        _ = std.fmt.hexToBytes(&amp;nonce, "101112131415161718191A1B1C1D1E1F") catch unreachable;
-
-        const plaintext = "";
-        var ad: [1]u8 = undefined;
-        _ = std.fmt.hexToBytes(&amp;ad, "30") catch unreachable;
-        var ciphertext: [plaintext.len]u8 = undefined;
-        var tag: [16]u8 = undefined;
-
-        AsconAead128.encrypt(&amp;ciphertext, &amp;tag, plaintext, &amp;ad, nonce, key);
-
-        var expected_tag: [16]u8 = undefined;
-        _ = std.fmt.hexToBytes(&amp;expected_tag, "CCCB674FE18A09A285D6AB11B35675C0") catch unreachable;
-        try testing.expectEqualSlices(u8, &amp;expected_tag, &amp;tag);
-    }
-
-    // Test vector 34: Single byte plaintext 0x20
-    {
-        var key: [16]u8 = undefined;
-        var nonce: [16]u8 = undefined;
-        _ = std.fmt.hexToBytes(&amp;key, "000102030405060708090A0B0C0D0E0F") catch unreachable;
-        _ = std.fmt.hexToBytes(&amp;nonce, "101112131415161718191A1B1C1D1E1F") catch unreachable;
-
-        var plaintext: [1]u8 = undefined;
-        _ = std.fmt.hexToBytes(&amp;plaintext, "20") catch unreachable;
-        const ad = "";
-        var ciphertext: [1]u8 = undefined;
-        var tag: [16]u8 = undefined;
-
-        AsconAead128.encrypt(&amp;ciphertext, &amp;tag, &amp;plaintext, ad, nonce, key);
-
-        var expected_ct: [1]u8 = undefined;
-        _ = std.fmt.hexToBytes(&amp;expected_ct, "E8") catch unreachable;
-        var expected_tag: [16]u8 = undefined;
-        _ = std.fmt.hexToBytes(&amp;expected_tag, "DD576ABA1CD3E6FC704DE02AEDB79588") catch unreachable;
-
-        try testing.expectEqualSlices(u8, &amp;expected_ct, &amp;ciphertext);
-        try testing.expectEqualSlices(u8, &amp;expected_tag, &amp;tag);
-
-        // Verify decryption
-        var decrypted: [1]u8 = undefined;
-        try AsconAead128.decrypt(&amp;decrypted, &amp;ciphertext, tag, ad, nonce, key);
-        try testing.expectEqualSlices(u8, &amp;plaintext, &amp;decrypted);
-    }
-
-    // Test vector with 3-byte plaintext
-    {
-        var key: [16]u8 = undefined;
-        var nonce: [16]u8 = undefined;
-        _ = std.fmt.hexToBytes(&amp;key, "000102030405060708090A0B0C0D0E0F") catch unreachable;
-        _ = std.fmt.hexToBytes(&amp;nonce, "101112131415161718191A1B1C1D1E1F") catch unreachable;
-
-        var plaintext: [3]u8 = undefined;
-        _ = std.fmt.hexToBytes(&amp;plaintext, "202122") catch unreachable;
-        const ad = "";
-        var ciphertext: [3]u8 = undefined;
-        var tag: [16]u8 = undefined;
-
-        AsconAead128.encrypt(&amp;ciphertext, &amp;tag, &amp;plaintext, ad, nonce, key);
-
-        var expected_ct: [3]u8 = undefined;
-        _ = std.fmt.hexToBytes(&amp;expected_ct, "E8C3DE") catch unreachable;
-        var expected_tag: [16]u8 = undefined;
-        _ = std.fmt.hexToBytes(&amp;expected_tag, "AF8E12816B8EDF39AD1571A9492B7CA2") catch unreachable;
-
-        try testing.expectEqualSlices(u8, &amp;expected_ct, &amp;ciphertext);
-        try testing.expectEqualSlices(u8, &amp;expected_tag, &amp;tag);
-
-        // Verify decryption
-        var decrypted: [3]u8 = undefined;
-        try AsconAead128.decrypt(&amp;decrypted, &amp;ciphertext, tag, ad, nonce, key);
-        try testing.expectEqualSlices(u8, &amp;plaintext, &amp;decrypted);
-    }
-}
-
-test "Ascon-Hash256 official test vectors" {
-
-    // Test vector 1: Empty message
-    {
-        const message = "";
-        var hash: [32]u8 = undefined;
-        AsconHash256.hash(message, &amp;hash, .{});
-
-        var expected: [32]u8 = undefined;
-        _ = std.fmt.hexToBytes(&amp;expected, "0B3BE5850F2F6B98CAF29F8FDEA89B64A1FA70AA249B8F839BD53BAA304D92B2") catch unreachable;
-        try testing.expectEqualSlices(u8, &amp;expected, &amp;hash);
-    }
-
-    // Test vector 2: Single byte 0x00
-    {
-        const message = [_]u8{0x00};
-        var hash: [32]u8 = undefined;
-        AsconHash256.hash(&amp;message, &amp;hash, .{});
-
-        var expected: [32]u8 = undefined;
-        _ = std.fmt.hexToBytes(&amp;expected, "0728621035AF3ED2BCA03BF6FDE900F9456F5330E4B5EE23E7F6A1E70291BC80") catch unreachable;
-        try testing.expectEqualSlices(u8, &amp;expected, &amp;hash);
-    }
-
-    // Test vector 3: 0x00, 0x01
-    {
-        const message = [_]u8{ 0x00, 0x01 };
-        var hash: [32]u8 = undefined;
-        AsconHash256.hash(&amp;message, &amp;hash, .{});
-
-        var expected: [32]u8 = undefined;
-        _ = std.fmt.hexToBytes(&amp;expected, "6115E7C9C4081C2797FC8FE1BC57A836AFA1C5381E556DD583860CA2DFB48DD2") catch unreachable;
-        try testing.expectEqualSlices(u8, &amp;expected, &amp;hash);
-    }
-
-    // Test vector 4: 0x00, 0x01, 0x02
-    {
-        const message = [_]u8{ 0x00, 0x01, 0x02 };
-        var hash: [32]u8 = undefined;
-        AsconHash256.hash(&amp;message, &amp;hash, .{});
-
-        var expected: [32]u8 = undefined;
-        _ = std.fmt.hexToBytes(&amp;expected, "265AB89A609F5A05DCA57E83FBBA700F9A2D2C4211BA4CC9F0A1A369E17B915C") catch unreachable;
-        try testing.expectEqualSlices(u8, &amp;expected, &amp;hash);
-    }
-
-    // Test vector 5: 0x00..0x03
-    {
-        const message = [_]u8{ 0x00, 0x01, 0x02, 0x03 };
-        var hash: [32]u8 = undefined;
-        AsconHash256.hash(&amp;message, &amp;hash, .{});
-
-        var expected: [32]u8 = undefined;
-        _ = std.fmt.hexToBytes(&amp;expected, "D7E4C7ED9B8A325CD08B9EF259F8877054ECD8304FE1B2D7FD847137DF6727EE") catch unreachable;
-        try testing.expectEqualSlices(u8, &amp;expected, &amp;hash);
-    }
-}
-
-test "Ascon-XOF128 official test vectors" {
-
-    // Test vector 1: Empty message, 64-byte output
-    {
-        var xof = AsconXof128.init(.{});
-        xof.update("");
-
-        var output: [64]u8 = undefined;
-        xof.squeeze(&amp;output);
-
-        var expected: [64]u8 = undefined;
-        _ = std.fmt.hexToBytes(&amp;expected, "473D5E6164F58B39DFD84AACDB8AE42EC2D91FED33388EE0D960D9B3993295C6AD77855A5D3B13FE6AD9E6098988373AF7D0956D05A8F1665D2C67D1A3AD10FF") catch unreachable;
-        try testing.expectEqualSlices(u8, &amp;expected, &amp;output);
-    }
-
-    // Test vector 2: Single byte 0x00, 64-byte output
-    {
-        var xof = AsconXof128.init(.{});
-        const msg = [_]u8{0x00};
-        xof.update(&amp;msg);
-
-        var output: [64]u8 = undefined;
-        xof.squeeze(&amp;output);
-
-        var expected: [64]u8 = undefined;
-        _ = std.fmt.hexToBytes(&amp;expected, "51430E0438ECDF642B393630D977625F5F337656BA58AB1E960784AC32A16E0D446405551F5469384F8EA283CF12E64FA72C426BFEBAEA3AA1529E2C4AB23A2F") catch unreachable;
-        try testing.expectEqualSlices(u8, &amp;expected, &amp;output);
-    }
-
-    // Test vector 3: 0x00, 0x01, 64-byte output
-    {
-        var xof = AsconXof128.init(.{});
-        const msg = [_]u8{ 0x00, 0x01 };
-        xof.update(&amp;msg);
-
-        var output: [64]u8 = undefined;
-        xof.squeeze(&amp;output);
-
-        var expected: [64]u8 = undefined;
-        _ = std.fmt.hexToBytes(&amp;expected, "A05383077AF971D3830BD37E7B981497A773D441DB077C6494CC73125953846EB6427FBA4CD308FF90A11385D51101341BF5379249217BFDACE9CCA1148CC966") catch unreachable;
-        try testing.expectEqualSlices(u8, &amp;expected, &amp;output);
-    }
-}
-
-test "Ascon-CXOF128 official test vectors" {
-
-    // Test vector 1: Empty message, empty customization, 64-byte output
-    {
-        var xof = AsconCxof128.init(.{});
-        xof.update("");
-
-        var output: [64]u8 = undefined;
-        xof.squeeze(&amp;output);
-
-        var expected: [64]u8 = undefined;
-        _ = std.fmt.hexToBytes(&amp;expected, "4F50159EF70BB3DAD8807E034EAEBD44C4FA2CBBC8CF1F05511AB66CDCC529905CA12083FC186AD899B270B1473DC5F7EC88D1052082DCDFE69FB75D269E7B74") catch unreachable;
-        try testing.expectEqualSlices(u8, &amp;expected, &amp;output);
-    }
-
-    // Test vector 2: Empty message, customization = 0x10, 64-byte output
-    {
-        const custom = [_]u8{0x10};
-        var xof = AsconCxof128.init(.{ .custom = &amp;custom });
-        xof.update("");
-
-        var output: [64]u8 = undefined;
-        xof.squeeze(&amp;output);
-
-        var expected: [64]u8 = undefined;
-        _ = std.fmt.hexToBytes(&amp;expected, "0C93A483E7D574D49FE52CCE03EE646117977D57A8AA57704AB4DAF44B501430FF6AC11A5D1FD6F2154B5C65728268270C8BB578508487B8965718ADA6272FD6") catch unreachable;
-        try testing.expectEqualSlices(u8, &amp;expected, &amp;output);
-    }
-
-    // Test vector 3: Empty message, customization = 0x10, 0x11, 64-byte output
-    {
-        const custom = [_]u8{ 0x10, 0x11 };
-        var xof = AsconCxof128.init(.{ .custom = &amp;custom });
-        xof.update("");
-
-        var output: [64]u8 = undefined;
-        xof.squeeze(&amp;output);
-
-        var expected: [64]u8 = undefined;
-        _ = std.fmt.hexToBytes(&amp;expected, "D1106C7622E79FE955BD9D79E03B918E770FE0E0CDDDE28BEB924B02C5FC936B33ACCA299C89ECA5D71886CBBFA4D54A21C55FDE2B679F5E2488063A1719DC32") catch unreachable;
-        try testing.expectEqualSlices(u8, &amp;expected, &amp;output);
-    }
-}</pre>
+    <pre><a id="L1"></a>//! Ascon is a 320-bit permutation, selected as new standard for lightweight cryptography
+<a id="L2"></a>//! in the NIST Lightweight Cryptography competition (2019–2023).
+<a id="L3"></a>//! https://csrc.nist.gov/pubs/sp/800/232/ipd
+<a id="L4"></a>//!
+<a id="L5"></a>//! The permutation is compact, and optimized for timing and side channel resistance,
+<a id="L6"></a>//! making it a good choice for embedded applications.
+<a id="L7"></a>//!
+<a id="L8"></a>//! It is not meant to be used directly, but as a building block for symmetric cryptography.
+<a id="L9"></a>
+<a id="L10"></a>const std = @import("std");
+<a id="L11"></a>const builtin = @import("builtin");
+<a id="L12"></a>const crypto = std.crypto;
+<a id="L13"></a>const debug = std.debug;
+<a id="L14"></a>const mem = std.mem;
+<a id="L15"></a>const testing = std.testing;
+<a id="L16"></a>const rotr = std.math.rotr;
+<a id="L17"></a>const native_endian = builtin.cpu.arch.endian();
+<a id="L18"></a>
+<a id="L19"></a>/// An Ascon state.
+<a id="L20"></a>///
+<a id="L21"></a>/// The state is represented as 5 64-bit words.
+<a id="L22"></a>///
+<a id="L23"></a>/// The original NIST submission (v1.2) serializes these words as big-endian,
+<a id="L24"></a>/// but NIST SP 800-232 switched to a little-endian representation.
+<a id="L25"></a>/// Software implementations are free to use native endianness with no security degradation.
+<a id="L26"></a>pub fn State(comptime endian: std.builtin.Endian) type {
+<a id="L27"></a>    return struct {
+<a id="L28"></a>        const Self = @This();
+<a id="L29"></a>
+<a id="L30"></a>        /// Number of bytes in the state.
+<a id="L31"></a>        pub const block_bytes = 40;
+<a id="L32"></a>
+<a id="L33"></a>        const Block = [5]u64;
+<a id="L34"></a>
+<a id="L35"></a>        st: Block,
+<a id="L36"></a>
+<a id="L37"></a>        /// Initialize the state from a slice of bytes.
+<a id="L38"></a>        ///
+<a id="L39"></a>        /// Parameters:
+<a id="L40"></a>        ///   - initial_state: A 40-byte array to initialize the state
+<a id="L41"></a>        ///
+<a id="L42"></a>        /// Returns: A new State initialized with the provided bytes
+<a id="L43"></a>        pub fn init(initial_state: [block_bytes]u8) Self {
+<a id="L44"></a>            var state = Self{ .st = undefined };
+<a id="L45"></a>            @memcpy(state.asBytes(), &amp;initial_state);
+<a id="L46"></a>            state.endianSwap();
+<a id="L47"></a>            return state;
+<a id="L48"></a>        }
+<a id="L49"></a>
+<a id="L50"></a>        /// Initialize the state from u64 words in native endianness.
+<a id="L51"></a>        ///
+<a id="L52"></a>        /// Parameters:
+<a id="L53"></a>        ///   - initial_state: An array of 5 u64 words in native endianness
+<a id="L54"></a>        ///
+<a id="L55"></a>        /// Returns: A new State with the provided words
+<a id="L56"></a>        pub fn initFromWords(initial_state: [5]u64) Self {
+<a id="L57"></a>            return .{ .st = initial_state };
+<a id="L58"></a>        }
+<a id="L59"></a>
+<a id="L60"></a>        /// Initialize the state for Ascon XOF.
+<a id="L61"></a>        ///
+<a id="L62"></a>        /// Returns: A new State initialized with the Ascon XOF initialization vector
+<a id="L63"></a>        pub fn initXof() Self {
+<a id="L64"></a>            return Self{ .st = Block{
+<a id="L65"></a>                0xb57e273b814cd416,
+<a id="L66"></a>                0x2b51042562ae2420,
+<a id="L67"></a>                0x66a3a7768ddf2218,
+<a id="L68"></a>                0x5aad0a7a8153650c,
+<a id="L69"></a>                0x4f3e0e32539493b6,
+<a id="L70"></a>            } };
+<a id="L71"></a>        }
+<a id="L72"></a>
+<a id="L73"></a>        /// Initialize the state for Ascon XOFa.
+<a id="L74"></a>        ///
+<a id="L75"></a>        /// Returns: A new State initialized with the Ascon XOFa initialization vector
+<a id="L76"></a>        pub fn initXofA() Self {
+<a id="L77"></a>            return Self{ .st = Block{
+<a id="L78"></a>                0x44906568b77b9832,
+<a id="L79"></a>                0xcd8d6cae53455532,
+<a id="L80"></a>                0xf7b5212756422129,
+<a id="L81"></a>                0x246885e1de0d225b,
+<a id="L82"></a>                0xa8cb5ce33449973f,
+<a id="L83"></a>            } };
+<a id="L84"></a>        }
+<a id="L85"></a>
+<a id="L86"></a>        /// A representation of the state as bytes. The byte order is architecture-dependent.
+<a id="L87"></a>        ///
+<a id="L88"></a>        /// Returns: A pointer to the state's internal byte representation
+<a id="L89"></a>        pub fn asBytes(self: *Self) *[block_bytes]u8 {
+<a id="L90"></a>            return mem.asBytes(&amp;self.st);
+<a id="L91"></a>        }
+<a id="L92"></a>
+<a id="L93"></a>        /// Byte-swap the entire state if the architecture doesn't match the required endianness.
+<a id="L94"></a>        ///
+<a id="L95"></a>        /// This ensures the state is in the correct endianness for the current platform.
+<a id="L96"></a>        pub fn endianSwap(self: *Self) void {
+<a id="L97"></a>            for (&amp;self.st) |*w| {
+<a id="L98"></a>                w.* = mem.toNative(u64, w.*, endian);
+<a id="L99"></a>            }
+<a id="L100"></a>        }
+<a id="L101"></a>
+<a id="L102"></a>        /// Set bytes starting at the beginning of the state.
+<a id="L103"></a>        ///
+<a id="L104"></a>        /// Parameters:
+<a id="L105"></a>        ///   - bytes: Slice of bytes to write into the state (up to 40 bytes)
+<a id="L106"></a>        ///
+<a id="L107"></a>        /// Note: If bytes.len &lt; 40, remaining state words are zero-padded
+<a id="L108"></a>        pub fn setBytes(self: *Self, bytes: []const u8) void {
+<a id="L109"></a>            var i: usize = 0;
+<a id="L110"></a>            while (i + 8 &lt;= bytes.len) : (i += 8) {
+<a id="L111"></a>                self.st[i / 8] = mem.readInt(u64, bytes[i..][0..8], endian);
+<a id="L112"></a>            }
+<a id="L113"></a>            if (i &lt; bytes.len) {
+<a id="L114"></a>                var padded: [8]u8 = @splat(0);
+<a id="L115"></a>                @memcpy(padded[0 .. bytes.len - i], bytes[i..]);
+<a id="L116"></a>                self.st[i / 8] = mem.readInt(u64, padded[0..], endian);
+<a id="L117"></a>            }
+<a id="L118"></a>        }
+<a id="L119"></a>
+<a id="L120"></a>        /// XOR a byte into the state at a given offset.
+<a id="L121"></a>        ///
+<a id="L122"></a>        /// Parameters:
+<a id="L123"></a>        ///   - byte: The byte to XOR into the state
+<a id="L124"></a>        ///   - offset: The byte offset in the state (0-39)
+<a id="L125"></a>        pub fn addByte(self: *Self, byte: u8, offset: usize) void {
+<a id="L126"></a>            const z = switch (endian) {
+<a id="L127"></a>                .big =&gt; 64 - 8 - 8 * @as(u6, @truncate(offset % 8)),
+<a id="L128"></a>                .little =&gt; 8 * @as(u6, @truncate(offset % 8)),
+<a id="L129"></a>            };
+<a id="L130"></a>            self.st[offset / 8] ^= @as(u64, byte) &lt;&lt; z;
+<a id="L131"></a>        }
+<a id="L132"></a>
+<a id="L133"></a>        /// XOR bytes into the beginning of the state.
+<a id="L134"></a>        ///
+<a id="L135"></a>        /// Parameters:
+<a id="L136"></a>        ///   - bytes: Slice of bytes to XOR into the state (up to 40 bytes)
+<a id="L137"></a>        ///
+<a id="L138"></a>        /// Note: Handles partial blocks with zero-padding
+<a id="L139"></a>        pub fn addBytes(self: *Self, bytes: []const u8) void {
+<a id="L140"></a>            var i: usize = 0;
+<a id="L141"></a>            while (i + 8 &lt;= bytes.len) : (i += 8) {
+<a id="L142"></a>                self.st[i / 8] ^= mem.readInt(u64, bytes[i..][0..8], endian);
+<a id="L143"></a>            }
+<a id="L144"></a>            if (i &lt; bytes.len) {
+<a id="L145"></a>                var padded: [8]u8 = @splat(0);
+<a id="L146"></a>                @memcpy(padded[0 .. bytes.len - i], bytes[i..]);
+<a id="L147"></a>                self.st[i / 8] ^= mem.readInt(u64, padded[0..], endian);
+<a id="L148"></a>            }
+<a id="L149"></a>        }
+<a id="L150"></a>
+<a id="L151"></a>        /// Extract the first bytes of the state.
+<a id="L152"></a>        ///
+<a id="L153"></a>        /// Parameters:
+<a id="L154"></a>        ///   - out: Output buffer to receive the extracted bytes
+<a id="L155"></a>        ///
+<a id="L156"></a>        /// Note: Extracts up to out.len bytes from the beginning of the state
+<a id="L157"></a>        pub fn extractBytes(self: *Self, out: []u8) void {
+<a id="L158"></a>            var i: usize = 0;
+<a id="L159"></a>            while (i + 8 &lt;= out.len) : (i += 8) {
+<a id="L160"></a>                mem.writeInt(u64, out[i..][0..8], self.st[i / 8], endian);
+<a id="L161"></a>            }
+<a id="L162"></a>            if (i &lt; out.len) {
+<a id="L163"></a>                var padded: [8]u8 = @splat(0);
+<a id="L164"></a>                mem.writeInt(u64, padded[0..], self.st[i / 8], endian);
+<a id="L165"></a>                @memcpy(out[i..], padded[0 .. out.len - i]);
+<a id="L166"></a>            }
+<a id="L167"></a>        }
+<a id="L168"></a>
+<a id="L169"></a>        /// XOR the first bytes of the state into a slice of bytes.
+<a id="L170"></a>        ///
+<a id="L171"></a>        /// Parameters:
+<a id="L172"></a>        ///   - out: Output buffer for the XORed result
+<a id="L173"></a>        ///   - in: Input bytes to XOR with the state
+<a id="L174"></a>        ///
+<a id="L175"></a>        /// Requires: out.len == in.len
+<a id="L176"></a>        pub fn xorBytes(self: *Self, out: []u8, in: []const u8) void {
+<a id="L177"></a>            debug.assert(out.len == in.len);
+<a id="L178"></a>
+<a id="L179"></a>            var i: usize = 0;
+<a id="L180"></a>            while (i + 8 &lt;= in.len) : (i += 8) {
+<a id="L181"></a>                const x = mem.readInt(u64, in[i..][0..8], native_endian) ^ mem.nativeTo(u64, self.st[i / 8], endian);
+<a id="L182"></a>                mem.writeInt(u64, out[i..][0..8], x, native_endian);
+<a id="L183"></a>            }
+<a id="L184"></a>            if (i &lt; in.len) {
+<a id="L185"></a>                var padded: [8]u8 = @splat(0);
+<a id="L186"></a>                @memcpy(padded[0 .. in.len - i], in[i..]);
+<a id="L187"></a>                const x = mem.readInt(u64, &amp;padded, native_endian) ^ mem.nativeTo(u64, self.st[i / 8], endian);
+<a id="L188"></a>                mem.writeInt(u64, &amp;padded, x, native_endian);
+<a id="L189"></a>                @memcpy(out[i..], padded[0 .. in.len - i]);
+<a id="L190"></a>            }
+<a id="L191"></a>        }
+<a id="L192"></a>
+<a id="L193"></a>        /// Set the words storing the bytes of a given range to zero.
+<a id="L194"></a>        ///
+<a id="L195"></a>        /// Parameters:
+<a id="L196"></a>        ///   - from: Starting byte offset (inclusive)
+<a id="L197"></a>        ///   - to: Ending byte offset (inclusive)
+<a id="L198"></a>        ///
+<a id="L199"></a>        /// Note: Clears complete words that contain the specified byte range
+<a id="L200"></a>        pub fn clear(self: *Self, from: usize, to: usize) void {
+<a id="L201"></a>            @memset(self.st[from / 8 .. (to + 7) / 8], 0);
+<a id="L202"></a>        }
+<a id="L203"></a>
+<a id="L204"></a>        /// Clear the entire state, disabling compiler optimizations.
+<a id="L205"></a>        ///
+<a id="L206"></a>        /// Uses secure zeroing to prevent the compiler from optimizing away
+<a id="L207"></a>        /// the clearing operation. Use for sensitive data cleanup.
+<a id="L208"></a>        pub fn secureZero(self: *Self) void {
+<a id="L209"></a>            crypto.secureZero(u64, &amp;self.st);
+<a id="L210"></a>        }
+<a id="L211"></a>
+<a id="L212"></a>        /// Apply a reduced-round permutation to the state.
+<a id="L213"></a>        ///
+<a id="L214"></a>        /// Parameters:
+<a id="L215"></a>        ///   - rounds: Number of rounds to apply (1-12)
+<a id="L216"></a>        ///
+<a id="L217"></a>        /// Note: Uses the last `rounds` round constants from the full set
+<a id="L218"></a>        pub fn permuteR(state: *Self, comptime rounds: u4) void {
+<a id="L219"></a>            const rks = [16]u64{ 0x3c, 0x2d, 0x1e, 0x0f, 0xf0, 0xe1, 0xd2, 0xc3, 0xb4, 0xa5, 0x96, 0x87, 0x78, 0x69, 0x5a, 0x4b };
+<a id="L220"></a>            inline for (rks[rks.len - rounds ..]) |rk| {
+<a id="L221"></a>                state.round(rk);
+<a id="L222"></a>            }
+<a id="L223"></a>        }
+<a id="L224"></a>
+<a id="L225"></a>        /// Apply a full-round permutation to the state.
+<a id="L226"></a>        ///
+<a id="L227"></a>        /// Applies the standard 12-round Ascon permutation.
+<a id="L228"></a>        pub fn permute(state: *Self) void {
+<a id="L229"></a>            state.permuteR(12);
+<a id="L230"></a>        }
+<a id="L231"></a>
+<a id="L232"></a>        /// Apply a permutation to the state and prevent backtracking.
+<a id="L233"></a>        ///
+<a id="L234"></a>        /// Parameters:
+<a id="L235"></a>        ///   - rounds: Number of permutation rounds to apply
+<a id="L236"></a>        ///   - rate: Rate in bytes (must be multiple of 8, &lt; 40)
+<a id="L237"></a>        ///
+<a id="L238"></a>        /// The capacity portion is XORed before and after permutation to
+<a id="L239"></a>        /// provide forward security (ratcheting).
+<a id="L240"></a>        pub fn permuteRatchet(state: *Self, comptime rounds: u4, comptime rate: u6) void {
+<a id="L241"></a>            const capacity = block_bytes - rate;
+<a id="L242"></a>            debug.assert(capacity &gt; 0 and capacity % 8 == 0); // capacity must be a multiple of 64 bits
+<a id="L243"></a>            var mask: [capacity / 8]u64 = undefined;
+<a id="L244"></a>            inline for (&amp;mask, state.st[state.st.len - mask.len ..]) |*m, x| m.* = x;
+<a id="L245"></a>            state.permuteR(rounds);
+<a id="L246"></a>            inline for (mask, state.st[state.st.len - mask.len ..]) |m, *x| x.* ^= m;
+<a id="L247"></a>        }
+<a id="L248"></a>
+<a id="L249"></a>        /// Core Ascon permutation round function.
+<a id="L250"></a>        ///
+<a id="L251"></a>        /// Parameters:
+<a id="L252"></a>        ///   - rk: Round constant for this round
+<a id="L253"></a>        ///
+<a id="L254"></a>        /// Implements one round of the Ascon permutation with S-box and linear layer.
+<a id="L255"></a>        fn round(state: *Self, rk: u64) void {
+<a id="L256"></a>            const x = &amp;state.st;
+<a id="L257"></a>            x[2] ^= rk;
+<a id="L258"></a>
+<a id="L259"></a>            x[0] ^= x[4];
+<a id="L260"></a>            x[4] ^= x[3];
+<a id="L261"></a>            x[2] ^= x[1];
+<a id="L262"></a>            var t: Block = .{
+<a id="L263"></a>                x[0] ^ (~x[1] &amp; x[2]),
+<a id="L264"></a>                x[1] ^ (~x[2] &amp; x[3]),
+<a id="L265"></a>                x[2] ^ (~x[3] &amp; x[4]),
+<a id="L266"></a>                x[3] ^ (~x[4] &amp; x[0]),
+<a id="L267"></a>                x[4] ^ (~x[0] &amp; x[1]),
+<a id="L268"></a>            };
+<a id="L269"></a>            t[1] ^= t[0];
+<a id="L270"></a>            t[3] ^= t[2];
+<a id="L271"></a>            t[0] ^= t[4];
+<a id="L272"></a>
+<a id="L273"></a>            x[2] = t[2] ^ rotr(u64, t[2], 6 - 1);
+<a id="L274"></a>            x[3] = t[3] ^ rotr(u64, t[3], 17 - 10);
+<a id="L275"></a>            x[4] = t[4] ^ rotr(u64, t[4], 41 - 7);
+<a id="L276"></a>            x[0] = t[0] ^ rotr(u64, t[0], 28 - 19);
+<a id="L277"></a>            x[1] = t[1] ^ rotr(u64, t[1], 61 - 39);
+<a id="L278"></a>            x[2] = t[2] ^ rotr(u64, x[2], 1);
+<a id="L279"></a>            x[3] = t[3] ^ rotr(u64, x[3], 10);
+<a id="L280"></a>            x[4] = t[4] ^ rotr(u64, x[4], 7);
+<a id="L281"></a>            x[0] = t[0] ^ rotr(u64, x[0], 19);
+<a id="L282"></a>            x[1] = t[1] ^ rotr(u64, x[1], 39);
+<a id="L283"></a>            x[2] = ~x[2];
+<a id="L284"></a>        }
+<a id="L285"></a>    };
+<a id="L286"></a>}
+<a id="L287"></a>
+<a id="L288"></a>test "ascon" {
+<a id="L289"></a>    const Ascon = State(.big);
+<a id="L290"></a>    var bytes: [Ascon.block_bytes]u8 = undefined;
+<a id="L291"></a>    @memset(&amp;bytes, 1);
+<a id="L292"></a>    var st = Ascon.init(bytes);
+<a id="L293"></a>    var out: [Ascon.block_bytes]u8 = undefined;
+<a id="L294"></a>    st.permute();
+<a id="L295"></a>    st.extractBytes(&amp;out);
+<a id="L296"></a>    const expected1 = [_]u8{ 148, 147, 49, 226, 218, 221, 208, 113, 186, 94, 96, 10, 183, 219, 119, 150, 169, 206, 65, 18, 215, 97, 78, 106, 118, 81, 211, 150, 52, 17, 117, 64, 216, 45, 148, 240, 65, 181, 90, 180 };
+<a id="L297"></a>    try testing.expectEqualSlices(u8, &amp;expected1, &amp;out);
+<a id="L298"></a>    st.clear(0, 10);
+<a id="L299"></a>    st.extractBytes(&amp;out);
+<a id="L300"></a>    const expected2 = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 169, 206, 65, 18, 215, 97, 78, 106, 118, 81, 211, 150, 52, 17, 117, 64, 216, 45, 148, 240, 65, 181, 90, 180 };
+<a id="L301"></a>    try testing.expectEqualSlices(u8, &amp;expected2, &amp;out);
+<a id="L302"></a>    st.addByte(1, 5);
+<a id="L303"></a>    st.addByte(2, 5);
+<a id="L304"></a>    st.extractBytes(&amp;out);
+<a id="L305"></a>    const expected3 = [_]u8{ 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 169, 206, 65, 18, 215, 97, 78, 106, 118, 81, 211, 150, 52, 17, 117, 64, 216, 45, 148, 240, 65, 181, 90, 180 };
+<a id="L306"></a>    try testing.expectEqualSlices(u8, &amp;expected3, &amp;out);
+<a id="L307"></a>    st.addBytes(&amp;bytes);
+<a id="L308"></a>    st.extractBytes(&amp;out);
+<a id="L309"></a>    const expected4 = [_]u8{ 1, 1, 1, 1, 1, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 168, 207, 64, 19, 214, 96, 79, 107, 119, 80, 210, 151, 53, 16, 116, 65, 217, 44, 149, 241, 64, 180, 91, 181 };
+<a id="L310"></a>    try testing.expectEqualSlices(u8, &amp;expected4, &amp;out);
+<a id="L311"></a>}
+<a id="L312"></a>
+<a id="L313"></a>const AsconState = State(.little);
+<a id="L314"></a>const AuthenticationError = crypto.errors.AuthenticationError;
+<a id="L315"></a>
+<a id="L316"></a>/// Ascon-AEAD128 as specified in NIST SP 800-232 Section 4
+<a id="L317"></a>pub const AsconAead128 = struct {
+<a id="L318"></a>    pub const tag_length = 16;
+<a id="L319"></a>    pub const nonce_length = 16;
+<a id="L320"></a>    pub const key_length = 16;
+<a id="L321"></a>    pub const block_length = 16;
+<a id="L322"></a>
+<a id="L323"></a>    const AeadState = struct {
+<a id="L324"></a>        st: AsconState,
+<a id="L325"></a>        k0: u64,
+<a id="L326"></a>        k1: u64,
+<a id="L327"></a>
+<a id="L328"></a>        /// Initialize AEAD state with key and nonce.
+<a id="L329"></a>        ///
+<a id="L330"></a>        /// Parameters:
+<a id="L331"></a>        ///   - key: 16-byte secret key
+<a id="L332"></a>        ///   - nonce: 16-byte nonce
+<a id="L333"></a>        ///
+<a id="L334"></a>        /// Returns: Initialized AEAD state ready for processing
+<a id="L335"></a>        fn init(key: [16]u8, nonce: [16]u8) AeadState {
+<a id="L336"></a>            const k0 = mem.readInt(u64, key[0..8], .little);
+<a id="L337"></a>            const k1 = mem.readInt(u64, key[8..16], .little);
+<a id="L338"></a>            const n0 = mem.readInt(u64, nonce[0..8], .little);
+<a id="L339"></a>            const n1 = mem.readInt(u64, nonce[8..16], .little);
+<a id="L340"></a>
+<a id="L341"></a>            // IV for Ascon-AEAD128 (Ascon-128a)
+<a id="L342"></a>            const iv: u64 = 0x00001000808C0001;
+<a id="L343"></a>            const words: [5]u64 = .{ iv, k0, k1, n0, n1 };
+<a id="L344"></a>
+<a id="L345"></a>            var st = AsconState.initFromWords(words);
+<a id="L346"></a>            st.permuteR(12);
+<a id="L347"></a>
+<a id="L348"></a>            st.st[3] ^= k0;
+<a id="L349"></a>            st.st[4] ^= k1;
+<a id="L350"></a>
+<a id="L351"></a>            return AeadState{ .st = st, .k0 = k0, .k1 = k1 };
+<a id="L352"></a>        }
+<a id="L353"></a>
+<a id="L354"></a>        /// Process associated data for authentication.
+<a id="L355"></a>        ///
+<a id="L356"></a>        /// Parameters:
+<a id="L357"></a>        ///   - ad: Associated data to authenticate
+<a id="L358"></a>        ///
+<a id="L359"></a>        /// Updates the state to include AD in authentication tag computation.
+<a id="L360"></a>        fn processAd(self: *AeadState, ad: []const u8) void {
+<a id="L361"></a>            if (ad.len == 0) return;
+<a id="L362"></a>
+<a id="L363"></a>            var i: usize = 0;
+<a id="L364"></a>            // Process full 128-bit blocks
+<a id="L365"></a>            while (i + 16 &lt;= ad.len) : (i += 16) {
+<a id="L366"></a>                self.st.addBytes(ad[i..][0..16]);
+<a id="L367"></a>                self.st.permuteR(8);
+<a id="L368"></a>            }
+<a id="L369"></a>
+<a id="L370"></a>            // Process final partial AD block
+<a id="L371"></a>            const adrem = ad.len - i;
+<a id="L372"></a>            if (adrem &gt; 0) {
+<a id="L373"></a>                if (adrem &gt;= 8) {
+<a id="L374"></a>                    var buf: [8]u8 = @splat(0);
+<a id="L375"></a>                    @memcpy(buf[0..8], ad[i..][0..8]);
+<a id="L376"></a>                    self.st.st[0] ^= mem.readInt(u64, &amp;buf, .little);
+<a id="L377"></a>
+<a id="L378"></a>                    buf = @splat(0);
+<a id="L379"></a>                    @memcpy(buf[0 .. adrem - 8], ad[i + 8 ..]);
+<a id="L380"></a>                    buf[adrem - 8] = 0x01;
+<a id="L381"></a>                    self.st.st[1] ^= mem.readInt(u64, &amp;buf, .little);
+<a id="L382"></a>                } else {
+<a id="L383"></a>                    var buf: [8]u8 = @splat(0);
+<a id="L384"></a>                    @memcpy(buf[0..adrem], ad[i..]);
+<a id="L385"></a>                    buf[adrem] = 0x01;
+<a id="L386"></a>                    self.st.st[0] ^= mem.readInt(u64, &amp;buf, .little);
+<a id="L387"></a>                }
+<a id="L388"></a>                self.st.permuteR(8);
+<a id="L389"></a>            }
+<a id="L390"></a>        }
+<a id="L391"></a>
+<a id="L392"></a>        /// Finalize the AEAD operation and prepare tag.
+<a id="L393"></a>        ///
+<a id="L394"></a>        /// Applies final permutation and XORs key for tag generation.
+<a id="L395"></a>        fn finalize(self: *AeadState) void {
+<a id="L396"></a>            // XOR key before final permutation
+<a id="L397"></a>            self.st.st[2] ^= self.k0;
+<a id="L398"></a>            self.st.st[3] ^= self.k1;
+<a id="L399"></a>            self.st.permuteR(12);
+<a id="L400"></a>
+<a id="L401"></a>            // XOR key again for tag generation
+<a id="L402"></a>            self.st.st[3] ^= self.k0;
+<a id="L403"></a>            self.st.st[4] ^= self.k1;
+<a id="L404"></a>        }
+<a id="L405"></a>    };
+<a id="L406"></a>
+<a id="L407"></a>    /// Encrypt a message with Ascon-AEAD128.
+<a id="L408"></a>    ///
+<a id="L409"></a>    /// Parameters:
+<a id="L410"></a>    ///   - c: Output buffer for ciphertext (must be same length as m)
+<a id="L411"></a>    ///   - tag: Output buffer for authentication tag (16 bytes)
+<a id="L412"></a>    ///   - m: Plaintext message to encrypt
+<a id="L413"></a>    ///   - ad: Associated data to authenticate but not encrypt
+<a id="L414"></a>    ///   - npub: Public nonce (16 bytes, must be unique per message)
+<a id="L415"></a>    ///   - k: Secret key (16 bytes)
+<a id="L416"></a>    ///
+<a id="L417"></a>    /// Note: The ciphertext and tag must be transmitted together for decryption
+<a id="L418"></a>    pub fn encrypt(c: []u8, tag: *[tag_length]u8, m: []const u8, ad: []const u8, npub: [nonce_length]u8, k: [key_length]u8) void {
+<a id="L419"></a>        debug.assert(c.len == m.len);
+<a id="L420"></a>
+<a id="L421"></a>        var state = AeadState.init(k, npub);
+<a id="L422"></a>
+<a id="L423"></a>        // Process associated data
+<a id="L424"></a>        state.processAd(ad);
+<a id="L425"></a>
+<a id="L426"></a>        // Domain separation (DSEP = 0x80 at byte 7 in little-endian)
+<a id="L427"></a>        state.st.st[4] ^= 0x8000000000000000;
+<a id="L428"></a>
+<a id="L429"></a>        // Process plaintext
+<a id="L430"></a>        var i: usize = 0;
+<a id="L431"></a>        while (i + 16 &lt;= m.len) : (i += 16) {
+<a id="L432"></a>            state.st.addBytes(m[i..][0..16]);
+<a id="L433"></a>            state.st.extractBytes(c[i..][0..16]);
+<a id="L434"></a>            state.st.permuteR(8);
+<a id="L435"></a>        }
+<a id="L436"></a>
+<a id="L437"></a>        // Process final partial block
+<a id="L438"></a>        const remaining = m.len - i;
+<a id="L439"></a>        if (remaining &gt; 8) {
+<a id="L440"></a>            // Split between two words
+<a id="L441"></a>            state.st.addBytes(m[i..][0..8]);
+<a id="L442"></a>            state.st.extractBytes(c[i..][0..8]);
+<a id="L443"></a>
+<a id="L444"></a>            var buf: [8]u8 = @splat(0);
+<a id="L445"></a>            @memcpy(buf[0 .. remaining - 8], m[i + 8 ..]);
+<a id="L446"></a>            const m1 = mem.readInt(u64, &amp;buf, .little);
+<a id="L447"></a>            state.st.st[1] ^= m1;
+<a id="L448"></a>            mem.writeInt(u64, buf[0..], state.st.st[1], .little);
+<a id="L449"></a>            @memcpy(c[i + 8 ..], buf[0 .. remaining - 8]);
+<a id="L450"></a>
+<a id="L451"></a>            // Add padding
+<a id="L452"></a>            state.st.st[1] ^= @as(u64, 0x01) &lt;&lt; @intCast((remaining - 8) * 8);
+<a id="L453"></a>        } else if (remaining == 8) {
+<a id="L454"></a>            // Exactly 8 bytes - all in word 0, padding in word 1
+<a id="L455"></a>            state.st.addBytes(m[i..][0..8]);
+<a id="L456"></a>            state.st.extractBytes(c[i..][0..8]);
+<a id="L457"></a>
+<a id="L458"></a>            // Add padding to word 1 at position 0
+<a id="L459"></a>            state.st.st[1] ^= 0x01;
+<a id="L460"></a>        } else if (remaining &gt; 0) {
+<a id="L461"></a>            // All in first word
+<a id="L462"></a>            var temp: [8]u8 = @splat(0);
+<a id="L463"></a>            @memcpy(temp[0..remaining], m[i..]);
+<a id="L464"></a>            state.st.addBytes(&amp;temp);
+<a id="L465"></a>            state.st.extractBytes(c[i..][0..remaining]);
+<a id="L466"></a>            // Add padding
+<a id="L467"></a>            temp = @splat(0);
+<a id="L468"></a>            temp[remaining] = 0x01;
+<a id="L469"></a>            state.st.addBytes(&amp;temp);
+<a id="L470"></a>            // Second word stays zero
+<a id="L471"></a>        } else {
+<a id="L472"></a>            // Empty message or exact multiple - add padding block
+<a id="L473"></a>            var padded: [16]u8 = @splat(0);
+<a id="L474"></a>            padded[0] = 0x01;
+<a id="L475"></a>            state.st.addBytes(&amp;padded);
+<a id="L476"></a>        }
+<a id="L477"></a>
+<a id="L478"></a>        // Finalization
+<a id="L479"></a>        state.finalize();
+<a id="L480"></a>
+<a id="L481"></a>        // Extract tag
+<a id="L482"></a>        mem.writeInt(u64, tag[0..8], state.st.st[3], .little);
+<a id="L483"></a>        mem.writeInt(u64, tag[8..16], state.st.st[4], .little);
+<a id="L484"></a>    }
+<a id="L485"></a>
+<a id="L486"></a>    /// Decrypt a message with Ascon-AEAD128.
+<a id="L487"></a>    ///
+<a id="L488"></a>    /// Parameters:
+<a id="L489"></a>    ///   - m: Output buffer for plaintext (must be same length as c)
+<a id="L490"></a>    ///   - c: Ciphertext to decrypt
+<a id="L491"></a>    ///   - tag: Authentication tag (16 bytes)
+<a id="L492"></a>    ///   - ad: Associated data that was authenticated
+<a id="L493"></a>    ///   - npub: Public nonce used during encryption (16 bytes)
+<a id="L494"></a>    ///   - k: Secret key (16 bytes)
+<a id="L495"></a>    ///
+<a id="L496"></a>    /// Returns: AuthenticationError if tag verification fails
+<a id="L497"></a>    ///
+<a id="L498"></a>    /// Note: On authentication failure, the output buffer is securely zeroed
+<a id="L499"></a>    pub fn decrypt(m: []u8, c: []const u8, tag: [tag_length]u8, ad: []const u8, npub: [nonce_length]u8, k: [key_length]u8) AuthenticationError!void {
+<a id="L500"></a>        debug.assert(m.len == c.len);
+<a id="L501"></a>
+<a id="L502"></a>        var state = AeadState.init(k, npub);
+<a id="L503"></a>
+<a id="L504"></a>        // Process associated data
+<a id="L505"></a>        state.processAd(ad);
+<a id="L506"></a>
+<a id="L507"></a>        // Domain separation (DSEP = 0x80 at byte 7 in little-endian)
+<a id="L508"></a>        state.st.st[4] ^= 0x8000000000000000;
+<a id="L509"></a>
+<a id="L510"></a>        // Process ciphertext
+<a id="L511"></a>        var i: usize = 0;
+<a id="L512"></a>        while (i + 16 &lt;= c.len) : (i += 16) {
+<a id="L513"></a>            const ct_block = c[i..][0..16].*; // Save ciphertext block for in-place operation support
+<a id="L514"></a>            state.st.xorBytes(m[i..][0..16], &amp;ct_block);
+<a id="L515"></a>            state.st.setBytes(&amp;ct_block);
+<a id="L516"></a>            state.st.permuteR(8);
+<a id="L517"></a>        }
+<a id="L518"></a>
+<a id="L519"></a>        // Final partial ciphertext block
+<a id="L520"></a>        const crem = c.len - i;
+<a id="L521"></a>        if (crem &gt; 8) {
+<a id="L522"></a>            // Save ciphertext for in-place operation support
+<a id="L523"></a>            var saved_ct: [16]u8 = undefined;
+<a id="L524"></a>            @memcpy(saved_ct[0..crem], c[i..]);
+<a id="L525"></a>
+<a id="L526"></a>            const c0 = mem.readInt(u64, saved_ct[0..8], .little);
+<a id="L527"></a>            state.st.st[0] ^= c0;
+<a id="L528"></a>            mem.writeInt(u64, m[i..][0..8], state.st.st[0], .little);
+<a id="L529"></a>            state.st.st[0] = c0;
+<a id="L530"></a>
+<a id="L531"></a>            var buf: [8]u8 = @splat(0);
+<a id="L532"></a>            @memcpy(buf[0 .. crem - 8], saved_ct[8..][0 .. crem - 8]);
+<a id="L533"></a>            const c1 = mem.readInt(u64, &amp;buf, .little);
+<a id="L534"></a>            const m1 = state.st.st[1] ^ c1;
+<a id="L535"></a>            mem.writeInt(u64, buf[0..], m1, .little);
+<a id="L536"></a>            @memcpy(m[i + 8 ..], buf[0 .. crem - 8]);
+<a id="L537"></a>
+<a id="L538"></a>            // Replace only the bytes we've read, keeping upper bytes intact
+<a id="L539"></a>            const mask = (@as(u64, 1) &lt;&lt; @intCast((crem - 8) * 8)) - 1;
+<a id="L540"></a>            state.st.st[1] = (state.st.st[1] &amp; ~mask) | (c1 &amp; mask);
+<a id="L541"></a>
+<a id="L542"></a>            state.st.st[1] ^= @as(u64, 0x01) &lt;&lt; @intCast((crem - 8) * 8);
+<a id="L543"></a>        } else if (crem == 8) {
+<a id="L544"></a>            // Exactly 8 bytes - process only word 0, add padding to word 1
+<a id="L545"></a>            const saved_ct = c[i..][0..8].*;
+<a id="L546"></a>
+<a id="L547"></a>            const c0 = mem.readInt(u64, &amp;saved_ct, .little);
+<a id="L548"></a>            state.st.st[0] ^= c0;
+<a id="L549"></a>            mem.writeInt(u64, m[i..][0..8], state.st.st[0], .little);
+<a id="L550"></a>            state.st.st[0] = c0;
+<a id="L551"></a>
+<a id="L552"></a>            // Add padding to word 1 at position 0
+<a id="L553"></a>            state.st.st[1] ^= 0x01;
+<a id="L554"></a>        } else if (crem &gt; 0) {
+<a id="L555"></a>            var buf: [8]u8 = @splat(0);
+<a id="L556"></a>            @memcpy(buf[0..crem], c[i..]);
+<a id="L557"></a>            const c0 = mem.readInt(u64, &amp;buf, .little);
+<a id="L558"></a>            const m0 = state.st.st[0] ^ c0;
+<a id="L559"></a>            mem.writeInt(u64, buf[0..], m0, .little);
+<a id="L560"></a>            @memcpy(m[i..], buf[0..crem]);
+<a id="L561"></a>
+<a id="L562"></a>            // Replace only the bytes we've read, keeping upper bytes intact
+<a id="L563"></a>            const mask = (@as(u64, 1) &lt;&lt; @intCast(crem * 8)) - 1;
+<a id="L564"></a>            state.st.st[0] = (state.st.st[0] &amp; ~mask) | (c0 &amp; mask);
+<a id="L565"></a>
+<a id="L566"></a>            state.st.st[0] ^= @as(u64, 0x01) &lt;&lt; @intCast(crem * 8);
+<a id="L567"></a>        } else {
+<a id="L568"></a>            state.st.st[0] ^= 0x01;
+<a id="L569"></a>        }
+<a id="L570"></a>
+<a id="L571"></a>        // Finalization
+<a id="L572"></a>        state.finalize();
+<a id="L573"></a>
+<a id="L574"></a>        // Verify tag
+<a id="L575"></a>        var computed_tag: [tag_length]u8 = undefined;
+<a id="L576"></a>        mem.writeInt(u64, computed_tag[0..8], state.st.st[3], .little);
+<a id="L577"></a>        mem.writeInt(u64, computed_tag[8..16], state.st.st[4], .little);
+<a id="L578"></a>
+<a id="L579"></a>        if (!crypto.timing_safe.eql([tag_length]u8, tag, computed_tag)) {
+<a id="L580"></a>            crypto.secureZero(u8, m);
+<a id="L581"></a>            return error.AuthenticationFailed;
+<a id="L582"></a>        }
+<a id="L583"></a>    }
+<a id="L584"></a>};
+<a id="L585"></a>
+<a id="L586"></a>/// Ascon-Hash256 as specified in NIST SP 800-232 Section 5
+<a id="L587"></a>pub const AsconHash256 = struct {
+<a id="L588"></a>    pub const digest_length = 32;
+<a id="L589"></a>    pub const block_length = 8;
+<a id="L590"></a>
+<a id="L591"></a>    st: AsconState,
+<a id="L592"></a>
+<a id="L593"></a>    pub const Options = struct {};
+<a id="L594"></a>
+<a id="L595"></a>    /// Initialize a new Ascon-Hash256 hasher.
+<a id="L596"></a>    ///
+<a id="L597"></a>    /// Parameters:
+<a id="L598"></a>    ///   - options: Configuration options (currently unused)
+<a id="L599"></a>    ///
+<a id="L600"></a>    /// Returns: An initialized AsconHash256 hasher
+<a id="L601"></a>    pub fn init(options: Options) AsconHash256 {
+<a id="L602"></a>        _ = options;
+<a id="L603"></a>
+<a id="L604"></a>        // IV for Ascon-Hash256: 0x0000080100cc0002
+<a id="L605"></a>        const iv: u64 = 0x0000080100cc0002;
+<a id="L606"></a>        const words: [5]u64 = .{ iv, 0, 0, 0, 0 };
+<a id="L607"></a>        var st = AsconState.initFromWords(words);
+<a id="L608"></a>        st.permuteR(12);
+<a id="L609"></a>        return AsconHash256{ .st = st };
+<a id="L610"></a>    }
+<a id="L611"></a>
+<a id="L612"></a>    /// Compute Ascon-Hash256 hash of input data in one call.
+<a id="L613"></a>    ///
+<a id="L614"></a>    /// Parameters:
+<a id="L615"></a>    ///   - b: Input data to hash
+<a id="L616"></a>    ///   - out: Output buffer for 32-byte hash digest
+<a id="L617"></a>    ///   - options: Configuration options (currently unused)
+<a id="L618"></a>    pub fn hash(b: []const u8, out: *[digest_length]u8, options: Options) void {
+<a id="L619"></a>        var h = init(options);
+<a id="L620"></a>        h.update(b);
+<a id="L621"></a>        h.final(out);
+<a id="L622"></a>    }
+<a id="L623"></a>
+<a id="L624"></a>    /// Update the hash state with additional data.
+<a id="L625"></a>    ///
+<a id="L626"></a>    /// Parameters:
+<a id="L627"></a>    ///   - b: Data to add to the hash
+<a id="L628"></a>    ///
+<a id="L629"></a>    /// Note: Can be called multiple times before final()
+<a id="L630"></a>    pub fn update(self: *AsconHash256, b: []const u8) void {
+<a id="L631"></a>        var i: usize = 0;
+<a id="L632"></a>
+<a id="L633"></a>        // Process full 64-bit blocks
+<a id="L634"></a>        while (i + 8 &lt;= b.len) : (i += 8) {
+<a id="L635"></a>            self.st.addBytes(b[i..][0..8]);
+<a id="L636"></a>            self.st.permuteR(12);
+<a id="L637"></a>        }
+<a id="L638"></a>
+<a id="L639"></a>        // Store partial block for finalization
+<a id="L640"></a>        if (i &lt; b.len) {
+<a id="L641"></a>            var padded: [8]u8 = @splat(0);
+<a id="L642"></a>            const remaining = b.len - i;
+<a id="L643"></a>            @memcpy(padded[0..remaining], b[i..]);
+<a id="L644"></a>            padded[remaining] = 0x01;
+<a id="L645"></a>            self.st.addBytes(&amp;padded);
+<a id="L646"></a>        } else {
+<a id="L647"></a>            // Add padding block
+<a id="L648"></a>            var padded: [8]u8 = @splat(0);
+<a id="L649"></a>            padded[0] = 0x01;
+<a id="L650"></a>            self.st.addBytes(&amp;padded);
+<a id="L651"></a>        }
+<a id="L652"></a>    }
+<a id="L653"></a>
+<a id="L654"></a>    /// Finalize the hash and output the digest.
+<a id="L655"></a>    ///
+<a id="L656"></a>    /// Parameters:
+<a id="L657"></a>    ///   - out: Output buffer for 32-byte hash digest
+<a id="L658"></a>    ///
+<a id="L659"></a>    /// Note: After calling final(), the hasher should not be used again
+<a id="L660"></a>    pub fn final(self: *AsconHash256, out: *[digest_length]u8) void {
+<a id="L661"></a>        // Final permutation after padding
+<a id="L662"></a>        self.st.permuteR(12);
+<a id="L663"></a>
+<a id="L664"></a>        // Extract hash output (4 × 64 bits = 256 bits)
+<a id="L665"></a>        var h: [4]u64 = undefined;
+<a id="L666"></a>        for (0..4) |i| {
+<a id="L667"></a>            h[i] = self.st.st[0];
+<a id="L668"></a>            self.st.permuteR(12);
+<a id="L669"></a>        }
+<a id="L670"></a>
+<a id="L671"></a>        // Write output
+<a id="L672"></a>        for (0..4) |i| {
+<a id="L673"></a>            mem.writeInt(u64, out[i * 8 ..][0..8], h[i], .little);
+<a id="L674"></a>        }
+<a id="L675"></a>    }
+<a id="L676"></a>};
+<a id="L677"></a>
+<a id="L678"></a>/// Ascon-XOF128 as specified in NIST SP 800-232 Section 5
+<a id="L679"></a>pub const AsconXof128 = struct {
+<a id="L680"></a>    pub const block_length = 8;
+<a id="L681"></a>
+<a id="L682"></a>    st: AsconState,
+<a id="L683"></a>    squeezed: bool,
+<a id="L684"></a>
+<a id="L685"></a>    pub const Options = struct {};
+<a id="L686"></a>
+<a id="L687"></a>    /// Initialize a new Ascon-XOF128 extendable output function.
+<a id="L688"></a>    ///
+<a id="L689"></a>    /// Parameters:
+<a id="L690"></a>    ///   - options: Configuration options (currently unused)
+<a id="L691"></a>    ///
+<a id="L692"></a>    /// Returns: An initialized AsconXof128 instance
+<a id="L693"></a>    pub fn init(options: Options) AsconXof128 {
+<a id="L694"></a>        _ = options;
+<a id="L695"></a>
+<a id="L696"></a>        // IV for Ascon-XOF128: 0x0000080000cc0003
+<a id="L697"></a>        const iv: u64 = 0x0000080000cc0003;
+<a id="L698"></a>        const words: [5]u64 = .{ iv, 0, 0, 0, 0 };
+<a id="L699"></a>        var st = AsconState.initFromWords(words);
+<a id="L700"></a>        st.permuteR(12);
+<a id="L701"></a>        return AsconXof128{ .st = st, .squeezed = false };
+<a id="L702"></a>    }
+<a id="L703"></a>
+<a id="L704"></a>    /// Hash a slice of bytes with variable-length output.
+<a id="L705"></a>    ///
+<a id="L706"></a>    /// Parameters:
+<a id="L707"></a>    ///   - bytes: Input data to hash
+<a id="L708"></a>    ///   - out: Output buffer (can be any length)
+<a id="L709"></a>    ///   - options: Configuration options (currently unused)
+<a id="L710"></a>    ///
+<a id="L711"></a>    /// Note: Convenience function that combines init, update, and squeeze
+<a id="L712"></a>    pub fn hash(bytes: []const u8, out: []u8, options: Options) void {
+<a id="L713"></a>        var st = init(options);
+<a id="L714"></a>        st.update(bytes);
+<a id="L715"></a>        st.squeeze(out);
+<a id="L716"></a>    }
+<a id="L717"></a>
+<a id="L718"></a>    /// Update the XOF state with additional data.
+<a id="L719"></a>    ///
+<a id="L720"></a>    /// Parameters:
+<a id="L721"></a>    ///   - b: Data to absorb into the XOF state
+<a id="L722"></a>    ///
+<a id="L723"></a>    /// Note: Cannot be called after squeeze() has been called
+<a id="L724"></a>    pub fn update(self: *AsconXof128, b: []const u8) void {
+<a id="L725"></a>        debug.assert(!self.squeezed); // Cannot update after squeezing
+<a id="L726"></a>
+<a id="L727"></a>        var i: usize = 0;
+<a id="L728"></a>
+<a id="L729"></a>        // Process full 64-bit blocks
+<a id="L730"></a>        while (i + 8 &lt;= b.len) : (i += 8) {
+<a id="L731"></a>            self.st.addBytes(b[i..][0..8]);
+<a id="L732"></a>            self.st.permuteR(12);
+<a id="L733"></a>        }
+<a id="L734"></a>
+<a id="L735"></a>        // Store partial block for finalization
+<a id="L736"></a>        if (i &lt; b.len) {
+<a id="L737"></a>            var padded: [8]u8 = @splat(0);
+<a id="L738"></a>            const remaining = b.len - i;
+<a id="L739"></a>            @memcpy(padded[0..remaining], b[i..]);
+<a id="L740"></a>            padded[remaining] = 0x01;
+<a id="L741"></a>            self.st.addBytes(&amp;padded);
+<a id="L742"></a>        } else {
+<a id="L743"></a>            // Add padding block
+<a id="L744"></a>            var padded: [8]u8 = @splat(0);
+<a id="L745"></a>            padded[0] = 0x01;
+<a id="L746"></a>            self.st.addBytes(&amp;padded);
+<a id="L747"></a>        }
+<a id="L748"></a>    }
+<a id="L749"></a>
+<a id="L750"></a>    /// Squeeze output bytes from the XOF.
+<a id="L751"></a>    ///
+<a id="L752"></a>    /// Parameters:
+<a id="L753"></a>    ///   - out: Output buffer to fill with pseudorandom bytes
+<a id="L754"></a>    ///
+<a id="L755"></a>    /// Note: Can be called multiple times to generate more output.
+<a id="L756"></a>    /// After first call, no more data can be absorbed with update().
+<a id="L757"></a>    pub fn squeeze(self: *AsconXof128, out: []u8) void {
+<a id="L758"></a>        if (!self.squeezed) {
+<a id="L759"></a>            // First squeeze - apply final permutation
+<a id="L760"></a>            self.st.permuteR(12);
+<a id="L761"></a>            self.squeezed = true;
+<a id="L762"></a>        }
+<a id="L763"></a>
+<a id="L764"></a>        var i: usize = 0;
+<a id="L765"></a>        while (i &lt; out.len) {
+<a id="L766"></a>            const to_copy = @min(8, out.len - i);
+<a id="L767"></a>            var block: [8]u8 = undefined;
+<a id="L768"></a>            mem.writeInt(u64, &amp;block, self.st.st[0], .little);
+<a id="L769"></a>            @memcpy(out[i..][0..to_copy], block[0..to_copy]);
+<a id="L770"></a>            i += to_copy;
+<a id="L771"></a>
+<a id="L772"></a>            if (i &lt; out.len) {
+<a id="L773"></a>                self.st.permuteR(12);
+<a id="L774"></a>            }
+<a id="L775"></a>        }
+<a id="L776"></a>    }
+<a id="L777"></a>};
+<a id="L778"></a>
+<a id="L779"></a>/// Ascon-CXOF128 as specified in NIST SP 800-232 Section 5
+<a id="L780"></a>pub const AsconCxof128 = struct {
+<a id="L781"></a>    pub const block_length = 8;
+<a id="L782"></a>    pub const max_custom_length = 256; // 2048 bits
+<a id="L783"></a>
+<a id="L784"></a>    st: AsconState,
+<a id="L785"></a>    squeezed: bool,
+<a id="L786"></a>
+<a id="L787"></a>    pub const Options = struct { custom: []const u8 = "" };
+<a id="L788"></a>
+<a id="L789"></a>    /// Initialize a new Ascon-CXOF128 customizable XOF.
+<a id="L790"></a>    ///
+<a id="L791"></a>    /// Parameters:
+<a id="L792"></a>    ///   - options: Configuration with optional customization string
+<a id="L793"></a>    ///     - custom: Customization string (max 256 bytes)
+<a id="L794"></a>    ///
+<a id="L795"></a>    /// Returns: An initialized AsconCxof128 instance
+<a id="L796"></a>    ///
+<a id="L797"></a>    /// Note: Different customization strings produce independent XOF instances
+<a id="L798"></a>    pub fn init(options: Options) AsconCxof128 {
+<a id="L799"></a>        debug.assert(options.custom.len &lt;= max_custom_length);
+<a id="L800"></a>
+<a id="L801"></a>        // IV for Ascon-CXOF128: 0x0000080000cc0004
+<a id="L802"></a>        const iv: u64 = 0x0000080000cc0004;
+<a id="L803"></a>        const words: [5]u64 = .{ iv, 0, 0, 0, 0 };
+<a id="L804"></a>        var st = AsconState.initFromWords(words);
+<a id="L805"></a>        st.permuteR(12);
+<a id="L806"></a>
+<a id="L807"></a>        var self = AsconCxof128{ .st = st, .squeezed = false };
+<a id="L808"></a>
+<a id="L809"></a>        // Process customization string - always process length and padding
+<a id="L810"></a>        // First block: length of customization string
+<a id="L811"></a>        const len_block = @as(u64, options.custom.len * 8); // Length in bits
+<a id="L812"></a>        self.st.st[0] ^= len_block;
+<a id="L813"></a>        self.st.permuteR(12);
+<a id="L814"></a>
+<a id="L815"></a>        if (options.custom.len &gt; 0) {
+<a id="L816"></a>            // Process customization string blocks
+<a id="L817"></a>            var i: usize = 0;
+<a id="L818"></a>            while (i + 8 &lt;= options.custom.len) : (i += 8) {
+<a id="L819"></a>                self.st.addBytes(options.custom[i..][0..8]);
+<a id="L820"></a>                self.st.permuteR(12);
+<a id="L821"></a>            }
+<a id="L822"></a>
+<a id="L823"></a>            // Process final partial block with padding
+<a id="L824"></a>            if (i &lt; options.custom.len) {
+<a id="L825"></a>                var padded: [8]u8 = @splat(0);
+<a id="L826"></a>                const remaining = options.custom.len - i;
+<a id="L827"></a>                @memcpy(padded[0..remaining], options.custom[i..]);
+<a id="L828"></a>                padded[remaining] = 0x01;
+<a id="L829"></a>                self.st.addBytes(&amp;padded);
+<a id="L830"></a>                self.st.permuteR(12);
+<a id="L831"></a>            } else {
+<a id="L832"></a>                // Add padding block
+<a id="L833"></a>                var padded: [8]u8 = @splat(0);
+<a id="L834"></a>                padded[0] = 0x01;
+<a id="L835"></a>                self.st.addBytes(&amp;padded);
+<a id="L836"></a>                self.st.permuteR(12);
+<a id="L837"></a>            }
+<a id="L838"></a>        } else {
+<a id="L839"></a>            // Empty customization still needs padding
+<a id="L840"></a>            var padded: [8]u8 = @splat(0);
+<a id="L841"></a>            padded[0] = 0x01;
+<a id="L842"></a>            self.st.addBytes(&amp;padded);
+<a id="L843"></a>            self.st.permuteR(12);
+<a id="L844"></a>        }
+<a id="L845"></a>
+<a id="L846"></a>        return self;
+<a id="L847"></a>    }
+<a id="L848"></a>
+<a id="L849"></a>    /// Hash a slice of bytes with customization and variable-length output.
+<a id="L850"></a>    ///
+<a id="L851"></a>    /// Parameters:
+<a id="L852"></a>    ///   - bytes: Input data to hash
+<a id="L853"></a>    ///   - out: Output buffer (can be any length)
+<a id="L854"></a>    ///   - options: Configuration with optional customization string
+<a id="L855"></a>    ///
+<a id="L856"></a>    /// Note: Convenience function that combines init, update, and squeeze
+<a id="L857"></a>    pub fn hash(bytes: []const u8, out: []u8, options: Options) void {
+<a id="L858"></a>        var st = init(options);
+<a id="L859"></a>        st.update(bytes);
+<a id="L860"></a>        st.squeeze(out);
+<a id="L861"></a>    }
+<a id="L862"></a>
+<a id="L863"></a>    /// Update the CXOF state with additional data.
+<a id="L864"></a>    ///
+<a id="L865"></a>    /// Parameters:
+<a id="L866"></a>    ///   - b: Data to absorb into the CXOF state
+<a id="L867"></a>    ///
+<a id="L868"></a>    /// Note: Cannot be called after squeeze() has been called
+<a id="L869"></a>    pub fn update(self: *AsconCxof128, b: []const u8) void {
+<a id="L870"></a>        debug.assert(!self.squeezed);
+<a id="L871"></a>
+<a id="L872"></a>        var i: usize = 0;
+<a id="L873"></a>
+<a id="L874"></a>        // Process full 64-bit blocks
+<a id="L875"></a>        while (i + 8 &lt;= b.len) : (i += 8) {
+<a id="L876"></a>            self.st.addBytes(b[i..][0..8]);
+<a id="L877"></a>            self.st.permuteR(12);
+<a id="L878"></a>        }
+<a id="L879"></a>
+<a id="L880"></a>        // Store partial block for finalization
+<a id="L881"></a>        if (i &lt; b.len) {
+<a id="L882"></a>            var padded: [8]u8 = @splat(0);
+<a id="L883"></a>            const remaining = b.len - i;
+<a id="L884"></a>            @memcpy(padded[0..remaining], b[i..]);
+<a id="L885"></a>            padded[remaining] = 0x01;
+<a id="L886"></a>            self.st.addBytes(&amp;padded);
+<a id="L887"></a>        } else {
+<a id="L888"></a>            // Add padding block
+<a id="L889"></a>            var padded: [8]u8 = @splat(0);
+<a id="L890"></a>            padded[0] = 0x01;
+<a id="L891"></a>            self.st.addBytes(&amp;padded);
+<a id="L892"></a>        }
+<a id="L893"></a>    }
+<a id="L894"></a>
+<a id="L895"></a>    /// Squeeze output bytes from the customizable XOF.
+<a id="L896"></a>    ///
+<a id="L897"></a>    /// Parameters:
+<a id="L898"></a>    ///   - out: Output buffer to fill with pseudorandom bytes
+<a id="L899"></a>    ///
+<a id="L900"></a>    /// Note: Can be called multiple times to generate more output.
+<a id="L901"></a>    /// After first call, no more data can be absorbed with update().
+<a id="L902"></a>    pub fn squeeze(self: *AsconCxof128, out: []u8) void {
+<a id="L903"></a>        if (!self.squeezed) {
+<a id="L904"></a>            // First squeeze - apply final permutation
+<a id="L905"></a>            self.st.permuteR(12);
+<a id="L906"></a>            self.squeezed = true;
+<a id="L907"></a>        }
+<a id="L908"></a>
+<a id="L909"></a>        var i: usize = 0;
+<a id="L910"></a>        while (i &lt; out.len) {
+<a id="L911"></a>            const to_copy = @min(8, out.len - i);
+<a id="L912"></a>            var block: [8]u8 = undefined;
+<a id="L913"></a>            mem.writeInt(u64, &amp;block, self.st.st[0], .little);
+<a id="L914"></a>            @memcpy(out[i..][0..to_copy], block[0..to_copy]);
+<a id="L915"></a>            i += to_copy;
+<a id="L916"></a>
+<a id="L917"></a>            if (i &lt; out.len) {
+<a id="L918"></a>                self.st.permuteR(12);
+<a id="L919"></a>            }
+<a id="L920"></a>        }
+<a id="L921"></a>    }
+<a id="L922"></a>};
+<a id="L923"></a>
+<a id="L924"></a>test "Ascon-Hash256 basic test" {
+<a id="L925"></a>    const message = "The quick brown fox jumps over the lazy dog";
+<a id="L926"></a>    var hash: [32]u8 = undefined;
+<a id="L927"></a>
+<a id="L928"></a>    AsconHash256.hash(message, &amp;hash, .{});
+<a id="L929"></a>
+<a id="L930"></a>    // Verify hash is generated (exact value depends on test vectors)
+<a id="L931"></a>    try testing.expect(hash.len == 32);
+<a id="L932"></a>}
+<a id="L933"></a>
+<a id="L934"></a>test "Ascon-XOF128 basic test" {
+<a id="L935"></a>    var xof = AsconXof128.init(.{});
+<a id="L936"></a>    xof.update("Hello, ");
+<a id="L937"></a>    xof.update("World!");
+<a id="L938"></a>
+<a id="L939"></a>    var out1: [16]u8 = undefined;
+<a id="L940"></a>    xof.squeeze(&amp;out1);
+<a id="L941"></a>
+<a id="L942"></a>    var out2: [32]u8 = undefined;
+<a id="L943"></a>    xof.squeeze(&amp;out2);
+<a id="L944"></a>
+<a id="L945"></a>    // XOF outputs should be continuous - out2 should NOT match out1
+<a id="L946"></a>    // Each squeeze produces new output
+<a id="L947"></a>    try testing.expect(!mem.eql(u8, &amp;out1, out2[0..16]));
+<a id="L948"></a>}
+<a id="L949"></a>
+<a id="L950"></a>test "Ascon-CXOF128 with customization" {
+<a id="L951"></a>    const custom = "MyCustomString";
+<a id="L952"></a>    var xof = AsconCxof128.init(.{ .custom = custom });
+<a id="L953"></a>    xof.update("Test message");
+<a id="L954"></a>
+<a id="L955"></a>    var out: [32]u8 = undefined;
+<a id="L956"></a>    xof.squeeze(&amp;out);
+<a id="L957"></a>
+<a id="L958"></a>    // Different customization should give different output
+<a id="L959"></a>    var xof2 = AsconCxof128.init(.{ .custom = "DifferentCustom" });
+<a id="L960"></a>    xof2.update("Test message");
+<a id="L961"></a>
+<a id="L962"></a>    var out2: [32]u8 = undefined;
+<a id="L963"></a>    xof2.squeeze(&amp;out2);
+<a id="L964"></a>
+<a id="L965"></a>    try testing.expect(!mem.eql(u8, &amp;out, &amp;out2));
+<a id="L966"></a>}
+<a id="L967"></a>
+<a id="L968"></a>test "Ascon-AEAD128 round trip with various data sizes" {
+<a id="L969"></a>    if (builtin.cpu.has(.riscv, .v) and builtin.zig_backend == .stage2_llvm) return error.SkipZigTest;
+<a id="L970"></a>
+<a id="L971"></a>    const key = [_]u8{ 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF, 0xFE, 0xDC, 0xBA, 0x98, 0x76, 0x54, 0x32, 0x10 };
+<a id="L972"></a>    const nonce = [_]u8{ 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF };
+<a id="L973"></a>
+<a id="L974"></a>    // Test with empty plaintext
+<a id="L975"></a>    {
+<a id="L976"></a>        const plaintext = "";
+<a id="L977"></a>        const ad = "metadata";
+<a id="L978"></a>        var ciphertext: [plaintext.len]u8 = undefined;
+<a id="L979"></a>        var tag: [16]u8 = undefined;
+<a id="L980"></a>
+<a id="L981"></a>        AsconAead128.encrypt(&amp;ciphertext, &amp;tag, plaintext, ad, nonce, key);
+<a id="L982"></a>
+<a id="L983"></a>        var decrypted: [plaintext.len]u8 = undefined;
+<a id="L984"></a>        try AsconAead128.decrypt(&amp;decrypted, &amp;ciphertext, tag, ad, nonce, key);
+<a id="L985"></a>        try testing.expectEqualStrings(plaintext, &amp;decrypted);
+<a id="L986"></a>    }
+<a id="L987"></a>
+<a id="L988"></a>    // Test with small plaintext
+<a id="L989"></a>    {
+<a id="L990"></a>        const plaintext = "Short";
+<a id="L991"></a>        const ad = "";
+<a id="L992"></a>        var ciphertext: [plaintext.len]u8 = undefined;
+<a id="L993"></a>        var tag: [16]u8 = undefined;
+<a id="L994"></a>
+<a id="L995"></a>        AsconAead128.encrypt(&amp;ciphertext, &amp;tag, plaintext, ad, nonce, key);
+<a id="L996"></a>
+<a id="L997"></a>        var decrypted: [plaintext.len]u8 = undefined;
+<a id="L998"></a>        try AsconAead128.decrypt(&amp;decrypted, &amp;ciphertext, tag, ad, nonce, key);
+<a id="L999"></a>        try testing.expectEqualStrings(plaintext, &amp;decrypted);
+<a id="L1000"></a>    }
+<a id="L1001"></a>
+<a id="L1002"></a>    // Test with longer plaintext and associated data
+<a id="L1003"></a>    {
+<a id="L1004"></a>        const plaintext = "This is a longer message to test the round trip encryption and decryption process";
+<a id="L1005"></a>        const ad = "Additional authenticated data that is not encrypted but is authenticated";
+<a id="L1006"></a>        var ciphertext: [plaintext.len]u8 = undefined;
+<a id="L1007"></a>        var tag: [16]u8 = undefined;
+<a id="L1008"></a>
+<a id="L1009"></a>        AsconAead128.encrypt(&amp;ciphertext, &amp;tag, plaintext, ad, nonce, key);
+<a id="L1010"></a>
+<a id="L1011"></a>        var decrypted: [plaintext.len]u8 = undefined;
+<a id="L1012"></a>        try AsconAead128.decrypt(&amp;decrypted, &amp;ciphertext, tag, ad, nonce, key);
+<a id="L1013"></a>        try testing.expectEqualStrings(plaintext, &amp;decrypted);
+<a id="L1014"></a>    }
+<a id="L1015"></a>
+<a id="L1016"></a>    // Test authentication failure with tampered ciphertext
+<a id="L1017"></a>    {
+<a id="L1018"></a>        const plaintext = "Tamper test";
+<a id="L1019"></a>        const ad = "metadata";
+<a id="L1020"></a>        var ciphertext: [plaintext.len]u8 = undefined;
+<a id="L1021"></a>        var tag: [16]u8 = undefined;
+<a id="L1022"></a>
+<a id="L1023"></a>        AsconAead128.encrypt(&amp;ciphertext, &amp;tag, plaintext, ad, nonce, key);
+<a id="L1024"></a>
+<a id="L1025"></a>        // Tamper with ciphertext
+<a id="L1026"></a>        ciphertext[0] ^= 0xFF;
+<a id="L1027"></a>
+<a id="L1028"></a>        var decrypted: [plaintext.len]u8 = undefined;
+<a id="L1029"></a>        const result = AsconAead128.decrypt(&amp;decrypted, &amp;ciphertext, tag, ad, nonce, key);
+<a id="L1030"></a>        try testing.expectError(error.AuthenticationFailed, result);
+<a id="L1031"></a>    }
+<a id="L1032"></a>
+<a id="L1033"></a>    // Test authentication failure with wrong tag
+<a id="L1034"></a>    {
+<a id="L1035"></a>        const plaintext = "Tag test";
+<a id="L1036"></a>        const ad = "metadata";
+<a id="L1037"></a>        var ciphertext: [plaintext.len]u8 = undefined;
+<a id="L1038"></a>        var tag: [16]u8 = undefined;
+<a id="L1039"></a>
+<a id="L1040"></a>        AsconAead128.encrypt(&amp;ciphertext, &amp;tag, plaintext, ad, nonce, key);
+<a id="L1041"></a>
+<a id="L1042"></a>        // Tamper with tag
+<a id="L1043"></a>        var wrong_tag = tag;
+<a id="L1044"></a>        wrong_tag[0] ^= 0xFF;
+<a id="L1045"></a>
+<a id="L1046"></a>        var decrypted: [plaintext.len]u8 = undefined;
+<a id="L1047"></a>        const result = AsconAead128.decrypt(&amp;decrypted, &amp;ciphertext, wrong_tag, ad, nonce, key);
+<a id="L1048"></a>        try testing.expectError(error.AuthenticationFailed, result);
+<a id="L1049"></a>    }
+<a id="L1050"></a>
+<a id="L1051"></a>    // Test authentication failure with wrong associated data
+<a id="L1052"></a>    {
+<a id="L1053"></a>        const plaintext = "AD test";
+<a id="L1054"></a>        const ad = "original";
+<a id="L1055"></a>        var ciphertext: [plaintext.len]u8 = undefined;
+<a id="L1056"></a>        var tag: [16]u8 = undefined;
+<a id="L1057"></a>
+<a id="L1058"></a>        AsconAead128.encrypt(&amp;ciphertext, &amp;tag, plaintext, ad, nonce, key);
+<a id="L1059"></a>
+<a id="L1060"></a>        var decrypted: [plaintext.len]u8 = undefined;
+<a id="L1061"></a>        const wrong_ad = "modified";
+<a id="L1062"></a>        const result = AsconAead128.decrypt(&amp;decrypted, &amp;ciphertext, tag, wrong_ad, nonce, key);
+<a id="L1063"></a>        try testing.expectError(error.AuthenticationFailed, result);
+<a id="L1064"></a>    }
+<a id="L1065"></a>}
+<a id="L1066"></a>
+<a id="L1067"></a>// Test vectors from NIST SP 800-232 / ascon-c reference implementation
+<a id="L1068"></a>test "Ascon-AEAD128 official test vectors" {
+<a id="L1069"></a>
+<a id="L1070"></a>    // Test vector 1: Empty PT, Empty AD
+<a id="L1071"></a>    {
+<a id="L1072"></a>        var key: [16]u8 = undefined;
+<a id="L1073"></a>        var nonce: [16]u8 = undefined;
+<a id="L1074"></a>        _ = std.fmt.hexToBytes(&amp;key, "000102030405060708090A0B0C0D0E0F") catch unreachable;
+<a id="L1075"></a>        _ = std.fmt.hexToBytes(&amp;nonce, "101112131415161718191A1B1C1D1E1F") catch unreachable;
+<a id="L1076"></a>
+<a id="L1077"></a>        const plaintext = "";
+<a id="L1078"></a>        const ad = "";
+<a id="L1079"></a>        var ciphertext: [plaintext.len]u8 = undefined;
+<a id="L1080"></a>        var tag: [16]u8 = undefined;
+<a id="L1081"></a>
+<a id="L1082"></a>        AsconAead128.encrypt(&amp;ciphertext, &amp;tag, plaintext, ad, nonce, key);
+<a id="L1083"></a>
+<a id="L1084"></a>        var expected_tag: [16]u8 = undefined;
+<a id="L1085"></a>        _ = std.fmt.hexToBytes(&amp;expected_tag, "4F9C278211BEC9316BF68F46EE8B2EC6") catch unreachable;
+<a id="L1086"></a>        try testing.expectEqualSlices(u8, &amp;expected_tag, &amp;tag);
+<a id="L1087"></a>    }
+<a id="L1088"></a>
+<a id="L1089"></a>    // Test vector 2: Empty PT, AD = "30"
+<a id="L1090"></a>    {
+<a id="L1091"></a>        var key: [16]u8 = undefined;
+<a id="L1092"></a>        var nonce: [16]u8 = undefined;
+<a id="L1093"></a>        _ = std.fmt.hexToBytes(&amp;key, "000102030405060708090A0B0C0D0E0F") catch unreachable;
+<a id="L1094"></a>        _ = std.fmt.hexToBytes(&amp;nonce, "101112131415161718191A1B1C1D1E1F") catch unreachable;
+<a id="L1095"></a>
+<a id="L1096"></a>        const plaintext = "";
+<a id="L1097"></a>        var ad: [1]u8 = undefined;
+<a id="L1098"></a>        _ = std.fmt.hexToBytes(&amp;ad, "30") catch unreachable;
+<a id="L1099"></a>        var ciphertext: [plaintext.len]u8 = undefined;
+<a id="L1100"></a>        var tag: [16]u8 = undefined;
+<a id="L1101"></a>
+<a id="L1102"></a>        AsconAead128.encrypt(&amp;ciphertext, &amp;tag, plaintext, &amp;ad, nonce, key);
+<a id="L1103"></a>
+<a id="L1104"></a>        var expected_tag: [16]u8 = undefined;
+<a id="L1105"></a>        _ = std.fmt.hexToBytes(&amp;expected_tag, "CCCB674FE18A09A285D6AB11B35675C0") catch unreachable;
+<a id="L1106"></a>        try testing.expectEqualSlices(u8, &amp;expected_tag, &amp;tag);
+<a id="L1107"></a>    }
+<a id="L1108"></a>
+<a id="L1109"></a>    // Test vector 34: Single byte plaintext 0x20
+<a id="L1110"></a>    {
+<a id="L1111"></a>        var key: [16]u8 = undefined;
+<a id="L1112"></a>        var nonce: [16]u8 = undefined;
+<a id="L1113"></a>        _ = std.fmt.hexToBytes(&amp;key, "000102030405060708090A0B0C0D0E0F") catch unreachable;
+<a id="L1114"></a>        _ = std.fmt.hexToBytes(&amp;nonce, "101112131415161718191A1B1C1D1E1F") catch unreachable;
+<a id="L1115"></a>
+<a id="L1116"></a>        var plaintext: [1]u8 = undefined;
+<a id="L1117"></a>        _ = std.fmt.hexToBytes(&amp;plaintext, "20") catch unreachable;
+<a id="L1118"></a>        const ad = "";
+<a id="L1119"></a>        var ciphertext: [1]u8 = undefined;
+<a id="L1120"></a>        var tag: [16]u8 = undefined;
+<a id="L1121"></a>
+<a id="L1122"></a>        AsconAead128.encrypt(&amp;ciphertext, &amp;tag, &amp;plaintext, ad, nonce, key);
+<a id="L1123"></a>
+<a id="L1124"></a>        var expected_ct: [1]u8 = undefined;
+<a id="L1125"></a>        _ = std.fmt.hexToBytes(&amp;expected_ct, "E8") catch unreachable;
+<a id="L1126"></a>        var expected_tag: [16]u8 = undefined;
+<a id="L1127"></a>        _ = std.fmt.hexToBytes(&amp;expected_tag, "DD576ABA1CD3E6FC704DE02AEDB79588") catch unreachable;
+<a id="L1128"></a>
+<a id="L1129"></a>        try testing.expectEqualSlices(u8, &amp;expected_ct, &amp;ciphertext);
+<a id="L1130"></a>        try testing.expectEqualSlices(u8, &amp;expected_tag, &amp;tag);
+<a id="L1131"></a>
+<a id="L1132"></a>        // Verify decryption
+<a id="L1133"></a>        var decrypted: [1]u8 = undefined;
+<a id="L1134"></a>        try AsconAead128.decrypt(&amp;decrypted, &amp;ciphertext, tag, ad, nonce, key);
+<a id="L1135"></a>        try testing.expectEqualSlices(u8, &amp;plaintext, &amp;decrypted);
+<a id="L1136"></a>    }
+<a id="L1137"></a>
+<a id="L1138"></a>    // Test vector with 3-byte plaintext
+<a id="L1139"></a>    {
+<a id="L1140"></a>        var key: [16]u8 = undefined;
+<a id="L1141"></a>        var nonce: [16]u8 = undefined;
+<a id="L1142"></a>        _ = std.fmt.hexToBytes(&amp;key, "000102030405060708090A0B0C0D0E0F") catch unreachable;
+<a id="L1143"></a>        _ = std.fmt.hexToBytes(&amp;nonce, "101112131415161718191A1B1C1D1E1F") catch unreachable;
+<a id="L1144"></a>
+<a id="L1145"></a>        var plaintext: [3]u8 = undefined;
+<a id="L1146"></a>        _ = std.fmt.hexToBytes(&amp;plaintext, "202122") catch unreachable;
+<a id="L1147"></a>        const ad = "";
+<a id="L1148"></a>        var ciphertext: [3]u8 = undefined;
+<a id="L1149"></a>        var tag: [16]u8 = undefined;
+<a id="L1150"></a>
+<a id="L1151"></a>        AsconAead128.encrypt(&amp;ciphertext, &amp;tag, &amp;plaintext, ad, nonce, key);
+<a id="L1152"></a>
+<a id="L1153"></a>        var expected_ct: [3]u8 = undefined;
+<a id="L1154"></a>        _ = std.fmt.hexToBytes(&amp;expected_ct, "E8C3DE") catch unreachable;
+<a id="L1155"></a>        var expected_tag: [16]u8 = undefined;
+<a id="L1156"></a>        _ = std.fmt.hexToBytes(&amp;expected_tag, "AF8E12816B8EDF39AD1571A9492B7CA2") catch unreachable;
+<a id="L1157"></a>
+<a id="L1158"></a>        try testing.expectEqualSlices(u8, &amp;expected_ct, &amp;ciphertext);
+<a id="L1159"></a>        try testing.expectEqualSlices(u8, &amp;expected_tag, &amp;tag);
+<a id="L1160"></a>
+<a id="L1161"></a>        // Verify decryption
+<a id="L1162"></a>        var decrypted: [3]u8 = undefined;
+<a id="L1163"></a>        try AsconAead128.decrypt(&amp;decrypted, &amp;ciphertext, tag, ad, nonce, key);
+<a id="L1164"></a>        try testing.expectEqualSlices(u8, &amp;plaintext, &amp;decrypted);
+<a id="L1165"></a>    }
+<a id="L1166"></a>}
+<a id="L1167"></a>
+<a id="L1168"></a>test "Ascon-Hash256 official test vectors" {
+<a id="L1169"></a>
+<a id="L1170"></a>    // Test vector 1: Empty message
+<a id="L1171"></a>    {
+<a id="L1172"></a>        const message = "";
+<a id="L1173"></a>        var hash: [32]u8 = undefined;
+<a id="L1174"></a>        AsconHash256.hash(message, &amp;hash, .{});
+<a id="L1175"></a>
+<a id="L1176"></a>        var expected: [32]u8 = undefined;
+<a id="L1177"></a>        _ = std.fmt.hexToBytes(&amp;expected, "0B3BE5850F2F6B98CAF29F8FDEA89B64A1FA70AA249B8F839BD53BAA304D92B2") catch unreachable;
+<a id="L1178"></a>        try testing.expectEqualSlices(u8, &amp;expected, &amp;hash);
+<a id="L1179"></a>    }
+<a id="L1180"></a>
+<a id="L1181"></a>    // Test vector 2: Single byte 0x00
+<a id="L1182"></a>    {
+<a id="L1183"></a>        const message = [_]u8{0x00};
+<a id="L1184"></a>        var hash: [32]u8 = undefined;
+<a id="L1185"></a>        AsconHash256.hash(&amp;message, &amp;hash, .{});
+<a id="L1186"></a>
+<a id="L1187"></a>        var expected: [32]u8 = undefined;
+<a id="L1188"></a>        _ = std.fmt.hexToBytes(&amp;expected, "0728621035AF3ED2BCA03BF6FDE900F9456F5330E4B5EE23E7F6A1E70291BC80") catch unreachable;
+<a id="L1189"></a>        try testing.expectEqualSlices(u8, &amp;expected, &amp;hash);
+<a id="L1190"></a>    }
+<a id="L1191"></a>
+<a id="L1192"></a>    // Test vector 3: 0x00, 0x01
+<a id="L1193"></a>    {
+<a id="L1194"></a>        const message = [_]u8{ 0x00, 0x01 };
+<a id="L1195"></a>        var hash: [32]u8 = undefined;
+<a id="L1196"></a>        AsconHash256.hash(&amp;message, &amp;hash, .{});
+<a id="L1197"></a>
+<a id="L1198"></a>        var expected: [32]u8 = undefined;
+<a id="L1199"></a>        _ = std.fmt.hexToBytes(&amp;expected, "6115E7C9C4081C2797FC8FE1BC57A836AFA1C5381E556DD583860CA2DFB48DD2") catch unreachable;
+<a id="L1200"></a>        try testing.expectEqualSlices(u8, &amp;expected, &amp;hash);
+<a id="L1201"></a>    }
+<a id="L1202"></a>
+<a id="L1203"></a>    // Test vector 4: 0x00, 0x01, 0x02
+<a id="L1204"></a>    {
+<a id="L1205"></a>        const message = [_]u8{ 0x00, 0x01, 0x02 };
+<a id="L1206"></a>        var hash: [32]u8 = undefined;
+<a id="L1207"></a>        AsconHash256.hash(&amp;message, &amp;hash, .{});
+<a id="L1208"></a>
+<a id="L1209"></a>        var expected: [32]u8 = undefined;
+<a id="L1210"></a>        _ = std.fmt.hexToBytes(&amp;expected, "265AB89A609F5A05DCA57E83FBBA700F9A2D2C4211BA4CC9F0A1A369E17B915C") catch unreachable;
+<a id="L1211"></a>        try testing.expectEqualSlices(u8, &amp;expected, &amp;hash);
+<a id="L1212"></a>    }
+<a id="L1213"></a>
+<a id="L1214"></a>    // Test vector 5: 0x00..0x03
+<a id="L1215"></a>    {
+<a id="L1216"></a>        const message = [_]u8{ 0x00, 0x01, 0x02, 0x03 };
+<a id="L1217"></a>        var hash: [32]u8 = undefined;
+<a id="L1218"></a>        AsconHash256.hash(&amp;message, &amp;hash, .{});
+<a id="L1219"></a>
+<a id="L1220"></a>        var expected: [32]u8 = undefined;
+<a id="L1221"></a>        _ = std.fmt.hexToBytes(&amp;expected, "D7E4C7ED9B8A325CD08B9EF259F8877054ECD8304FE1B2D7FD847137DF6727EE") catch unreachable;
+<a id="L1222"></a>        try testing.expectEqualSlices(u8, &amp;expected, &amp;hash);
+<a id="L1223"></a>    }
+<a id="L1224"></a>}
+<a id="L1225"></a>
+<a id="L1226"></a>test "Ascon-XOF128 official test vectors" {
+<a id="L1227"></a>
+<a id="L1228"></a>    // Test vector 1: Empty message, 64-byte output
+<a id="L1229"></a>    {
+<a id="L1230"></a>        var xof = AsconXof128.init(.{});
+<a id="L1231"></a>        xof.update("");
+<a id="L1232"></a>
+<a id="L1233"></a>        var output: [64]u8 = undefined;
+<a id="L1234"></a>        xof.squeeze(&amp;output);
+<a id="L1235"></a>
+<a id="L1236"></a>        var expected: [64]u8 = undefined;
+<a id="L1237"></a>        _ = std.fmt.hexToBytes(&amp;expected, "473D5E6164F58B39DFD84AACDB8AE42EC2D91FED33388EE0D960D9B3993295C6AD77855A5D3B13FE6AD9E6098988373AF7D0956D05A8F1665D2C67D1A3AD10FF") catch unreachable;
+<a id="L1238"></a>        try testing.expectEqualSlices(u8, &amp;expected, &amp;output);
+<a id="L1239"></a>    }
+<a id="L1240"></a>
+<a id="L1241"></a>    // Test vector 2: Single byte 0x00, 64-byte output
+<a id="L1242"></a>    {
+<a id="L1243"></a>        var xof = AsconXof128.init(.{});
+<a id="L1244"></a>        const msg = [_]u8{0x00};
+<a id="L1245"></a>        xof.update(&amp;msg);
+<a id="L1246"></a>
+<a id="L1247"></a>        var output: [64]u8 = undefined;
+<a id="L1248"></a>        xof.squeeze(&amp;output);
+<a id="L1249"></a>
+<a id="L1250"></a>        var expected: [64]u8 = undefined;
+<a id="L1251"></a>        _ = std.fmt.hexToBytes(&amp;expected, "51430E0438ECDF642B393630D977625F5F337656BA58AB1E960784AC32A16E0D446405551F5469384F8EA283CF12E64FA72C426BFEBAEA3AA1529E2C4AB23A2F") catch unreachable;
+<a id="L1252"></a>        try testing.expectEqualSlices(u8, &amp;expected, &amp;output);
+<a id="L1253"></a>    }
+<a id="L1254"></a>
+<a id="L1255"></a>    // Test vector 3: 0x00, 0x01, 64-byte output
+<a id="L1256"></a>    {
+<a id="L1257"></a>        var xof = AsconXof128.init(.{});
+<a id="L1258"></a>        const msg = [_]u8{ 0x00, 0x01 };
+<a id="L1259"></a>        xof.update(&amp;msg);
+<a id="L1260"></a>
+<a id="L1261"></a>        var output: [64]u8 = undefined;
+<a id="L1262"></a>        xof.squeeze(&amp;output);
+<a id="L1263"></a>
+<a id="L1264"></a>        var expected: [64]u8 = undefined;
+<a id="L1265"></a>        _ = std.fmt.hexToBytes(&amp;expected, "A05383077AF971D3830BD37E7B981497A773D441DB077C6494CC73125953846EB6427FBA4CD308FF90A11385D51101341BF5379249217BFDACE9CCA1148CC966") catch unreachable;
+<a id="L1266"></a>        try testing.expectEqualSlices(u8, &amp;expected, &amp;output);
+<a id="L1267"></a>    }
+<a id="L1268"></a>}
+<a id="L1269"></a>
+<a id="L1270"></a>test "Ascon-CXOF128 official test vectors" {
+<a id="L1271"></a>
+<a id="L1272"></a>    // Test vector 1: Empty message, empty customization, 64-byte output
+<a id="L1273"></a>    {
+<a id="L1274"></a>        var xof = AsconCxof128.init(.{});
+<a id="L1275"></a>        xof.update("");
+<a id="L1276"></a>
+<a id="L1277"></a>        var output: [64]u8 = undefined;
+<a id="L1278"></a>        xof.squeeze(&amp;output);
+<a id="L1279"></a>
+<a id="L1280"></a>        var expected: [64]u8 = undefined;
+<a id="L1281"></a>        _ = std.fmt.hexToBytes(&amp;expected, "4F50159EF70BB3DAD8807E034EAEBD44C4FA2CBBC8CF1F05511AB66CDCC529905CA12083FC186AD899B270B1473DC5F7EC88D1052082DCDFE69FB75D269E7B74") catch unreachable;
+<a id="L1282"></a>        try testing.expectEqualSlices(u8, &amp;expected, &amp;output);
+<a id="L1283"></a>    }
+<a id="L1284"></a>
+<a id="L1285"></a>    // Test vector 2: Empty message, customization = 0x10, 64-byte output
+<a id="L1286"></a>    {
+<a id="L1287"></a>        const custom = [_]u8{0x10};
+<a id="L1288"></a>        var xof = AsconCxof128.init(.{ .custom = &amp;custom });
+<a id="L1289"></a>        xof.update("");
+<a id="L1290"></a>
+<a id="L1291"></a>        var output: [64]u8 = undefined;
+<a id="L1292"></a>        xof.squeeze(&amp;output);
+<a id="L1293"></a>
+<a id="L1294"></a>        var expected: [64]u8 = undefined;
+<a id="L1295"></a>        _ = std.fmt.hexToBytes(&amp;expected, "0C93A483E7D574D49FE52CCE03EE646117977D57A8AA57704AB4DAF44B501430FF6AC11A5D1FD6F2154B5C65728268270C8BB578508487B8965718ADA6272FD6") catch unreachable;
+<a id="L1296"></a>        try testing.expectEqualSlices(u8, &amp;expected, &amp;output);
+<a id="L1297"></a>    }
+<a id="L1298"></a>
+<a id="L1299"></a>    // Test vector 3: Empty message, customization = 0x10, 0x11, 64-byte output
+<a id="L1300"></a>    {
+<a id="L1301"></a>        const custom = [_]u8{ 0x10, 0x11 };
+<a id="L1302"></a>        var xof = AsconCxof128.init(.{ .custom = &amp;custom });
+<a id="L1303"></a>        xof.update("");
+<a id="L1304"></a>
+<a id="L1305"></a>        var output: [64]u8 = undefined;
+<a id="L1306"></a>        xof.squeeze(&amp;output);
+<a id="L1307"></a>
+<a id="L1308"></a>        var expected: [64]u8 = undefined;
+<a id="L1309"></a>        _ = std.fmt.hexToBytes(&amp;expected, "D1106C7622E79FE955BD9D79E03B918E770FE0E0CDDDE28BEB924B02C5FC936B33ACCA299C89ECA5D71886CBBFA4D54A21C55FDE2B679F5E2488063A1719DC32") catch unreachable;
+<a id="L1310"></a>        try testing.expectEqualSlices(u8, &amp;expected, &amp;output);
+<a id="L1311"></a>    }
+<a id="L1312"></a>}
+</pre>
 </body>
 </html>

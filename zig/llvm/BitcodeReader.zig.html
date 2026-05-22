@@ -2,540 +2,543 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Source: zig-0.16.0-std/zig/llvm/BitcodeReader.zig</title>
+    <title>Source: zig/llvm/BitcodeReader.zig</title>
     <style>
         body { background: #1e1e1e; color: #d4d4d4; font-family: monospace; padding: 20px; }
         pre { white-space: pre-wrap; word-wrap: break-word; }
         .header { border-bottom: 1px solid #444; padding-bottom: 10px; margin-bottom: 20px; }
         a { color: #569cd6; }
+        a[id] { color: inherit; text-decoration: none; }
+        :target { background: #3a3a00; }
     </style>
 </head>
 <body>
     <div class="header">
-        <a href="/">Index</a> | <strong>File: zig-0.16.0-std/zig/llvm/BitcodeReader.zig</strong>
+        <a href="/">Index</a> | <strong>File: zig/llvm/BitcodeReader.zig</strong>
     </div>
-    <pre>const BitcodeReader = @This();
-
-const std = @import("../../std.zig");
-const assert = std.debug.assert;
-
-allocator: std.mem.Allocator,
-record_arena: std.heap.ArenaAllocator.State,
-reader: *std.Io.Reader,
-keep_names: bool,
-bit_buffer: u32,
-bit_offset: u5,
-stack: std.ArrayList(State),
-block_info: std.AutoHashMapUnmanaged(u32, Block.Info),
-
-pub const Item = union(enum) {
-    start_block: Block,
-    record: Record,
-    end_block: Block,
-};
-
-pub const Block = struct {
-    name: []const u8,
-    id: u32,
-    len: u32,
-
-    const block_info: u32 = 0;
-    const first_reserved: u32 = 1;
-    const last_standard: u32 = 7;
-
-    const Info = struct {
-        block_name: []const u8,
-        record_names: std.AutoHashMapUnmanaged(u32, []const u8),
-        abbrevs: Abbrev.Store,
-
-        const default: Info = .{
-            .block_name = &amp;.{},
-            .record_names = .empty,
-            .abbrevs = .{ .abbrevs = .empty },
-        };
-
-        const set_bid_id: u32 = 1;
-        const block_name_id: u32 = 2;
-        const set_record_name_id: u32 = 3;
-
-        fn deinit(info: *Info, allocator: std.mem.Allocator) void {
-            allocator.free(info.block_name);
-            var record_names_it = info.record_names.valueIterator();
-            while (record_names_it.next()) |record_name| allocator.free(record_name.*);
-            info.record_names.deinit(allocator);
-            info.abbrevs.deinit(allocator);
-            info.* = undefined;
-        }
-    };
-};
-
-pub const Record = struct {
-    name: []const u8,
-    id: u32,
-    operands: []const u64,
-    blob: []const u8,
-
-    fn toOwnedAbbrev(record: Record, allocator: std.mem.Allocator) !Abbrev {
-        var operands = std.array_list.Managed(Abbrev.Operand).init(allocator);
-        defer operands.deinit();
-
-        assert(record.id == Abbrev.Builtin.define_abbrev.toRecordId());
-        var i: usize = 0;
-        while (i &lt; record.operands.len) switch (record.operands[i]) {
-            Abbrev.Operand.literal_id =&gt; {
-                try operands.append(.{ .literal = record.operands[i + 1] });
-                i += 2;
-            },
-            @intFromEnum(Abbrev.Operand.Encoding.fixed) =&gt; {
-                try operands.append(.{ .encoding = .{ .fixed = @intCast(record.operands[i + 1]) } });
-                i += 2;
-            },
-            @intFromEnum(Abbrev.Operand.Encoding.vbr) =&gt; {
-                try operands.append(.{ .encoding = .{ .vbr = @intCast(record.operands[i + 1]) } });
-                i += 2;
-            },
-            @intFromEnum(Abbrev.Operand.Encoding.array) =&gt; {
-                try operands.append(.{ .encoding = .{ .array = 6 } });
-                i += 1;
-            },
-            @intFromEnum(Abbrev.Operand.Encoding.char6) =&gt; {
-                try operands.append(.{ .encoding = .char6 });
-                i += 1;
-            },
-            @intFromEnum(Abbrev.Operand.Encoding.blob) =&gt; {
-                try operands.append(.{ .encoding = .{ .blob = 6 } });
-                i += 1;
-            },
-            else =&gt; unreachable,
-        };
-
-        return .{ .operands = try operands.toOwnedSlice() };
-    }
-};
-
-pub const InitOptions = struct {
-    reader: *std.Io.Reader,
-    keep_names: bool = false,
-};
-pub fn init(allocator: std.mem.Allocator, options: InitOptions) BitcodeReader {
-    return .{
-        .allocator = allocator,
-        .record_arena = .{},
-        .reader = options.reader,
-        .keep_names = options.keep_names,
-        .bit_buffer = 0,
-        .bit_offset = 0,
-        .stack = .empty,
-        .block_info = .empty,
-    };
-}
-
-pub fn deinit(bc: *BitcodeReader) void {
-    var block_info_it = bc.block_info.valueIterator();
-    while (block_info_it.next()) |block_info| block_info.deinit(bc.allocator);
-    bc.block_info.deinit(bc.allocator);
-    for (bc.stack.items) |*state| state.deinit(bc.allocator);
-    bc.stack.deinit(bc.allocator);
-    bc.record_arena.promote(bc.allocator).deinit();
-    bc.* = undefined;
-}
-
-pub fn checkMagic(bc: *BitcodeReader, magic: *const [4]u8) !void {
-    var buffer: [4]u8 = undefined;
-    try bc.readBytes(&amp;buffer);
-    if (!std.mem.eql(u8, &amp;buffer, magic)) return error.InvalidMagic;
-
-    try bc.startBlock(null, 2);
-    try bc.block_info.put(bc.allocator, Block.block_info, Block.Info.default);
-}
-
-pub fn next(bc: *BitcodeReader) !?Item {
-    while (true) {
-        const record = (try bc.nextRecord()) orelse
-            return if (bc.stack.items.len &gt; 1) error.EndOfStream else null;
-        switch (record.id) {
-            else =&gt; return .{ .record = record },
-            Abbrev.Builtin.end_block.toRecordId() =&gt; {
-                const block_id = bc.stack.items[bc.stack.items.len - 1].block_id.?;
-                try bc.endBlock();
-                return .{ .end_block = .{
-                    .name = if (bc.block_info.get(block_id)) |block_info|
-                        block_info.block_name
-                    else
-                        &amp;.{},
-                    .id = block_id,
-                    .len = 0,
-                } };
-            },
-            Abbrev.Builtin.enter_subblock.toRecordId() =&gt; {
-                const block_id: u32 = @intCast(record.operands[0]);
-                switch (block_id) {
-                    Block.block_info =&gt; {
-                        try bc.startBlock(Block.block_info, @intCast(record.operands[1]));
-                        try bc.parseBlockInfoBlock();
-                        try bc.endBlock();
-                    },
-                    Block.first_reserved...Block.last_standard =&gt; return error.UnsupportedBlockId,
-                    else =&gt; {
-                        try bc.startBlock(block_id, @intCast(record.operands[1]));
-                        return .{ .start_block = .{
-                            .name = if (bc.block_info.get(block_id)) |block_info|
-                                block_info.block_name
-                            else
-                                &amp;.{},
-                            .id = block_id,
-                            .len = @intCast(record.operands[2]),
-                        } };
-                    },
-                }
-            },
-            Abbrev.Builtin.define_abbrev.toRecordId() =&gt; try bc.stack.items[bc.stack.items.len - 1]
-                .abbrevs.addOwnedAbbrev(bc.allocator, try record.toOwnedAbbrev(bc.allocator)),
-        }
-    }
-}
-
-pub fn skipBlock(bc: *BitcodeReader, block: Block) !void {
-    assert(bc.bit_offset == 0);
-    try bc.reader.discardAll(4 * @as(usize, block.len));
-    try bc.endBlock();
-}
-
-fn nextRecord(bc: *BitcodeReader) !?Record {
-    const state = &amp;bc.stack.items[bc.stack.items.len - 1];
-    const abbrev_id = bc.readFixed(u32, state.abbrev_id_width) catch |err| switch (err) {
-        error.EndOfStream =&gt; return null,
-        else =&gt; |e| return e,
-    };
-    if (abbrev_id &gt;= state.abbrevs.abbrevs.items.len) return error.InvalidAbbrevId;
-    const abbrev = state.abbrevs.abbrevs.items[abbrev_id];
-
-    var record_arena = bc.record_arena.promote(bc.allocator);
-    defer bc.record_arena = record_arena.state;
-    _ = record_arena.reset(.retain_capacity);
-
-    var operands = try std.array_list.Managed(u64).initCapacity(record_arena.allocator(), abbrev.operands.len);
-    var blob = std.array_list.Managed(u8).init(record_arena.allocator());
-    for (abbrev.operands, 0..) |abbrev_operand, abbrev_operand_i| switch (abbrev_operand) {
-        .literal =&gt; |value| operands.appendAssumeCapacity(value),
-        .encoding =&gt; |abbrev_encoding| switch (abbrev_encoding) {
-            .fixed =&gt; |width| operands.appendAssumeCapacity(try bc.readFixed(u64, width)),
-            .vbr =&gt; |width| operands.appendAssumeCapacity(try bc.readVbr(u64, width)),
-            .array =&gt; |len_width| {
-                assert(abbrev_operand_i + 2 == abbrev.operands.len);
-                const len: usize = @intCast(try bc.readVbr(u32, len_width));
-                try operands.ensureUnusedCapacity(len);
-                for (0..len) |_| switch (abbrev.operands[abbrev.operands.len - 1]) {
-                    .literal =&gt; |elem_value| operands.appendAssumeCapacity(elem_value),
-                    .encoding =&gt; |elem_encoding| switch (elem_encoding) {
-                        .fixed =&gt; |elem_width| operands.appendAssumeCapacity(try bc.readFixed(u64, elem_width)),
-                        .vbr =&gt; |elem_width| operands.appendAssumeCapacity(try bc.readVbr(u64, elem_width)),
-                        .array, .blob =&gt; return error.InvalidArrayElement,
-                        .char6 =&gt; operands.appendAssumeCapacity(try bc.readChar6()),
-                    },
-                    .align_32_bits, .block_len =&gt; return error.UnsupportedArrayElement,
-                    .abbrev_op =&gt; switch (try bc.readFixed(u1, 1)) {
-                        1 =&gt; try operands.appendSlice(&amp;.{
-                            Abbrev.Operand.literal_id,
-                            try bc.readVbr(u64, 8),
-                        }),
-                        0 =&gt; {
-                            const encoding: Abbrev.Operand.Encoding =
-                                @enumFromInt(try bc.readFixed(u3, 3));
-                            try operands.append(@intFromEnum(encoding));
-                            switch (encoding) {
-                                .fixed, .vbr =&gt; try operands.append(try bc.readVbr(u7, 5)),
-                                .array, .char6, .blob =&gt; {},
-                                _ =&gt; return error.UnsuportedAbbrevEncoding,
-                            }
-                        },
-                    },
-                };
-                break;
-            },
-            .char6 =&gt; operands.appendAssumeCapacity(try bc.readChar6()),
-            .blob =&gt; |len_width| {
-                assert(abbrev_operand_i + 1 == abbrev.operands.len);
-                const len = std.math.cast(usize, try bc.readVbr(u32, len_width)) orelse
-                    return error.Overflow;
-                bc.align32Bits();
-                try bc.readBytes(try blob.addManyAsSlice(len));
-                bc.align32Bits();
-            },
-        },
-        .align_32_bits =&gt; bc.align32Bits(),
-        .block_len =&gt; operands.appendAssumeCapacity(try bc.read32Bits()),
-        .abbrev_op =&gt; unreachable,
-    };
-    return .{
-        .name = name: {
-            if (operands.items.len &lt; 1) break :name &amp;.{};
-            const record_id = std.math.cast(u32, operands.items[0]) orelse break :name &amp;.{};
-            if (state.block_id) |block_id| {
-                if (bc.block_info.get(block_id)) |block_info| {
-                    break :name block_info.record_names.get(record_id) orelse break :name &amp;.{};
-                }
-            }
-            break :name &amp;.{};
-        },
-        .id = std.math.cast(u32, operands.items[0]) orelse return error.InvalidRecordId,
-        .operands = operands.items[1..],
-        .blob = blob.items,
-    };
-}
-
-fn startBlock(bc: *BitcodeReader, block_id: ?u32, new_abbrev_len: u6) !void {
-    const abbrevs = if (block_id) |id|
-        if (bc.block_info.get(id)) |block_info| block_info.abbrevs.abbrevs.items else &amp;.{}
-    else
-        &amp;.{};
-
-    const state = try bc.stack.addOne(bc.allocator);
-    state.* = .{
-        .block_id = block_id,
-        .abbrev_id_width = new_abbrev_len,
-        .abbrevs = .{ .abbrevs = .empty },
-    };
-    try state.abbrevs.abbrevs.ensureTotalCapacity(
-        bc.allocator,
-        @typeInfo(Abbrev.Builtin).@"enum".fields.len + abbrevs.len,
-    );
-
-    assert(state.abbrevs.abbrevs.items.len == @intFromEnum(Abbrev.Builtin.end_block));
-    try state.abbrevs.addAbbrevAssumeCapacity(bc.allocator, .{
-        .operands = &amp;.{
-            .{ .literal = Abbrev.Builtin.end_block.toRecordId() },
-            .align_32_bits,
-        },
-    });
-    assert(state.abbrevs.abbrevs.items.len == @intFromEnum(Abbrev.Builtin.enter_subblock));
-    try state.abbrevs.addAbbrevAssumeCapacity(bc.allocator, .{
-        .operands = &amp;.{
-            .{ .literal = Abbrev.Builtin.enter_subblock.toRecordId() },
-            .{ .encoding = .{ .vbr = 8 } }, // blockid
-            .{ .encoding = .{ .vbr = 4 } }, // newabbrevlen
-            .align_32_bits,
-            .block_len,
-        },
-    });
-    assert(state.abbrevs.abbrevs.items.len == @intFromEnum(Abbrev.Builtin.define_abbrev));
-    try state.abbrevs.addAbbrevAssumeCapacity(bc.allocator, .{
-        .operands = &amp;.{
-            .{ .literal = Abbrev.Builtin.define_abbrev.toRecordId() },
-            .{ .encoding = .{ .array = 5 } }, // numabbrevops
-            .abbrev_op,
-        },
-    });
-    assert(state.abbrevs.abbrevs.items.len == @intFromEnum(Abbrev.Builtin.unabbrev_record));
-    try state.abbrevs.addAbbrevAssumeCapacity(bc.allocator, .{
-        .operands = &amp;.{
-            .{ .encoding = .{ .vbr = 6 } }, // code
-            .{ .encoding = .{ .array = 6 } }, // numops
-            .{ .encoding = .{ .vbr = 6 } }, // ops
-        },
-    });
-    assert(state.abbrevs.abbrevs.items.len == @typeInfo(Abbrev.Builtin).@"enum".fields.len);
-    for (abbrevs) |abbrev| try state.abbrevs.addAbbrevAssumeCapacity(bc.allocator, abbrev);
-}
-
-fn endBlock(bc: *BitcodeReader) !void {
-    if (bc.stack.items.len == 0) return error.InvalidEndBlock;
-    bc.stack.items[bc.stack.items.len - 1].deinit(bc.allocator);
-    bc.stack.items.len -= 1;
-}
-
-fn parseBlockInfoBlock(bc: *BitcodeReader) !void {
-    var block_id: ?u32 = null;
-    while (true) {
-        const record = (try bc.nextRecord()) orelse return error.EndOfStream;
-        switch (record.id) {
-            Abbrev.Builtin.end_block.toRecordId() =&gt; break,
-            Abbrev.Builtin.define_abbrev.toRecordId() =&gt; {
-                const gop = try bc.block_info.getOrPut(bc.allocator, block_id orelse
-                    return error.UnspecifiedBlockId);
-                if (!gop.found_existing) gop.value_ptr.* = Block.Info.default;
-                try gop.value_ptr.abbrevs.addOwnedAbbrev(
-                    bc.allocator,
-                    try record.toOwnedAbbrev(bc.allocator),
-                );
-            },
-            Block.Info.set_bid_id =&gt; block_id = std.math.cast(u32, record.operands[0]) orelse
-                return error.Overflow,
-            Block.Info.block_name_id =&gt; if (bc.keep_names) {
-                const gop = try bc.block_info.getOrPut(bc.allocator, block_id orelse
-                    return error.UnspecifiedBlockId);
-                if (!gop.found_existing) gop.value_ptr.* = Block.Info.default;
-                const name = try bc.allocator.alloc(u8, record.operands.len);
-                errdefer bc.allocator.free(name);
-                for (name, record.operands) |*byte, operand|
-                    byte.* = std.math.cast(u8, operand) orelse return error.InvalidName;
-                gop.value_ptr.block_name = name;
-            },
-            Block.Info.set_record_name_id =&gt; if (bc.keep_names) {
-                const gop = try bc.block_info.getOrPut(bc.allocator, block_id orelse
-                    return error.UnspecifiedBlockId);
-                if (!gop.found_existing) gop.value_ptr.* = Block.Info.default;
-                const name = try bc.allocator.alloc(u8, record.operands.len - 1);
-                errdefer bc.allocator.free(name);
-                for (name, record.operands[1..]) |*byte, operand|
-                    byte.* = std.math.cast(u8, operand) orelse return error.InvalidName;
-                try gop.value_ptr.record_names.put(
-                    bc.allocator,
-                    std.math.cast(u32, record.operands[0]) orelse return error.Overflow,
-                    name,
-                );
-            },
-            else =&gt; return error.UnsupportedBlockInfoRecord,
-        }
-    }
-}
-
-fn align32Bits(bc: *BitcodeReader) void {
-    bc.bit_offset = 0;
-}
-
-fn read32Bits(bc: *BitcodeReader) !u32 {
-    assert(bc.bit_offset == 0);
-    return bc.reader.takeInt(u32, .little);
-}
-
-fn readBytes(bc: *BitcodeReader, bytes: []u8) !void {
-    assert(bc.bit_offset == 0);
-    try bc.reader.readSliceAll(bytes);
-
-    const trailing_bytes = bytes.len % 4;
-    if (trailing_bytes &gt; 0) {
-        var bit_buffer: [4]u8 = @splat(0);
-        try bc.reader.readSliceAll(bit_buffer[trailing_bytes..]);
-        bc.bit_buffer = std.mem.readInt(u32, &amp;bit_buffer, .little);
-        bc.bit_offset = @intCast(8 * trailing_bytes);
-    }
-}
-
-fn readFixed(bc: *BitcodeReader, comptime T: type, bits: u7) !T {
-    var result: T = 0;
-    var shift: std.math.Log2IntCeil(T) = 0;
-    var remaining = bits;
-    while (remaining &gt; 0) {
-        if (bc.bit_offset == 0) bc.bit_buffer = try bc.read32Bits();
-        const chunk_len = @min(@as(u6, 32) - bc.bit_offset, remaining);
-        const chunk_mask = @as(u32, std.math.maxInt(u32)) &gt;&gt; @intCast(32 - chunk_len);
-        result |= @as(T, @intCast(bc.bit_buffer &gt;&gt; bc.bit_offset &amp; chunk_mask)) &lt;&lt; @intCast(shift);
-        shift += @intCast(chunk_len);
-        remaining -= chunk_len;
-        bc.bit_offset = @truncate(bc.bit_offset + chunk_len);
-    }
-    return result;
-}
-
-fn readVbr(bc: *BitcodeReader, comptime T: type, bits: u7) !T {
-    const chunk_bits: u6 = @intCast(bits - 1);
-    const chunk_msb = @as(u64, 1) &lt;&lt; chunk_bits;
-
-    var result: u64 = 0;
-    var shift: u6 = 0;
-    while (true) {
-        const chunk = try bc.readFixed(u64, bits);
-        result |= (chunk &amp; (chunk_msb - 1)) &lt;&lt; shift;
-        if (chunk &amp; chunk_msb == 0) break;
-        shift += chunk_bits;
-    }
-    return @intCast(result);
-}
-
-fn readChar6(bc: *BitcodeReader) !u8 {
-    return switch (try bc.readFixed(u6, 6)) {
-        0...25 =&gt; |c| @as(u8, c - 0) + 'a',
-        26...51 =&gt; |c| @as(u8, c - 26) + 'A',
-        52...61 =&gt; |c| @as(u8, c - 52) + '0',
-        62 =&gt; '.',
-        63 =&gt; '_',
-    };
-}
-
-const State = struct {
-    block_id: ?u32,
-    abbrev_id_width: u6,
-    abbrevs: Abbrev.Store,
-
-    fn deinit(state: *State, allocator: std.mem.Allocator) void {
-        state.abbrevs.deinit(allocator);
-        state.* = undefined;
-    }
-};
-
-const Abbrev = struct {
-    operands: []const Operand,
-
-    const Builtin = enum(u2) {
-        end_block,
-        enter_subblock,
-        define_abbrev,
-        unabbrev_record,
-
-        const first_record_id: u32 = std.math.maxInt(u32) - @typeInfo(Builtin).@"enum".fields.len + 1;
-        fn toRecordId(builtin: Builtin) u32 {
-            return first_record_id + @intFromEnum(builtin);
-        }
-    };
-
-    const Operand = union(enum) {
-        literal: u64,
-        encoding: union(Encoding) {
-            fixed: u7,
-            vbr: u6,
-            array: u3,
-            char6,
-            blob: u3,
-        },
-        align_32_bits,
-        block_len,
-        abbrev_op,
-
-        const literal_id = std.math.maxInt(u64);
-        const Encoding = enum(u3) {
-            fixed = 1,
-            vbr = 2,
-            array = 3,
-            char6 = 4,
-            blob = 5,
-            _,
-        };
-    };
-
-    const Store = struct {
-        abbrevs: std.ArrayList(Abbrev),
-
-        fn deinit(store: *Store, allocator: std.mem.Allocator) void {
-            for (store.abbrevs.items) |abbrev| allocator.free(abbrev.operands);
-            store.abbrevs.deinit(allocator);
-            store.* = undefined;
-        }
-
-        fn addAbbrev(store: *Store, allocator: std.mem.Allocator, abbrev: Abbrev) !void {
-            try store.ensureUnusedCapacity(allocator, 1);
-            store.addAbbrevAssumeCapacity(abbrev);
-        }
-
-        fn addAbbrevAssumeCapacity(store: *Store, allocator: std.mem.Allocator, abbrev: Abbrev) !void {
-            store.abbrevs.appendAssumeCapacity(.{
-                .operands = try allocator.dupe(Abbrev.Operand, abbrev.operands),
-            });
-        }
-
-        fn addOwnedAbbrev(store: *Store, allocator: std.mem.Allocator, abbrev: Abbrev) !void {
-            try store.abbrevs.ensureUnusedCapacity(allocator, 1);
-            store.addOwnedAbbrevAssumeCapacity(abbrev);
-        }
-
-        fn addOwnedAbbrevAssumeCapacity(store: *Store, abbrev: Abbrev) void {
-            store.abbrevs.appendAssumeCapacity(abbrev);
-        }
-    };
-};
-
-test {
-    _ = &amp;skipBlock;
-}</pre>
+    <pre><a id="L1"></a>const BitcodeReader = @This();
+<a id="L2"></a>
+<a id="L3"></a>const std = @import("../../std.zig");
+<a id="L4"></a>const assert = std.debug.assert;
+<a id="L5"></a>
+<a id="L6"></a>allocator: std.mem.Allocator,
+<a id="L7"></a>record_arena: std.heap.ArenaAllocator.State,
+<a id="L8"></a>reader: *std.Io.Reader,
+<a id="L9"></a>keep_names: bool,
+<a id="L10"></a>bit_buffer: u32,
+<a id="L11"></a>bit_offset: u5,
+<a id="L12"></a>stack: std.ArrayList(State),
+<a id="L13"></a>block_info: std.AutoHashMapUnmanaged(u32, Block.Info),
+<a id="L14"></a>
+<a id="L15"></a>pub const Item = union(enum) {
+<a id="L16"></a>    start_block: Block,
+<a id="L17"></a>    record: Record,
+<a id="L18"></a>    end_block: Block,
+<a id="L19"></a>};
+<a id="L20"></a>
+<a id="L21"></a>pub const Block = struct {
+<a id="L22"></a>    name: []const u8,
+<a id="L23"></a>    id: u32,
+<a id="L24"></a>    len: u32,
+<a id="L25"></a>
+<a id="L26"></a>    const block_info: u32 = 0;
+<a id="L27"></a>    const first_reserved: u32 = 1;
+<a id="L28"></a>    const last_standard: u32 = 7;
+<a id="L29"></a>
+<a id="L30"></a>    const Info = struct {
+<a id="L31"></a>        block_name: []const u8,
+<a id="L32"></a>        record_names: std.AutoHashMapUnmanaged(u32, []const u8),
+<a id="L33"></a>        abbrevs: Abbrev.Store,
+<a id="L34"></a>
+<a id="L35"></a>        const default: Info = .{
+<a id="L36"></a>            .block_name = &amp;.{},
+<a id="L37"></a>            .record_names = .empty,
+<a id="L38"></a>            .abbrevs = .{ .abbrevs = .empty },
+<a id="L39"></a>        };
+<a id="L40"></a>
+<a id="L41"></a>        const set_bid_id: u32 = 1;
+<a id="L42"></a>        const block_name_id: u32 = 2;
+<a id="L43"></a>        const set_record_name_id: u32 = 3;
+<a id="L44"></a>
+<a id="L45"></a>        fn deinit(info: *Info, allocator: std.mem.Allocator) void {
+<a id="L46"></a>            allocator.free(info.block_name);
+<a id="L47"></a>            var record_names_it = info.record_names.valueIterator();
+<a id="L48"></a>            while (record_names_it.next()) |record_name| allocator.free(record_name.*);
+<a id="L49"></a>            info.record_names.deinit(allocator);
+<a id="L50"></a>            info.abbrevs.deinit(allocator);
+<a id="L51"></a>            info.* = undefined;
+<a id="L52"></a>        }
+<a id="L53"></a>    };
+<a id="L54"></a>};
+<a id="L55"></a>
+<a id="L56"></a>pub const Record = struct {
+<a id="L57"></a>    name: []const u8,
+<a id="L58"></a>    id: u32,
+<a id="L59"></a>    operands: []const u64,
+<a id="L60"></a>    blob: []const u8,
+<a id="L61"></a>
+<a id="L62"></a>    fn toOwnedAbbrev(record: Record, allocator: std.mem.Allocator) !Abbrev {
+<a id="L63"></a>        var operands = std.array_list.Managed(Abbrev.Operand).init(allocator);
+<a id="L64"></a>        defer operands.deinit();
+<a id="L65"></a>
+<a id="L66"></a>        assert(record.id == Abbrev.Builtin.define_abbrev.toRecordId());
+<a id="L67"></a>        var i: usize = 0;
+<a id="L68"></a>        while (i &lt; record.operands.len) switch (record.operands[i]) {
+<a id="L69"></a>            Abbrev.Operand.literal_id =&gt; {
+<a id="L70"></a>                try operands.append(.{ .literal = record.operands[i + 1] });
+<a id="L71"></a>                i += 2;
+<a id="L72"></a>            },
+<a id="L73"></a>            @intFromEnum(Abbrev.Operand.Encoding.fixed) =&gt; {
+<a id="L74"></a>                try operands.append(.{ .encoding = .{ .fixed = @intCast(record.operands[i + 1]) } });
+<a id="L75"></a>                i += 2;
+<a id="L76"></a>            },
+<a id="L77"></a>            @intFromEnum(Abbrev.Operand.Encoding.vbr) =&gt; {
+<a id="L78"></a>                try operands.append(.{ .encoding = .{ .vbr = @intCast(record.operands[i + 1]) } });
+<a id="L79"></a>                i += 2;
+<a id="L80"></a>            },
+<a id="L81"></a>            @intFromEnum(Abbrev.Operand.Encoding.array) =&gt; {
+<a id="L82"></a>                try operands.append(.{ .encoding = .{ .array = 6 } });
+<a id="L83"></a>                i += 1;
+<a id="L84"></a>            },
+<a id="L85"></a>            @intFromEnum(Abbrev.Operand.Encoding.char6) =&gt; {
+<a id="L86"></a>                try operands.append(.{ .encoding = .char6 });
+<a id="L87"></a>                i += 1;
+<a id="L88"></a>            },
+<a id="L89"></a>            @intFromEnum(Abbrev.Operand.Encoding.blob) =&gt; {
+<a id="L90"></a>                try operands.append(.{ .encoding = .{ .blob = 6 } });
+<a id="L91"></a>                i += 1;
+<a id="L92"></a>            },
+<a id="L93"></a>            else =&gt; unreachable,
+<a id="L94"></a>        };
+<a id="L95"></a>
+<a id="L96"></a>        return .{ .operands = try operands.toOwnedSlice() };
+<a id="L97"></a>    }
+<a id="L98"></a>};
+<a id="L99"></a>
+<a id="L100"></a>pub const InitOptions = struct {
+<a id="L101"></a>    reader: *std.Io.Reader,
+<a id="L102"></a>    keep_names: bool = false,
+<a id="L103"></a>};
+<a id="L104"></a>pub fn init(allocator: std.mem.Allocator, options: InitOptions) BitcodeReader {
+<a id="L105"></a>    return .{
+<a id="L106"></a>        .allocator = allocator,
+<a id="L107"></a>        .record_arena = .{},
+<a id="L108"></a>        .reader = options.reader,
+<a id="L109"></a>        .keep_names = options.keep_names,
+<a id="L110"></a>        .bit_buffer = 0,
+<a id="L111"></a>        .bit_offset = 0,
+<a id="L112"></a>        .stack = .empty,
+<a id="L113"></a>        .block_info = .empty,
+<a id="L114"></a>    };
+<a id="L115"></a>}
+<a id="L116"></a>
+<a id="L117"></a>pub fn deinit(bc: *BitcodeReader) void {
+<a id="L118"></a>    var block_info_it = bc.block_info.valueIterator();
+<a id="L119"></a>    while (block_info_it.next()) |block_info| block_info.deinit(bc.allocator);
+<a id="L120"></a>    bc.block_info.deinit(bc.allocator);
+<a id="L121"></a>    for (bc.stack.items) |*state| state.deinit(bc.allocator);
+<a id="L122"></a>    bc.stack.deinit(bc.allocator);
+<a id="L123"></a>    bc.record_arena.promote(bc.allocator).deinit();
+<a id="L124"></a>    bc.* = undefined;
+<a id="L125"></a>}
+<a id="L126"></a>
+<a id="L127"></a>pub fn checkMagic(bc: *BitcodeReader, magic: *const [4]u8) !void {
+<a id="L128"></a>    var buffer: [4]u8 = undefined;
+<a id="L129"></a>    try bc.readBytes(&amp;buffer);
+<a id="L130"></a>    if (!std.mem.eql(u8, &amp;buffer, magic)) return error.InvalidMagic;
+<a id="L131"></a>
+<a id="L132"></a>    try bc.startBlock(null, 2);
+<a id="L133"></a>    try bc.block_info.put(bc.allocator, Block.block_info, Block.Info.default);
+<a id="L134"></a>}
+<a id="L135"></a>
+<a id="L136"></a>pub fn next(bc: *BitcodeReader) !?Item {
+<a id="L137"></a>    while (true) {
+<a id="L138"></a>        const record = (try bc.nextRecord()) orelse
+<a id="L139"></a>            return if (bc.stack.items.len &gt; 1) error.EndOfStream else null;
+<a id="L140"></a>        switch (record.id) {
+<a id="L141"></a>            else =&gt; return .{ .record = record },
+<a id="L142"></a>            Abbrev.Builtin.end_block.toRecordId() =&gt; {
+<a id="L143"></a>                const block_id = bc.stack.items[bc.stack.items.len - 1].block_id.?;
+<a id="L144"></a>                try bc.endBlock();
+<a id="L145"></a>                return .{ .end_block = .{
+<a id="L146"></a>                    .name = if (bc.block_info.get(block_id)) |block_info|
+<a id="L147"></a>                        block_info.block_name
+<a id="L148"></a>                    else
+<a id="L149"></a>                        &amp;.{},
+<a id="L150"></a>                    .id = block_id,
+<a id="L151"></a>                    .len = 0,
+<a id="L152"></a>                } };
+<a id="L153"></a>            },
+<a id="L154"></a>            Abbrev.Builtin.enter_subblock.toRecordId() =&gt; {
+<a id="L155"></a>                const block_id: u32 = @intCast(record.operands[0]);
+<a id="L156"></a>                switch (block_id) {
+<a id="L157"></a>                    Block.block_info =&gt; {
+<a id="L158"></a>                        try bc.startBlock(Block.block_info, @intCast(record.operands[1]));
+<a id="L159"></a>                        try bc.parseBlockInfoBlock();
+<a id="L160"></a>                        try bc.endBlock();
+<a id="L161"></a>                    },
+<a id="L162"></a>                    Block.first_reserved...Block.last_standard =&gt; return error.UnsupportedBlockId,
+<a id="L163"></a>                    else =&gt; {
+<a id="L164"></a>                        try bc.startBlock(block_id, @intCast(record.operands[1]));
+<a id="L165"></a>                        return .{ .start_block = .{
+<a id="L166"></a>                            .name = if (bc.block_info.get(block_id)) |block_info|
+<a id="L167"></a>                                block_info.block_name
+<a id="L168"></a>                            else
+<a id="L169"></a>                                &amp;.{},
+<a id="L170"></a>                            .id = block_id,
+<a id="L171"></a>                            .len = @intCast(record.operands[2]),
+<a id="L172"></a>                        } };
+<a id="L173"></a>                    },
+<a id="L174"></a>                }
+<a id="L175"></a>            },
+<a id="L176"></a>            Abbrev.Builtin.define_abbrev.toRecordId() =&gt; try bc.stack.items[bc.stack.items.len - 1]
+<a id="L177"></a>                .abbrevs.addOwnedAbbrev(bc.allocator, try record.toOwnedAbbrev(bc.allocator)),
+<a id="L178"></a>        }
+<a id="L179"></a>    }
+<a id="L180"></a>}
+<a id="L181"></a>
+<a id="L182"></a>pub fn skipBlock(bc: *BitcodeReader, block: Block) !void {
+<a id="L183"></a>    assert(bc.bit_offset == 0);
+<a id="L184"></a>    try bc.reader.discardAll(4 * @as(usize, block.len));
+<a id="L185"></a>    try bc.endBlock();
+<a id="L186"></a>}
+<a id="L187"></a>
+<a id="L188"></a>fn nextRecord(bc: *BitcodeReader) !?Record {
+<a id="L189"></a>    const state = &amp;bc.stack.items[bc.stack.items.len - 1];
+<a id="L190"></a>    const abbrev_id = bc.readFixed(u32, state.abbrev_id_width) catch |err| switch (err) {
+<a id="L191"></a>        error.EndOfStream =&gt; return null,
+<a id="L192"></a>        else =&gt; |e| return e,
+<a id="L193"></a>    };
+<a id="L194"></a>    if (abbrev_id &gt;= state.abbrevs.abbrevs.items.len) return error.InvalidAbbrevId;
+<a id="L195"></a>    const abbrev = state.abbrevs.abbrevs.items[abbrev_id];
+<a id="L196"></a>
+<a id="L197"></a>    var record_arena = bc.record_arena.promote(bc.allocator);
+<a id="L198"></a>    defer bc.record_arena = record_arena.state;
+<a id="L199"></a>    _ = record_arena.reset(.retain_capacity);
+<a id="L200"></a>
+<a id="L201"></a>    var operands = try std.array_list.Managed(u64).initCapacity(record_arena.allocator(), abbrev.operands.len);
+<a id="L202"></a>    var blob = std.array_list.Managed(u8).init(record_arena.allocator());
+<a id="L203"></a>    for (abbrev.operands, 0..) |abbrev_operand, abbrev_operand_i| switch (abbrev_operand) {
+<a id="L204"></a>        .literal =&gt; |value| operands.appendAssumeCapacity(value),
+<a id="L205"></a>        .encoding =&gt; |abbrev_encoding| switch (abbrev_encoding) {
+<a id="L206"></a>            .fixed =&gt; |width| operands.appendAssumeCapacity(try bc.readFixed(u64, width)),
+<a id="L207"></a>            .vbr =&gt; |width| operands.appendAssumeCapacity(try bc.readVbr(u64, width)),
+<a id="L208"></a>            .array =&gt; |len_width| {
+<a id="L209"></a>                assert(abbrev_operand_i + 2 == abbrev.operands.len);
+<a id="L210"></a>                const len: usize = @intCast(try bc.readVbr(u32, len_width));
+<a id="L211"></a>                try operands.ensureUnusedCapacity(len);
+<a id="L212"></a>                for (0..len) |_| switch (abbrev.operands[abbrev.operands.len - 1]) {
+<a id="L213"></a>                    .literal =&gt; |elem_value| operands.appendAssumeCapacity(elem_value),
+<a id="L214"></a>                    .encoding =&gt; |elem_encoding| switch (elem_encoding) {
+<a id="L215"></a>                        .fixed =&gt; |elem_width| operands.appendAssumeCapacity(try bc.readFixed(u64, elem_width)),
+<a id="L216"></a>                        .vbr =&gt; |elem_width| operands.appendAssumeCapacity(try bc.readVbr(u64, elem_width)),
+<a id="L217"></a>                        .array, .blob =&gt; return error.InvalidArrayElement,
+<a id="L218"></a>                        .char6 =&gt; operands.appendAssumeCapacity(try bc.readChar6()),
+<a id="L219"></a>                    },
+<a id="L220"></a>                    .align_32_bits, .block_len =&gt; return error.UnsupportedArrayElement,
+<a id="L221"></a>                    .abbrev_op =&gt; switch (try bc.readFixed(u1, 1)) {
+<a id="L222"></a>                        1 =&gt; try operands.appendSlice(&amp;.{
+<a id="L223"></a>                            Abbrev.Operand.literal_id,
+<a id="L224"></a>                            try bc.readVbr(u64, 8),
+<a id="L225"></a>                        }),
+<a id="L226"></a>                        0 =&gt; {
+<a id="L227"></a>                            const encoding: Abbrev.Operand.Encoding =
+<a id="L228"></a>                                @enumFromInt(try bc.readFixed(u3, 3));
+<a id="L229"></a>                            try operands.append(@intFromEnum(encoding));
+<a id="L230"></a>                            switch (encoding) {
+<a id="L231"></a>                                .fixed, .vbr =&gt; try operands.append(try bc.readVbr(u7, 5)),
+<a id="L232"></a>                                .array, .char6, .blob =&gt; {},
+<a id="L233"></a>                                _ =&gt; return error.UnsuportedAbbrevEncoding,
+<a id="L234"></a>                            }
+<a id="L235"></a>                        },
+<a id="L236"></a>                    },
+<a id="L237"></a>                };
+<a id="L238"></a>                break;
+<a id="L239"></a>            },
+<a id="L240"></a>            .char6 =&gt; operands.appendAssumeCapacity(try bc.readChar6()),
+<a id="L241"></a>            .blob =&gt; |len_width| {
+<a id="L242"></a>                assert(abbrev_operand_i + 1 == abbrev.operands.len);
+<a id="L243"></a>                const len = std.math.cast(usize, try bc.readVbr(u32, len_width)) orelse
+<a id="L244"></a>                    return error.Overflow;
+<a id="L245"></a>                bc.align32Bits();
+<a id="L246"></a>                try bc.readBytes(try blob.addManyAsSlice(len));
+<a id="L247"></a>                bc.align32Bits();
+<a id="L248"></a>            },
+<a id="L249"></a>        },
+<a id="L250"></a>        .align_32_bits =&gt; bc.align32Bits(),
+<a id="L251"></a>        .block_len =&gt; operands.appendAssumeCapacity(try bc.read32Bits()),
+<a id="L252"></a>        .abbrev_op =&gt; unreachable,
+<a id="L253"></a>    };
+<a id="L254"></a>    return .{
+<a id="L255"></a>        .name = name: {
+<a id="L256"></a>            if (operands.items.len &lt; 1) break :name &amp;.{};
+<a id="L257"></a>            const record_id = std.math.cast(u32, operands.items[0]) orelse break :name &amp;.{};
+<a id="L258"></a>            if (state.block_id) |block_id| {
+<a id="L259"></a>                if (bc.block_info.get(block_id)) |block_info| {
+<a id="L260"></a>                    break :name block_info.record_names.get(record_id) orelse break :name &amp;.{};
+<a id="L261"></a>                }
+<a id="L262"></a>            }
+<a id="L263"></a>            break :name &amp;.{};
+<a id="L264"></a>        },
+<a id="L265"></a>        .id = std.math.cast(u32, operands.items[0]) orelse return error.InvalidRecordId,
+<a id="L266"></a>        .operands = operands.items[1..],
+<a id="L267"></a>        .blob = blob.items,
+<a id="L268"></a>    };
+<a id="L269"></a>}
+<a id="L270"></a>
+<a id="L271"></a>fn startBlock(bc: *BitcodeReader, block_id: ?u32, new_abbrev_len: u6) !void {
+<a id="L272"></a>    const abbrevs = if (block_id) |id|
+<a id="L273"></a>        if (bc.block_info.get(id)) |block_info| block_info.abbrevs.abbrevs.items else &amp;.{}
+<a id="L274"></a>    else
+<a id="L275"></a>        &amp;.{};
+<a id="L276"></a>
+<a id="L277"></a>    const state = try bc.stack.addOne(bc.allocator);
+<a id="L278"></a>    state.* = .{
+<a id="L279"></a>        .block_id = block_id,
+<a id="L280"></a>        .abbrev_id_width = new_abbrev_len,
+<a id="L281"></a>        .abbrevs = .{ .abbrevs = .empty },
+<a id="L282"></a>    };
+<a id="L283"></a>    try state.abbrevs.abbrevs.ensureTotalCapacity(
+<a id="L284"></a>        bc.allocator,
+<a id="L285"></a>        @typeInfo(Abbrev.Builtin).@"enum".fields.len + abbrevs.len,
+<a id="L286"></a>    );
+<a id="L287"></a>
+<a id="L288"></a>    assert(state.abbrevs.abbrevs.items.len == @intFromEnum(Abbrev.Builtin.end_block));
+<a id="L289"></a>    try state.abbrevs.addAbbrevAssumeCapacity(bc.allocator, .{
+<a id="L290"></a>        .operands = &amp;.{
+<a id="L291"></a>            .{ .literal = Abbrev.Builtin.end_block.toRecordId() },
+<a id="L292"></a>            .align_32_bits,
+<a id="L293"></a>        },
+<a id="L294"></a>    });
+<a id="L295"></a>    assert(state.abbrevs.abbrevs.items.len == @intFromEnum(Abbrev.Builtin.enter_subblock));
+<a id="L296"></a>    try state.abbrevs.addAbbrevAssumeCapacity(bc.allocator, .{
+<a id="L297"></a>        .operands = &amp;.{
+<a id="L298"></a>            .{ .literal = Abbrev.Builtin.enter_subblock.toRecordId() },
+<a id="L299"></a>            .{ .encoding = .{ .vbr = 8 } }, // blockid
+<a id="L300"></a>            .{ .encoding = .{ .vbr = 4 } }, // newabbrevlen
+<a id="L301"></a>            .align_32_bits,
+<a id="L302"></a>            .block_len,
+<a id="L303"></a>        },
+<a id="L304"></a>    });
+<a id="L305"></a>    assert(state.abbrevs.abbrevs.items.len == @intFromEnum(Abbrev.Builtin.define_abbrev));
+<a id="L306"></a>    try state.abbrevs.addAbbrevAssumeCapacity(bc.allocator, .{
+<a id="L307"></a>        .operands = &amp;.{
+<a id="L308"></a>            .{ .literal = Abbrev.Builtin.define_abbrev.toRecordId() },
+<a id="L309"></a>            .{ .encoding = .{ .array = 5 } }, // numabbrevops
+<a id="L310"></a>            .abbrev_op,
+<a id="L311"></a>        },
+<a id="L312"></a>    });
+<a id="L313"></a>    assert(state.abbrevs.abbrevs.items.len == @intFromEnum(Abbrev.Builtin.unabbrev_record));
+<a id="L314"></a>    try state.abbrevs.addAbbrevAssumeCapacity(bc.allocator, .{
+<a id="L315"></a>        .operands = &amp;.{
+<a id="L316"></a>            .{ .encoding = .{ .vbr = 6 } }, // code
+<a id="L317"></a>            .{ .encoding = .{ .array = 6 } }, // numops
+<a id="L318"></a>            .{ .encoding = .{ .vbr = 6 } }, // ops
+<a id="L319"></a>        },
+<a id="L320"></a>    });
+<a id="L321"></a>    assert(state.abbrevs.abbrevs.items.len == @typeInfo(Abbrev.Builtin).@"enum".fields.len);
+<a id="L322"></a>    for (abbrevs) |abbrev| try state.abbrevs.addAbbrevAssumeCapacity(bc.allocator, abbrev);
+<a id="L323"></a>}
+<a id="L324"></a>
+<a id="L325"></a>fn endBlock(bc: *BitcodeReader) !void {
+<a id="L326"></a>    if (bc.stack.items.len == 0) return error.InvalidEndBlock;
+<a id="L327"></a>    bc.stack.items[bc.stack.items.len - 1].deinit(bc.allocator);
+<a id="L328"></a>    bc.stack.items.len -= 1;
+<a id="L329"></a>}
+<a id="L330"></a>
+<a id="L331"></a>fn parseBlockInfoBlock(bc: *BitcodeReader) !void {
+<a id="L332"></a>    var block_id: ?u32 = null;
+<a id="L333"></a>    while (true) {
+<a id="L334"></a>        const record = (try bc.nextRecord()) orelse return error.EndOfStream;
+<a id="L335"></a>        switch (record.id) {
+<a id="L336"></a>            Abbrev.Builtin.end_block.toRecordId() =&gt; break,
+<a id="L337"></a>            Abbrev.Builtin.define_abbrev.toRecordId() =&gt; {
+<a id="L338"></a>                const gop = try bc.block_info.getOrPut(bc.allocator, block_id orelse
+<a id="L339"></a>                    return error.UnspecifiedBlockId);
+<a id="L340"></a>                if (!gop.found_existing) gop.value_ptr.* = Block.Info.default;
+<a id="L341"></a>                try gop.value_ptr.abbrevs.addOwnedAbbrev(
+<a id="L342"></a>                    bc.allocator,
+<a id="L343"></a>                    try record.toOwnedAbbrev(bc.allocator),
+<a id="L344"></a>                );
+<a id="L345"></a>            },
+<a id="L346"></a>            Block.Info.set_bid_id =&gt; block_id = std.math.cast(u32, record.operands[0]) orelse
+<a id="L347"></a>                return error.Overflow,
+<a id="L348"></a>            Block.Info.block_name_id =&gt; if (bc.keep_names) {
+<a id="L349"></a>                const gop = try bc.block_info.getOrPut(bc.allocator, block_id orelse
+<a id="L350"></a>                    return error.UnspecifiedBlockId);
+<a id="L351"></a>                if (!gop.found_existing) gop.value_ptr.* = Block.Info.default;
+<a id="L352"></a>                const name = try bc.allocator.alloc(u8, record.operands.len);
+<a id="L353"></a>                errdefer bc.allocator.free(name);
+<a id="L354"></a>                for (name, record.operands) |*byte, operand|
+<a id="L355"></a>                    byte.* = std.math.cast(u8, operand) orelse return error.InvalidName;
+<a id="L356"></a>                gop.value_ptr.block_name = name;
+<a id="L357"></a>            },
+<a id="L358"></a>            Block.Info.set_record_name_id =&gt; if (bc.keep_names) {
+<a id="L359"></a>                const gop = try bc.block_info.getOrPut(bc.allocator, block_id orelse
+<a id="L360"></a>                    return error.UnspecifiedBlockId);
+<a id="L361"></a>                if (!gop.found_existing) gop.value_ptr.* = Block.Info.default;
+<a id="L362"></a>                const name = try bc.allocator.alloc(u8, record.operands.len - 1);
+<a id="L363"></a>                errdefer bc.allocator.free(name);
+<a id="L364"></a>                for (name, record.operands[1..]) |*byte, operand|
+<a id="L365"></a>                    byte.* = std.math.cast(u8, operand) orelse return error.InvalidName;
+<a id="L366"></a>                try gop.value_ptr.record_names.put(
+<a id="L367"></a>                    bc.allocator,
+<a id="L368"></a>                    std.math.cast(u32, record.operands[0]) orelse return error.Overflow,
+<a id="L369"></a>                    name,
+<a id="L370"></a>                );
+<a id="L371"></a>            },
+<a id="L372"></a>            else =&gt; return error.UnsupportedBlockInfoRecord,
+<a id="L373"></a>        }
+<a id="L374"></a>    }
+<a id="L375"></a>}
+<a id="L376"></a>
+<a id="L377"></a>fn align32Bits(bc: *BitcodeReader) void {
+<a id="L378"></a>    bc.bit_offset = 0;
+<a id="L379"></a>}
+<a id="L380"></a>
+<a id="L381"></a>fn read32Bits(bc: *BitcodeReader) !u32 {
+<a id="L382"></a>    assert(bc.bit_offset == 0);
+<a id="L383"></a>    return bc.reader.takeInt(u32, .little);
+<a id="L384"></a>}
+<a id="L385"></a>
+<a id="L386"></a>fn readBytes(bc: *BitcodeReader, bytes: []u8) !void {
+<a id="L387"></a>    assert(bc.bit_offset == 0);
+<a id="L388"></a>    try bc.reader.readSliceAll(bytes);
+<a id="L389"></a>
+<a id="L390"></a>    const trailing_bytes = bytes.len % 4;
+<a id="L391"></a>    if (trailing_bytes &gt; 0) {
+<a id="L392"></a>        var bit_buffer: [4]u8 = @splat(0);
+<a id="L393"></a>        try bc.reader.readSliceAll(bit_buffer[trailing_bytes..]);
+<a id="L394"></a>        bc.bit_buffer = std.mem.readInt(u32, &amp;bit_buffer, .little);
+<a id="L395"></a>        bc.bit_offset = @intCast(8 * trailing_bytes);
+<a id="L396"></a>    }
+<a id="L397"></a>}
+<a id="L398"></a>
+<a id="L399"></a>fn readFixed(bc: *BitcodeReader, comptime T: type, bits: u7) !T {
+<a id="L400"></a>    var result: T = 0;
+<a id="L401"></a>    var shift: std.math.Log2IntCeil(T) = 0;
+<a id="L402"></a>    var remaining = bits;
+<a id="L403"></a>    while (remaining &gt; 0) {
+<a id="L404"></a>        if (bc.bit_offset == 0) bc.bit_buffer = try bc.read32Bits();
+<a id="L405"></a>        const chunk_len = @min(@as(u6, 32) - bc.bit_offset, remaining);
+<a id="L406"></a>        const chunk_mask = @as(u32, std.math.maxInt(u32)) &gt;&gt; @intCast(32 - chunk_len);
+<a id="L407"></a>        result |= @as(T, @intCast(bc.bit_buffer &gt;&gt; bc.bit_offset &amp; chunk_mask)) &lt;&lt; @intCast(shift);
+<a id="L408"></a>        shift += @intCast(chunk_len);
+<a id="L409"></a>        remaining -= chunk_len;
+<a id="L410"></a>        bc.bit_offset = @truncate(bc.bit_offset + chunk_len);
+<a id="L411"></a>    }
+<a id="L412"></a>    return result;
+<a id="L413"></a>}
+<a id="L414"></a>
+<a id="L415"></a>fn readVbr(bc: *BitcodeReader, comptime T: type, bits: u7) !T {
+<a id="L416"></a>    const chunk_bits: u6 = @intCast(bits - 1);
+<a id="L417"></a>    const chunk_msb = @as(u64, 1) &lt;&lt; chunk_bits;
+<a id="L418"></a>
+<a id="L419"></a>    var result: u64 = 0;
+<a id="L420"></a>    var shift: u6 = 0;
+<a id="L421"></a>    while (true) {
+<a id="L422"></a>        const chunk = try bc.readFixed(u64, bits);
+<a id="L423"></a>        result |= (chunk &amp; (chunk_msb - 1)) &lt;&lt; shift;
+<a id="L424"></a>        if (chunk &amp; chunk_msb == 0) break;
+<a id="L425"></a>        shift += chunk_bits;
+<a id="L426"></a>    }
+<a id="L427"></a>    return @intCast(result);
+<a id="L428"></a>}
+<a id="L429"></a>
+<a id="L430"></a>fn readChar6(bc: *BitcodeReader) !u8 {
+<a id="L431"></a>    return switch (try bc.readFixed(u6, 6)) {
+<a id="L432"></a>        0...25 =&gt; |c| @as(u8, c - 0) + 'a',
+<a id="L433"></a>        26...51 =&gt; |c| @as(u8, c - 26) + 'A',
+<a id="L434"></a>        52...61 =&gt; |c| @as(u8, c - 52) + '0',
+<a id="L435"></a>        62 =&gt; '.',
+<a id="L436"></a>        63 =&gt; '_',
+<a id="L437"></a>    };
+<a id="L438"></a>}
+<a id="L439"></a>
+<a id="L440"></a>const State = struct {
+<a id="L441"></a>    block_id: ?u32,
+<a id="L442"></a>    abbrev_id_width: u6,
+<a id="L443"></a>    abbrevs: Abbrev.Store,
+<a id="L444"></a>
+<a id="L445"></a>    fn deinit(state: *State, allocator: std.mem.Allocator) void {
+<a id="L446"></a>        state.abbrevs.deinit(allocator);
+<a id="L447"></a>        state.* = undefined;
+<a id="L448"></a>    }
+<a id="L449"></a>};
+<a id="L450"></a>
+<a id="L451"></a>const Abbrev = struct {
+<a id="L452"></a>    operands: []const Operand,
+<a id="L453"></a>
+<a id="L454"></a>    const Builtin = enum(u2) {
+<a id="L455"></a>        end_block,
+<a id="L456"></a>        enter_subblock,
+<a id="L457"></a>        define_abbrev,
+<a id="L458"></a>        unabbrev_record,
+<a id="L459"></a>
+<a id="L460"></a>        const first_record_id: u32 = std.math.maxInt(u32) - @typeInfo(Builtin).@"enum".fields.len + 1;
+<a id="L461"></a>        fn toRecordId(builtin: Builtin) u32 {
+<a id="L462"></a>            return first_record_id + @intFromEnum(builtin);
+<a id="L463"></a>        }
+<a id="L464"></a>    };
+<a id="L465"></a>
+<a id="L466"></a>    const Operand = union(enum) {
+<a id="L467"></a>        literal: u64,
+<a id="L468"></a>        encoding: union(Encoding) {
+<a id="L469"></a>            fixed: u7,
+<a id="L470"></a>            vbr: u6,
+<a id="L471"></a>            array: u3,
+<a id="L472"></a>            char6,
+<a id="L473"></a>            blob: u3,
+<a id="L474"></a>        },
+<a id="L475"></a>        align_32_bits,
+<a id="L476"></a>        block_len,
+<a id="L477"></a>        abbrev_op,
+<a id="L478"></a>
+<a id="L479"></a>        const literal_id = std.math.maxInt(u64);
+<a id="L480"></a>        const Encoding = enum(u3) {
+<a id="L481"></a>            fixed = 1,
+<a id="L482"></a>            vbr = 2,
+<a id="L483"></a>            array = 3,
+<a id="L484"></a>            char6 = 4,
+<a id="L485"></a>            blob = 5,
+<a id="L486"></a>            _,
+<a id="L487"></a>        };
+<a id="L488"></a>    };
+<a id="L489"></a>
+<a id="L490"></a>    const Store = struct {
+<a id="L491"></a>        abbrevs: std.ArrayList(Abbrev),
+<a id="L492"></a>
+<a id="L493"></a>        fn deinit(store: *Store, allocator: std.mem.Allocator) void {
+<a id="L494"></a>            for (store.abbrevs.items) |abbrev| allocator.free(abbrev.operands);
+<a id="L495"></a>            store.abbrevs.deinit(allocator);
+<a id="L496"></a>            store.* = undefined;
+<a id="L497"></a>        }
+<a id="L498"></a>
+<a id="L499"></a>        fn addAbbrev(store: *Store, allocator: std.mem.Allocator, abbrev: Abbrev) !void {
+<a id="L500"></a>            try store.ensureUnusedCapacity(allocator, 1);
+<a id="L501"></a>            store.addAbbrevAssumeCapacity(abbrev);
+<a id="L502"></a>        }
+<a id="L503"></a>
+<a id="L504"></a>        fn addAbbrevAssumeCapacity(store: *Store, allocator: std.mem.Allocator, abbrev: Abbrev) !void {
+<a id="L505"></a>            store.abbrevs.appendAssumeCapacity(.{
+<a id="L506"></a>                .operands = try allocator.dupe(Abbrev.Operand, abbrev.operands),
+<a id="L507"></a>            });
+<a id="L508"></a>        }
+<a id="L509"></a>
+<a id="L510"></a>        fn addOwnedAbbrev(store: *Store, allocator: std.mem.Allocator, abbrev: Abbrev) !void {
+<a id="L511"></a>            try store.abbrevs.ensureUnusedCapacity(allocator, 1);
+<a id="L512"></a>            store.addOwnedAbbrevAssumeCapacity(abbrev);
+<a id="L513"></a>        }
+<a id="L514"></a>
+<a id="L515"></a>        fn addOwnedAbbrevAssumeCapacity(store: *Store, abbrev: Abbrev) void {
+<a id="L516"></a>            store.abbrevs.appendAssumeCapacity(abbrev);
+<a id="L517"></a>        }
+<a id="L518"></a>    };
+<a id="L519"></a>};
+<a id="L520"></a>
+<a id="L521"></a>test {
+<a id="L522"></a>    _ = &amp;skipBlock;
+<a id="L523"></a>}
+</pre>
 </body>
 </html>

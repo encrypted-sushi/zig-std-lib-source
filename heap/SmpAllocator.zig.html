@@ -2,241 +2,244 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Source: zig-0.16.0-std/heap/SmpAllocator.zig</title>
+    <title>Source: heap/SmpAllocator.zig</title>
     <style>
         body { background: #1e1e1e; color: #d4d4d4; font-family: monospace; padding: 20px; }
         pre { white-space: pre-wrap; word-wrap: break-word; }
         .header { border-bottom: 1px solid #444; padding-bottom: 10px; margin-bottom: 20px; }
         a { color: #569cd6; }
+        a[id] { color: inherit; text-decoration: none; }
+        :target { background: #3a3a00; }
     </style>
 </head>
 <body>
     <div class="header">
-        <a href="/">Index</a> | <strong>File: zig-0.16.0-std/heap/SmpAllocator.zig</strong>
+        <a href="/">Index</a> | <strong>File: heap/SmpAllocator.zig</strong>
     </div>
-    <pre>//! An allocator that is designed for ReleaseFast optimization mode, with
-//! multi-threading enabled.
-//!
-//! This allocator is a singleton; it uses global state and only one should be
-//! instantiated for the entire process.
-//!
-//! ## Basic Design
-//!
-//! Each thread gets a separate freelist, however, the data must be recoverable
-//! when the thread exits. We do not directly learn when a thread exits, so
-//! occasionally, one thread must attempt to reclaim another thread's
-//! resources.
-//!
-//! Above a certain size, those allocations are memory mapped directly, with no
-//! storage of allocation metadata. This works because the implementation
-//! refuses resizes that would move an allocation from small category to large
-//! category or vice versa.
-//!
-//! Each allocator operation checks the thread identifier from a threadlocal
-//! variable to find out which metadata in the global state to access, and
-//! attempts to grab its lock. This will usually succeed without contention,
-//! unless another thread has been assigned the same id. In the case of such
-//! contention, the thread moves on to the next thread metadata slot and
-//! repeats the process of attempting to obtain the lock.
-//!
-//! By limiting the thread-local metadata array to the same number as the CPU
-//! count, ensures that as threads are created and destroyed, they cycle
-//! through the full set of freelists.
-const SmpAllocator = @This();
-
-const builtin = @import("builtin");
-
-const std = @import("../std.zig");
-const assert = std.debug.assert;
-const mem = std.mem;
-const math = std.math;
-const Allocator = std.mem.Allocator;
-const Alignment = std.mem.Alignment;
-const PageAllocator = std.heap.PageAllocator;
-
-cpu_count: u32,
-threads: [max_thread_count]Thread,
-
-var global: SmpAllocator = .{
-    .threads = @splat(.{}),
-    .cpu_count = 0,
-};
-threadlocal var thread_index: u32 = 0;
-
-const max_thread_count = 128;
-const slab_len: usize = @max(std.heap.page_size_max, 64 * 1024);
-/// Because of storing free list pointers, the minimum size class is 3.
-const min_class = math.log2(@sizeOf(usize));
-const size_class_count = math.log2(slab_len) - min_class;
-/// Before mapping a fresh page, `alloc` will rotate this many times.
-const max_alloc_search = 1;
-
-const Thread = struct {
-    /// Avoid false sharing.
-    _: void align(std.atomic.cache_line) = {},
-
-    /// Protects the state in this struct (per-thread state).
-    ///
-    /// Threads lock this before accessing their own state in order
-    /// to support freelist reclamation.
-    mutex: std.atomic.Mutex = .unlocked,
-
-    /// For each size class, tracks the next address to be returned from
-    /// `alloc` when the freelist is empty.
-    next_addrs: [size_class_count]usize = @splat(0),
-    /// For each size class, points to the freed pointer.
-    frees: [size_class_count]usize = @splat(0),
-
-    fn lock() *Thread {
-        var index = thread_index;
-        {
-            const t = &amp;global.threads[index];
-            if (t.mutex.tryLock()) {
-                @branchHint(.likely);
-                return t;
-            }
-        }
-        const cpu_count = getCpuCount();
-        assert(cpu_count != 0);
-        while (true) {
-            index = (index + 1) % cpu_count;
-            const t = &amp;global.threads[index];
-            if (t.mutex.tryLock()) {
-                thread_index = index;
-                return t;
-            }
-        }
-    }
-
-    fn unlock(t: *Thread) void {
-        t.mutex.unlock();
-    }
-};
-
-fn getCpuCount() u32 {
-    const cpu_count = @atomicLoad(u32, &amp;global.cpu_count, .unordered);
-    if (cpu_count != 0) return cpu_count;
-    const n: u32 = @min(std.Thread.getCpuCount() catch max_thread_count, max_thread_count);
-    return if (@cmpxchgStrong(u32, &amp;global.cpu_count, 0, n, .monotonic, .monotonic)) |other| other else n;
-}
-
-pub const vtable: Allocator.VTable = .{
-    .alloc = alloc,
-    .resize = resize,
-    .remap = remap,
-    .free = free,
-};
-
-comptime {
-    assert(!builtin.single_threaded); // you're holding it wrong
-}
-
-fn alloc(context: *anyopaque, len: usize, alignment: Alignment, ra: usize) ?[*]u8 {
-    _ = context;
-    _ = ra;
-    const class = sizeClassIndex(len, alignment);
-    if (class &gt;= size_class_count) {
-        @branchHint(.unlikely);
-        return PageAllocator.map(len, alignment);
-    }
-
-    const slot_size = slotSize(class);
-    assert(slab_len % slot_size == 0);
-    var search_count: u8 = 0;
-
-    var t = Thread.lock();
-
-    outer: while (true) {
-        const top_free_ptr = t.frees[class];
-        if (top_free_ptr != 0) {
-            @branchHint(.likely);
-            defer t.unlock();
-            const node: *usize = @ptrFromInt(top_free_ptr);
-            t.frees[class] = node.*;
-            return @ptrFromInt(top_free_ptr);
-        }
-
-        const next_addr = t.next_addrs[class];
-        if ((next_addr % slab_len) != 0) {
-            @branchHint(.likely);
-            defer t.unlock();
-            t.next_addrs[class] = next_addr + slot_size;
-            return @ptrFromInt(next_addr);
-        }
-
-        if (search_count &gt;= max_alloc_search) {
-            @branchHint(.likely);
-            defer t.unlock();
-            // slab alignment here ensures the % slab len earlier catches the end of slots.
-            const slab = PageAllocator.map(slab_len, .fromByteUnits(slab_len)) orelse return null;
-            t.next_addrs[class] = @intFromPtr(slab) + slot_size;
-            return slab;
-        }
-
-        t.unlock();
-        const cpu_count = getCpuCount();
-        assert(cpu_count != 0);
-        var index = thread_index;
-        while (true) {
-            index = (index + 1) % cpu_count;
-            t = &amp;global.threads[index];
-            if (t.mutex.tryLock()) {
-                thread_index = index;
-                search_count += 1;
-                continue :outer;
-            }
-        }
-    }
-}
-
-fn resize(context: *anyopaque, memory: []u8, alignment: Alignment, new_len: usize, ra: usize) bool {
-    _ = context;
-    _ = ra;
-    const class = sizeClassIndex(memory.len, alignment);
-    const new_class = sizeClassIndex(new_len, alignment);
-    if (class &gt;= size_class_count) {
-        if (new_class &lt; size_class_count) return false;
-        return PageAllocator.realloc(memory, alignment, new_len, false) != null;
-    }
-    return new_class == class;
-}
-
-fn remap(context: *anyopaque, memory: []u8, alignment: Alignment, new_len: usize, ra: usize) ?[*]u8 {
-    _ = context;
-    _ = ra;
-    const class = sizeClassIndex(memory.len, alignment);
-    const new_class = sizeClassIndex(new_len, alignment);
-    if (class &gt;= size_class_count) {
-        if (new_class &lt; size_class_count) return null;
-        return PageAllocator.realloc(memory, alignment, new_len, true);
-    }
-    return if (new_class == class) memory.ptr else null;
-}
-
-fn free(context: *anyopaque, memory: []u8, alignment: Alignment, ra: usize) void {
-    _ = context;
-    _ = ra;
-    const class = sizeClassIndex(memory.len, alignment);
-    if (class &gt;= size_class_count) {
-        @branchHint(.unlikely);
-        return PageAllocator.unmap(@alignCast(memory));
-    }
-
-    const node: *usize = @ptrCast(@alignCast(memory.ptr));
-
-    const t = Thread.lock();
-    defer t.unlock();
-
-    node.* = t.frees[class];
-    t.frees[class] = @intFromPtr(node);
-}
-
-fn sizeClassIndex(len: usize, alignment: Alignment) usize {
-    return @max(@bitSizeOf(usize) - @clz(len - 1), @intFromEnum(alignment), min_class) - min_class;
-}
-
-fn slotSize(class: usize) usize {
-    return @as(usize, 1) &lt;&lt; @intCast(class + min_class);
-}</pre>
+    <pre><a id="L1"></a>//! An allocator that is designed for ReleaseFast optimization mode, with
+<a id="L2"></a>//! multi-threading enabled.
+<a id="L3"></a>//!
+<a id="L4"></a>//! This allocator is a singleton; it uses global state and only one should be
+<a id="L5"></a>//! instantiated for the entire process.
+<a id="L6"></a>//!
+<a id="L7"></a>//! ## Basic Design
+<a id="L8"></a>//!
+<a id="L9"></a>//! Each thread gets a separate freelist, however, the data must be recoverable
+<a id="L10"></a>//! when the thread exits. We do not directly learn when a thread exits, so
+<a id="L11"></a>//! occasionally, one thread must attempt to reclaim another thread's
+<a id="L12"></a>//! resources.
+<a id="L13"></a>//!
+<a id="L14"></a>//! Above a certain size, those allocations are memory mapped directly, with no
+<a id="L15"></a>//! storage of allocation metadata. This works because the implementation
+<a id="L16"></a>//! refuses resizes that would move an allocation from small category to large
+<a id="L17"></a>//! category or vice versa.
+<a id="L18"></a>//!
+<a id="L19"></a>//! Each allocator operation checks the thread identifier from a threadlocal
+<a id="L20"></a>//! variable to find out which metadata in the global state to access, and
+<a id="L21"></a>//! attempts to grab its lock. This will usually succeed without contention,
+<a id="L22"></a>//! unless another thread has been assigned the same id. In the case of such
+<a id="L23"></a>//! contention, the thread moves on to the next thread metadata slot and
+<a id="L24"></a>//! repeats the process of attempting to obtain the lock.
+<a id="L25"></a>//!
+<a id="L26"></a>//! By limiting the thread-local metadata array to the same number as the CPU
+<a id="L27"></a>//! count, ensures that as threads are created and destroyed, they cycle
+<a id="L28"></a>//! through the full set of freelists.
+<a id="L29"></a>const SmpAllocator = @This();
+<a id="L30"></a>
+<a id="L31"></a>const builtin = @import("builtin");
+<a id="L32"></a>
+<a id="L33"></a>const std = @import("../std.zig");
+<a id="L34"></a>const assert = std.debug.assert;
+<a id="L35"></a>const mem = std.mem;
+<a id="L36"></a>const math = std.math;
+<a id="L37"></a>const Allocator = std.mem.Allocator;
+<a id="L38"></a>const Alignment = std.mem.Alignment;
+<a id="L39"></a>const PageAllocator = std.heap.PageAllocator;
+<a id="L40"></a>
+<a id="L41"></a>cpu_count: u32,
+<a id="L42"></a>threads: [max_thread_count]Thread,
+<a id="L43"></a>
+<a id="L44"></a>var global: SmpAllocator = .{
+<a id="L45"></a>    .threads = @splat(.{}),
+<a id="L46"></a>    .cpu_count = 0,
+<a id="L47"></a>};
+<a id="L48"></a>threadlocal var thread_index: u32 = 0;
+<a id="L49"></a>
+<a id="L50"></a>const max_thread_count = 128;
+<a id="L51"></a>const slab_len: usize = @max(std.heap.page_size_max, 64 * 1024);
+<a id="L52"></a>/// Because of storing free list pointers, the minimum size class is 3.
+<a id="L53"></a>const min_class = math.log2(@sizeOf(usize));
+<a id="L54"></a>const size_class_count = math.log2(slab_len) - min_class;
+<a id="L55"></a>/// Before mapping a fresh page, `alloc` will rotate this many times.
+<a id="L56"></a>const max_alloc_search = 1;
+<a id="L57"></a>
+<a id="L58"></a>const Thread = struct {
+<a id="L59"></a>    /// Avoid false sharing.
+<a id="L60"></a>    _: void align(std.atomic.cache_line) = {},
+<a id="L61"></a>
+<a id="L62"></a>    /// Protects the state in this struct (per-thread state).
+<a id="L63"></a>    ///
+<a id="L64"></a>    /// Threads lock this before accessing their own state in order
+<a id="L65"></a>    /// to support freelist reclamation.
+<a id="L66"></a>    mutex: std.atomic.Mutex = .unlocked,
+<a id="L67"></a>
+<a id="L68"></a>    /// For each size class, tracks the next address to be returned from
+<a id="L69"></a>    /// `alloc` when the freelist is empty.
+<a id="L70"></a>    next_addrs: [size_class_count]usize = @splat(0),
+<a id="L71"></a>    /// For each size class, points to the freed pointer.
+<a id="L72"></a>    frees: [size_class_count]usize = @splat(0),
+<a id="L73"></a>
+<a id="L74"></a>    fn lock() *Thread {
+<a id="L75"></a>        var index = thread_index;
+<a id="L76"></a>        {
+<a id="L77"></a>            const t = &amp;global.threads[index];
+<a id="L78"></a>            if (t.mutex.tryLock()) {
+<a id="L79"></a>                @branchHint(.likely);
+<a id="L80"></a>                return t;
+<a id="L81"></a>            }
+<a id="L82"></a>        }
+<a id="L83"></a>        const cpu_count = getCpuCount();
+<a id="L84"></a>        assert(cpu_count != 0);
+<a id="L85"></a>        while (true) {
+<a id="L86"></a>            index = (index + 1) % cpu_count;
+<a id="L87"></a>            const t = &amp;global.threads[index];
+<a id="L88"></a>            if (t.mutex.tryLock()) {
+<a id="L89"></a>                thread_index = index;
+<a id="L90"></a>                return t;
+<a id="L91"></a>            }
+<a id="L92"></a>        }
+<a id="L93"></a>    }
+<a id="L94"></a>
+<a id="L95"></a>    fn unlock(t: *Thread) void {
+<a id="L96"></a>        t.mutex.unlock();
+<a id="L97"></a>    }
+<a id="L98"></a>};
+<a id="L99"></a>
+<a id="L100"></a>fn getCpuCount() u32 {
+<a id="L101"></a>    const cpu_count = @atomicLoad(u32, &amp;global.cpu_count, .unordered);
+<a id="L102"></a>    if (cpu_count != 0) return cpu_count;
+<a id="L103"></a>    const n: u32 = @min(std.Thread.getCpuCount() catch max_thread_count, max_thread_count);
+<a id="L104"></a>    return if (@cmpxchgStrong(u32, &amp;global.cpu_count, 0, n, .monotonic, .monotonic)) |other| other else n;
+<a id="L105"></a>}
+<a id="L106"></a>
+<a id="L107"></a>pub const vtable: Allocator.VTable = .{
+<a id="L108"></a>    .alloc = alloc,
+<a id="L109"></a>    .resize = resize,
+<a id="L110"></a>    .remap = remap,
+<a id="L111"></a>    .free = free,
+<a id="L112"></a>};
+<a id="L113"></a>
+<a id="L114"></a>comptime {
+<a id="L115"></a>    assert(!builtin.single_threaded); // you're holding it wrong
+<a id="L116"></a>}
+<a id="L117"></a>
+<a id="L118"></a>fn alloc(context: *anyopaque, len: usize, alignment: Alignment, ra: usize) ?[*]u8 {
+<a id="L119"></a>    _ = context;
+<a id="L120"></a>    _ = ra;
+<a id="L121"></a>    const class = sizeClassIndex(len, alignment);
+<a id="L122"></a>    if (class &gt;= size_class_count) {
+<a id="L123"></a>        @branchHint(.unlikely);
+<a id="L124"></a>        return PageAllocator.map(len, alignment);
+<a id="L125"></a>    }
+<a id="L126"></a>
+<a id="L127"></a>    const slot_size = slotSize(class);
+<a id="L128"></a>    assert(slab_len % slot_size == 0);
+<a id="L129"></a>    var search_count: u8 = 0;
+<a id="L130"></a>
+<a id="L131"></a>    var t = Thread.lock();
+<a id="L132"></a>
+<a id="L133"></a>    outer: while (true) {
+<a id="L134"></a>        const top_free_ptr = t.frees[class];
+<a id="L135"></a>        if (top_free_ptr != 0) {
+<a id="L136"></a>            @branchHint(.likely);
+<a id="L137"></a>            defer t.unlock();
+<a id="L138"></a>            const node: *usize = @ptrFromInt(top_free_ptr);
+<a id="L139"></a>            t.frees[class] = node.*;
+<a id="L140"></a>            return @ptrFromInt(top_free_ptr);
+<a id="L141"></a>        }
+<a id="L142"></a>
+<a id="L143"></a>        const next_addr = t.next_addrs[class];
+<a id="L144"></a>        if ((next_addr % slab_len) != 0) {
+<a id="L145"></a>            @branchHint(.likely);
+<a id="L146"></a>            defer t.unlock();
+<a id="L147"></a>            t.next_addrs[class] = next_addr + slot_size;
+<a id="L148"></a>            return @ptrFromInt(next_addr);
+<a id="L149"></a>        }
+<a id="L150"></a>
+<a id="L151"></a>        if (search_count &gt;= max_alloc_search) {
+<a id="L152"></a>            @branchHint(.likely);
+<a id="L153"></a>            defer t.unlock();
+<a id="L154"></a>            // slab alignment here ensures the % slab len earlier catches the end of slots.
+<a id="L155"></a>            const slab = PageAllocator.map(slab_len, .fromByteUnits(slab_len)) orelse return null;
+<a id="L156"></a>            t.next_addrs[class] = @intFromPtr(slab) + slot_size;
+<a id="L157"></a>            return slab;
+<a id="L158"></a>        }
+<a id="L159"></a>
+<a id="L160"></a>        t.unlock();
+<a id="L161"></a>        const cpu_count = getCpuCount();
+<a id="L162"></a>        assert(cpu_count != 0);
+<a id="L163"></a>        var index = thread_index;
+<a id="L164"></a>        while (true) {
+<a id="L165"></a>            index = (index + 1) % cpu_count;
+<a id="L166"></a>            t = &amp;global.threads[index];
+<a id="L167"></a>            if (t.mutex.tryLock()) {
+<a id="L168"></a>                thread_index = index;
+<a id="L169"></a>                search_count += 1;
+<a id="L170"></a>                continue :outer;
+<a id="L171"></a>            }
+<a id="L172"></a>        }
+<a id="L173"></a>    }
+<a id="L174"></a>}
+<a id="L175"></a>
+<a id="L176"></a>fn resize(context: *anyopaque, memory: []u8, alignment: Alignment, new_len: usize, ra: usize) bool {
+<a id="L177"></a>    _ = context;
+<a id="L178"></a>    _ = ra;
+<a id="L179"></a>    const class = sizeClassIndex(memory.len, alignment);
+<a id="L180"></a>    const new_class = sizeClassIndex(new_len, alignment);
+<a id="L181"></a>    if (class &gt;= size_class_count) {
+<a id="L182"></a>        if (new_class &lt; size_class_count) return false;
+<a id="L183"></a>        return PageAllocator.realloc(memory, alignment, new_len, false) != null;
+<a id="L184"></a>    }
+<a id="L185"></a>    return new_class == class;
+<a id="L186"></a>}
+<a id="L187"></a>
+<a id="L188"></a>fn remap(context: *anyopaque, memory: []u8, alignment: Alignment, new_len: usize, ra: usize) ?[*]u8 {
+<a id="L189"></a>    _ = context;
+<a id="L190"></a>    _ = ra;
+<a id="L191"></a>    const class = sizeClassIndex(memory.len, alignment);
+<a id="L192"></a>    const new_class = sizeClassIndex(new_len, alignment);
+<a id="L193"></a>    if (class &gt;= size_class_count) {
+<a id="L194"></a>        if (new_class &lt; size_class_count) return null;
+<a id="L195"></a>        return PageAllocator.realloc(memory, alignment, new_len, true);
+<a id="L196"></a>    }
+<a id="L197"></a>    return if (new_class == class) memory.ptr else null;
+<a id="L198"></a>}
+<a id="L199"></a>
+<a id="L200"></a>fn free(context: *anyopaque, memory: []u8, alignment: Alignment, ra: usize) void {
+<a id="L201"></a>    _ = context;
+<a id="L202"></a>    _ = ra;
+<a id="L203"></a>    const class = sizeClassIndex(memory.len, alignment);
+<a id="L204"></a>    if (class &gt;= size_class_count) {
+<a id="L205"></a>        @branchHint(.unlikely);
+<a id="L206"></a>        return PageAllocator.unmap(@alignCast(memory));
+<a id="L207"></a>    }
+<a id="L208"></a>
+<a id="L209"></a>    const node: *usize = @ptrCast(@alignCast(memory.ptr));
+<a id="L210"></a>
+<a id="L211"></a>    const t = Thread.lock();
+<a id="L212"></a>    defer t.unlock();
+<a id="L213"></a>
+<a id="L214"></a>    node.* = t.frees[class];
+<a id="L215"></a>    t.frees[class] = @intFromPtr(node);
+<a id="L216"></a>}
+<a id="L217"></a>
+<a id="L218"></a>fn sizeClassIndex(len: usize, alignment: Alignment) usize {
+<a id="L219"></a>    return @max(@bitSizeOf(usize) - @clz(len - 1), @intFromEnum(alignment), min_class) - min_class;
+<a id="L220"></a>}
+<a id="L221"></a>
+<a id="L222"></a>fn slotSize(class: usize) usize {
+<a id="L223"></a>    return @as(usize, 1) &lt;&lt; @intCast(class + min_class);
+<a id="L224"></a>}
+</pre>
 </body>
 </html>

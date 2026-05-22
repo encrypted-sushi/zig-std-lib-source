@@ -2,543 +2,546 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Source: zig-0.16.0-std/crypto/aes_siv.zig</title>
+    <title>Source: crypto/aes_siv.zig</title>
     <style>
         body { background: #1e1e1e; color: #d4d4d4; font-family: monospace; padding: 20px; }
         pre { white-space: pre-wrap; word-wrap: break-word; }
         .header { border-bottom: 1px solid #444; padding-bottom: 10px; margin-bottom: 20px; }
         a { color: #569cd6; }
+        a[id] { color: inherit; text-decoration: none; }
+        :target { background: #3a3a00; }
     </style>
 </head>
 <body>
     <div class="header">
-        <a href="/">Index</a> | <strong>File: zig-0.16.0-std/crypto/aes_siv.zig</strong>
+        <a href="/">Index</a> | <strong>File: crypto/aes_siv.zig</strong>
     </div>
-    <pre>const std = @import("std");
-const assert = std.debug.assert;
-const crypto = std.crypto;
-const debug = std.debug;
-const mem = std.mem;
-const math = std.math;
-const modes = crypto.core.modes;
-const Cmac = @import("cmac.zig").Cmac;
-const AuthenticationError = crypto.errors.AuthenticationError;
-
-pub const Aes128Siv = AesSiv(crypto.core.aes.Aes128);
-pub const Aes256Siv = AesSiv(crypto.core.aes.Aes256);
-
-/// AES-SIV: Deterministic authenticated encryption - the same message always produces the same ciphertext.
-///
-/// What it does: Encrypts data and protects it from tampering. Unlike most encryption modes,
-/// AES-SIV is deterministic: encrypting the same message with the same key always produces
-/// the same ciphertext (unless you provide an optional nonce).
-///
-/// When to use AES-SIV:
-/// - When you need deterministic encryption (e.g., for deduplication in encrypted storage)
-/// - When you can't store or generate nonces
-/// - For key wrapping (protecting cryptographic keys)
-/// - When you need to search encrypted data without decrypting it
-///
-/// When NOT to use AES-SIV:
-/// - When identical plaintexts must produce different ciphertexts (use AES-GCM or AES-GCM-SIV)
-/// - For network protocols where replay attacks are a concern
-///
-/// Unique features:
-/// - Optional nonce: You can add a nonce to make encryption non-deterministic, but this is optional
-/// - Multiple associated data: Supports a vector of associated data strings instead of just one.
-///   The algorithm cryptographically ensures each component is properly separated, preventing
-///   canonicalization attacks where different splits of data could be accepted as valid.
-///
-/// Security properties:
-/// - Deterministic: Same input always gives same output (this can leak information about patterns)
-/// - Nonce misuse resistant: Doesn't catastrophically fail if you reuse a nonce
-/// - Key commitment: Ciphertext can only be decrypted with the exact key that encrypted it
-///
-/// AES-SIV has better security properties than AES-GCM-SIV, but is must slower.
-///
-/// How it works: Combines two keys - one for authentication (S2V) and one for encryption (CTR mode).
-/// The total key size is double the AES key size (256 bits for AES-128-SIV, 512 bits for AES-256-SIV).
-///
-/// Defined in RFC 5297.
-fn AesSiv(comptime Aes: anytype) type {
-    debug.assert(Aes.block.block_length == 16);
-
-    return struct {
-        pub const tag_length = 16;
-        pub const key_length = Aes.key_bits / 8 * 2; // SIV uses 2x key size
-
-        const CmacImpl = Cmac(Aes);
-
-        /// S2V (String to Vector) - RFC 5297 Section 2.4
-        /// Derives a synthetic IV from the key and input strings using CMAC.
-        /// This function implements a cryptographic pseudo-random function that maps
-        /// a variable-length vector of strings to a fixed 128-bit output.
-        fn s2v(iv: *[16]u8, key: [Aes.key_bits / 8]u8, strings: []const []const u8) void {
-            assert(strings.len &gt; 0);
-            assert(strings.len &lt;= 127); // S2V limitation
-
-            var d: [16]u8 = undefined;
-
-            // Special case: single empty string
-            if (strings.len == 1 and strings[0].len == 0) {
-                CmacImpl.create(&amp;d, &amp;[_]u8{}, &amp;key);
-                iv.* = d;
-                return;
-            }
-
-            // Initialize with CMAC of zero block
-            const zero_block: [16]u8 = @splat(0);
-            CmacImpl.create(&amp;d, &amp;zero_block, &amp;key);
-
-            // Process all strings except the last one
-            var i: usize = 0;
-            while (i &lt; strings.len - 1) : (i += 1) {
-                d = dbl(d);
-                var tmp: [16]u8 = undefined;
-                CmacImpl.create(&amp;tmp, strings[i], &amp;key);
-                for (&amp;d, tmp) |*b, t| {
-                    b.* ^= t;
-                }
-            }
-
-            // Process the final string
-            const sn = strings[strings.len - 1];
-            if (sn.len &gt;= 16) {
-                // XOR d with the last 16 bytes of Sn,
-                // and give the entire Sn to CMAC incrementally.
-                var cmac = CmacImpl.init(&amp;key);
-                const prefix = sn.len - 16;
-                cmac.update(sn[0..prefix]);
-
-                var tail: [16]u8 = undefined;
-                for (&amp;tail, sn[prefix..][0..16], d) |*out, s, db| {
-                    out.* = s ^ db;
-                }
-                cmac.update(&amp;tail);
-
-                cmac.final(iv);
-            } else {
-                // Pad and XOR
-                d = dbl(d);
-                var padded: [16]u8 = @splat(0);
-                @memcpy(padded[0..sn.len], sn);
-                padded[sn.len] = 0x80;
-                for (&amp;d, padded) |*b, p| {
-                    b.* ^= p;
-                }
-                CmacImpl.create(iv, &amp;d, &amp;key);
-            }
-        }
-
-        /// Double operation as defined in RFC 5297.
-        /// Performs multiplication by x (i.e., left shift by 1) in GF(2^128).
-        /// This is the same operation used in CMAC subkey generation.
-        /// If the MSB is set, XORs with the polynomial 0x87 after shifting.
-        fn dbl(d: [16]u8) [16]u8 {
-            // Read as big-endian 128-bit integer
-            const val = mem.readInt(u128, &amp;d, .big);
-
-            // Left shift by 1, and XOR with 0x87 if MSB was set
-            const doubled = (val &lt;&lt; 1) ^ (0x87 &amp; -%(@as(u128, val &gt;&gt; 127)));
-
-            // Write back as big-endian
-            var result: [16]u8 = undefined;
-            mem.writeInt(u128, &amp;result, doubled, .big);
-            return result;
-        }
-
-        /// Encrypt plaintext using AES-SIV
-        /// `c`: Output buffer for ciphertext (same size as plaintext)
-        /// `tag`: Output buffer for authentication tag (synthetic IV)
-        /// `m`: Plaintext to encrypt
-        /// `ad`: Optional associated data
-        /// `nonce`: Optional nonce (if provided, will be added as last AD component)
-        /// `key`: Combined key (2x AES key size)
-        pub fn encrypt(c: []u8, tag: *[tag_length]u8, m: []const u8, ad: ?[]const u8, nonce: ?[]const u8, key: [key_length]u8) void {
-            debug.assert(c.len == m.len);
-
-            // Split key into K1 (for S2V) and K2 (for CTR)
-            const k1 = key[0 .. Aes.key_bits / 8];
-            const k2 = key[Aes.key_bits / 8 ..];
-
-            // Prepare strings for S2V: AD components followed by plaintext
-            var strings_buf: [128][]const u8 = undefined;
-            var strings_len: usize = 0;
-
-            if (ad) |a| {
-                strings_buf[strings_len] = a;
-                strings_len += 1;
-            }
-            if (nonce) |n| {
-                strings_buf[strings_len] = n;
-                strings_len += 1;
-            }
-            strings_buf[strings_len] = m;
-            strings_len += 1;
-
-            // Compute synthetic IV using S2V
-            s2v(tag, k1.*, strings_buf[0..strings_len]);
-
-            // Clear the 31st and 63rd bits for use as CTR IV
-            var ctr_iv = tag.*;
-            ctr_iv[8] &amp;= 0x7f;
-            ctr_iv[12] &amp;= 0x7f;
-
-            // Encrypt plaintext using CTR mode
-            const aes_ctx = Aes.initEnc(k2.*);
-            modes.ctr(@TypeOf(aes_ctx), aes_ctx, c, m, ctr_iv, .big);
-        }
-
-        /// Decrypt ciphertext using AES-SIV
-        /// `m`: Output buffer for decrypted plaintext
-        /// `c`: Ciphertext to decrypt
-        /// `tag`: Authentication tag (synthetic IV)
-        /// `ad`: Optional associated data (must match encryption)
-        /// `nonce`: Optional nonce (must match encryption)
-        /// `key`: Combined key (2x AES key size)
-        pub fn decrypt(m: []u8, c: []const u8, tag: [tag_length]u8, ad: ?[]const u8, nonce: ?[]const u8, key: [key_length]u8) AuthenticationError!void {
-            assert(c.len == m.len);
-
-            // Split key into K1 (for S2V) and K2 (for CTR)
-            const k1 = key[0 .. Aes.key_bits / 8];
-            const k2 = key[Aes.key_bits / 8 ..];
-
-            // Clear the 31st and 63rd bits for use as CTR IV
-            var ctr_iv = tag;
-            ctr_iv[8] &amp;= 0x7f;
-            ctr_iv[12] &amp;= 0x7f;
-
-            // Decrypt ciphertext using CTR mode
-            const aes_ctx = Aes.initEnc(k2.*);
-            modes.ctr(@TypeOf(aes_ctx), aes_ctx, m, c, ctr_iv, .big);
-
-            // Prepare strings for S2V: AD components followed by plaintext
-            var strings_buf: [128][]const u8 = undefined;
-            var strings_len: usize = 0;
-
-            if (ad) |a| {
-                strings_buf[strings_len] = a;
-                strings_len += 1;
-            }
-            if (nonce) |n| {
-                strings_buf[strings_len] = n;
-                strings_len += 1;
-            }
-            strings_buf[strings_len] = m;
-            strings_len += 1;
-
-            // Verify synthetic IV using S2V
-            var computed_tag: [tag_length]u8 = undefined;
-            s2v(&amp;computed_tag, k1.*, strings_buf[0..strings_len]);
-
-            // Verify tag
-            const verify = crypto.timing_safe.eql([tag_length]u8, computed_tag, tag);
-            if (!verify) {
-                crypto.secureZero(u8, &amp;computed_tag);
-                @memset(m, undefined);
-                return error.AuthenticationFailed;
-            }
-        }
-
-        /// Encrypts plaintext with multiple associated data components.
-        /// This is the most general form of AES-SIV encryption that accepts
-        /// an arbitrary vector of associated data strings as specified in RFC 5297.
-        pub fn encryptWithAdVector(c: []u8, tag: *[tag_length]u8, m: []const u8, ad: []const []const u8, key: [key_length]u8) void {
-            debug.assert(c.len == m.len);
-
-            // Split key into K1 (for S2V) and K2 (for CTR)
-            const k1 = key[0 .. Aes.key_bits / 8];
-            const k2 = key[Aes.key_bits / 8 ..];
-
-            // Prepare strings for S2V: AD components followed by plaintext
-            var strings_buf: [128][]const u8 = undefined;
-            var strings_len: usize = 0;
-
-            for (ad) |a| {
-                strings_buf[strings_len] = a;
-                strings_len += 1;
-            }
-            strings_buf[strings_len] = m;
-            strings_len += 1;
-
-            // Compute synthetic IV using S2V
-            s2v(tag, k1.*, strings_buf[0..strings_len]);
-
-            // Clear the 31st and 63rd bits for use as CTR IV
-            var ctr_iv = tag.*;
-            ctr_iv[8] &amp;= 0x7f;
-            ctr_iv[12] &amp;= 0x7f;
-
-            // Encrypt plaintext using CTR mode
-            const aes_ctx = Aes.initEnc(k2.*);
-            modes.ctr(@TypeOf(aes_ctx), aes_ctx, c, m, ctr_iv, .big);
-        }
-
-        /// Decrypts ciphertext with multiple associated data components.
-        /// This is the most general form of AES-SIV decryption that accepts
-        /// an arbitrary vector of associated data strings as specified in RFC 5297.
-        pub fn decryptWithAdVector(m: []u8, c: []const u8, tag: [tag_length]u8, ad: []const []const u8, key: [key_length]u8) AuthenticationError!void {
-            assert(c.len == m.len);
-
-            // Split key into K1 (for S2V) and K2 (for CTR)
-            const k1 = key[0 .. Aes.key_bits / 8];
-            const k2 = key[Aes.key_bits / 8 ..];
-
-            // Clear the 31st and 63rd bits for use as CTR IV
-            var ctr_iv = tag;
-            ctr_iv[8] &amp;= 0x7f;
-            ctr_iv[12] &amp;= 0x7f;
-
-            // Decrypt ciphertext using CTR mode
-            const aes_ctx = Aes.initEnc(k2.*);
-            modes.ctr(@TypeOf(aes_ctx), aes_ctx, m, c, ctr_iv, .big);
-
-            // Prepare strings for S2V: AD components followed by plaintext
-            var strings_buf: [128][]const u8 = undefined;
-            var strings_len: usize = 0;
-
-            for (ad) |a| {
-                strings_buf[strings_len] = a;
-                strings_len += 1;
-            }
-            strings_buf[strings_len] = m;
-            strings_len += 1;
-
-            // Verify synthetic IV using S2V
-            var computed_tag: [tag_length]u8 = undefined;
-            s2v(&amp;computed_tag, k1.*, strings_buf[0..strings_len]);
-
-            // Verify tag
-            const verify = crypto.timing_safe.eql([tag_length]u8, computed_tag, tag);
-            if (!verify) {
-                crypto.secureZero(u8, &amp;computed_tag);
-                @memset(m, undefined);
-                return error.AuthenticationFailed;
-            }
-        }
-    };
-}
-
-const htest = @import("test.zig");
-const testing = std.testing;
-
-test "AES-SIV double operation" {
-    const AesSivTest = AesSiv(crypto.core.aes.Aes128);
-
-    // Test vector from RFC 5297
-    const input = [_]u8{ 0x0e, 0x04, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e };
-    const expected = [_]u8{ 0x1c, 0x08, 0x02, 0x04, 0x06, 0x08, 0x0a, 0x0c, 0x0e, 0x10, 0x12, 0x14, 0x16, 0x18, 0x1a, 0x1c };
-
-    const result = AesSivTest.dbl(input);
-    try testing.expectEqualSlices(u8, &amp;expected, &amp;result);
-}
-
-test "AES-SIV double operation with MSB set" {
-    const AesSivTest = AesSiv(crypto.core.aes.Aes128);
-
-    const input = [_]u8{ 0xe0, 0x40, 0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80, 0x90, 0xa0, 0xb0, 0xc0, 0xd0, 0xe0 };
-    const expected = [_]u8{ 0xc0, 0x80, 0x20, 0x40, 0x60, 0x80, 0xa0, 0xc0, 0xe1, 0x01, 0x21, 0x41, 0x61, 0x81, 0xa1, 0x47 };
-
-    const result = AesSivTest.dbl(input);
-    try testing.expectEqualSlices(u8, &amp;expected, &amp;result);
-}
-
-test "Aes128Siv - RFC 5297 Test Vector A.1" {
-    // Test vector from RFC 5297 Appendix A.1
-    const key = [_]u8{
-        0xff, 0xfe, 0xfd, 0xfc, 0xfb, 0xfa, 0xf9, 0xf8, 0xf7, 0xf6, 0xf5, 0xf4, 0xf3, 0xf2, 0xf1, 0xf0,
-        0xf0, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8, 0xf9, 0xfa, 0xfb, 0xfc, 0xfd, 0xfe, 0xff,
-    };
-    const ad = [_]u8{
-        0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
-        0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27,
-    };
-    const plaintext = [_]u8{
-        0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee,
-    };
-
-    var ciphertext: [plaintext.len]u8 = undefined;
-    var tag: [16]u8 = undefined;
-
-    // Test using vector API for RFC compliance
-    const ad_components = [_][]const u8{&amp;ad};
-    Aes128Siv.encryptWithAdVector(&amp;ciphertext, &amp;tag, &amp;plaintext, &amp;ad_components, key);
-
-    // Expected values from RFC 5297
-    try htest.assertEqual("85632d07c6e8f37f950acd320a2ecc93", &amp;tag);
-    try htest.assertEqual("40c02b9690c4dc04daef7f6afe5c", &amp;ciphertext);
-
-    // Test decryption
-    var decrypted: [plaintext.len]u8 = undefined;
-    try Aes128Siv.decryptWithAdVector(&amp;decrypted, &amp;ciphertext, tag, &amp;ad_components, key);
-    try testing.expectEqualSlices(u8, &amp;plaintext, &amp;decrypted);
-}
-
-test "Aes128Siv - RFC 5297 Test Vector A.2" {
-    // Test vector from RFC 5297 Appendix A.2
-    const key: [32]u8 = .{
-        0x7f, 0x7e, 0x7d, 0x7c, 0x7b, 0x7a, 0x79, 0x78,
-        0x77, 0x76, 0x75, 0x74, 0x73, 0x72, 0x71, 0x70,
-        0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47,
-        0x48, 0x49, 0x4a, 0x4b, 0x4c, 0x4d, 0x4e, 0x4f,
-    };
-    const ad1 = [_]u8{
-        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
-        0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
-        0xde, 0xad, 0xda, 0xda, 0xde, 0xad, 0xda, 0xda,
-        0xff, 0xee, 0xdd, 0xcc, 0xbb, 0xaa, 0x99, 0x88,
-        0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, 0x00,
-    };
-    const ad2 = [_]u8{
-        0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80,
-        0x90, 0xa0,
-    };
-    const nonce: [16]u8 = .{
-        0x09, 0xf9, 0x11, 0x02, 0x9d, 0x74, 0xe3, 0x5b,
-        0xd8, 0x41, 0x56, 0xc5, 0x63, 0x56, 0x88, 0xc0,
-    };
-    const plaintext = [_]u8{
-        0x74, 0x68, 0x69, 0x73, 0x20, 0x69, 0x73, 0x20,
-        0x73, 0x6f, 0x6d, 0x65, 0x20, 0x70, 0x6c, 0x61,
-        0x69, 0x6e, 0x74, 0x65, 0x78, 0x74, 0x20, 0x74,
-        0x6f, 0x20, 0x65, 0x6e, 0x63, 0x72, 0x79, 0x70,
-        0x74, 0x20, 0x75, 0x73, 0x69, 0x6e, 0x67, 0x20,
-        0x53, 0x49, 0x56, 0x2d, 0x41, 0x45, 0x53,
-    };
-
-    var ciphertext: [plaintext.len]u8 = undefined;
-    var tag: [16]u8 = undefined;
-
-    Aes128Siv.encryptWithAdVector(&amp;ciphertext, &amp;tag, &amp;plaintext, &amp;.{ &amp;ad1, &amp;ad2, &amp;nonce }, key);
-
-    // Expected values from RFC 5297
-    try htest.assertEqual("7bdb6e3b432667eb06f4d14bff2fbd0f", &amp;tag);
-    try htest.assertEqual("cb900f2fddbe404326601965c889bf17dba77ceb094fa663b7a3f748ba8af829ea64ad544a272e9c485b62a3fd5c0d", &amp;ciphertext);
-}
-
-test "Aes128Siv - empty plaintext" {
-    const key: [32]u8 = @splat(0x42);
-    const plaintext = "";
-    const ad = "additional data";
-
-    var ciphertext: [plaintext.len]u8 = undefined;
-    var tag: [16]u8 = undefined;
-
-    Aes128Siv.encrypt(&amp;ciphertext, &amp;tag, plaintext, ad, null, key);
-
-    var decrypted: [plaintext.len]u8 = undefined;
-    try Aes128Siv.decrypt(&amp;decrypted, &amp;ciphertext, tag, ad, null, key);
-}
-
-test "Aes128Siv - with nonce" {
-    const key: [32]u8 = @splat(0x69);
-    const nonce: [16]u8 = @splat(0x42);
-    const plaintext = "Hello, AES-SIV!";
-    const ad = "metadata";
-
-    var ciphertext: [plaintext.len]u8 = undefined;
-    var tag: [16]u8 = undefined;
-
-    Aes128Siv.encrypt(&amp;ciphertext, &amp;tag, plaintext, ad, &amp;nonce, key);
-
-    var decrypted: [plaintext.len]u8 = undefined;
-    try Aes128Siv.decrypt(&amp;decrypted, &amp;ciphertext, tag, ad, &amp;nonce, key);
-    try testing.expectEqualSlices(u8, plaintext, &amp;decrypted);
-}
-
-test "Aes256Siv - basic functionality" {
-    const key: [64]u8 = @splat(0x96);
-    const plaintext = "Test message for AES-256-SIV";
-    const ad1 = "header";
-    const ad2 = "more data";
-
-    var ciphertext: [plaintext.len]u8 = undefined;
-    var tag: [16]u8 = undefined;
-
-    // Test with multiple AD components using the vector API
-    const ad_components = [_][]const u8{ ad1, ad2 };
-    Aes256Siv.encryptWithAdVector(&amp;ciphertext, &amp;tag, plaintext, &amp;ad_components, key);
-
-    var decrypted: [plaintext.len]u8 = undefined;
-    try Aes256Siv.decryptWithAdVector(&amp;decrypted, &amp;ciphertext, tag, &amp;ad_components, key);
-    try testing.expectEqualSlices(u8, plaintext, &amp;decrypted);
-}
-
-test "Aes128Siv - demonstrating optional parameters" {
-    const key: [32]u8 = @splat(0x77);
-
-    // Test 1: No AD, no nonce (pure deterministic)
-    {
-        const plaintext = "Deterministic encryption";
-        var ciphertext: [plaintext.len]u8 = undefined;
-        var tag: [16]u8 = undefined;
-
-        Aes128Siv.encrypt(&amp;ciphertext, &amp;tag, plaintext, null, null, key);
-
-        var decrypted: [plaintext.len]u8 = undefined;
-        try Aes128Siv.decrypt(&amp;decrypted, &amp;ciphertext, tag, null, null, key);
-        try testing.expectEqualSlices(u8, plaintext, &amp;decrypted);
-    }
-
-    // Test 2: With AD, no nonce
-    {
-        const plaintext = "With associated data";
-        const ad = "some context";
-        var ciphertext: [plaintext.len]u8 = undefined;
-        var tag: [16]u8 = undefined;
-
-        Aes128Siv.encrypt(&amp;ciphertext, &amp;tag, plaintext, ad, null, key);
-
-        var decrypted: [plaintext.len]u8 = undefined;
-        try Aes128Siv.decrypt(&amp;decrypted, &amp;ciphertext, tag, ad, null, key);
-        try testing.expectEqualSlices(u8, plaintext, &amp;decrypted);
-    }
-
-    // Test 3: No AD, with nonce
-    {
-        const plaintext = "Nonce-based encryption";
-        const nonce: [12]u8 = @splat(0x01);
-        var ciphertext: [plaintext.len]u8 = undefined;
-        var tag: [16]u8 = undefined;
-
-        Aes128Siv.encrypt(&amp;ciphertext, &amp;tag, plaintext, null, &amp;nonce, key);
-
-        var decrypted: [plaintext.len]u8 = undefined;
-        try Aes128Siv.decrypt(&amp;decrypted, &amp;ciphertext, tag, null, &amp;nonce, key);
-        try testing.expectEqualSlices(u8, plaintext, &amp;decrypted);
-    }
-
-    // Test 4: With both AD and nonce
-    {
-        const plaintext = "Full featured";
-        const ad = "context";
-        const nonce: [16]u8 = @splat(0x02);
-        var ciphertext: [plaintext.len]u8 = undefined;
-        var tag: [16]u8 = undefined;
-
-        Aes128Siv.encrypt(&amp;ciphertext, &amp;tag, plaintext, ad, &amp;nonce, key);
-
-        var decrypted: [plaintext.len]u8 = undefined;
-        try Aes128Siv.decrypt(&amp;decrypted, &amp;ciphertext, tag, ad, &amp;nonce, key);
-        try testing.expectEqualSlices(u8, plaintext, &amp;decrypted);
-    }
-}
-
-test "Aes128Siv - authentication failure" {
-    const key: [32]u8 = @splat(0x13);
-    const plaintext = "Secret message";
-    const ad = "";
-
-    var ciphertext: [plaintext.len]u8 = undefined;
-    var tag: [16]u8 = undefined;
-
-    Aes128Siv.encrypt(&amp;ciphertext, &amp;tag, plaintext, ad, null, key);
-
-    // Corrupt the tag
-    tag[0] ^= 0x01;
-
-    var decrypted: [plaintext.len]u8 = undefined;
-    try testing.expectError(error.AuthenticationFailed, Aes128Siv.decrypt(&amp;decrypted, &amp;ciphertext, tag, ad, null, key));
-}</pre>
+    <pre><a id="L1"></a>const std = @import("std");
+<a id="L2"></a>const assert = std.debug.assert;
+<a id="L3"></a>const crypto = std.crypto;
+<a id="L4"></a>const debug = std.debug;
+<a id="L5"></a>const mem = std.mem;
+<a id="L6"></a>const math = std.math;
+<a id="L7"></a>const modes = crypto.core.modes;
+<a id="L8"></a>const Cmac = @import("cmac.zig").Cmac;
+<a id="L9"></a>const AuthenticationError = crypto.errors.AuthenticationError;
+<a id="L10"></a>
+<a id="L11"></a>pub const Aes128Siv = AesSiv(crypto.core.aes.Aes128);
+<a id="L12"></a>pub const Aes256Siv = AesSiv(crypto.core.aes.Aes256);
+<a id="L13"></a>
+<a id="L14"></a>/// AES-SIV: Deterministic authenticated encryption - the same message always produces the same ciphertext.
+<a id="L15"></a>///
+<a id="L16"></a>/// What it does: Encrypts data and protects it from tampering. Unlike most encryption modes,
+<a id="L17"></a>/// AES-SIV is deterministic: encrypting the same message with the same key always produces
+<a id="L18"></a>/// the same ciphertext (unless you provide an optional nonce).
+<a id="L19"></a>///
+<a id="L20"></a>/// When to use AES-SIV:
+<a id="L21"></a>/// - When you need deterministic encryption (e.g., for deduplication in encrypted storage)
+<a id="L22"></a>/// - When you can't store or generate nonces
+<a id="L23"></a>/// - For key wrapping (protecting cryptographic keys)
+<a id="L24"></a>/// - When you need to search encrypted data without decrypting it
+<a id="L25"></a>///
+<a id="L26"></a>/// When NOT to use AES-SIV:
+<a id="L27"></a>/// - When identical plaintexts must produce different ciphertexts (use AES-GCM or AES-GCM-SIV)
+<a id="L28"></a>/// - For network protocols where replay attacks are a concern
+<a id="L29"></a>///
+<a id="L30"></a>/// Unique features:
+<a id="L31"></a>/// - Optional nonce: You can add a nonce to make encryption non-deterministic, but this is optional
+<a id="L32"></a>/// - Multiple associated data: Supports a vector of associated data strings instead of just one.
+<a id="L33"></a>///   The algorithm cryptographically ensures each component is properly separated, preventing
+<a id="L34"></a>///   canonicalization attacks where different splits of data could be accepted as valid.
+<a id="L35"></a>///
+<a id="L36"></a>/// Security properties:
+<a id="L37"></a>/// - Deterministic: Same input always gives same output (this can leak information about patterns)
+<a id="L38"></a>/// - Nonce misuse resistant: Doesn't catastrophically fail if you reuse a nonce
+<a id="L39"></a>/// - Key commitment: Ciphertext can only be decrypted with the exact key that encrypted it
+<a id="L40"></a>///
+<a id="L41"></a>/// AES-SIV has better security properties than AES-GCM-SIV, but is must slower.
+<a id="L42"></a>///
+<a id="L43"></a>/// How it works: Combines two keys - one for authentication (S2V) and one for encryption (CTR mode).
+<a id="L44"></a>/// The total key size is double the AES key size (256 bits for AES-128-SIV, 512 bits for AES-256-SIV).
+<a id="L45"></a>///
+<a id="L46"></a>/// Defined in RFC 5297.
+<a id="L47"></a>fn AesSiv(comptime Aes: anytype) type {
+<a id="L48"></a>    debug.assert(Aes.block.block_length == 16);
+<a id="L49"></a>
+<a id="L50"></a>    return struct {
+<a id="L51"></a>        pub const tag_length = 16;
+<a id="L52"></a>        pub const key_length = Aes.key_bits / 8 * 2; // SIV uses 2x key size
+<a id="L53"></a>
+<a id="L54"></a>        const CmacImpl = Cmac(Aes);
+<a id="L55"></a>
+<a id="L56"></a>        /// S2V (String to Vector) - RFC 5297 Section 2.4
+<a id="L57"></a>        /// Derives a synthetic IV from the key and input strings using CMAC.
+<a id="L58"></a>        /// This function implements a cryptographic pseudo-random function that maps
+<a id="L59"></a>        /// a variable-length vector of strings to a fixed 128-bit output.
+<a id="L60"></a>        fn s2v(iv: *[16]u8, key: [Aes.key_bits / 8]u8, strings: []const []const u8) void {
+<a id="L61"></a>            assert(strings.len &gt; 0);
+<a id="L62"></a>            assert(strings.len &lt;= 127); // S2V limitation
+<a id="L63"></a>
+<a id="L64"></a>            var d: [16]u8 = undefined;
+<a id="L65"></a>
+<a id="L66"></a>            // Special case: single empty string
+<a id="L67"></a>            if (strings.len == 1 and strings[0].len == 0) {
+<a id="L68"></a>                CmacImpl.create(&amp;d, &amp;[_]u8{}, &amp;key);
+<a id="L69"></a>                iv.* = d;
+<a id="L70"></a>                return;
+<a id="L71"></a>            }
+<a id="L72"></a>
+<a id="L73"></a>            // Initialize with CMAC of zero block
+<a id="L74"></a>            const zero_block: [16]u8 = @splat(0);
+<a id="L75"></a>            CmacImpl.create(&amp;d, &amp;zero_block, &amp;key);
+<a id="L76"></a>
+<a id="L77"></a>            // Process all strings except the last one
+<a id="L78"></a>            var i: usize = 0;
+<a id="L79"></a>            while (i &lt; strings.len - 1) : (i += 1) {
+<a id="L80"></a>                d = dbl(d);
+<a id="L81"></a>                var tmp: [16]u8 = undefined;
+<a id="L82"></a>                CmacImpl.create(&amp;tmp, strings[i], &amp;key);
+<a id="L83"></a>                for (&amp;d, tmp) |*b, t| {
+<a id="L84"></a>                    b.* ^= t;
+<a id="L85"></a>                }
+<a id="L86"></a>            }
+<a id="L87"></a>
+<a id="L88"></a>            // Process the final string
+<a id="L89"></a>            const sn = strings[strings.len - 1];
+<a id="L90"></a>            if (sn.len &gt;= 16) {
+<a id="L91"></a>                // XOR d with the last 16 bytes of Sn,
+<a id="L92"></a>                // and give the entire Sn to CMAC incrementally.
+<a id="L93"></a>                var cmac = CmacImpl.init(&amp;key);
+<a id="L94"></a>                const prefix = sn.len - 16;
+<a id="L95"></a>                cmac.update(sn[0..prefix]);
+<a id="L96"></a>
+<a id="L97"></a>                var tail: [16]u8 = undefined;
+<a id="L98"></a>                for (&amp;tail, sn[prefix..][0..16], d) |*out, s, db| {
+<a id="L99"></a>                    out.* = s ^ db;
+<a id="L100"></a>                }
+<a id="L101"></a>                cmac.update(&amp;tail);
+<a id="L102"></a>
+<a id="L103"></a>                cmac.final(iv);
+<a id="L104"></a>            } else {
+<a id="L105"></a>                // Pad and XOR
+<a id="L106"></a>                d = dbl(d);
+<a id="L107"></a>                var padded: [16]u8 = @splat(0);
+<a id="L108"></a>                @memcpy(padded[0..sn.len], sn);
+<a id="L109"></a>                padded[sn.len] = 0x80;
+<a id="L110"></a>                for (&amp;d, padded) |*b, p| {
+<a id="L111"></a>                    b.* ^= p;
+<a id="L112"></a>                }
+<a id="L113"></a>                CmacImpl.create(iv, &amp;d, &amp;key);
+<a id="L114"></a>            }
+<a id="L115"></a>        }
+<a id="L116"></a>
+<a id="L117"></a>        /// Double operation as defined in RFC 5297.
+<a id="L118"></a>        /// Performs multiplication by x (i.e., left shift by 1) in GF(2^128).
+<a id="L119"></a>        /// This is the same operation used in CMAC subkey generation.
+<a id="L120"></a>        /// If the MSB is set, XORs with the polynomial 0x87 after shifting.
+<a id="L121"></a>        fn dbl(d: [16]u8) [16]u8 {
+<a id="L122"></a>            // Read as big-endian 128-bit integer
+<a id="L123"></a>            const val = mem.readInt(u128, &amp;d, .big);
+<a id="L124"></a>
+<a id="L125"></a>            // Left shift by 1, and XOR with 0x87 if MSB was set
+<a id="L126"></a>            const doubled = (val &lt;&lt; 1) ^ (0x87 &amp; -%(@as(u128, val &gt;&gt; 127)));
+<a id="L127"></a>
+<a id="L128"></a>            // Write back as big-endian
+<a id="L129"></a>            var result: [16]u8 = undefined;
+<a id="L130"></a>            mem.writeInt(u128, &amp;result, doubled, .big);
+<a id="L131"></a>            return result;
+<a id="L132"></a>        }
+<a id="L133"></a>
+<a id="L134"></a>        /// Encrypt plaintext using AES-SIV
+<a id="L135"></a>        /// `c`: Output buffer for ciphertext (same size as plaintext)
+<a id="L136"></a>        /// `tag`: Output buffer for authentication tag (synthetic IV)
+<a id="L137"></a>        /// `m`: Plaintext to encrypt
+<a id="L138"></a>        /// `ad`: Optional associated data
+<a id="L139"></a>        /// `nonce`: Optional nonce (if provided, will be added as last AD component)
+<a id="L140"></a>        /// `key`: Combined key (2x AES key size)
+<a id="L141"></a>        pub fn encrypt(c: []u8, tag: *[tag_length]u8, m: []const u8, ad: ?[]const u8, nonce: ?[]const u8, key: [key_length]u8) void {
+<a id="L142"></a>            debug.assert(c.len == m.len);
+<a id="L143"></a>
+<a id="L144"></a>            // Split key into K1 (for S2V) and K2 (for CTR)
+<a id="L145"></a>            const k1 = key[0 .. Aes.key_bits / 8];
+<a id="L146"></a>            const k2 = key[Aes.key_bits / 8 ..];
+<a id="L147"></a>
+<a id="L148"></a>            // Prepare strings for S2V: AD components followed by plaintext
+<a id="L149"></a>            var strings_buf: [128][]const u8 = undefined;
+<a id="L150"></a>            var strings_len: usize = 0;
+<a id="L151"></a>
+<a id="L152"></a>            if (ad) |a| {
+<a id="L153"></a>                strings_buf[strings_len] = a;
+<a id="L154"></a>                strings_len += 1;
+<a id="L155"></a>            }
+<a id="L156"></a>            if (nonce) |n| {
+<a id="L157"></a>                strings_buf[strings_len] = n;
+<a id="L158"></a>                strings_len += 1;
+<a id="L159"></a>            }
+<a id="L160"></a>            strings_buf[strings_len] = m;
+<a id="L161"></a>            strings_len += 1;
+<a id="L162"></a>
+<a id="L163"></a>            // Compute synthetic IV using S2V
+<a id="L164"></a>            s2v(tag, k1.*, strings_buf[0..strings_len]);
+<a id="L165"></a>
+<a id="L166"></a>            // Clear the 31st and 63rd bits for use as CTR IV
+<a id="L167"></a>            var ctr_iv = tag.*;
+<a id="L168"></a>            ctr_iv[8] &amp;= 0x7f;
+<a id="L169"></a>            ctr_iv[12] &amp;= 0x7f;
+<a id="L170"></a>
+<a id="L171"></a>            // Encrypt plaintext using CTR mode
+<a id="L172"></a>            const aes_ctx = Aes.initEnc(k2.*);
+<a id="L173"></a>            modes.ctr(@TypeOf(aes_ctx), aes_ctx, c, m, ctr_iv, .big);
+<a id="L174"></a>        }
+<a id="L175"></a>
+<a id="L176"></a>        /// Decrypt ciphertext using AES-SIV
+<a id="L177"></a>        /// `m`: Output buffer for decrypted plaintext
+<a id="L178"></a>        /// `c`: Ciphertext to decrypt
+<a id="L179"></a>        /// `tag`: Authentication tag (synthetic IV)
+<a id="L180"></a>        /// `ad`: Optional associated data (must match encryption)
+<a id="L181"></a>        /// `nonce`: Optional nonce (must match encryption)
+<a id="L182"></a>        /// `key`: Combined key (2x AES key size)
+<a id="L183"></a>        pub fn decrypt(m: []u8, c: []const u8, tag: [tag_length]u8, ad: ?[]const u8, nonce: ?[]const u8, key: [key_length]u8) AuthenticationError!void {
+<a id="L184"></a>            assert(c.len == m.len);
+<a id="L185"></a>
+<a id="L186"></a>            // Split key into K1 (for S2V) and K2 (for CTR)
+<a id="L187"></a>            const k1 = key[0 .. Aes.key_bits / 8];
+<a id="L188"></a>            const k2 = key[Aes.key_bits / 8 ..];
+<a id="L189"></a>
+<a id="L190"></a>            // Clear the 31st and 63rd bits for use as CTR IV
+<a id="L191"></a>            var ctr_iv = tag;
+<a id="L192"></a>            ctr_iv[8] &amp;= 0x7f;
+<a id="L193"></a>            ctr_iv[12] &amp;= 0x7f;
+<a id="L194"></a>
+<a id="L195"></a>            // Decrypt ciphertext using CTR mode
+<a id="L196"></a>            const aes_ctx = Aes.initEnc(k2.*);
+<a id="L197"></a>            modes.ctr(@TypeOf(aes_ctx), aes_ctx, m, c, ctr_iv, .big);
+<a id="L198"></a>
+<a id="L199"></a>            // Prepare strings for S2V: AD components followed by plaintext
+<a id="L200"></a>            var strings_buf: [128][]const u8 = undefined;
+<a id="L201"></a>            var strings_len: usize = 0;
+<a id="L202"></a>
+<a id="L203"></a>            if (ad) |a| {
+<a id="L204"></a>                strings_buf[strings_len] = a;
+<a id="L205"></a>                strings_len += 1;
+<a id="L206"></a>            }
+<a id="L207"></a>            if (nonce) |n| {
+<a id="L208"></a>                strings_buf[strings_len] = n;
+<a id="L209"></a>                strings_len += 1;
+<a id="L210"></a>            }
+<a id="L211"></a>            strings_buf[strings_len] = m;
+<a id="L212"></a>            strings_len += 1;
+<a id="L213"></a>
+<a id="L214"></a>            // Verify synthetic IV using S2V
+<a id="L215"></a>            var computed_tag: [tag_length]u8 = undefined;
+<a id="L216"></a>            s2v(&amp;computed_tag, k1.*, strings_buf[0..strings_len]);
+<a id="L217"></a>
+<a id="L218"></a>            // Verify tag
+<a id="L219"></a>            const verify = crypto.timing_safe.eql([tag_length]u8, computed_tag, tag);
+<a id="L220"></a>            if (!verify) {
+<a id="L221"></a>                crypto.secureZero(u8, &amp;computed_tag);
+<a id="L222"></a>                @memset(m, undefined);
+<a id="L223"></a>                return error.AuthenticationFailed;
+<a id="L224"></a>            }
+<a id="L225"></a>        }
+<a id="L226"></a>
+<a id="L227"></a>        /// Encrypts plaintext with multiple associated data components.
+<a id="L228"></a>        /// This is the most general form of AES-SIV encryption that accepts
+<a id="L229"></a>        /// an arbitrary vector of associated data strings as specified in RFC 5297.
+<a id="L230"></a>        pub fn encryptWithAdVector(c: []u8, tag: *[tag_length]u8, m: []const u8, ad: []const []const u8, key: [key_length]u8) void {
+<a id="L231"></a>            debug.assert(c.len == m.len);
+<a id="L232"></a>
+<a id="L233"></a>            // Split key into K1 (for S2V) and K2 (for CTR)
+<a id="L234"></a>            const k1 = key[0 .. Aes.key_bits / 8];
+<a id="L235"></a>            const k2 = key[Aes.key_bits / 8 ..];
+<a id="L236"></a>
+<a id="L237"></a>            // Prepare strings for S2V: AD components followed by plaintext
+<a id="L238"></a>            var strings_buf: [128][]const u8 = undefined;
+<a id="L239"></a>            var strings_len: usize = 0;
+<a id="L240"></a>
+<a id="L241"></a>            for (ad) |a| {
+<a id="L242"></a>                strings_buf[strings_len] = a;
+<a id="L243"></a>                strings_len += 1;
+<a id="L244"></a>            }
+<a id="L245"></a>            strings_buf[strings_len] = m;
+<a id="L246"></a>            strings_len += 1;
+<a id="L247"></a>
+<a id="L248"></a>            // Compute synthetic IV using S2V
+<a id="L249"></a>            s2v(tag, k1.*, strings_buf[0..strings_len]);
+<a id="L250"></a>
+<a id="L251"></a>            // Clear the 31st and 63rd bits for use as CTR IV
+<a id="L252"></a>            var ctr_iv = tag.*;
+<a id="L253"></a>            ctr_iv[8] &amp;= 0x7f;
+<a id="L254"></a>            ctr_iv[12] &amp;= 0x7f;
+<a id="L255"></a>
+<a id="L256"></a>            // Encrypt plaintext using CTR mode
+<a id="L257"></a>            const aes_ctx = Aes.initEnc(k2.*);
+<a id="L258"></a>            modes.ctr(@TypeOf(aes_ctx), aes_ctx, c, m, ctr_iv, .big);
+<a id="L259"></a>        }
+<a id="L260"></a>
+<a id="L261"></a>        /// Decrypts ciphertext with multiple associated data components.
+<a id="L262"></a>        /// This is the most general form of AES-SIV decryption that accepts
+<a id="L263"></a>        /// an arbitrary vector of associated data strings as specified in RFC 5297.
+<a id="L264"></a>        pub fn decryptWithAdVector(m: []u8, c: []const u8, tag: [tag_length]u8, ad: []const []const u8, key: [key_length]u8) AuthenticationError!void {
+<a id="L265"></a>            assert(c.len == m.len);
+<a id="L266"></a>
+<a id="L267"></a>            // Split key into K1 (for S2V) and K2 (for CTR)
+<a id="L268"></a>            const k1 = key[0 .. Aes.key_bits / 8];
+<a id="L269"></a>            const k2 = key[Aes.key_bits / 8 ..];
+<a id="L270"></a>
+<a id="L271"></a>            // Clear the 31st and 63rd bits for use as CTR IV
+<a id="L272"></a>            var ctr_iv = tag;
+<a id="L273"></a>            ctr_iv[8] &amp;= 0x7f;
+<a id="L274"></a>            ctr_iv[12] &amp;= 0x7f;
+<a id="L275"></a>
+<a id="L276"></a>            // Decrypt ciphertext using CTR mode
+<a id="L277"></a>            const aes_ctx = Aes.initEnc(k2.*);
+<a id="L278"></a>            modes.ctr(@TypeOf(aes_ctx), aes_ctx, m, c, ctr_iv, .big);
+<a id="L279"></a>
+<a id="L280"></a>            // Prepare strings for S2V: AD components followed by plaintext
+<a id="L281"></a>            var strings_buf: [128][]const u8 = undefined;
+<a id="L282"></a>            var strings_len: usize = 0;
+<a id="L283"></a>
+<a id="L284"></a>            for (ad) |a| {
+<a id="L285"></a>                strings_buf[strings_len] = a;
+<a id="L286"></a>                strings_len += 1;
+<a id="L287"></a>            }
+<a id="L288"></a>            strings_buf[strings_len] = m;
+<a id="L289"></a>            strings_len += 1;
+<a id="L290"></a>
+<a id="L291"></a>            // Verify synthetic IV using S2V
+<a id="L292"></a>            var computed_tag: [tag_length]u8 = undefined;
+<a id="L293"></a>            s2v(&amp;computed_tag, k1.*, strings_buf[0..strings_len]);
+<a id="L294"></a>
+<a id="L295"></a>            // Verify tag
+<a id="L296"></a>            const verify = crypto.timing_safe.eql([tag_length]u8, computed_tag, tag);
+<a id="L297"></a>            if (!verify) {
+<a id="L298"></a>                crypto.secureZero(u8, &amp;computed_tag);
+<a id="L299"></a>                @memset(m, undefined);
+<a id="L300"></a>                return error.AuthenticationFailed;
+<a id="L301"></a>            }
+<a id="L302"></a>        }
+<a id="L303"></a>    };
+<a id="L304"></a>}
+<a id="L305"></a>
+<a id="L306"></a>const htest = @import("test.zig");
+<a id="L307"></a>const testing = std.testing;
+<a id="L308"></a>
+<a id="L309"></a>test "AES-SIV double operation" {
+<a id="L310"></a>    const AesSivTest = AesSiv(crypto.core.aes.Aes128);
+<a id="L311"></a>
+<a id="L312"></a>    // Test vector from RFC 5297
+<a id="L313"></a>    const input = [_]u8{ 0x0e, 0x04, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e };
+<a id="L314"></a>    const expected = [_]u8{ 0x1c, 0x08, 0x02, 0x04, 0x06, 0x08, 0x0a, 0x0c, 0x0e, 0x10, 0x12, 0x14, 0x16, 0x18, 0x1a, 0x1c };
+<a id="L315"></a>
+<a id="L316"></a>    const result = AesSivTest.dbl(input);
+<a id="L317"></a>    try testing.expectEqualSlices(u8, &amp;expected, &amp;result);
+<a id="L318"></a>}
+<a id="L319"></a>
+<a id="L320"></a>test "AES-SIV double operation with MSB set" {
+<a id="L321"></a>    const AesSivTest = AesSiv(crypto.core.aes.Aes128);
+<a id="L322"></a>
+<a id="L323"></a>    const input = [_]u8{ 0xe0, 0x40, 0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80, 0x90, 0xa0, 0xb0, 0xc0, 0xd0, 0xe0 };
+<a id="L324"></a>    const expected = [_]u8{ 0xc0, 0x80, 0x20, 0x40, 0x60, 0x80, 0xa0, 0xc0, 0xe1, 0x01, 0x21, 0x41, 0x61, 0x81, 0xa1, 0x47 };
+<a id="L325"></a>
+<a id="L326"></a>    const result = AesSivTest.dbl(input);
+<a id="L327"></a>    try testing.expectEqualSlices(u8, &amp;expected, &amp;result);
+<a id="L328"></a>}
+<a id="L329"></a>
+<a id="L330"></a>test "Aes128Siv - RFC 5297 Test Vector A.1" {
+<a id="L331"></a>    // Test vector from RFC 5297 Appendix A.1
+<a id="L332"></a>    const key = [_]u8{
+<a id="L333"></a>        0xff, 0xfe, 0xfd, 0xfc, 0xfb, 0xfa, 0xf9, 0xf8, 0xf7, 0xf6, 0xf5, 0xf4, 0xf3, 0xf2, 0xf1, 0xf0,
+<a id="L334"></a>        0xf0, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8, 0xf9, 0xfa, 0xfb, 0xfc, 0xfd, 0xfe, 0xff,
+<a id="L335"></a>    };
+<a id="L336"></a>    const ad = [_]u8{
+<a id="L337"></a>        0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
+<a id="L338"></a>        0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27,
+<a id="L339"></a>    };
+<a id="L340"></a>    const plaintext = [_]u8{
+<a id="L341"></a>        0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee,
+<a id="L342"></a>    };
+<a id="L343"></a>
+<a id="L344"></a>    var ciphertext: [plaintext.len]u8 = undefined;
+<a id="L345"></a>    var tag: [16]u8 = undefined;
+<a id="L346"></a>
+<a id="L347"></a>    // Test using vector API for RFC compliance
+<a id="L348"></a>    const ad_components = [_][]const u8{&amp;ad};
+<a id="L349"></a>    Aes128Siv.encryptWithAdVector(&amp;ciphertext, &amp;tag, &amp;plaintext, &amp;ad_components, key);
+<a id="L350"></a>
+<a id="L351"></a>    // Expected values from RFC 5297
+<a id="L352"></a>    try htest.assertEqual("85632d07c6e8f37f950acd320a2ecc93", &amp;tag);
+<a id="L353"></a>    try htest.assertEqual("40c02b9690c4dc04daef7f6afe5c", &amp;ciphertext);
+<a id="L354"></a>
+<a id="L355"></a>    // Test decryption
+<a id="L356"></a>    var decrypted: [plaintext.len]u8 = undefined;
+<a id="L357"></a>    try Aes128Siv.decryptWithAdVector(&amp;decrypted, &amp;ciphertext, tag, &amp;ad_components, key);
+<a id="L358"></a>    try testing.expectEqualSlices(u8, &amp;plaintext, &amp;decrypted);
+<a id="L359"></a>}
+<a id="L360"></a>
+<a id="L361"></a>test "Aes128Siv - RFC 5297 Test Vector A.2" {
+<a id="L362"></a>    // Test vector from RFC 5297 Appendix A.2
+<a id="L363"></a>    const key: [32]u8 = .{
+<a id="L364"></a>        0x7f, 0x7e, 0x7d, 0x7c, 0x7b, 0x7a, 0x79, 0x78,
+<a id="L365"></a>        0x77, 0x76, 0x75, 0x74, 0x73, 0x72, 0x71, 0x70,
+<a id="L366"></a>        0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47,
+<a id="L367"></a>        0x48, 0x49, 0x4a, 0x4b, 0x4c, 0x4d, 0x4e, 0x4f,
+<a id="L368"></a>    };
+<a id="L369"></a>    const ad1 = [_]u8{
+<a id="L370"></a>        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+<a id="L371"></a>        0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
+<a id="L372"></a>        0xde, 0xad, 0xda, 0xda, 0xde, 0xad, 0xda, 0xda,
+<a id="L373"></a>        0xff, 0xee, 0xdd, 0xcc, 0xbb, 0xaa, 0x99, 0x88,
+<a id="L374"></a>        0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, 0x00,
+<a id="L375"></a>    };
+<a id="L376"></a>    const ad2 = [_]u8{
+<a id="L377"></a>        0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80,
+<a id="L378"></a>        0x90, 0xa0,
+<a id="L379"></a>    };
+<a id="L380"></a>    const nonce: [16]u8 = .{
+<a id="L381"></a>        0x09, 0xf9, 0x11, 0x02, 0x9d, 0x74, 0xe3, 0x5b,
+<a id="L382"></a>        0xd8, 0x41, 0x56, 0xc5, 0x63, 0x56, 0x88, 0xc0,
+<a id="L383"></a>    };
+<a id="L384"></a>    const plaintext = [_]u8{
+<a id="L385"></a>        0x74, 0x68, 0x69, 0x73, 0x20, 0x69, 0x73, 0x20,
+<a id="L386"></a>        0x73, 0x6f, 0x6d, 0x65, 0x20, 0x70, 0x6c, 0x61,
+<a id="L387"></a>        0x69, 0x6e, 0x74, 0x65, 0x78, 0x74, 0x20, 0x74,
+<a id="L388"></a>        0x6f, 0x20, 0x65, 0x6e, 0x63, 0x72, 0x79, 0x70,
+<a id="L389"></a>        0x74, 0x20, 0x75, 0x73, 0x69, 0x6e, 0x67, 0x20,
+<a id="L390"></a>        0x53, 0x49, 0x56, 0x2d, 0x41, 0x45, 0x53,
+<a id="L391"></a>    };
+<a id="L392"></a>
+<a id="L393"></a>    var ciphertext: [plaintext.len]u8 = undefined;
+<a id="L394"></a>    var tag: [16]u8 = undefined;
+<a id="L395"></a>
+<a id="L396"></a>    Aes128Siv.encryptWithAdVector(&amp;ciphertext, &amp;tag, &amp;plaintext, &amp;.{ &amp;ad1, &amp;ad2, &amp;nonce }, key);
+<a id="L397"></a>
+<a id="L398"></a>    // Expected values from RFC 5297
+<a id="L399"></a>    try htest.assertEqual("7bdb6e3b432667eb06f4d14bff2fbd0f", &amp;tag);
+<a id="L400"></a>    try htest.assertEqual("cb900f2fddbe404326601965c889bf17dba77ceb094fa663b7a3f748ba8af829ea64ad544a272e9c485b62a3fd5c0d", &amp;ciphertext);
+<a id="L401"></a>}
+<a id="L402"></a>
+<a id="L403"></a>test "Aes128Siv - empty plaintext" {
+<a id="L404"></a>    const key: [32]u8 = @splat(0x42);
+<a id="L405"></a>    const plaintext = "";
+<a id="L406"></a>    const ad = "additional data";
+<a id="L407"></a>
+<a id="L408"></a>    var ciphertext: [plaintext.len]u8 = undefined;
+<a id="L409"></a>    var tag: [16]u8 = undefined;
+<a id="L410"></a>
+<a id="L411"></a>    Aes128Siv.encrypt(&amp;ciphertext, &amp;tag, plaintext, ad, null, key);
+<a id="L412"></a>
+<a id="L413"></a>    var decrypted: [plaintext.len]u8 = undefined;
+<a id="L414"></a>    try Aes128Siv.decrypt(&amp;decrypted, &amp;ciphertext, tag, ad, null, key);
+<a id="L415"></a>}
+<a id="L416"></a>
+<a id="L417"></a>test "Aes128Siv - with nonce" {
+<a id="L418"></a>    const key: [32]u8 = @splat(0x69);
+<a id="L419"></a>    const nonce: [16]u8 = @splat(0x42);
+<a id="L420"></a>    const plaintext = "Hello, AES-SIV!";
+<a id="L421"></a>    const ad = "metadata";
+<a id="L422"></a>
+<a id="L423"></a>    var ciphertext: [plaintext.len]u8 = undefined;
+<a id="L424"></a>    var tag: [16]u8 = undefined;
+<a id="L425"></a>
+<a id="L426"></a>    Aes128Siv.encrypt(&amp;ciphertext, &amp;tag, plaintext, ad, &amp;nonce, key);
+<a id="L427"></a>
+<a id="L428"></a>    var decrypted: [plaintext.len]u8 = undefined;
+<a id="L429"></a>    try Aes128Siv.decrypt(&amp;decrypted, &amp;ciphertext, tag, ad, &amp;nonce, key);
+<a id="L430"></a>    try testing.expectEqualSlices(u8, plaintext, &amp;decrypted);
+<a id="L431"></a>}
+<a id="L432"></a>
+<a id="L433"></a>test "Aes256Siv - basic functionality" {
+<a id="L434"></a>    const key: [64]u8 = @splat(0x96);
+<a id="L435"></a>    const plaintext = "Test message for AES-256-SIV";
+<a id="L436"></a>    const ad1 = "header";
+<a id="L437"></a>    const ad2 = "more data";
+<a id="L438"></a>
+<a id="L439"></a>    var ciphertext: [plaintext.len]u8 = undefined;
+<a id="L440"></a>    var tag: [16]u8 = undefined;
+<a id="L441"></a>
+<a id="L442"></a>    // Test with multiple AD components using the vector API
+<a id="L443"></a>    const ad_components = [_][]const u8{ ad1, ad2 };
+<a id="L444"></a>    Aes256Siv.encryptWithAdVector(&amp;ciphertext, &amp;tag, plaintext, &amp;ad_components, key);
+<a id="L445"></a>
+<a id="L446"></a>    var decrypted: [plaintext.len]u8 = undefined;
+<a id="L447"></a>    try Aes256Siv.decryptWithAdVector(&amp;decrypted, &amp;ciphertext, tag, &amp;ad_components, key);
+<a id="L448"></a>    try testing.expectEqualSlices(u8, plaintext, &amp;decrypted);
+<a id="L449"></a>}
+<a id="L450"></a>
+<a id="L451"></a>test "Aes128Siv - demonstrating optional parameters" {
+<a id="L452"></a>    const key: [32]u8 = @splat(0x77);
+<a id="L453"></a>
+<a id="L454"></a>    // Test 1: No AD, no nonce (pure deterministic)
+<a id="L455"></a>    {
+<a id="L456"></a>        const plaintext = "Deterministic encryption";
+<a id="L457"></a>        var ciphertext: [plaintext.len]u8 = undefined;
+<a id="L458"></a>        var tag: [16]u8 = undefined;
+<a id="L459"></a>
+<a id="L460"></a>        Aes128Siv.encrypt(&amp;ciphertext, &amp;tag, plaintext, null, null, key);
+<a id="L461"></a>
+<a id="L462"></a>        var decrypted: [plaintext.len]u8 = undefined;
+<a id="L463"></a>        try Aes128Siv.decrypt(&amp;decrypted, &amp;ciphertext, tag, null, null, key);
+<a id="L464"></a>        try testing.expectEqualSlices(u8, plaintext, &amp;decrypted);
+<a id="L465"></a>    }
+<a id="L466"></a>
+<a id="L467"></a>    // Test 2: With AD, no nonce
+<a id="L468"></a>    {
+<a id="L469"></a>        const plaintext = "With associated data";
+<a id="L470"></a>        const ad = "some context";
+<a id="L471"></a>        var ciphertext: [plaintext.len]u8 = undefined;
+<a id="L472"></a>        var tag: [16]u8 = undefined;
+<a id="L473"></a>
+<a id="L474"></a>        Aes128Siv.encrypt(&amp;ciphertext, &amp;tag, plaintext, ad, null, key);
+<a id="L475"></a>
+<a id="L476"></a>        var decrypted: [plaintext.len]u8 = undefined;
+<a id="L477"></a>        try Aes128Siv.decrypt(&amp;decrypted, &amp;ciphertext, tag, ad, null, key);
+<a id="L478"></a>        try testing.expectEqualSlices(u8, plaintext, &amp;decrypted);
+<a id="L479"></a>    }
+<a id="L480"></a>
+<a id="L481"></a>    // Test 3: No AD, with nonce
+<a id="L482"></a>    {
+<a id="L483"></a>        const plaintext = "Nonce-based encryption";
+<a id="L484"></a>        const nonce: [12]u8 = @splat(0x01);
+<a id="L485"></a>        var ciphertext: [plaintext.len]u8 = undefined;
+<a id="L486"></a>        var tag: [16]u8 = undefined;
+<a id="L487"></a>
+<a id="L488"></a>        Aes128Siv.encrypt(&amp;ciphertext, &amp;tag, plaintext, null, &amp;nonce, key);
+<a id="L489"></a>
+<a id="L490"></a>        var decrypted: [plaintext.len]u8 = undefined;
+<a id="L491"></a>        try Aes128Siv.decrypt(&amp;decrypted, &amp;ciphertext, tag, null, &amp;nonce, key);
+<a id="L492"></a>        try testing.expectEqualSlices(u8, plaintext, &amp;decrypted);
+<a id="L493"></a>    }
+<a id="L494"></a>
+<a id="L495"></a>    // Test 4: With both AD and nonce
+<a id="L496"></a>    {
+<a id="L497"></a>        const plaintext = "Full featured";
+<a id="L498"></a>        const ad = "context";
+<a id="L499"></a>        const nonce: [16]u8 = @splat(0x02);
+<a id="L500"></a>        var ciphertext: [plaintext.len]u8 = undefined;
+<a id="L501"></a>        var tag: [16]u8 = undefined;
+<a id="L502"></a>
+<a id="L503"></a>        Aes128Siv.encrypt(&amp;ciphertext, &amp;tag, plaintext, ad, &amp;nonce, key);
+<a id="L504"></a>
+<a id="L505"></a>        var decrypted: [plaintext.len]u8 = undefined;
+<a id="L506"></a>        try Aes128Siv.decrypt(&amp;decrypted, &amp;ciphertext, tag, ad, &amp;nonce, key);
+<a id="L507"></a>        try testing.expectEqualSlices(u8, plaintext, &amp;decrypted);
+<a id="L508"></a>    }
+<a id="L509"></a>}
+<a id="L510"></a>
+<a id="L511"></a>test "Aes128Siv - authentication failure" {
+<a id="L512"></a>    const key: [32]u8 = @splat(0x13);
+<a id="L513"></a>    const plaintext = "Secret message";
+<a id="L514"></a>    const ad = "";
+<a id="L515"></a>
+<a id="L516"></a>    var ciphertext: [plaintext.len]u8 = undefined;
+<a id="L517"></a>    var tag: [16]u8 = undefined;
+<a id="L518"></a>
+<a id="L519"></a>    Aes128Siv.encrypt(&amp;ciphertext, &amp;tag, plaintext, ad, null, key);
+<a id="L520"></a>
+<a id="L521"></a>    // Corrupt the tag
+<a id="L522"></a>    tag[0] ^= 0x01;
+<a id="L523"></a>
+<a id="L524"></a>    var decrypted: [plaintext.len]u8 = undefined;
+<a id="L525"></a>    try testing.expectError(error.AuthenticationFailed, Aes128Siv.decrypt(&amp;decrypted, &amp;ciphertext, tag, ad, null, key));
+<a id="L526"></a>}
+</pre>
 </body>
 </html>

@@ -2,1094 +2,1097 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Source: zig-0.16.0-std/heap/ArenaAllocator.zig</title>
+    <title>Source: heap/ArenaAllocator.zig</title>
     <style>
         body { background: #1e1e1e; color: #d4d4d4; font-family: monospace; padding: 20px; }
         pre { white-space: pre-wrap; word-wrap: break-word; }
         .header { border-bottom: 1px solid #444; padding-bottom: 10px; margin-bottom: 20px; }
         a { color: #569cd6; }
+        a[id] { color: inherit; text-decoration: none; }
+        :target { background: #3a3a00; }
     </style>
 </head>
 <body>
     <div class="header">
-        <a href="/">Index</a> | <strong>File: zig-0.16.0-std/heap/ArenaAllocator.zig</strong>
+        <a href="/">Index</a> | <strong>File: heap/ArenaAllocator.zig</strong>
     </div>
-    <pre>//! This allocator takes an existing allocator, wraps it, and provides an interface where
-//! you can allocate and then free it all together. Calls to free an individual item only
-//! free the item if it was the most recent allocation, otherwise calls to free do
-//! nothing.
-//!
-//! The `Allocator` implementation provided is threadsafe, given that `child_allocator`
-//! is threadsafe as well.
-const ArenaAllocator = @This();
-
-child_allocator: Allocator,
-state: State,
-
-/// Inner state of ArenaAllocator. Can be stored rather than the entire ArenaAllocator
-/// as a memory-saving optimization.
-///
-/// Default initialization of this struct is deprecated; use `init` instead.
-pub const State = struct {
-    used_list: ?*Node = null,
-    free_list: ?*Node = null,
-
-    pub const init: State = .{
-        .used_list = null,
-        .free_list = null,
-    };
-
-    pub fn promote(state: State, child_allocator: Allocator) ArenaAllocator {
-        return .{
-            .child_allocator = child_allocator,
-            .state = state,
-        };
-    }
-};
-
-pub fn allocator(arena: *ArenaAllocator) Allocator {
-    return .{
-        .ptr = arena,
-        .vtable = &amp;.{
-            .alloc = alloc,
-            .resize = resize,
-            .remap = remap,
-            .free = free,
-        },
-    };
-}
-
-pub fn init(child_allocator: Allocator) ArenaAllocator {
-    return State.init.promote(child_allocator);
-}
-
-/// Not threadsafe.
-pub fn deinit(arena: ArenaAllocator) void {
-    // NOTE: When changing this, make sure `reset()` is adjusted accordingly!
-
-    for ([_]?*Node{ arena.state.used_list, arena.state.free_list }) |first_node| {
-        var it = first_node;
-        while (it) |node| {
-            // this has to occur before the free because the free frees node
-            it = node.next;
-            arena.child_allocator.rawFree(node.allocatedSliceUnsafe(), .of(Node), @returnAddress());
-        }
-    }
-}
-
-/// Queries the current memory use of this arena.
-/// This will **not** include the storage required for internal keeping.
-///
-/// Not threadsafe.
-pub fn queryCapacity(arena: ArenaAllocator) usize {
-    var capacity: usize = 0;
-    for ([_]?*Node{ arena.state.used_list, arena.state.free_list }) |first_node| {
-        capacity += countListCapacity(first_node);
-    }
-    return capacity;
-}
-fn countListCapacity(first_node: ?*Node) usize {
-    var capacity: usize = 0;
-    var it = first_node;
-    while (it) |node| : (it = node.next) {
-        // Compute the actually allocated size excluding the
-        // linked list node.
-        capacity += node.size.toInt() - @sizeOf(Node);
-    }
-    return capacity;
-}
-
-pub const ResetMode = union(enum) {
-    /// Releases all allocated memory in the arena.
-    free_all,
-    /// This will pre-heat the arena for future allocations by allocating a
-    /// large enough buffer for all previously done allocations.
-    /// Preheating will speed up the allocation process by invoking the backing allocator
-    /// less often than before. If `reset()` is used in a loop, this means that after the
-    /// biggest operation, no memory allocations are performed anymore.
-    retain_capacity,
-    /// This is the same as `retain_capacity`, but the memory will be shrunk to
-    /// this value if it exceeds the limit.
-    retain_with_limit: usize,
-};
-/// Resets the arena allocator and frees all allocated memory.
-///
-/// `mode` defines how the currently allocated memory is handled.
-/// See the variant documentation for `ResetMode` for the effects of each mode.
-///
-/// The function will return whether the reset operation was successful or not.
-/// If the reallocation  failed `false` is returned. The arena will still be fully
-/// functional in that case, all memory is released. Future allocations just might
-/// be slower.
-///
-/// Not threadsafe.
-///
-/// NOTE: If `mode` is `free_all`, the function will always return `true`.
-pub fn reset(arena: *ArenaAllocator, mode: ResetMode) bool {
-    // Some words on the implementation:
-    // The reset function can be implemented with two basic approaches:
-    // - Counting how much bytes were allocated since the last reset, and storing that
-    //   information in State. This will make reset fast and alloc only a teeny tiny bit
-    //   slower.
-    // - Counting how much bytes were allocated by iterating the chunk linked list. This
-    //   will make reset slower, but alloc() keeps the same speed when reset() as if reset()
-    //   would not exist.
-    //
-    // The second variant was chosen for implementation, as with more and more calls to reset(),
-    // the function will get faster and faster. At one point, the complexity of the function
-    // will drop to amortized O(1), as we're only ever having a single chunk that will not be
-    // reallocated, and we're not even touching the backing allocator anymore.
-    //
-    // Thus, only the first hand full of calls to reset() will actually need to iterate the linked
-    // list, all future calls are just taking the first node, and only resetting the `end_index`
-    // value.
-
-    const limit: ?usize = switch (mode) {
-        .retain_capacity =&gt; null,
-        .retain_with_limit =&gt; |limit| limit,
-        .free_all =&gt; 0,
-    };
-    if (limit == 0) {
-        // just reset when we don't have anything to reallocate
-        arena.deinit();
-        arena.state = .init;
-        return true;
-    }
-
-    const used_capacity = countListCapacity(arena.state.used_list);
-    const free_capacity = countListCapacity(arena.state.free_list);
-
-    const new_used_capacity = if (limit) |lim| @min(lim, used_capacity) else used_capacity;
-    const new_free_capacity = if (limit) |lim| @min(lim - new_used_capacity, free_capacity) else free_capacity;
-
-    var ok = true;
-
-    for (
-        [_]*?*Node{ &amp;arena.state.used_list, &amp;arena.state.free_list },
-        [_]usize{ new_used_capacity, new_free_capacity },
-    ) |first_node_ptr, new_capacity| {
-        // Free all nodes except for the last one
-        var it = first_node_ptr.*;
-        const node: *Node = while (it) |node| {
-            // this has to occur before the free because the free frees node
-            it = node.next;
-            if (it == null) break node;
-            arena.child_allocator.rawFree(node.allocatedSliceUnsafe(), .of(Node), @returnAddress());
-        } else {
-            continue;
-        };
-        const allocated_slice = node.allocatedSliceUnsafe();
-
-        // Align backwards to always stay below limit.
-        const new_size = mem.alignBackward(usize, @sizeOf(Node) + new_capacity, 2);
-
-        if (new_size == @sizeOf(Node)) {
-            arena.child_allocator.rawFree(allocated_slice, .of(Node), @returnAddress());
-            first_node_ptr.* = null;
-            continue;
-        }
-
-        node.end_index = 0;
-        first_node_ptr.* = node;
-
-        if (allocated_slice.len == new_size) {
-            // perfect, no need to invoke the child_allocator
-            continue;
-        }
-
-        if (arena.child_allocator.rawResize(allocated_slice, .of(Node), new_size, @returnAddress())) {
-            // successful resize
-            node.size = .fromInt(new_size);
-        } else {
-            // manual realloc
-            const new_ptr = arena.child_allocator.rawAlloc(new_size, .of(Node), @returnAddress()) orelse {
-                // we failed to preheat the arena properly, signal this to the user.
-                ok = false;
-                continue;
-            };
-            arena.child_allocator.rawFree(allocated_slice, .of(Node), @returnAddress());
-            const new_first_node: *Node = @ptrCast(@alignCast(new_ptr));
-            new_first_node.* = .{
-                .size = .fromInt(new_size),
-                .end_index = 0,
-                .next = null,
-            };
-            first_node_ptr.* = new_first_node;
-        }
-    }
-
-    return ok;
-}
-
-/// Concurrent accesses to node pointers generally have to have acquire/release
-/// semantics to guarantee that newly allocated notes are in a valid state when
-/// being inserted into a list. Exceptions are possible, e.g. a cmpxchg loop that
-/// never accesses the node returned on failure can use monotonic semantics on
-/// failure, but must still use release semantics on success to protect the node
-/// it's trying to push.
-const Node = struct {
-    /// Only meant to be accessed indirectly via the methods supplied by this type,
-    /// except if the node is owned by the thread accessing it.
-    /// Must always be an even number to accommodate `resize` bit.
-    size: Size,
-    /// Any increase of `end_index` has to use acquire semantics;
-    /// any decrease of `end_index` that invalidates (formerly) active allocations
-    /// has to use release semantics.
-    /// This guarantees that all accesses to memory that's about to be freed
-    /// happen-before the free is published.
-    /// Since `size` can only grow and never shrink, memory access depending on
-    /// any `end_index` &lt;= any `size` can never be OOB.
-    end_index: usize,
-    /// This field should only be accessed if the node is owned by the thread
-    /// accessing it.
-    next: ?*Node,
-
-    const Size = packed struct(usize) {
-        resizing: bool,
-        _: @Int(.unsigned, @bitSizeOf(usize) - 1) = 0,
-
-        fn fromInt(int: usize) Size {
-            assert(int &gt;= @sizeOf(Node));
-            const size: Size = @bitCast(int);
-            assert(!size.resizing);
-            return size;
-        }
-
-        fn toInt(size: Size) usize {
-            var int = size;
-            int.resizing = false;
-            return @bitCast(int);
-        }
-
-        comptime {
-            assert(Size{ .resizing = true } == @as(Size, @bitCast(@as(usize, 1))));
-        }
-    };
-
-    fn loadBuf(node: *Node) []u8 {
-        // `size` can only ever grow, so the buffer returned by this function is
-        // always valid memory.
-        const size = @atomicLoad(Size, &amp;node.size, .monotonic);
-        return @as([*]u8, @ptrCast(node))[0..size.toInt()][@sizeOf(Node)..];
-    }
-
-    /// Returns allocated slice or `null` if node is already (being) resized.
-    fn beginResize(node: *Node) ?[]u8 {
-        const size = @atomicRmw(Size, &amp;node.size, .Or, .{ .resizing = true }, .acquire); // syncs with release in `endResize`
-        if (size.resizing) return null;
-        return @as([*]u8, @ptrCast(node))[0..size.toInt()];
-    }
-
-    fn endResize(node: *Node, size: usize, prev_size: usize) void {
-        assert(size &gt;= prev_size); // nodes must not shrink
-        assert(@atomicLoad(Size, &amp;node.size, .unordered).toInt() == prev_size);
-        return @atomicStore(Size, &amp;node.size, .fromInt(size), .release); // syncs with acquire in `beginResize`
-    }
-
-    /// Not threadsafe.
-    fn allocatedSliceUnsafe(node: *Node) []u8 {
-        return @as([*]u8, @ptrCast(node))[0..node.size.toInt()];
-    }
-};
-
-fn loadFirstNode(arena: *ArenaAllocator) ?*Node {
-    return @atomicLoad(?*Node, &amp;arena.state.used_list, .acquire); // syncs with release in successful `tryPushNode`
-}
-
-const PushResult = union(enum) {
-    success,
-    failure: ?*Node,
-};
-fn tryPushNode(arena: *ArenaAllocator, node: *Node) PushResult {
-    assert(node != node.next);
-    if (@cmpxchgStrong( // strong because retrying means discarding a fitting node -&gt; expensive
-        ?*Node,
-        &amp;arena.state.used_list,
-        node.next,
-        node,
-        .release, // syncs with acquire in failure path or `loadFirstNode`
-        .acquire, // syncs with release in success path
-    )) |old_node| {
-        return .{ .failure = old_node };
-    } else {
-        return .success;
-    }
-}
-
-fn stealFreeList(arena: *ArenaAllocator) ?*Node {
-    // We don't need acq_rel here because we're always swapping in `null`, so
-    // there's no node we'd need to release.
-    return @atomicRmw(?*Node, &amp;arena.state.free_list, .Xchg, null, .acquire); // syncs with release in `pushFreeList`
-}
-
-fn pushFreeList(arena: *ArenaAllocator, first: *Node, last: *Node) void {
-    assert(first != last.next);
-    assert(first != first.next);
-    assert(last != last.next);
-    while (@cmpxchgWeak(
-        ?*Node,
-        &amp;arena.state.free_list,
-        last.next,
-        first,
-        .release, // syncs with acquire in `stealFreeList`
-        .monotonic, // we never access any fields of `old_free_list`, we only care about the pointer
-    )) |old_free_list| {
-        last.next = old_free_list;
-    }
-}
-
-fn alignedIndex(buf_ptr: [*]u8, end_index: usize, alignment: Alignment) usize {
-    // Wrapping arithmetic to avoid overflows since `end_index` isn't bounded by
-    // `size`. This is always ok since the max alignment in byte units is also
-    // the max value of `usize` so wrapped values are correctly aligned anyway.
-    return alignment.forward(@intFromPtr(buf_ptr) +% end_index) -% @intFromPtr(buf_ptr);
-}
-
-fn alloc(ctx: *anyopaque, n: usize, alignment: Alignment, ret_addr: usize) ?[*]u8 {
-    const arena: *ArenaAllocator = @ptrCast(@alignCast(ctx));
-    _ = ret_addr;
-
-    assert(n &gt; 0);
-
-    var cur_first_node = arena.loadFirstNode();
-
-    var cur_new_node: ?*Node = null;
-    defer if (cur_new_node) |node| {
-        node.next = null; // optimize for empty free list
-        arena.pushFreeList(node, node);
-    };
-
-    retry: while (true) {
-        const first_node: ?*Node, const prev_size: usize = first_node: {
-            const node = cur_first_node orelse break :first_node .{ null, 0 };
-            const buf = node.loadBuf();
-
-            // To avoid using a CAS loop in the hot path we atomically increase
-            // `end_index` by a large enough amount to be able to always provide
-            // the required alignment within the reserved memory. To recover the
-            // space this potentially wastes we try to subtract the 'overshoot'
-            // with a single cmpxchg afterwards, which may fail.
-
-            const alignable = n + alignment.toByteUnits() - 1;
-            const end_index = @atomicRmw(usize, &amp;node.end_index, .Add, alignable, .acquire); // acquire any memory that may have been freed
-            const aligned_index = alignedIndex(buf.ptr, end_index, alignment);
-            assert(end_index + alignable &gt;= aligned_index + n);
-            if (end_index + alignable != aligned_index + n) {
-                _ = @cmpxchgStrong(
-                    usize,
-                    &amp;node.end_index,
-                    end_index + alignable,
-                    aligned_index + n,
-                    .monotonic, // no need to release alignment padding; there's no one accessing it!
-                    .monotonic,
-                );
-            }
-
-            if (aligned_index + n &gt; buf.len) break :first_node .{ node, buf.len };
-            return buf[aligned_index..][0..n].ptr;
-        };
-
-        resize: {
-            // Before attempting to get our hands on a new node, we try to resize
-            // the one we're currently holding. This is an exclusive operation;
-            // if another thread is already in this section we can never resize.
-
-            const node = first_node orelse break :resize;
-            const allocated_slice = node.beginResize() orelse break :resize;
-            var size = allocated_slice.len;
-            defer node.endResize(size, allocated_slice.len);
-
-            const buf = allocated_slice[@sizeOf(Node)..];
-            const end_index = @atomicLoad(usize, &amp;node.end_index, .monotonic);
-            const aligned_index = alignedIndex(buf.ptr, end_index, alignment);
-            const new_size = mem.alignForward(usize, @sizeOf(Node) + aligned_index + n, 2);
-
-            if (new_size &lt;= allocated_slice.len) {
-                // A `resize` or `free` call managed to sneak in and we need to
-                // guarantee that `size` is only ever increased; retry!
-                continue :retry;
-            }
-
-            if (arena.child_allocator.rawResize(allocated_slice, .of(Node), new_size, @returnAddress())) {
-                size = new_size;
-
-                // strong because a spurious failure could result in suboptimal
-                // usage of this node
-                if (null == @cmpxchgStrong(
-                    usize,
-                    &amp;node.end_index,
-                    end_index,
-                    aligned_index + n,
-                    .acquire, // acquire any memory that may have been freed
-                    .monotonic,
-                )) {
-                    const new_buf = allocated_slice.ptr[0..new_size][@sizeOf(Node)..];
-                    return new_buf[aligned_index..][0..n].ptr;
-                }
-            }
-        }
-
-        // We need a new node! First, we search `free_list` for one that's big
-        // enough, if we don't find one there we fall back to allocating a new
-        // node with `child_allocator` (if we haven't already done that!).
-
-        from_free_list: {
-            // We 'steal' the entire free list to operate on it without other
-            // threads getting up into our business.
-            // This is a rather pragmatic approach, but since the free list isn't
-            // used very frequently it's fine performance-wise, even under load.
-            // Also this avoids the ABA problem; stealing the list with an atomic
-            // swap doesn't introduce any potentially stale `next` pointers.
-
-            const free_list = arena.stealFreeList() orelse break :from_free_list;
-
-            const first_free: *Node, const last_free: *Node, const node: *Node, const prev: ?*Node = find: {
-                var best_fit_prev: ?*Node = null;
-                var best_fit: ?*Node = null;
-                var best_fit_diff: usize = std.math.maxInt(usize);
-
-                var it_prev: ?*Node = null;
-                var it: ?*Node = free_list;
-                while (it) |node| : ({
-                    it_prev = node;
-                    it = node.next;
-                }) {
-                    assert(!node.size.resizing);
-                    const buf = node.allocatedSliceUnsafe()[@sizeOf(Node)..];
-                    const aligned_index = alignedIndex(buf.ptr, 0, alignment);
-
-                    const diff = aligned_index + n -| buf.len;
-                    if (diff &lt; best_fit_diff) {
-                        best_fit_prev = it_prev;
-                        best_fit = node;
-                        best_fit_diff = diff;
-                    }
-                }
-
-                break :find .{ free_list, it_prev.?, best_fit.?, best_fit_prev };
-            };
-
-            const aligned_index, const need_resize = aligned_index: {
-                const buf = node.allocatedSliceUnsafe()[@sizeOf(Node)..];
-                const aligned_index = alignedIndex(buf.ptr, 0, alignment);
-                break :aligned_index .{ aligned_index, aligned_index + n &gt; buf.len };
-            };
-
-            if (need_resize) {
-                // Ideally we want to use all nodes in `free_list` eventually,
-                // so even if none fit we'll try to resize the one that was the
-                // closest to being large enough.
-                const new_size = mem.alignForward(usize, @sizeOf(Node) + aligned_index + n, 2);
-                if (arena.child_allocator.rawResize(node.allocatedSliceUnsafe(), .of(Node), new_size, @returnAddress())) {
-                    node.size = .fromInt(new_size);
-                } else {
-                    arena.pushFreeList(first_free, last_free);
-                    break :from_free_list; // we couldn't find a fitting free node
-                }
-            }
-
-            const buf = node.allocatedSliceUnsafe()[@sizeOf(Node)..];
-            const old_next = node.next;
-
-            node.end_index = aligned_index + n;
-            node.next = first_node;
-
-            switch (arena.tryPushNode(node)) {
-                .success =&gt; {
-                    // Finish removing node from free list.
-                    if (prev) |p| p.next = old_next;
-
-                    // Push remaining stolen free list back onto `arena.state.free_list`.
-                    const new_first_free = if (node == first_free) old_next else first_free;
-                    const new_last_free = if (node == last_free) prev else last_free;
-                    if (new_first_free) |first| {
-                        const last = new_last_free.?;
-                        arena.pushFreeList(first, last);
-                    }
-
-                    return buf[aligned_index..][0..n].ptr;
-                },
-                .failure =&gt; |old_first_node| {
-                    // restore free list to as we found it
-                    node.next = old_next;
-                    arena.pushFreeList(first_free, last_free);
-
-                    cur_first_node = old_first_node;
-                    continue :retry; // there's a new first node; retry!
-                },
-            }
-        }
-
-        const new_node: *Node = new_node: {
-            if (cur_new_node) |new_node| {
-                break :new_node new_node;
-            } else {
-                @branchHint(.cold);
-            }
-
-            const size: Node.Size = size: {
-                const min_size = @sizeOf(Node) + alignment.toByteUnits() + n;
-                const big_enough_size = prev_size + min_size + 16;
-                const size = mem.alignForward(usize, big_enough_size + big_enough_size / 2, 2);
-                break :size .fromInt(size);
-            };
-            const ptr = arena.child_allocator.rawAlloc(size.toInt(), .of(Node), @returnAddress()) orelse
-                return null;
-            const new_node: *Node = @ptrCast(@alignCast(ptr));
-            new_node.* = .{
-                .size = size,
-                .end_index = undefined, // set below
-                .next = undefined, // set below
-            };
-            cur_new_node = new_node;
-            break :new_node new_node;
-        };
-
-        const buf = new_node.allocatedSliceUnsafe()[@sizeOf(Node)..];
-        const aligned_index = alignedIndex(buf.ptr, 0, alignment);
-        assert(new_node.size.toInt() &gt;= @sizeOf(Node) + aligned_index + n);
-
-        new_node.end_index = aligned_index + n;
-        new_node.next = first_node;
-
-        switch (arena.tryPushNode(new_node)) {
-            .success =&gt; {
-                cur_new_node = null;
-                return buf[aligned_index..][0..n].ptr;
-            },
-            .failure =&gt; |old_first_node| {
-                cur_first_node = old_first_node;
-            },
-        }
-    }
-}
-
-fn resize(ctx: *anyopaque, memory: []u8, alignment: Alignment, new_len: usize, ret_addr: usize) bool {
-    const arena: *ArenaAllocator = @ptrCast(@alignCast(ctx));
-    _ = alignment;
-    _ = ret_addr;
-
-    assert(memory.len &gt; 0);
-    assert(new_len &gt; 0);
-
-    const node = arena.loadFirstNode().?;
-    const buf_ptr = @as([*]u8, @ptrCast(node)) + @sizeOf(Node);
-
-    const cur_end_index = @atomicLoad(usize, &amp;node.end_index, .monotonic);
-
-    if (buf_ptr + cur_end_index != memory.ptr + memory.len) {
-        // It's not the most recent allocation, so it cannot be expanded,
-        // but it's fine if they want to make it smaller.
-        return new_len &lt;= memory.len;
-    }
-
-    if (new_len &lt;= memory.len) {
-        const new_end_index = cur_end_index - (memory.len - new_len);
-        assert(buf_ptr + new_end_index == memory.ptr + new_len);
-
-        _ = @cmpxchgStrong(
-            usize,
-            &amp;node.end_index,
-            cur_end_index,
-            new_end_index,
-            .release, // release freed memory
-            .monotonic,
-        );
-        return true; // Shrinking allocations should always succeed.
-    }
-
-    // Saturating arithmetic because `end_index` is not guaranteed to be `&lt;= size`.
-    // The allocation we're trying to resize *could* belong to a different node!
-    if (node.loadBuf().len -| cur_end_index &gt;= new_len - memory.len) {
-        const new_end_index = cur_end_index + (new_len - memory.len);
-        assert(buf_ptr + new_end_index == memory.ptr + new_len);
-
-        return null == @cmpxchgStrong(
-            usize,
-            &amp;node.end_index,
-            cur_end_index,
-            new_end_index,
-            .acquire, // acquire any memory that may have been freed
-            .monotonic,
-        );
-    }
-
-    return false;
-}
-
-fn remap(ctx: *anyopaque, memory: []u8, alignment: Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
-    return if (resize(ctx, memory, alignment, new_len, ret_addr)) memory.ptr else null;
-}
-
-fn free(ctx: *anyopaque, memory: []u8, alignment: Alignment, ret_addr: usize) void {
-    const arena: *ArenaAllocator = @ptrCast(@alignCast(ctx));
-    _ = alignment;
-    _ = ret_addr;
-
-    assert(memory.len &gt; 0);
-
-    const node = arena.loadFirstNode().?;
-    const buf_ptr = @as([*]u8, @ptrCast(node)) + @sizeOf(Node);
-
-    const cur_end_index = @atomicLoad(usize, &amp;node.end_index, .monotonic);
-
-    if (buf_ptr + cur_end_index != memory.ptr + memory.len) {
-        // Not the most recent allocation; we cannot free it.
-        return;
-    }
-
-    const new_end_index = cur_end_index - memory.len;
-    assert(buf_ptr + new_end_index == memory.ptr);
-
-    _ = @cmpxchgStrong(
-        usize,
-        &amp;node.end_index,
-        cur_end_index,
-        new_end_index,
-        .release, // release freed memory
-        .monotonic,
-    );
-}
-
-const std = @import("std");
-const assert = std.debug.assert;
-const mem = std.mem;
-const Allocator = std.mem.Allocator;
-const Alignment = std.mem.Alignment;
-
-test "reset with preheating" {
-    var arena_allocator = ArenaAllocator.init(std.testing.allocator);
-    defer arena_allocator.deinit();
-    // provides some variance in the allocated data
-    var rng_src = std.Random.DefaultPrng.init(std.testing.random_seed);
-    const random = rng_src.random();
-    var rounds: usize = 25;
-    while (rounds &gt; 0) {
-        rounds -= 1;
-        _ = arena_allocator.reset(.retain_capacity);
-        var alloced_bytes: usize = 0;
-        const total_size: usize = random.intRangeAtMost(usize, 256, 16384);
-        while (alloced_bytes &lt; total_size) {
-            const size = random.intRangeAtMost(usize, 16, 256);
-            const alignment: Alignment = .@"32";
-            const slice = try arena_allocator.allocator().alignedAlloc(u8, alignment, size);
-            try std.testing.expect(alignment.check(@intFromPtr(slice.ptr)));
-            try std.testing.expectEqual(size, slice.len);
-            alloced_bytes += slice.len;
-        }
-    }
-}
-
-test "reset while retaining a buffer" {
-    var arena_allocator = ArenaAllocator.init(std.testing.allocator);
-    defer arena_allocator.deinit();
-    const a = arena_allocator.allocator();
-
-    // Create two internal buffers
-    _ = try a.alloc(u8, 1);
-    _ = try a.alloc(u8, 1000);
-
-    try std.testing.expect(arena_allocator.state.used_list != null);
-
-    // Check that we have at least two buffers
-    try std.testing.expect(arena_allocator.state.used_list.?.next != null);
-
-    // This retains the first allocated buffer
-    try std.testing.expect(arena_allocator.reset(.{ .retain_with_limit = 2 }));
-    try std.testing.expect(arena_allocator.state.used_list.?.next == null);
-    try std.testing.expectEqual(2, arena_allocator.queryCapacity());
-}
-
-test "fuzz multi threaded" {
-    @disableInstrumentation();
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
-
-    const gpa = std.heap.smp_allocator;
-
-    var io_instance: std.Io.Threaded = .init(gpa, .{});
-    defer io_instance.deinit();
-
-    var arena_state: ArenaAllocator.State = .init;
-    // No need to deinit arena_state, all allocations are in `sample_buffer`!
-
-    const buffer_size = FuzzContext.max_alloc_count * FuzzContext.max_alloc_size;
-
-    const control_buffer = try gpa.alloc(u8, buffer_size);
-    defer gpa.free(control_buffer);
-    var control_instance: std.heap.FixedBufferAllocator = .init(control_buffer);
-
-    const sample_buffer = try gpa.alloc(u8, buffer_size);
-    defer gpa.free(sample_buffer);
-    var sample_instance: FuzzAllocator = .init(sample_buffer);
-
-    try std.testing.fuzz(FuzzContext.Init{
-        .threaded_instance = &amp;io_instance,
-        .arena_state = &amp;arena_state,
-        .control_instance = &amp;control_instance,
-        .sample_instance = &amp;sample_instance,
-    }, fuzzMultiThreaded, .{});
-}
-
-fn fuzzMultiThreaded(fuzz_init: FuzzContext.Init, smith: *std.testing.Smith) anyerror!void {
-    @disableInstrumentation();
-    const testing = std.testing;
-    const io = fuzz_init.threaded_instance.io();
-
-    fuzz_init.sample_instance.prepareFailures(smith);
-
-    const control_allocator = fuzz_init.control_instance.threadSafeAllocator();
-    const sample_child_allocator = fuzz_init.sample_instance.allocator();
-
-    var arena_instance = fuzz_init.arena_state.*.promote(sample_child_allocator);
-    defer fuzz_init.arena_state.* = arena_instance.state;
-
-    var ctx: FuzzContext = .init(
-        control_allocator,
-        arena_instance.allocator(),
-    );
-    defer ctx.deinit();
-
-    var group: std.Io.Group = .init;
-    defer group.cancel(io);
-
-    var n_allocs: usize = 0;
-    var n_actions: usize = 0;
-    while (!smith.eosWeightedSimple(99, 1) and n_actions &lt; FuzzContext.max_action_count) {
-        errdefer comptime unreachable;
-
-        const weights: []const testing.Smith.Weight = if (n_allocs == FuzzContext.max_alloc_count)
-            &amp;.{
-                .value(FuzzContext.Action, .resize, 1),
-                .value(FuzzContext.Action, .remap, 1),
-                .value(FuzzContext.Action, .free, 1),
-            }
-        else
-            &amp;.{
-                .value(FuzzContext.Action, .resize, 1),
-                .value(FuzzContext.Action, .remap, 1),
-                .value(FuzzContext.Action, .free, 1),
-                .value(FuzzContext.Action, .alloc, 3),
-            };
-        switch (smith.valueWeighted(FuzzContext.Action, weights)) {
-            .alloc =&gt; {
-                const alloc_index = n_allocs;
-                n_allocs += 1;
-                ctx.allocs[alloc_index].common.len = .free;
-                group.concurrent(io, FuzzContext.doOneAlloc, .{
-                    &amp;ctx,
-                    nextLen(smith),
-                    smith.valueRangeAtMost(
-                        Alignment,
-                        .@"1",
-                        .fromByteUnits(2 * std.heap.page_size_max),
-                    ),
-                    @enumFromInt(alloc_index),
-                }) catch unreachable;
-            },
-            .resize =&gt; group.concurrent(io, FuzzContext.doOneResize, .{ &amp;ctx, nextLen(smith) }) catch unreachable,
-            .remap =&gt; group.concurrent(io, FuzzContext.doOneRemap, .{ &amp;ctx, nextLen(smith) }) catch unreachable,
-            .free =&gt; group.concurrent(io, FuzzContext.doOneFree, .{&amp;ctx}) catch unreachable,
-        }
-        n_actions += 1;
-    }
-
-    try group.await(io);
-    try ctx.check(n_allocs);
-
-    // This also covers the `deinit` logic since `free_all` uses it internally.
-
-    const old_capacity = arena_instance.queryCapacity();
-    const reset_mode: ResetMode = switch (smith.value(@typeInfo(ResetMode).@"union".tag_type.?)) {
-        .free_all =&gt; .free_all,
-        .retain_capacity =&gt; .retain_capacity,
-        .retain_with_limit =&gt; .{ .retain_with_limit = smith.value(usize) },
-    };
-    const ok = arena_instance.reset(reset_mode);
-    const new_capacity = arena_instance.queryCapacity();
-    switch (reset_mode) {
-        .free_all =&gt; {
-            try testing.expect(ok);
-            try testing.expectEqual(0, new_capacity);
-            fuzz_init.sample_instance.reset();
-        },
-        .retain_with_limit =&gt; |limit| if (ok) try testing.expect(new_capacity &lt;= limit),
-        .retain_capacity =&gt; if (ok) try testing.expectEqual(old_capacity, new_capacity),
-    }
-
-    fuzz_init.control_instance.reset();
-}
-fn nextLen(smith: *std.testing.Smith) @typeInfo(FuzzContext.Alloc.Len).@"enum".tag_type {
-    @disableInstrumentation();
-    const BackingInt = @typeInfo(FuzzContext.Alloc.Len).@"enum".tag_type;
-    return smith.valueRangeAtMost(BackingInt, 1, FuzzContext.max_alloc_size);
-}
-
-const FuzzContext = struct {
-    control_allocator: Allocator,
-    sample_allocator: Allocator,
-
-    last_alloc_index: Alloc.Index,
-    allocs: [max_alloc_count]Alloc,
-
-    const max_alloc_count = 64;
-    const max_action_count = 2 * max_alloc_count;
-
-    const max_alloc_size = 16 &lt;&lt; 10;
-
-    const Alloc = struct {
-        control_ptr: [*]u8,
-        sample_ptr: [*]u8,
-        common: packed struct(usize) {
-            len: Len,
-            alignment: Alignment,
-            _: @Int(.unsigned, padding_bits) = 0,
-        },
-
-        const Len = enum(@Int(.unsigned, len_bits)) {
-            free = (1 &lt;&lt; len_bits) - 1,
-            _,
-        };
-        const len_bits = @min(64, @bitSizeOf(usize)) - @bitSizeOf(Alignment);
-        const padding_bits = @bitSizeOf(usize) - (len_bits + @bitSizeOf(Alignment));
-
-        const Index = enum(usize) {
-            none = std.math.maxInt(usize),
-            _,
-        };
-    };
-
-    const Action = enum {
-        alloc,
-        resize,
-        remap,
-        free,
-    };
-
-    const Init = struct {
-        threaded_instance: *std.Io.Threaded,
-        arena_state: *ArenaAllocator.State,
-        control_instance: *std.heap.FixedBufferAllocator,
-        sample_instance: *FuzzAllocator,
-    };
-
-    fn init(
-        control_allocator: Allocator,
-        sample_allocator: Allocator,
-    ) FuzzContext {
-        @disableInstrumentation();
-        return .{
-            .control_allocator = control_allocator,
-            .sample_allocator = sample_allocator,
-            .last_alloc_index = .none,
-            .allocs = undefined,
-        };
-    }
-
-    fn deinit(ctx: *FuzzContext) void {
-        @disableInstrumentation();
-        ctx.* = undefined;
-    }
-
-    fn check(ctx: *const FuzzContext, n_allocs: usize) !void {
-        @disableInstrumentation();
-        for (ctx.allocs[0..n_allocs]) |allocation| {
-            const len: usize = switch (allocation.common.len) {
-                .free =&gt; continue,
-                _ =&gt; |len| @intFromEnum(len),
-            };
-            const control = allocation.control_ptr[0..len];
-            const sample = allocation.sample_ptr[0..len];
-            try std.testing.expectEqualSlices(u8, control, sample);
-        }
-    }
-
-    fn doOneAlloc(ctx: *FuzzContext, len: usize, alignment: Alignment, index: Alloc.Index) void {
-        @disableInstrumentation();
-        assert(ctx.allocs[@intFromEnum(index)].common.len == .free);
-
-        const control_ptr = ctx.control_allocator.rawAlloc(len, alignment, @returnAddress()) orelse
-            return;
-        const sample_ptr = ctx.sample_allocator.rawAlloc(len, alignment, @returnAddress()) orelse {
-            ctx.control_allocator.rawFree(control_ptr[0..len], alignment, @returnAddress());
-            return;
-        };
-
-        ctx.allocs[@intFromEnum(index)] = .{
-            .control_ptr = control_ptr,
-            .sample_ptr = sample_ptr,
-            .common = .{
-                .len = @enumFromInt(len),
-                .alignment = alignment,
-            },
-        };
-
-        for (control_ptr[0..len], sample_ptr[0..len], 0..) |*control, *sample, i| {
-            control.* = @truncate(i);
-            sample.* = @truncate(i);
-        }
-
-        @atomicStore(Alloc.Index, &amp;ctx.last_alloc_index, index, .release);
-    }
-    fn doOneResize(ctx: *FuzzContext, new_len: usize) void {
-        @disableInstrumentation();
-
-        const index = @atomicRmw(Alloc.Index, &amp;ctx.last_alloc_index, .Xchg, .none, .acquire);
-        if (index == .none) return;
-
-        const allocation = &amp;ctx.allocs[@intFromEnum(index)];
-        assert(allocation.common.len != .free);
-        const memory = allocation.sample_ptr[0..@intFromEnum(allocation.common.len)];
-        const alignment = allocation.common.alignment;
-
-        assert(alignment.check(@intFromPtr(allocation.control_ptr)));
-        assert(alignment.check(@intFromPtr(allocation.sample_ptr)));
-
-        // Since `resize` is fallible, we have to ensure that `control_allocator`
-        // is always successful by reserving the memory we need beforehand.
-        const new_control_ptr = ctx.control_allocator.rawAlloc(new_len, alignment, @returnAddress()) orelse
-            return;
-        if (ctx.sample_allocator.rawResize(memory, alignment, new_len, @returnAddress())) {
-            const old_control = allocation.control_ptr[0..memory.len];
-            const overlap = @min(memory.len, new_len);
-            @memcpy(new_control_ptr[0..overlap], old_control[0..overlap]);
-            ctx.control_allocator.rawFree(old_control, alignment, @returnAddress());
-        } else {
-            ctx.control_allocator.rawFree(new_control_ptr[0..new_len], alignment, @returnAddress());
-            return;
-        }
-
-        ctx.allocs[@intFromEnum(index)] = .{
-            .control_ptr = new_control_ptr,
-            .sample_ptr = memory.ptr,
-            .common = .{
-                .len = @enumFromInt(new_len),
-                .alignment = alignment,
-            },
-        };
-
-        if (new_len &gt; memory.len) {
-            for (
-                allocation.control_ptr[memory.len..new_len],
-                allocation.sample_ptr[memory.len..new_len],
-                0..,
-            ) |*control, *sample, i| {
-                control.* = @truncate(i);
-                sample.* = @truncate(i);
-            }
-        }
-
-        @atomicStore(Alloc.Index, &amp;ctx.last_alloc_index, index, .release);
-    }
-    fn doOneRemap(ctx: *FuzzContext, new_len: usize) void {
-        @disableInstrumentation();
-        return doOneResize(ctx, new_len);
-    }
-    fn doOneFree(ctx: *FuzzContext) void {
-        @disableInstrumentation();
-
-        const index = @atomicRmw(Alloc.Index, &amp;ctx.last_alloc_index, .Xchg, .none, .acquire);
-        if (index == .none) return;
-
-        const allocation = &amp;ctx.allocs[@intFromEnum(index)];
-        assert(allocation.common.len != .free);
-        const len: usize = @intFromEnum(allocation.common.len);
-        const alignment = allocation.common.alignment;
-
-        assert(alignment.check(@intFromPtr(allocation.control_ptr)));
-        assert(alignment.check(@intFromPtr(allocation.sample_ptr)));
-
-        ctx.control_allocator.rawFree(allocation.control_ptr[0..len], alignment, @returnAddress());
-        ctx.sample_allocator.rawFree(allocation.sample_ptr[0..len], alignment, @returnAddress());
-
-        ctx.allocs[@intFromEnum(index)] = .{
-            .control_ptr = undefined,
-            .sample_ptr = undefined,
-            .common = .{
-                .len = .free,
-                .alignment = .@"1",
-            },
-        };
-    }
-};
-
-const FuzzAllocator = struct {
-    fba: std.heap.FixedBufferAllocator,
-    spurious_failures: [256]u8,
-    index: u8,
-
-    fn init(buffer: []u8) FuzzAllocator {
-        @disableInstrumentation();
-        return .{
-            .fba = .init(buffer),
-            .spurious_failures = undefined, // set with `preprepareFailures`
-            .index = 0,
-        };
-    }
-
-    fn prepareFailures(fa: *FuzzAllocator, smith: *std.testing.Smith) void {
-        @disableInstrumentation();
-        const bool_weights: []const std.testing.Smith.Weight = &amp;.{
-            .value(u8, 0, 10),
-            .value(u8, 1, 1),
-        };
-        smith.bytesWeighted(&amp;fa.spurious_failures, bool_weights);
-        fa.index = 0;
-    }
-
-    fn reset(fa: *FuzzAllocator) void {
-        @disableInstrumentation();
-        fa.fba.reset();
-    }
-
-    fn allocator(fa: *FuzzAllocator) Allocator {
-        @disableInstrumentation();
-        return .{
-            .ptr = fa,
-            .vtable = &amp;.{
-                .alloc = FuzzAllocator.alloc,
-                .resize = FuzzAllocator.resize,
-                .remap = FuzzAllocator.remap,
-                .free = FuzzAllocator.free,
-            },
-        };
-    }
-
-    fn alloc(ctx: *anyopaque, len: usize, alignment: Alignment, ret_addr: usize) ?[*]u8 {
-        @disableInstrumentation();
-        const fa: *FuzzAllocator = @ptrCast(@alignCast(ctx));
-        _ = ret_addr;
-
-        const index = @atomicRmw(u8, &amp;fa.index, .Add, 1, .monotonic);
-        if (fa.spurious_failures[index] != 0) return null;
-        return fa.fba.threadSafeAllocator().rawAlloc(len, alignment, @returnAddress());
-    }
-
-    fn resize(ctx: *anyopaque, memory: []u8, alignment: Alignment, new_len: usize, ret_addr: usize) bool {
-        @disableInstrumentation();
-        const fa: *FuzzAllocator = @ptrCast(@alignCast(ctx));
-        _ = ret_addr;
-
-        const index = @atomicRmw(u8, &amp;fa.index, .Add, 1, .monotonic);
-        if (fa.spurious_failures[index] != 0) return false;
-        return fa.fba.threadSafeAllocator().rawResize(memory, alignment, new_len, @returnAddress());
-    }
-
-    fn remap(ctx: *anyopaque, memory: []u8, alignment: Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
-        @disableInstrumentation();
-        const fa: *FuzzAllocator = @ptrCast(@alignCast(ctx));
-        _ = ret_addr;
-
-        const index = @atomicRmw(u8, &amp;fa.index, .Add, 1, .monotonic);
-        if (fa.spurious_failures[index] != 0) return null;
-        return fa.fba.threadSafeAllocator().rawRemap(memory, alignment, new_len, @returnAddress());
-    }
-
-    fn free(ctx: *anyopaque, memory: []u8, alignment: Alignment, ret_addr: usize) void {
-        @disableInstrumentation();
-        const fa: *FuzzAllocator = @ptrCast(@alignCast(ctx));
-        _ = ret_addr;
-        return fa.fba.threadSafeAllocator().rawFree(memory, alignment, @returnAddress());
-    }
-};</pre>
+    <pre><a id="L1"></a>//! This allocator takes an existing allocator, wraps it, and provides an interface where
+<a id="L2"></a>//! you can allocate and then free it all together. Calls to free an individual item only
+<a id="L3"></a>//! free the item if it was the most recent allocation, otherwise calls to free do
+<a id="L4"></a>//! nothing.
+<a id="L5"></a>//!
+<a id="L6"></a>//! The `Allocator` implementation provided is threadsafe, given that `child_allocator`
+<a id="L7"></a>//! is threadsafe as well.
+<a id="L8"></a>const ArenaAllocator = @This();
+<a id="L9"></a>
+<a id="L10"></a>child_allocator: Allocator,
+<a id="L11"></a>state: State,
+<a id="L12"></a>
+<a id="L13"></a>/// Inner state of ArenaAllocator. Can be stored rather than the entire ArenaAllocator
+<a id="L14"></a>/// as a memory-saving optimization.
+<a id="L15"></a>///
+<a id="L16"></a>/// Default initialization of this struct is deprecated; use `init` instead.
+<a id="L17"></a>pub const State = struct {
+<a id="L18"></a>    used_list: ?*Node = null,
+<a id="L19"></a>    free_list: ?*Node = null,
+<a id="L20"></a>
+<a id="L21"></a>    pub const init: State = .{
+<a id="L22"></a>        .used_list = null,
+<a id="L23"></a>        .free_list = null,
+<a id="L24"></a>    };
+<a id="L25"></a>
+<a id="L26"></a>    pub fn promote(state: State, child_allocator: Allocator) ArenaAllocator {
+<a id="L27"></a>        return .{
+<a id="L28"></a>            .child_allocator = child_allocator,
+<a id="L29"></a>            .state = state,
+<a id="L30"></a>        };
+<a id="L31"></a>    }
+<a id="L32"></a>};
+<a id="L33"></a>
+<a id="L34"></a>pub fn allocator(arena: *ArenaAllocator) Allocator {
+<a id="L35"></a>    return .{
+<a id="L36"></a>        .ptr = arena,
+<a id="L37"></a>        .vtable = &amp;.{
+<a id="L38"></a>            .alloc = alloc,
+<a id="L39"></a>            .resize = resize,
+<a id="L40"></a>            .remap = remap,
+<a id="L41"></a>            .free = free,
+<a id="L42"></a>        },
+<a id="L43"></a>    };
+<a id="L44"></a>}
+<a id="L45"></a>
+<a id="L46"></a>pub fn init(child_allocator: Allocator) ArenaAllocator {
+<a id="L47"></a>    return State.init.promote(child_allocator);
+<a id="L48"></a>}
+<a id="L49"></a>
+<a id="L50"></a>/// Not threadsafe.
+<a id="L51"></a>pub fn deinit(arena: ArenaAllocator) void {
+<a id="L52"></a>    // NOTE: When changing this, make sure `reset()` is adjusted accordingly!
+<a id="L53"></a>
+<a id="L54"></a>    for ([_]?*Node{ arena.state.used_list, arena.state.free_list }) |first_node| {
+<a id="L55"></a>        var it = first_node;
+<a id="L56"></a>        while (it) |node| {
+<a id="L57"></a>            // this has to occur before the free because the free frees node
+<a id="L58"></a>            it = node.next;
+<a id="L59"></a>            arena.child_allocator.rawFree(node.allocatedSliceUnsafe(), .of(Node), @returnAddress());
+<a id="L60"></a>        }
+<a id="L61"></a>    }
+<a id="L62"></a>}
+<a id="L63"></a>
+<a id="L64"></a>/// Queries the current memory use of this arena.
+<a id="L65"></a>/// This will **not** include the storage required for internal keeping.
+<a id="L66"></a>///
+<a id="L67"></a>/// Not threadsafe.
+<a id="L68"></a>pub fn queryCapacity(arena: ArenaAllocator) usize {
+<a id="L69"></a>    var capacity: usize = 0;
+<a id="L70"></a>    for ([_]?*Node{ arena.state.used_list, arena.state.free_list }) |first_node| {
+<a id="L71"></a>        capacity += countListCapacity(first_node);
+<a id="L72"></a>    }
+<a id="L73"></a>    return capacity;
+<a id="L74"></a>}
+<a id="L75"></a>fn countListCapacity(first_node: ?*Node) usize {
+<a id="L76"></a>    var capacity: usize = 0;
+<a id="L77"></a>    var it = first_node;
+<a id="L78"></a>    while (it) |node| : (it = node.next) {
+<a id="L79"></a>        // Compute the actually allocated size excluding the
+<a id="L80"></a>        // linked list node.
+<a id="L81"></a>        capacity += node.size.toInt() - @sizeOf(Node);
+<a id="L82"></a>    }
+<a id="L83"></a>    return capacity;
+<a id="L84"></a>}
+<a id="L85"></a>
+<a id="L86"></a>pub const ResetMode = union(enum) {
+<a id="L87"></a>    /// Releases all allocated memory in the arena.
+<a id="L88"></a>    free_all,
+<a id="L89"></a>    /// This will pre-heat the arena for future allocations by allocating a
+<a id="L90"></a>    /// large enough buffer for all previously done allocations.
+<a id="L91"></a>    /// Preheating will speed up the allocation process by invoking the backing allocator
+<a id="L92"></a>    /// less often than before. If `reset()` is used in a loop, this means that after the
+<a id="L93"></a>    /// biggest operation, no memory allocations are performed anymore.
+<a id="L94"></a>    retain_capacity,
+<a id="L95"></a>    /// This is the same as `retain_capacity`, but the memory will be shrunk to
+<a id="L96"></a>    /// this value if it exceeds the limit.
+<a id="L97"></a>    retain_with_limit: usize,
+<a id="L98"></a>};
+<a id="L99"></a>/// Resets the arena allocator and frees all allocated memory.
+<a id="L100"></a>///
+<a id="L101"></a>/// `mode` defines how the currently allocated memory is handled.
+<a id="L102"></a>/// See the variant documentation for `ResetMode` for the effects of each mode.
+<a id="L103"></a>///
+<a id="L104"></a>/// The function will return whether the reset operation was successful or not.
+<a id="L105"></a>/// If the reallocation  failed `false` is returned. The arena will still be fully
+<a id="L106"></a>/// functional in that case, all memory is released. Future allocations just might
+<a id="L107"></a>/// be slower.
+<a id="L108"></a>///
+<a id="L109"></a>/// Not threadsafe.
+<a id="L110"></a>///
+<a id="L111"></a>/// NOTE: If `mode` is `free_all`, the function will always return `true`.
+<a id="L112"></a>pub fn reset(arena: *ArenaAllocator, mode: ResetMode) bool {
+<a id="L113"></a>    // Some words on the implementation:
+<a id="L114"></a>    // The reset function can be implemented with two basic approaches:
+<a id="L115"></a>    // - Counting how much bytes were allocated since the last reset, and storing that
+<a id="L116"></a>    //   information in State. This will make reset fast and alloc only a teeny tiny bit
+<a id="L117"></a>    //   slower.
+<a id="L118"></a>    // - Counting how much bytes were allocated by iterating the chunk linked list. This
+<a id="L119"></a>    //   will make reset slower, but alloc() keeps the same speed when reset() as if reset()
+<a id="L120"></a>    //   would not exist.
+<a id="L121"></a>    //
+<a id="L122"></a>    // The second variant was chosen for implementation, as with more and more calls to reset(),
+<a id="L123"></a>    // the function will get faster and faster. At one point, the complexity of the function
+<a id="L124"></a>    // will drop to amortized O(1), as we're only ever having a single chunk that will not be
+<a id="L125"></a>    // reallocated, and we're not even touching the backing allocator anymore.
+<a id="L126"></a>    //
+<a id="L127"></a>    // Thus, only the first hand full of calls to reset() will actually need to iterate the linked
+<a id="L128"></a>    // list, all future calls are just taking the first node, and only resetting the `end_index`
+<a id="L129"></a>    // value.
+<a id="L130"></a>
+<a id="L131"></a>    const limit: ?usize = switch (mode) {
+<a id="L132"></a>        .retain_capacity =&gt; null,
+<a id="L133"></a>        .retain_with_limit =&gt; |limit| limit,
+<a id="L134"></a>        .free_all =&gt; 0,
+<a id="L135"></a>    };
+<a id="L136"></a>    if (limit == 0) {
+<a id="L137"></a>        // just reset when we don't have anything to reallocate
+<a id="L138"></a>        arena.deinit();
+<a id="L139"></a>        arena.state = .init;
+<a id="L140"></a>        return true;
+<a id="L141"></a>    }
+<a id="L142"></a>
+<a id="L143"></a>    const used_capacity = countListCapacity(arena.state.used_list);
+<a id="L144"></a>    const free_capacity = countListCapacity(arena.state.free_list);
+<a id="L145"></a>
+<a id="L146"></a>    const new_used_capacity = if (limit) |lim| @min(lim, used_capacity) else used_capacity;
+<a id="L147"></a>    const new_free_capacity = if (limit) |lim| @min(lim - new_used_capacity, free_capacity) else free_capacity;
+<a id="L148"></a>
+<a id="L149"></a>    var ok = true;
+<a id="L150"></a>
+<a id="L151"></a>    for (
+<a id="L152"></a>        [_]*?*Node{ &amp;arena.state.used_list, &amp;arena.state.free_list },
+<a id="L153"></a>        [_]usize{ new_used_capacity, new_free_capacity },
+<a id="L154"></a>    ) |first_node_ptr, new_capacity| {
+<a id="L155"></a>        // Free all nodes except for the last one
+<a id="L156"></a>        var it = first_node_ptr.*;
+<a id="L157"></a>        const node: *Node = while (it) |node| {
+<a id="L158"></a>            // this has to occur before the free because the free frees node
+<a id="L159"></a>            it = node.next;
+<a id="L160"></a>            if (it == null) break node;
+<a id="L161"></a>            arena.child_allocator.rawFree(node.allocatedSliceUnsafe(), .of(Node), @returnAddress());
+<a id="L162"></a>        } else {
+<a id="L163"></a>            continue;
+<a id="L164"></a>        };
+<a id="L165"></a>        const allocated_slice = node.allocatedSliceUnsafe();
+<a id="L166"></a>
+<a id="L167"></a>        // Align backwards to always stay below limit.
+<a id="L168"></a>        const new_size = mem.alignBackward(usize, @sizeOf(Node) + new_capacity, 2);
+<a id="L169"></a>
+<a id="L170"></a>        if (new_size == @sizeOf(Node)) {
+<a id="L171"></a>            arena.child_allocator.rawFree(allocated_slice, .of(Node), @returnAddress());
+<a id="L172"></a>            first_node_ptr.* = null;
+<a id="L173"></a>            continue;
+<a id="L174"></a>        }
+<a id="L175"></a>
+<a id="L176"></a>        node.end_index = 0;
+<a id="L177"></a>        first_node_ptr.* = node;
+<a id="L178"></a>
+<a id="L179"></a>        if (allocated_slice.len == new_size) {
+<a id="L180"></a>            // perfect, no need to invoke the child_allocator
+<a id="L181"></a>            continue;
+<a id="L182"></a>        }
+<a id="L183"></a>
+<a id="L184"></a>        if (arena.child_allocator.rawResize(allocated_slice, .of(Node), new_size, @returnAddress())) {
+<a id="L185"></a>            // successful resize
+<a id="L186"></a>            node.size = .fromInt(new_size);
+<a id="L187"></a>        } else {
+<a id="L188"></a>            // manual realloc
+<a id="L189"></a>            const new_ptr = arena.child_allocator.rawAlloc(new_size, .of(Node), @returnAddress()) orelse {
+<a id="L190"></a>                // we failed to preheat the arena properly, signal this to the user.
+<a id="L191"></a>                ok = false;
+<a id="L192"></a>                continue;
+<a id="L193"></a>            };
+<a id="L194"></a>            arena.child_allocator.rawFree(allocated_slice, .of(Node), @returnAddress());
+<a id="L195"></a>            const new_first_node: *Node = @ptrCast(@alignCast(new_ptr));
+<a id="L196"></a>            new_first_node.* = .{
+<a id="L197"></a>                .size = .fromInt(new_size),
+<a id="L198"></a>                .end_index = 0,
+<a id="L199"></a>                .next = null,
+<a id="L200"></a>            };
+<a id="L201"></a>            first_node_ptr.* = new_first_node;
+<a id="L202"></a>        }
+<a id="L203"></a>    }
+<a id="L204"></a>
+<a id="L205"></a>    return ok;
+<a id="L206"></a>}
+<a id="L207"></a>
+<a id="L208"></a>/// Concurrent accesses to node pointers generally have to have acquire/release
+<a id="L209"></a>/// semantics to guarantee that newly allocated notes are in a valid state when
+<a id="L210"></a>/// being inserted into a list. Exceptions are possible, e.g. a cmpxchg loop that
+<a id="L211"></a>/// never accesses the node returned on failure can use monotonic semantics on
+<a id="L212"></a>/// failure, but must still use release semantics on success to protect the node
+<a id="L213"></a>/// it's trying to push.
+<a id="L214"></a>const Node = struct {
+<a id="L215"></a>    /// Only meant to be accessed indirectly via the methods supplied by this type,
+<a id="L216"></a>    /// except if the node is owned by the thread accessing it.
+<a id="L217"></a>    /// Must always be an even number to accommodate `resize` bit.
+<a id="L218"></a>    size: Size,
+<a id="L219"></a>    /// Any increase of `end_index` has to use acquire semantics;
+<a id="L220"></a>    /// any decrease of `end_index` that invalidates (formerly) active allocations
+<a id="L221"></a>    /// has to use release semantics.
+<a id="L222"></a>    /// This guarantees that all accesses to memory that's about to be freed
+<a id="L223"></a>    /// happen-before the free is published.
+<a id="L224"></a>    /// Since `size` can only grow and never shrink, memory access depending on
+<a id="L225"></a>    /// any `end_index` &lt;= any `size` can never be OOB.
+<a id="L226"></a>    end_index: usize,
+<a id="L227"></a>    /// This field should only be accessed if the node is owned by the thread
+<a id="L228"></a>    /// accessing it.
+<a id="L229"></a>    next: ?*Node,
+<a id="L230"></a>
+<a id="L231"></a>    const Size = packed struct(usize) {
+<a id="L232"></a>        resizing: bool,
+<a id="L233"></a>        _: @Int(.unsigned, @bitSizeOf(usize) - 1) = 0,
+<a id="L234"></a>
+<a id="L235"></a>        fn fromInt(int: usize) Size {
+<a id="L236"></a>            assert(int &gt;= @sizeOf(Node));
+<a id="L237"></a>            const size: Size = @bitCast(int);
+<a id="L238"></a>            assert(!size.resizing);
+<a id="L239"></a>            return size;
+<a id="L240"></a>        }
+<a id="L241"></a>
+<a id="L242"></a>        fn toInt(size: Size) usize {
+<a id="L243"></a>            var int = size;
+<a id="L244"></a>            int.resizing = false;
+<a id="L245"></a>            return @bitCast(int);
+<a id="L246"></a>        }
+<a id="L247"></a>
+<a id="L248"></a>        comptime {
+<a id="L249"></a>            assert(Size{ .resizing = true } == @as(Size, @bitCast(@as(usize, 1))));
+<a id="L250"></a>        }
+<a id="L251"></a>    };
+<a id="L252"></a>
+<a id="L253"></a>    fn loadBuf(node: *Node) []u8 {
+<a id="L254"></a>        // `size` can only ever grow, so the buffer returned by this function is
+<a id="L255"></a>        // always valid memory.
+<a id="L256"></a>        const size = @atomicLoad(Size, &amp;node.size, .monotonic);
+<a id="L257"></a>        return @as([*]u8, @ptrCast(node))[0..size.toInt()][@sizeOf(Node)..];
+<a id="L258"></a>    }
+<a id="L259"></a>
+<a id="L260"></a>    /// Returns allocated slice or `null` if node is already (being) resized.
+<a id="L261"></a>    fn beginResize(node: *Node) ?[]u8 {
+<a id="L262"></a>        const size = @atomicRmw(Size, &amp;node.size, .Or, .{ .resizing = true }, .acquire); // syncs with release in `endResize`
+<a id="L263"></a>        if (size.resizing) return null;
+<a id="L264"></a>        return @as([*]u8, @ptrCast(node))[0..size.toInt()];
+<a id="L265"></a>    }
+<a id="L266"></a>
+<a id="L267"></a>    fn endResize(node: *Node, size: usize, prev_size: usize) void {
+<a id="L268"></a>        assert(size &gt;= prev_size); // nodes must not shrink
+<a id="L269"></a>        assert(@atomicLoad(Size, &amp;node.size, .unordered).toInt() == prev_size);
+<a id="L270"></a>        return @atomicStore(Size, &amp;node.size, .fromInt(size), .release); // syncs with acquire in `beginResize`
+<a id="L271"></a>    }
+<a id="L272"></a>
+<a id="L273"></a>    /// Not threadsafe.
+<a id="L274"></a>    fn allocatedSliceUnsafe(node: *Node) []u8 {
+<a id="L275"></a>        return @as([*]u8, @ptrCast(node))[0..node.size.toInt()];
+<a id="L276"></a>    }
+<a id="L277"></a>};
+<a id="L278"></a>
+<a id="L279"></a>fn loadFirstNode(arena: *ArenaAllocator) ?*Node {
+<a id="L280"></a>    return @atomicLoad(?*Node, &amp;arena.state.used_list, .acquire); // syncs with release in successful `tryPushNode`
+<a id="L281"></a>}
+<a id="L282"></a>
+<a id="L283"></a>const PushResult = union(enum) {
+<a id="L284"></a>    success,
+<a id="L285"></a>    failure: ?*Node,
+<a id="L286"></a>};
+<a id="L287"></a>fn tryPushNode(arena: *ArenaAllocator, node: *Node) PushResult {
+<a id="L288"></a>    assert(node != node.next);
+<a id="L289"></a>    if (@cmpxchgStrong( // strong because retrying means discarding a fitting node -&gt; expensive
+<a id="L290"></a>        ?*Node,
+<a id="L291"></a>        &amp;arena.state.used_list,
+<a id="L292"></a>        node.next,
+<a id="L293"></a>        node,
+<a id="L294"></a>        .release, // syncs with acquire in failure path or `loadFirstNode`
+<a id="L295"></a>        .acquire, // syncs with release in success path
+<a id="L296"></a>    )) |old_node| {
+<a id="L297"></a>        return .{ .failure = old_node };
+<a id="L298"></a>    } else {
+<a id="L299"></a>        return .success;
+<a id="L300"></a>    }
+<a id="L301"></a>}
+<a id="L302"></a>
+<a id="L303"></a>fn stealFreeList(arena: *ArenaAllocator) ?*Node {
+<a id="L304"></a>    // We don't need acq_rel here because we're always swapping in `null`, so
+<a id="L305"></a>    // there's no node we'd need to release.
+<a id="L306"></a>    return @atomicRmw(?*Node, &amp;arena.state.free_list, .Xchg, null, .acquire); // syncs with release in `pushFreeList`
+<a id="L307"></a>}
+<a id="L308"></a>
+<a id="L309"></a>fn pushFreeList(arena: *ArenaAllocator, first: *Node, last: *Node) void {
+<a id="L310"></a>    assert(first != last.next);
+<a id="L311"></a>    assert(first != first.next);
+<a id="L312"></a>    assert(last != last.next);
+<a id="L313"></a>    while (@cmpxchgWeak(
+<a id="L314"></a>        ?*Node,
+<a id="L315"></a>        &amp;arena.state.free_list,
+<a id="L316"></a>        last.next,
+<a id="L317"></a>        first,
+<a id="L318"></a>        .release, // syncs with acquire in `stealFreeList`
+<a id="L319"></a>        .monotonic, // we never access any fields of `old_free_list`, we only care about the pointer
+<a id="L320"></a>    )) |old_free_list| {
+<a id="L321"></a>        last.next = old_free_list;
+<a id="L322"></a>    }
+<a id="L323"></a>}
+<a id="L324"></a>
+<a id="L325"></a>fn alignedIndex(buf_ptr: [*]u8, end_index: usize, alignment: Alignment) usize {
+<a id="L326"></a>    // Wrapping arithmetic to avoid overflows since `end_index` isn't bounded by
+<a id="L327"></a>    // `size`. This is always ok since the max alignment in byte units is also
+<a id="L328"></a>    // the max value of `usize` so wrapped values are correctly aligned anyway.
+<a id="L329"></a>    return alignment.forward(@intFromPtr(buf_ptr) +% end_index) -% @intFromPtr(buf_ptr);
+<a id="L330"></a>}
+<a id="L331"></a>
+<a id="L332"></a>fn alloc(ctx: *anyopaque, n: usize, alignment: Alignment, ret_addr: usize) ?[*]u8 {
+<a id="L333"></a>    const arena: *ArenaAllocator = @ptrCast(@alignCast(ctx));
+<a id="L334"></a>    _ = ret_addr;
+<a id="L335"></a>
+<a id="L336"></a>    assert(n &gt; 0);
+<a id="L337"></a>
+<a id="L338"></a>    var cur_first_node = arena.loadFirstNode();
+<a id="L339"></a>
+<a id="L340"></a>    var cur_new_node: ?*Node = null;
+<a id="L341"></a>    defer if (cur_new_node) |node| {
+<a id="L342"></a>        node.next = null; // optimize for empty free list
+<a id="L343"></a>        arena.pushFreeList(node, node);
+<a id="L344"></a>    };
+<a id="L345"></a>
+<a id="L346"></a>    retry: while (true) {
+<a id="L347"></a>        const first_node: ?*Node, const prev_size: usize = first_node: {
+<a id="L348"></a>            const node = cur_first_node orelse break :first_node .{ null, 0 };
+<a id="L349"></a>            const buf = node.loadBuf();
+<a id="L350"></a>
+<a id="L351"></a>            // To avoid using a CAS loop in the hot path we atomically increase
+<a id="L352"></a>            // `end_index` by a large enough amount to be able to always provide
+<a id="L353"></a>            // the required alignment within the reserved memory. To recover the
+<a id="L354"></a>            // space this potentially wastes we try to subtract the 'overshoot'
+<a id="L355"></a>            // with a single cmpxchg afterwards, which may fail.
+<a id="L356"></a>
+<a id="L357"></a>            const alignable = n + alignment.toByteUnits() - 1;
+<a id="L358"></a>            const end_index = @atomicRmw(usize, &amp;node.end_index, .Add, alignable, .acquire); // acquire any memory that may have been freed
+<a id="L359"></a>            const aligned_index = alignedIndex(buf.ptr, end_index, alignment);
+<a id="L360"></a>            assert(end_index + alignable &gt;= aligned_index + n);
+<a id="L361"></a>            if (end_index + alignable != aligned_index + n) {
+<a id="L362"></a>                _ = @cmpxchgStrong(
+<a id="L363"></a>                    usize,
+<a id="L364"></a>                    &amp;node.end_index,
+<a id="L365"></a>                    end_index + alignable,
+<a id="L366"></a>                    aligned_index + n,
+<a id="L367"></a>                    .monotonic, // no need to release alignment padding; there's no one accessing it!
+<a id="L368"></a>                    .monotonic,
+<a id="L369"></a>                );
+<a id="L370"></a>            }
+<a id="L371"></a>
+<a id="L372"></a>            if (aligned_index + n &gt; buf.len) break :first_node .{ node, buf.len };
+<a id="L373"></a>            return buf[aligned_index..][0..n].ptr;
+<a id="L374"></a>        };
+<a id="L375"></a>
+<a id="L376"></a>        resize: {
+<a id="L377"></a>            // Before attempting to get our hands on a new node, we try to resize
+<a id="L378"></a>            // the one we're currently holding. This is an exclusive operation;
+<a id="L379"></a>            // if another thread is already in this section we can never resize.
+<a id="L380"></a>
+<a id="L381"></a>            const node = first_node orelse break :resize;
+<a id="L382"></a>            const allocated_slice = node.beginResize() orelse break :resize;
+<a id="L383"></a>            var size = allocated_slice.len;
+<a id="L384"></a>            defer node.endResize(size, allocated_slice.len);
+<a id="L385"></a>
+<a id="L386"></a>            const buf = allocated_slice[@sizeOf(Node)..];
+<a id="L387"></a>            const end_index = @atomicLoad(usize, &amp;node.end_index, .monotonic);
+<a id="L388"></a>            const aligned_index = alignedIndex(buf.ptr, end_index, alignment);
+<a id="L389"></a>            const new_size = mem.alignForward(usize, @sizeOf(Node) + aligned_index + n, 2);
+<a id="L390"></a>
+<a id="L391"></a>            if (new_size &lt;= allocated_slice.len) {
+<a id="L392"></a>                // A `resize` or `free` call managed to sneak in and we need to
+<a id="L393"></a>                // guarantee that `size` is only ever increased; retry!
+<a id="L394"></a>                continue :retry;
+<a id="L395"></a>            }
+<a id="L396"></a>
+<a id="L397"></a>            if (arena.child_allocator.rawResize(allocated_slice, .of(Node), new_size, @returnAddress())) {
+<a id="L398"></a>                size = new_size;
+<a id="L399"></a>
+<a id="L400"></a>                // strong because a spurious failure could result in suboptimal
+<a id="L401"></a>                // usage of this node
+<a id="L402"></a>                if (null == @cmpxchgStrong(
+<a id="L403"></a>                    usize,
+<a id="L404"></a>                    &amp;node.end_index,
+<a id="L405"></a>                    end_index,
+<a id="L406"></a>                    aligned_index + n,
+<a id="L407"></a>                    .acquire, // acquire any memory that may have been freed
+<a id="L408"></a>                    .monotonic,
+<a id="L409"></a>                )) {
+<a id="L410"></a>                    const new_buf = allocated_slice.ptr[0..new_size][@sizeOf(Node)..];
+<a id="L411"></a>                    return new_buf[aligned_index..][0..n].ptr;
+<a id="L412"></a>                }
+<a id="L413"></a>            }
+<a id="L414"></a>        }
+<a id="L415"></a>
+<a id="L416"></a>        // We need a new node! First, we search `free_list` for one that's big
+<a id="L417"></a>        // enough, if we don't find one there we fall back to allocating a new
+<a id="L418"></a>        // node with `child_allocator` (if we haven't already done that!).
+<a id="L419"></a>
+<a id="L420"></a>        from_free_list: {
+<a id="L421"></a>            // We 'steal' the entire free list to operate on it without other
+<a id="L422"></a>            // threads getting up into our business.
+<a id="L423"></a>            // This is a rather pragmatic approach, but since the free list isn't
+<a id="L424"></a>            // used very frequently it's fine performance-wise, even under load.
+<a id="L425"></a>            // Also this avoids the ABA problem; stealing the list with an atomic
+<a id="L426"></a>            // swap doesn't introduce any potentially stale `next` pointers.
+<a id="L427"></a>
+<a id="L428"></a>            const free_list = arena.stealFreeList() orelse break :from_free_list;
+<a id="L429"></a>
+<a id="L430"></a>            const first_free: *Node, const last_free: *Node, const node: *Node, const prev: ?*Node = find: {
+<a id="L431"></a>                var best_fit_prev: ?*Node = null;
+<a id="L432"></a>                var best_fit: ?*Node = null;
+<a id="L433"></a>                var best_fit_diff: usize = std.math.maxInt(usize);
+<a id="L434"></a>
+<a id="L435"></a>                var it_prev: ?*Node = null;
+<a id="L436"></a>                var it: ?*Node = free_list;
+<a id="L437"></a>                while (it) |node| : ({
+<a id="L438"></a>                    it_prev = node;
+<a id="L439"></a>                    it = node.next;
+<a id="L440"></a>                }) {
+<a id="L441"></a>                    assert(!node.size.resizing);
+<a id="L442"></a>                    const buf = node.allocatedSliceUnsafe()[@sizeOf(Node)..];
+<a id="L443"></a>                    const aligned_index = alignedIndex(buf.ptr, 0, alignment);
+<a id="L444"></a>
+<a id="L445"></a>                    const diff = aligned_index + n -| buf.len;
+<a id="L446"></a>                    if (diff &lt; best_fit_diff) {
+<a id="L447"></a>                        best_fit_prev = it_prev;
+<a id="L448"></a>                        best_fit = node;
+<a id="L449"></a>                        best_fit_diff = diff;
+<a id="L450"></a>                    }
+<a id="L451"></a>                }
+<a id="L452"></a>
+<a id="L453"></a>                break :find .{ free_list, it_prev.?, best_fit.?, best_fit_prev };
+<a id="L454"></a>            };
+<a id="L455"></a>
+<a id="L456"></a>            const aligned_index, const need_resize = aligned_index: {
+<a id="L457"></a>                const buf = node.allocatedSliceUnsafe()[@sizeOf(Node)..];
+<a id="L458"></a>                const aligned_index = alignedIndex(buf.ptr, 0, alignment);
+<a id="L459"></a>                break :aligned_index .{ aligned_index, aligned_index + n &gt; buf.len };
+<a id="L460"></a>            };
+<a id="L461"></a>
+<a id="L462"></a>            if (need_resize) {
+<a id="L463"></a>                // Ideally we want to use all nodes in `free_list` eventually,
+<a id="L464"></a>                // so even if none fit we'll try to resize the one that was the
+<a id="L465"></a>                // closest to being large enough.
+<a id="L466"></a>                const new_size = mem.alignForward(usize, @sizeOf(Node) + aligned_index + n, 2);
+<a id="L467"></a>                if (arena.child_allocator.rawResize(node.allocatedSliceUnsafe(), .of(Node), new_size, @returnAddress())) {
+<a id="L468"></a>                    node.size = .fromInt(new_size);
+<a id="L469"></a>                } else {
+<a id="L470"></a>                    arena.pushFreeList(first_free, last_free);
+<a id="L471"></a>                    break :from_free_list; // we couldn't find a fitting free node
+<a id="L472"></a>                }
+<a id="L473"></a>            }
+<a id="L474"></a>
+<a id="L475"></a>            const buf = node.allocatedSliceUnsafe()[@sizeOf(Node)..];
+<a id="L476"></a>            const old_next = node.next;
+<a id="L477"></a>
+<a id="L478"></a>            node.end_index = aligned_index + n;
+<a id="L479"></a>            node.next = first_node;
+<a id="L480"></a>
+<a id="L481"></a>            switch (arena.tryPushNode(node)) {
+<a id="L482"></a>                .success =&gt; {
+<a id="L483"></a>                    // Finish removing node from free list.
+<a id="L484"></a>                    if (prev) |p| p.next = old_next;
+<a id="L485"></a>
+<a id="L486"></a>                    // Push remaining stolen free list back onto `arena.state.free_list`.
+<a id="L487"></a>                    const new_first_free = if (node == first_free) old_next else first_free;
+<a id="L488"></a>                    const new_last_free = if (node == last_free) prev else last_free;
+<a id="L489"></a>                    if (new_first_free) |first| {
+<a id="L490"></a>                        const last = new_last_free.?;
+<a id="L491"></a>                        arena.pushFreeList(first, last);
+<a id="L492"></a>                    }
+<a id="L493"></a>
+<a id="L494"></a>                    return buf[aligned_index..][0..n].ptr;
+<a id="L495"></a>                },
+<a id="L496"></a>                .failure =&gt; |old_first_node| {
+<a id="L497"></a>                    // restore free list to as we found it
+<a id="L498"></a>                    node.next = old_next;
+<a id="L499"></a>                    arena.pushFreeList(first_free, last_free);
+<a id="L500"></a>
+<a id="L501"></a>                    cur_first_node = old_first_node;
+<a id="L502"></a>                    continue :retry; // there's a new first node; retry!
+<a id="L503"></a>                },
+<a id="L504"></a>            }
+<a id="L505"></a>        }
+<a id="L506"></a>
+<a id="L507"></a>        const new_node: *Node = new_node: {
+<a id="L508"></a>            if (cur_new_node) |new_node| {
+<a id="L509"></a>                break :new_node new_node;
+<a id="L510"></a>            } else {
+<a id="L511"></a>                @branchHint(.cold);
+<a id="L512"></a>            }
+<a id="L513"></a>
+<a id="L514"></a>            const size: Node.Size = size: {
+<a id="L515"></a>                const min_size = @sizeOf(Node) + alignment.toByteUnits() + n;
+<a id="L516"></a>                const big_enough_size = prev_size + min_size + 16;
+<a id="L517"></a>                const size = mem.alignForward(usize, big_enough_size + big_enough_size / 2, 2);
+<a id="L518"></a>                break :size .fromInt(size);
+<a id="L519"></a>            };
+<a id="L520"></a>            const ptr = arena.child_allocator.rawAlloc(size.toInt(), .of(Node), @returnAddress()) orelse
+<a id="L521"></a>                return null;
+<a id="L522"></a>            const new_node: *Node = @ptrCast(@alignCast(ptr));
+<a id="L523"></a>            new_node.* = .{
+<a id="L524"></a>                .size = size,
+<a id="L525"></a>                .end_index = undefined, // set below
+<a id="L526"></a>                .next = undefined, // set below
+<a id="L527"></a>            };
+<a id="L528"></a>            cur_new_node = new_node;
+<a id="L529"></a>            break :new_node new_node;
+<a id="L530"></a>        };
+<a id="L531"></a>
+<a id="L532"></a>        const buf = new_node.allocatedSliceUnsafe()[@sizeOf(Node)..];
+<a id="L533"></a>        const aligned_index = alignedIndex(buf.ptr, 0, alignment);
+<a id="L534"></a>        assert(new_node.size.toInt() &gt;= @sizeOf(Node) + aligned_index + n);
+<a id="L535"></a>
+<a id="L536"></a>        new_node.end_index = aligned_index + n;
+<a id="L537"></a>        new_node.next = first_node;
+<a id="L538"></a>
+<a id="L539"></a>        switch (arena.tryPushNode(new_node)) {
+<a id="L540"></a>            .success =&gt; {
+<a id="L541"></a>                cur_new_node = null;
+<a id="L542"></a>                return buf[aligned_index..][0..n].ptr;
+<a id="L543"></a>            },
+<a id="L544"></a>            .failure =&gt; |old_first_node| {
+<a id="L545"></a>                cur_first_node = old_first_node;
+<a id="L546"></a>            },
+<a id="L547"></a>        }
+<a id="L548"></a>    }
+<a id="L549"></a>}
+<a id="L550"></a>
+<a id="L551"></a>fn resize(ctx: *anyopaque, memory: []u8, alignment: Alignment, new_len: usize, ret_addr: usize) bool {
+<a id="L552"></a>    const arena: *ArenaAllocator = @ptrCast(@alignCast(ctx));
+<a id="L553"></a>    _ = alignment;
+<a id="L554"></a>    _ = ret_addr;
+<a id="L555"></a>
+<a id="L556"></a>    assert(memory.len &gt; 0);
+<a id="L557"></a>    assert(new_len &gt; 0);
+<a id="L558"></a>
+<a id="L559"></a>    const node = arena.loadFirstNode().?;
+<a id="L560"></a>    const buf_ptr = @as([*]u8, @ptrCast(node)) + @sizeOf(Node);
+<a id="L561"></a>
+<a id="L562"></a>    const cur_end_index = @atomicLoad(usize, &amp;node.end_index, .monotonic);
+<a id="L563"></a>
+<a id="L564"></a>    if (buf_ptr + cur_end_index != memory.ptr + memory.len) {
+<a id="L565"></a>        // It's not the most recent allocation, so it cannot be expanded,
+<a id="L566"></a>        // but it's fine if they want to make it smaller.
+<a id="L567"></a>        return new_len &lt;= memory.len;
+<a id="L568"></a>    }
+<a id="L569"></a>
+<a id="L570"></a>    if (new_len &lt;= memory.len) {
+<a id="L571"></a>        const new_end_index = cur_end_index - (memory.len - new_len);
+<a id="L572"></a>        assert(buf_ptr + new_end_index == memory.ptr + new_len);
+<a id="L573"></a>
+<a id="L574"></a>        _ = @cmpxchgStrong(
+<a id="L575"></a>            usize,
+<a id="L576"></a>            &amp;node.end_index,
+<a id="L577"></a>            cur_end_index,
+<a id="L578"></a>            new_end_index,
+<a id="L579"></a>            .release, // release freed memory
+<a id="L580"></a>            .monotonic,
+<a id="L581"></a>        );
+<a id="L582"></a>        return true; // Shrinking allocations should always succeed.
+<a id="L583"></a>    }
+<a id="L584"></a>
+<a id="L585"></a>    // Saturating arithmetic because `end_index` is not guaranteed to be `&lt;= size`.
+<a id="L586"></a>    // The allocation we're trying to resize *could* belong to a different node!
+<a id="L587"></a>    if (node.loadBuf().len -| cur_end_index &gt;= new_len - memory.len) {
+<a id="L588"></a>        const new_end_index = cur_end_index + (new_len - memory.len);
+<a id="L589"></a>        assert(buf_ptr + new_end_index == memory.ptr + new_len);
+<a id="L590"></a>
+<a id="L591"></a>        return null == @cmpxchgStrong(
+<a id="L592"></a>            usize,
+<a id="L593"></a>            &amp;node.end_index,
+<a id="L594"></a>            cur_end_index,
+<a id="L595"></a>            new_end_index,
+<a id="L596"></a>            .acquire, // acquire any memory that may have been freed
+<a id="L597"></a>            .monotonic,
+<a id="L598"></a>        );
+<a id="L599"></a>    }
+<a id="L600"></a>
+<a id="L601"></a>    return false;
+<a id="L602"></a>}
+<a id="L603"></a>
+<a id="L604"></a>fn remap(ctx: *anyopaque, memory: []u8, alignment: Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+<a id="L605"></a>    return if (resize(ctx, memory, alignment, new_len, ret_addr)) memory.ptr else null;
+<a id="L606"></a>}
+<a id="L607"></a>
+<a id="L608"></a>fn free(ctx: *anyopaque, memory: []u8, alignment: Alignment, ret_addr: usize) void {
+<a id="L609"></a>    const arena: *ArenaAllocator = @ptrCast(@alignCast(ctx));
+<a id="L610"></a>    _ = alignment;
+<a id="L611"></a>    _ = ret_addr;
+<a id="L612"></a>
+<a id="L613"></a>    assert(memory.len &gt; 0);
+<a id="L614"></a>
+<a id="L615"></a>    const node = arena.loadFirstNode().?;
+<a id="L616"></a>    const buf_ptr = @as([*]u8, @ptrCast(node)) + @sizeOf(Node);
+<a id="L617"></a>
+<a id="L618"></a>    const cur_end_index = @atomicLoad(usize, &amp;node.end_index, .monotonic);
+<a id="L619"></a>
+<a id="L620"></a>    if (buf_ptr + cur_end_index != memory.ptr + memory.len) {
+<a id="L621"></a>        // Not the most recent allocation; we cannot free it.
+<a id="L622"></a>        return;
+<a id="L623"></a>    }
+<a id="L624"></a>
+<a id="L625"></a>    const new_end_index = cur_end_index - memory.len;
+<a id="L626"></a>    assert(buf_ptr + new_end_index == memory.ptr);
+<a id="L627"></a>
+<a id="L628"></a>    _ = @cmpxchgStrong(
+<a id="L629"></a>        usize,
+<a id="L630"></a>        &amp;node.end_index,
+<a id="L631"></a>        cur_end_index,
+<a id="L632"></a>        new_end_index,
+<a id="L633"></a>        .release, // release freed memory
+<a id="L634"></a>        .monotonic,
+<a id="L635"></a>    );
+<a id="L636"></a>}
+<a id="L637"></a>
+<a id="L638"></a>const std = @import("std");
+<a id="L639"></a>const assert = std.debug.assert;
+<a id="L640"></a>const mem = std.mem;
+<a id="L641"></a>const Allocator = std.mem.Allocator;
+<a id="L642"></a>const Alignment = std.mem.Alignment;
+<a id="L643"></a>
+<a id="L644"></a>test "reset with preheating" {
+<a id="L645"></a>    var arena_allocator = ArenaAllocator.init(std.testing.allocator);
+<a id="L646"></a>    defer arena_allocator.deinit();
+<a id="L647"></a>    // provides some variance in the allocated data
+<a id="L648"></a>    var rng_src = std.Random.DefaultPrng.init(std.testing.random_seed);
+<a id="L649"></a>    const random = rng_src.random();
+<a id="L650"></a>    var rounds: usize = 25;
+<a id="L651"></a>    while (rounds &gt; 0) {
+<a id="L652"></a>        rounds -= 1;
+<a id="L653"></a>        _ = arena_allocator.reset(.retain_capacity);
+<a id="L654"></a>        var alloced_bytes: usize = 0;
+<a id="L655"></a>        const total_size: usize = random.intRangeAtMost(usize, 256, 16384);
+<a id="L656"></a>        while (alloced_bytes &lt; total_size) {
+<a id="L657"></a>            const size = random.intRangeAtMost(usize, 16, 256);
+<a id="L658"></a>            const alignment: Alignment = .@"32";
+<a id="L659"></a>            const slice = try arena_allocator.allocator().alignedAlloc(u8, alignment, size);
+<a id="L660"></a>            try std.testing.expect(alignment.check(@intFromPtr(slice.ptr)));
+<a id="L661"></a>            try std.testing.expectEqual(size, slice.len);
+<a id="L662"></a>            alloced_bytes += slice.len;
+<a id="L663"></a>        }
+<a id="L664"></a>    }
+<a id="L665"></a>}
+<a id="L666"></a>
+<a id="L667"></a>test "reset while retaining a buffer" {
+<a id="L668"></a>    var arena_allocator = ArenaAllocator.init(std.testing.allocator);
+<a id="L669"></a>    defer arena_allocator.deinit();
+<a id="L670"></a>    const a = arena_allocator.allocator();
+<a id="L671"></a>
+<a id="L672"></a>    // Create two internal buffers
+<a id="L673"></a>    _ = try a.alloc(u8, 1);
+<a id="L674"></a>    _ = try a.alloc(u8, 1000);
+<a id="L675"></a>
+<a id="L676"></a>    try std.testing.expect(arena_allocator.state.used_list != null);
+<a id="L677"></a>
+<a id="L678"></a>    // Check that we have at least two buffers
+<a id="L679"></a>    try std.testing.expect(arena_allocator.state.used_list.?.next != null);
+<a id="L680"></a>
+<a id="L681"></a>    // This retains the first allocated buffer
+<a id="L682"></a>    try std.testing.expect(arena_allocator.reset(.{ .retain_with_limit = 2 }));
+<a id="L683"></a>    try std.testing.expect(arena_allocator.state.used_list.?.next == null);
+<a id="L684"></a>    try std.testing.expectEqual(2, arena_allocator.queryCapacity());
+<a id="L685"></a>}
+<a id="L686"></a>
+<a id="L687"></a>test "fuzz multi threaded" {
+<a id="L688"></a>    @disableInstrumentation();
+<a id="L689"></a>    if (@import("builtin").single_threaded) return error.SkipZigTest;
+<a id="L690"></a>
+<a id="L691"></a>    const gpa = std.heap.smp_allocator;
+<a id="L692"></a>
+<a id="L693"></a>    var io_instance: std.Io.Threaded = .init(gpa, .{});
+<a id="L694"></a>    defer io_instance.deinit();
+<a id="L695"></a>
+<a id="L696"></a>    var arena_state: ArenaAllocator.State = .init;
+<a id="L697"></a>    // No need to deinit arena_state, all allocations are in `sample_buffer`!
+<a id="L698"></a>
+<a id="L699"></a>    const buffer_size = FuzzContext.max_alloc_count * FuzzContext.max_alloc_size;
+<a id="L700"></a>
+<a id="L701"></a>    const control_buffer = try gpa.alloc(u8, buffer_size);
+<a id="L702"></a>    defer gpa.free(control_buffer);
+<a id="L703"></a>    var control_instance: std.heap.FixedBufferAllocator = .init(control_buffer);
+<a id="L704"></a>
+<a id="L705"></a>    const sample_buffer = try gpa.alloc(u8, buffer_size);
+<a id="L706"></a>    defer gpa.free(sample_buffer);
+<a id="L707"></a>    var sample_instance: FuzzAllocator = .init(sample_buffer);
+<a id="L708"></a>
+<a id="L709"></a>    try std.testing.fuzz(FuzzContext.Init{
+<a id="L710"></a>        .threaded_instance = &amp;io_instance,
+<a id="L711"></a>        .arena_state = &amp;arena_state,
+<a id="L712"></a>        .control_instance = &amp;control_instance,
+<a id="L713"></a>        .sample_instance = &amp;sample_instance,
+<a id="L714"></a>    }, fuzzMultiThreaded, .{});
+<a id="L715"></a>}
+<a id="L716"></a>
+<a id="L717"></a>fn fuzzMultiThreaded(fuzz_init: FuzzContext.Init, smith: *std.testing.Smith) anyerror!void {
+<a id="L718"></a>    @disableInstrumentation();
+<a id="L719"></a>    const testing = std.testing;
+<a id="L720"></a>    const io = fuzz_init.threaded_instance.io();
+<a id="L721"></a>
+<a id="L722"></a>    fuzz_init.sample_instance.prepareFailures(smith);
+<a id="L723"></a>
+<a id="L724"></a>    const control_allocator = fuzz_init.control_instance.threadSafeAllocator();
+<a id="L725"></a>    const sample_child_allocator = fuzz_init.sample_instance.allocator();
+<a id="L726"></a>
+<a id="L727"></a>    var arena_instance = fuzz_init.arena_state.*.promote(sample_child_allocator);
+<a id="L728"></a>    defer fuzz_init.arena_state.* = arena_instance.state;
+<a id="L729"></a>
+<a id="L730"></a>    var ctx: FuzzContext = .init(
+<a id="L731"></a>        control_allocator,
+<a id="L732"></a>        arena_instance.allocator(),
+<a id="L733"></a>    );
+<a id="L734"></a>    defer ctx.deinit();
+<a id="L735"></a>
+<a id="L736"></a>    var group: std.Io.Group = .init;
+<a id="L737"></a>    defer group.cancel(io);
+<a id="L738"></a>
+<a id="L739"></a>    var n_allocs: usize = 0;
+<a id="L740"></a>    var n_actions: usize = 0;
+<a id="L741"></a>    while (!smith.eosWeightedSimple(99, 1) and n_actions &lt; FuzzContext.max_action_count) {
+<a id="L742"></a>        errdefer comptime unreachable;
+<a id="L743"></a>
+<a id="L744"></a>        const weights: []const testing.Smith.Weight = if (n_allocs == FuzzContext.max_alloc_count)
+<a id="L745"></a>            &amp;.{
+<a id="L746"></a>                .value(FuzzContext.Action, .resize, 1),
+<a id="L747"></a>                .value(FuzzContext.Action, .remap, 1),
+<a id="L748"></a>                .value(FuzzContext.Action, .free, 1),
+<a id="L749"></a>            }
+<a id="L750"></a>        else
+<a id="L751"></a>            &amp;.{
+<a id="L752"></a>                .value(FuzzContext.Action, .resize, 1),
+<a id="L753"></a>                .value(FuzzContext.Action, .remap, 1),
+<a id="L754"></a>                .value(FuzzContext.Action, .free, 1),
+<a id="L755"></a>                .value(FuzzContext.Action, .alloc, 3),
+<a id="L756"></a>            };
+<a id="L757"></a>        switch (smith.valueWeighted(FuzzContext.Action, weights)) {
+<a id="L758"></a>            .alloc =&gt; {
+<a id="L759"></a>                const alloc_index = n_allocs;
+<a id="L760"></a>                n_allocs += 1;
+<a id="L761"></a>                ctx.allocs[alloc_index].common.len = .free;
+<a id="L762"></a>                group.concurrent(io, FuzzContext.doOneAlloc, .{
+<a id="L763"></a>                    &amp;ctx,
+<a id="L764"></a>                    nextLen(smith),
+<a id="L765"></a>                    smith.valueRangeAtMost(
+<a id="L766"></a>                        Alignment,
+<a id="L767"></a>                        .@"1",
+<a id="L768"></a>                        .fromByteUnits(2 * std.heap.page_size_max),
+<a id="L769"></a>                    ),
+<a id="L770"></a>                    @enumFromInt(alloc_index),
+<a id="L771"></a>                }) catch unreachable;
+<a id="L772"></a>            },
+<a id="L773"></a>            .resize =&gt; group.concurrent(io, FuzzContext.doOneResize, .{ &amp;ctx, nextLen(smith) }) catch unreachable,
+<a id="L774"></a>            .remap =&gt; group.concurrent(io, FuzzContext.doOneRemap, .{ &amp;ctx, nextLen(smith) }) catch unreachable,
+<a id="L775"></a>            .free =&gt; group.concurrent(io, FuzzContext.doOneFree, .{&amp;ctx}) catch unreachable,
+<a id="L776"></a>        }
+<a id="L777"></a>        n_actions += 1;
+<a id="L778"></a>    }
+<a id="L779"></a>
+<a id="L780"></a>    try group.await(io);
+<a id="L781"></a>    try ctx.check(n_allocs);
+<a id="L782"></a>
+<a id="L783"></a>    // This also covers the `deinit` logic since `free_all` uses it internally.
+<a id="L784"></a>
+<a id="L785"></a>    const old_capacity = arena_instance.queryCapacity();
+<a id="L786"></a>    const reset_mode: ResetMode = switch (smith.value(@typeInfo(ResetMode).@"union".tag_type.?)) {
+<a id="L787"></a>        .free_all =&gt; .free_all,
+<a id="L788"></a>        .retain_capacity =&gt; .retain_capacity,
+<a id="L789"></a>        .retain_with_limit =&gt; .{ .retain_with_limit = smith.value(usize) },
+<a id="L790"></a>    };
+<a id="L791"></a>    const ok = arena_instance.reset(reset_mode);
+<a id="L792"></a>    const new_capacity = arena_instance.queryCapacity();
+<a id="L793"></a>    switch (reset_mode) {
+<a id="L794"></a>        .free_all =&gt; {
+<a id="L795"></a>            try testing.expect(ok);
+<a id="L796"></a>            try testing.expectEqual(0, new_capacity);
+<a id="L797"></a>            fuzz_init.sample_instance.reset();
+<a id="L798"></a>        },
+<a id="L799"></a>        .retain_with_limit =&gt; |limit| if (ok) try testing.expect(new_capacity &lt;= limit),
+<a id="L800"></a>        .retain_capacity =&gt; if (ok) try testing.expectEqual(old_capacity, new_capacity),
+<a id="L801"></a>    }
+<a id="L802"></a>
+<a id="L803"></a>    fuzz_init.control_instance.reset();
+<a id="L804"></a>}
+<a id="L805"></a>fn nextLen(smith: *std.testing.Smith) @typeInfo(FuzzContext.Alloc.Len).@"enum".tag_type {
+<a id="L806"></a>    @disableInstrumentation();
+<a id="L807"></a>    const BackingInt = @typeInfo(FuzzContext.Alloc.Len).@"enum".tag_type;
+<a id="L808"></a>    return smith.valueRangeAtMost(BackingInt, 1, FuzzContext.max_alloc_size);
+<a id="L809"></a>}
+<a id="L810"></a>
+<a id="L811"></a>const FuzzContext = struct {
+<a id="L812"></a>    control_allocator: Allocator,
+<a id="L813"></a>    sample_allocator: Allocator,
+<a id="L814"></a>
+<a id="L815"></a>    last_alloc_index: Alloc.Index,
+<a id="L816"></a>    allocs: [max_alloc_count]Alloc,
+<a id="L817"></a>
+<a id="L818"></a>    const max_alloc_count = 64;
+<a id="L819"></a>    const max_action_count = 2 * max_alloc_count;
+<a id="L820"></a>
+<a id="L821"></a>    const max_alloc_size = 16 &lt;&lt; 10;
+<a id="L822"></a>
+<a id="L823"></a>    const Alloc = struct {
+<a id="L824"></a>        control_ptr: [*]u8,
+<a id="L825"></a>        sample_ptr: [*]u8,
+<a id="L826"></a>        common: packed struct(usize) {
+<a id="L827"></a>            len: Len,
+<a id="L828"></a>            alignment: Alignment,
+<a id="L829"></a>            _: @Int(.unsigned, padding_bits) = 0,
+<a id="L830"></a>        },
+<a id="L831"></a>
+<a id="L832"></a>        const Len = enum(@Int(.unsigned, len_bits)) {
+<a id="L833"></a>            free = (1 &lt;&lt; len_bits) - 1,
+<a id="L834"></a>            _,
+<a id="L835"></a>        };
+<a id="L836"></a>        const len_bits = @min(64, @bitSizeOf(usize)) - @bitSizeOf(Alignment);
+<a id="L837"></a>        const padding_bits = @bitSizeOf(usize) - (len_bits + @bitSizeOf(Alignment));
+<a id="L838"></a>
+<a id="L839"></a>        const Index = enum(usize) {
+<a id="L840"></a>            none = std.math.maxInt(usize),
+<a id="L841"></a>            _,
+<a id="L842"></a>        };
+<a id="L843"></a>    };
+<a id="L844"></a>
+<a id="L845"></a>    const Action = enum {
+<a id="L846"></a>        alloc,
+<a id="L847"></a>        resize,
+<a id="L848"></a>        remap,
+<a id="L849"></a>        free,
+<a id="L850"></a>    };
+<a id="L851"></a>
+<a id="L852"></a>    const Init = struct {
+<a id="L853"></a>        threaded_instance: *std.Io.Threaded,
+<a id="L854"></a>        arena_state: *ArenaAllocator.State,
+<a id="L855"></a>        control_instance: *std.heap.FixedBufferAllocator,
+<a id="L856"></a>        sample_instance: *FuzzAllocator,
+<a id="L857"></a>    };
+<a id="L858"></a>
+<a id="L859"></a>    fn init(
+<a id="L860"></a>        control_allocator: Allocator,
+<a id="L861"></a>        sample_allocator: Allocator,
+<a id="L862"></a>    ) FuzzContext {
+<a id="L863"></a>        @disableInstrumentation();
+<a id="L864"></a>        return .{
+<a id="L865"></a>            .control_allocator = control_allocator,
+<a id="L866"></a>            .sample_allocator = sample_allocator,
+<a id="L867"></a>            .last_alloc_index = .none,
+<a id="L868"></a>            .allocs = undefined,
+<a id="L869"></a>        };
+<a id="L870"></a>    }
+<a id="L871"></a>
+<a id="L872"></a>    fn deinit(ctx: *FuzzContext) void {
+<a id="L873"></a>        @disableInstrumentation();
+<a id="L874"></a>        ctx.* = undefined;
+<a id="L875"></a>    }
+<a id="L876"></a>
+<a id="L877"></a>    fn check(ctx: *const FuzzContext, n_allocs: usize) !void {
+<a id="L878"></a>        @disableInstrumentation();
+<a id="L879"></a>        for (ctx.allocs[0..n_allocs]) |allocation| {
+<a id="L880"></a>            const len: usize = switch (allocation.common.len) {
+<a id="L881"></a>                .free =&gt; continue,
+<a id="L882"></a>                _ =&gt; |len| @intFromEnum(len),
+<a id="L883"></a>            };
+<a id="L884"></a>            const control = allocation.control_ptr[0..len];
+<a id="L885"></a>            const sample = allocation.sample_ptr[0..len];
+<a id="L886"></a>            try std.testing.expectEqualSlices(u8, control, sample);
+<a id="L887"></a>        }
+<a id="L888"></a>    }
+<a id="L889"></a>
+<a id="L890"></a>    fn doOneAlloc(ctx: *FuzzContext, len: usize, alignment: Alignment, index: Alloc.Index) void {
+<a id="L891"></a>        @disableInstrumentation();
+<a id="L892"></a>        assert(ctx.allocs[@intFromEnum(index)].common.len == .free);
+<a id="L893"></a>
+<a id="L894"></a>        const control_ptr = ctx.control_allocator.rawAlloc(len, alignment, @returnAddress()) orelse
+<a id="L895"></a>            return;
+<a id="L896"></a>        const sample_ptr = ctx.sample_allocator.rawAlloc(len, alignment, @returnAddress()) orelse {
+<a id="L897"></a>            ctx.control_allocator.rawFree(control_ptr[0..len], alignment, @returnAddress());
+<a id="L898"></a>            return;
+<a id="L899"></a>        };
+<a id="L900"></a>
+<a id="L901"></a>        ctx.allocs[@intFromEnum(index)] = .{
+<a id="L902"></a>            .control_ptr = control_ptr,
+<a id="L903"></a>            .sample_ptr = sample_ptr,
+<a id="L904"></a>            .common = .{
+<a id="L905"></a>                .len = @enumFromInt(len),
+<a id="L906"></a>                .alignment = alignment,
+<a id="L907"></a>            },
+<a id="L908"></a>        };
+<a id="L909"></a>
+<a id="L910"></a>        for (control_ptr[0..len], sample_ptr[0..len], 0..) |*control, *sample, i| {
+<a id="L911"></a>            control.* = @truncate(i);
+<a id="L912"></a>            sample.* = @truncate(i);
+<a id="L913"></a>        }
+<a id="L914"></a>
+<a id="L915"></a>        @atomicStore(Alloc.Index, &amp;ctx.last_alloc_index, index, .release);
+<a id="L916"></a>    }
+<a id="L917"></a>    fn doOneResize(ctx: *FuzzContext, new_len: usize) void {
+<a id="L918"></a>        @disableInstrumentation();
+<a id="L919"></a>
+<a id="L920"></a>        const index = @atomicRmw(Alloc.Index, &amp;ctx.last_alloc_index, .Xchg, .none, .acquire);
+<a id="L921"></a>        if (index == .none) return;
+<a id="L922"></a>
+<a id="L923"></a>        const allocation = &amp;ctx.allocs[@intFromEnum(index)];
+<a id="L924"></a>        assert(allocation.common.len != .free);
+<a id="L925"></a>        const memory = allocation.sample_ptr[0..@intFromEnum(allocation.common.len)];
+<a id="L926"></a>        const alignment = allocation.common.alignment;
+<a id="L927"></a>
+<a id="L928"></a>        assert(alignment.check(@intFromPtr(allocation.control_ptr)));
+<a id="L929"></a>        assert(alignment.check(@intFromPtr(allocation.sample_ptr)));
+<a id="L930"></a>
+<a id="L931"></a>        // Since `resize` is fallible, we have to ensure that `control_allocator`
+<a id="L932"></a>        // is always successful by reserving the memory we need beforehand.
+<a id="L933"></a>        const new_control_ptr = ctx.control_allocator.rawAlloc(new_len, alignment, @returnAddress()) orelse
+<a id="L934"></a>            return;
+<a id="L935"></a>        if (ctx.sample_allocator.rawResize(memory, alignment, new_len, @returnAddress())) {
+<a id="L936"></a>            const old_control = allocation.control_ptr[0..memory.len];
+<a id="L937"></a>            const overlap = @min(memory.len, new_len);
+<a id="L938"></a>            @memcpy(new_control_ptr[0..overlap], old_control[0..overlap]);
+<a id="L939"></a>            ctx.control_allocator.rawFree(old_control, alignment, @returnAddress());
+<a id="L940"></a>        } else {
+<a id="L941"></a>            ctx.control_allocator.rawFree(new_control_ptr[0..new_len], alignment, @returnAddress());
+<a id="L942"></a>            return;
+<a id="L943"></a>        }
+<a id="L944"></a>
+<a id="L945"></a>        ctx.allocs[@intFromEnum(index)] = .{
+<a id="L946"></a>            .control_ptr = new_control_ptr,
+<a id="L947"></a>            .sample_ptr = memory.ptr,
+<a id="L948"></a>            .common = .{
+<a id="L949"></a>                .len = @enumFromInt(new_len),
+<a id="L950"></a>                .alignment = alignment,
+<a id="L951"></a>            },
+<a id="L952"></a>        };
+<a id="L953"></a>
+<a id="L954"></a>        if (new_len &gt; memory.len) {
+<a id="L955"></a>            for (
+<a id="L956"></a>                allocation.control_ptr[memory.len..new_len],
+<a id="L957"></a>                allocation.sample_ptr[memory.len..new_len],
+<a id="L958"></a>                0..,
+<a id="L959"></a>            ) |*control, *sample, i| {
+<a id="L960"></a>                control.* = @truncate(i);
+<a id="L961"></a>                sample.* = @truncate(i);
+<a id="L962"></a>            }
+<a id="L963"></a>        }
+<a id="L964"></a>
+<a id="L965"></a>        @atomicStore(Alloc.Index, &amp;ctx.last_alloc_index, index, .release);
+<a id="L966"></a>    }
+<a id="L967"></a>    fn doOneRemap(ctx: *FuzzContext, new_len: usize) void {
+<a id="L968"></a>        @disableInstrumentation();
+<a id="L969"></a>        return doOneResize(ctx, new_len);
+<a id="L970"></a>    }
+<a id="L971"></a>    fn doOneFree(ctx: *FuzzContext) void {
+<a id="L972"></a>        @disableInstrumentation();
+<a id="L973"></a>
+<a id="L974"></a>        const index = @atomicRmw(Alloc.Index, &amp;ctx.last_alloc_index, .Xchg, .none, .acquire);
+<a id="L975"></a>        if (index == .none) return;
+<a id="L976"></a>
+<a id="L977"></a>        const allocation = &amp;ctx.allocs[@intFromEnum(index)];
+<a id="L978"></a>        assert(allocation.common.len != .free);
+<a id="L979"></a>        const len: usize = @intFromEnum(allocation.common.len);
+<a id="L980"></a>        const alignment = allocation.common.alignment;
+<a id="L981"></a>
+<a id="L982"></a>        assert(alignment.check(@intFromPtr(allocation.control_ptr)));
+<a id="L983"></a>        assert(alignment.check(@intFromPtr(allocation.sample_ptr)));
+<a id="L984"></a>
+<a id="L985"></a>        ctx.control_allocator.rawFree(allocation.control_ptr[0..len], alignment, @returnAddress());
+<a id="L986"></a>        ctx.sample_allocator.rawFree(allocation.sample_ptr[0..len], alignment, @returnAddress());
+<a id="L987"></a>
+<a id="L988"></a>        ctx.allocs[@intFromEnum(index)] = .{
+<a id="L989"></a>            .control_ptr = undefined,
+<a id="L990"></a>            .sample_ptr = undefined,
+<a id="L991"></a>            .common = .{
+<a id="L992"></a>                .len = .free,
+<a id="L993"></a>                .alignment = .@"1",
+<a id="L994"></a>            },
+<a id="L995"></a>        };
+<a id="L996"></a>    }
+<a id="L997"></a>};
+<a id="L998"></a>
+<a id="L999"></a>const FuzzAllocator = struct {
+<a id="L1000"></a>    fba: std.heap.FixedBufferAllocator,
+<a id="L1001"></a>    spurious_failures: [256]u8,
+<a id="L1002"></a>    index: u8,
+<a id="L1003"></a>
+<a id="L1004"></a>    fn init(buffer: []u8) FuzzAllocator {
+<a id="L1005"></a>        @disableInstrumentation();
+<a id="L1006"></a>        return .{
+<a id="L1007"></a>            .fba = .init(buffer),
+<a id="L1008"></a>            .spurious_failures = undefined, // set with `preprepareFailures`
+<a id="L1009"></a>            .index = 0,
+<a id="L1010"></a>        };
+<a id="L1011"></a>    }
+<a id="L1012"></a>
+<a id="L1013"></a>    fn prepareFailures(fa: *FuzzAllocator, smith: *std.testing.Smith) void {
+<a id="L1014"></a>        @disableInstrumentation();
+<a id="L1015"></a>        const bool_weights: []const std.testing.Smith.Weight = &amp;.{
+<a id="L1016"></a>            .value(u8, 0, 10),
+<a id="L1017"></a>            .value(u8, 1, 1),
+<a id="L1018"></a>        };
+<a id="L1019"></a>        smith.bytesWeighted(&amp;fa.spurious_failures, bool_weights);
+<a id="L1020"></a>        fa.index = 0;
+<a id="L1021"></a>    }
+<a id="L1022"></a>
+<a id="L1023"></a>    fn reset(fa: *FuzzAllocator) void {
+<a id="L1024"></a>        @disableInstrumentation();
+<a id="L1025"></a>        fa.fba.reset();
+<a id="L1026"></a>    }
+<a id="L1027"></a>
+<a id="L1028"></a>    fn allocator(fa: *FuzzAllocator) Allocator {
+<a id="L1029"></a>        @disableInstrumentation();
+<a id="L1030"></a>        return .{
+<a id="L1031"></a>            .ptr = fa,
+<a id="L1032"></a>            .vtable = &amp;.{
+<a id="L1033"></a>                .alloc = FuzzAllocator.alloc,
+<a id="L1034"></a>                .resize = FuzzAllocator.resize,
+<a id="L1035"></a>                .remap = FuzzAllocator.remap,
+<a id="L1036"></a>                .free = FuzzAllocator.free,
+<a id="L1037"></a>            },
+<a id="L1038"></a>        };
+<a id="L1039"></a>    }
+<a id="L1040"></a>
+<a id="L1041"></a>    fn alloc(ctx: *anyopaque, len: usize, alignment: Alignment, ret_addr: usize) ?[*]u8 {
+<a id="L1042"></a>        @disableInstrumentation();
+<a id="L1043"></a>        const fa: *FuzzAllocator = @ptrCast(@alignCast(ctx));
+<a id="L1044"></a>        _ = ret_addr;
+<a id="L1045"></a>
+<a id="L1046"></a>        const index = @atomicRmw(u8, &amp;fa.index, .Add, 1, .monotonic);
+<a id="L1047"></a>        if (fa.spurious_failures[index] != 0) return null;
+<a id="L1048"></a>        return fa.fba.threadSafeAllocator().rawAlloc(len, alignment, @returnAddress());
+<a id="L1049"></a>    }
+<a id="L1050"></a>
+<a id="L1051"></a>    fn resize(ctx: *anyopaque, memory: []u8, alignment: Alignment, new_len: usize, ret_addr: usize) bool {
+<a id="L1052"></a>        @disableInstrumentation();
+<a id="L1053"></a>        const fa: *FuzzAllocator = @ptrCast(@alignCast(ctx));
+<a id="L1054"></a>        _ = ret_addr;
+<a id="L1055"></a>
+<a id="L1056"></a>        const index = @atomicRmw(u8, &amp;fa.index, .Add, 1, .monotonic);
+<a id="L1057"></a>        if (fa.spurious_failures[index] != 0) return false;
+<a id="L1058"></a>        return fa.fba.threadSafeAllocator().rawResize(memory, alignment, new_len, @returnAddress());
+<a id="L1059"></a>    }
+<a id="L1060"></a>
+<a id="L1061"></a>    fn remap(ctx: *anyopaque, memory: []u8, alignment: Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+<a id="L1062"></a>        @disableInstrumentation();
+<a id="L1063"></a>        const fa: *FuzzAllocator = @ptrCast(@alignCast(ctx));
+<a id="L1064"></a>        _ = ret_addr;
+<a id="L1065"></a>
+<a id="L1066"></a>        const index = @atomicRmw(u8, &amp;fa.index, .Add, 1, .monotonic);
+<a id="L1067"></a>        if (fa.spurious_failures[index] != 0) return null;
+<a id="L1068"></a>        return fa.fba.threadSafeAllocator().rawRemap(memory, alignment, new_len, @returnAddress());
+<a id="L1069"></a>    }
+<a id="L1070"></a>
+<a id="L1071"></a>    fn free(ctx: *anyopaque, memory: []u8, alignment: Alignment, ret_addr: usize) void {
+<a id="L1072"></a>        @disableInstrumentation();
+<a id="L1073"></a>        const fa: *FuzzAllocator = @ptrCast(@alignCast(ctx));
+<a id="L1074"></a>        _ = ret_addr;
+<a id="L1075"></a>        return fa.fba.threadSafeAllocator().rawFree(memory, alignment, @returnAddress());
+<a id="L1076"></a>    }
+<a id="L1077"></a>};
+</pre>
 </body>
 </html>

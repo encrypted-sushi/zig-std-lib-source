@@ -2,464 +2,467 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Source: zig-0.16.0-std/zig/system/darwin/macos.zig</title>
+    <title>Source: zig/system/darwin/macos.zig</title>
     <style>
         body { background: #1e1e1e; color: #d4d4d4; font-family: monospace; padding: 20px; }
         pre { white-space: pre-wrap; word-wrap: break-word; }
         .header { border-bottom: 1px solid #444; padding-bottom: 10px; margin-bottom: 20px; }
         a { color: #569cd6; }
+        a[id] { color: inherit; text-decoration: none; }
+        :target { background: #3a3a00; }
     </style>
 </head>
 <body>
     <div class="header">
-        <a href="/">Index</a> | <strong>File: zig-0.16.0-std/zig/system/darwin/macos.zig</strong>
+        <a href="/">Index</a> | <strong>File: zig/system/darwin/macos.zig</strong>
     </div>
-    <pre>const builtin = @import("builtin");
-
-const std = @import("std");
-const Io = std.Io;
-const posix = std.posix;
-const assert = std.debug.assert;
-const mem = std.mem;
-const testing = std.testing;
-const Target = std.Target;
-
-/// Detect macOS version.
-/// `target_os` is not modified in case of error.
-pub fn detect(io: Io, target_os: *Target.Os) !void {
-    // Drop use of osproductversion sysctl because:
-    //   1. only available 10.13.4 High Sierra and later
-    //   2. when used from a binary built against &lt; SDK 11.0 it returns 10.16 and masks Big Sur 11.x version
-    //
-    // NEW APPROACH, STEP 1, parse file:
-    //
-    //   /System/Library/CoreServices/SystemVersion.plist
-    //
-    // NOTE: Historically `SystemVersion.plist` first appeared circa '2003
-    // with the release of Mac OS X 10.3.0 Panther.
-    //
-    // and if it contains a `10.16` value where the `16` is `&gt;= 16` then it is non-canonical,
-    // discarded, and we move on to next step. Otherwise we accept the version.
-    //
-    // BACKGROUND: `10.(16+)` is not a proper version and does not have enough fidelity to
-    // indicate minor/point version of Big Sur and later. It is a context-sensitive result
-    // issued by the kernel for backwards compatibility purposes. Likely the kernel checks
-    // if the executable was linked against an SDK older than Big Sur.
-    //
-    // STEP 2, parse next file:
-    //
-    //   /System/Library/CoreServices/.SystemVersionPlatform.plist
-    //
-    // NOTE: Historically `SystemVersionPlatform.plist` first appeared circa '2020
-    // with the release of macOS 11.0 Big Sur.
-    //
-    // Accessing the content via this path circumvents a context-sensitive result and
-    // yields a canonical Big Sur version.
-    //
-    // At this time there is no other known way for a &lt; SDK 11.0 executable to obtain a
-    // canonical Big Sur version.
-    //
-    // This implementation uses a reasonably simplified approach to parse .plist file
-    // that while it is an xml document, we have good history on the file and its format
-    // such that I am comfortable with implementing a minimalistic parser.
-    // Things like string and general escapes are not supported.
-    const prefixSlash = "/System/Library/CoreServices/";
-    const paths = [_][]const u8{
-        prefixSlash ++ "SystemVersion.plist",
-        prefixSlash ++ ".SystemVersionPlatform.plist",
-    };
-    for (paths) |path| {
-        // approx. 4 times historical file size
-        var buf: [2048]u8 = undefined;
-
-        if (Io.Dir.cwd().readFile(io, path, &amp;buf)) |bytes| {
-            if (parseSystemVersion(bytes)) |ver| {
-                // never return non-canonical `10.(16+)`
-                if (!(ver.major == 10 and ver.minor &gt;= 16)) {
-                    assert(ver.pre == null);
-                    assert(ver.build == null);
-                    target_os.version_range.semver.min = ver;
-                    target_os.version_range.semver.max = ver;
-                    return;
-                }
-                continue;
-            } else |_| {
-                return error.OSVersionDetectionFail;
-            }
-        } else |_| {
-            return error.OSVersionDetectionFail;
-        }
-    }
-    return error.OSVersionDetectionFail;
-}
-
-fn parseSystemVersion(buf: []const u8) !std.SemanticVersion {
-    var svt = SystemVersionTokenizer{ .bytes = buf };
-    try svt.skipUntilTag(.start, "dict");
-    while (true) {
-        try svt.skipUntilTag(.start, "key");
-        const content = try svt.expectContent();
-        try svt.skipUntilTag(.end, "key");
-        if (mem.eql(u8, content, "ProductVersion")) break;
-    }
-    try svt.skipUntilTag(.start, "string");
-    const ver = try svt.expectContent();
-    try svt.skipUntilTag(.end, "string");
-
-    return try std.Target.Query.parseVersion(ver);
-}
-
-const SystemVersionTokenizer = struct {
-    bytes: []const u8,
-    index: usize = 0,
-    state: State = .begin,
-
-    fn next(self: *@This()) !?Token {
-        var mark: usize = self.index;
-        var tag = Tag{};
-        var content: []const u8 = "";
-
-        while (self.index &lt; self.bytes.len) {
-            const char = self.bytes[self.index];
-            switch (self.state) {
-                .begin =&gt; switch (char) {
-                    '&lt;' =&gt; {
-                        self.state = .tag0;
-                        self.index += 1;
-                        tag = Tag{};
-                        mark = self.index;
-                    },
-                    '&gt;' =&gt; {
-                        return error.BadToken;
-                    },
-                    else =&gt; {
-                        self.state = .content;
-                        content = "";
-                        mark = self.index;
-                    },
-                },
-                .tag0 =&gt; switch (char) {
-                    '&lt;' =&gt; {
-                        return error.BadToken;
-                    },
-                    '&gt;' =&gt; {
-                        self.state = .begin;
-                        self.index += 1;
-                        tag.name = self.bytes[mark..self.index];
-                        return Token{ .tag = tag };
-                    },
-                    '"' =&gt; {
-                        self.state = .tag_string;
-                        self.index += 1;
-                    },
-                    '/' =&gt; {
-                        self.state = .tag0_end_or_empty;
-                        self.index += 1;
-                    },
-                    'A'...'Z', 'a'...'z' =&gt; {
-                        self.state = .tagN;
-                        tag.kind = .start;
-                        self.index += 1;
-                    },
-                    else =&gt; {
-                        self.state = .tagN;
-                        self.index += 1;
-                    },
-                },
-                .tag0_end_or_empty =&gt; switch (char) {
-                    '&lt;' =&gt; {
-                        return error.BadToken;
-                    },
-                    '&gt;' =&gt; {
-                        self.state = .begin;
-                        tag.kind = .empty;
-                        tag.name = self.bytes[self.index..self.index];
-                        self.index += 1;
-                        return Token{ .tag = tag };
-                    },
-                    else =&gt; {
-                        self.state = .tagN;
-                        tag.kind = .end;
-                        mark = self.index;
-                        self.index += 1;
-                    },
-                },
-                .tagN =&gt; switch (char) {
-                    '&lt;' =&gt; {
-                        return error.BadToken;
-                    },
-                    '&gt;' =&gt; {
-                        self.state = .begin;
-                        tag.name = self.bytes[mark..self.index];
-                        self.index += 1;
-                        return Token{ .tag = tag };
-                    },
-                    '"' =&gt; {
-                        self.state = .tag_string;
-                        self.index += 1;
-                    },
-                    '/' =&gt; {
-                        self.state = .tagN_end;
-                        tag.kind = .end;
-                        self.index += 1;
-                    },
-                    else =&gt; {
-                        self.index += 1;
-                    },
-                },
-                .tagN_end =&gt; switch (char) {
-                    '&gt;' =&gt; {
-                        self.state = .begin;
-                        tag.name = self.bytes[mark..self.index];
-                        self.index += 1;
-                        return Token{ .tag = tag };
-                    },
-                    else =&gt; {
-                        return error.BadToken;
-                    },
-                },
-                .tag_string =&gt; switch (char) {
-                    '"' =&gt; {
-                        self.state = .tagN;
-                        self.index += 1;
-                    },
-                    else =&gt; {
-                        self.index += 1;
-                    },
-                },
-                .content =&gt; switch (char) {
-                    '&lt;' =&gt; {
-                        self.state = .tag0;
-                        content = self.bytes[mark..self.index];
-                        self.index += 1;
-                        tag = Tag{};
-                        mark = self.index;
-                        return Token{ .content = content };
-                    },
-                    '&gt;' =&gt; {
-                        return error.BadToken;
-                    },
-                    else =&gt; {
-                        self.index += 1;
-                    },
-                },
-            }
-        }
-
-        return null;
-    }
-
-    fn expectContent(self: *@This()) ![]const u8 {
-        if (try self.next()) |tok| {
-            switch (tok) {
-                .content =&gt; |content| {
-                    return content;
-                },
-                else =&gt; {},
-            }
-        }
-        return error.UnexpectedToken;
-    }
-
-    fn skipUntilTag(self: *@This(), kind: Tag.Kind, name: []const u8) !void {
-        while (try self.next()) |tok| {
-            switch (tok) {
-                .tag =&gt; |tag| {
-                    if (tag.kind == kind and mem.eql(u8, tag.name, name)) return;
-                },
-                else =&gt; {},
-            }
-        }
-        return error.TagNotFound;
-    }
-
-    const State = enum {
-        begin,
-        tag0,
-        tag0_end_or_empty,
-        tagN,
-        tagN_end,
-        tag_string,
-        content,
-    };
-
-    const Token = union(enum) {
-        tag: Tag,
-        content: []const u8,
-    };
-
-    const Tag = struct {
-        kind: Kind = .unknown,
-        name: []const u8 = "",
-
-        const Kind = enum { unknown, start, end, empty };
-    };
-};
-
-test "detect" {
-    const cases: [5]struct { []const u8, std.SemanticVersion } = .{
-        .{
-            \\&lt;?xml version="1.0" encoding="UTF-8"?&gt;
-            \\&lt;!DOCTYPE plist PUBLIC "-//Apple Computer//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"&gt;
-            \\&lt;plist version="1.0"&gt;
-            \\&lt;dict&gt;
-            \\    &lt;key&gt;ProductBuildVersion&lt;/key&gt;
-            \\    &lt;string&gt;7B85&lt;/string&gt;
-            \\    &lt;key&gt;ProductCopyright&lt;/key&gt;
-            \\    &lt;string&gt;Apple Computer, Inc. 1983-2003&lt;/string&gt;
-            \\    &lt;key&gt;ProductName&lt;/key&gt;
-            \\    &lt;string&gt;Mac OS X&lt;/string&gt;
-            \\    &lt;key&gt;ProductUserVisibleVersion&lt;/key&gt;
-            \\    &lt;string&gt;10.3&lt;/string&gt;
-            \\    &lt;key&gt;ProductVersion&lt;/key&gt;
-            \\    &lt;string&gt;10.3&lt;/string&gt;
-            \\&lt;/dict&gt;
-            \\&lt;/plist&gt;
-            ,
-            .{ .major = 10, .minor = 3, .patch = 0 },
-        },
-        .{
-            \\&lt;?xml version="1.0" encoding="UTF-8"?&gt;
-            \\&lt;!DOCTYPE plist PUBLIC "-//Apple Computer//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"&gt;
-            \\&lt;plist version="1.0"&gt;
-            \\&lt;dict&gt;
-            \\ &lt;key&gt;ProductBuildVersion&lt;/key&gt;
-            \\ &lt;string&gt;7W98&lt;/string&gt;
-            \\ &lt;key&gt;ProductCopyright&lt;/key&gt;
-            \\ &lt;string&gt;Apple Computer, Inc. 1983-2004&lt;/string&gt;
-            \\ &lt;key&gt;ProductName&lt;/key&gt;
-            \\ &lt;string&gt;Mac OS X&lt;/string&gt;
-            \\ &lt;key&gt;ProductUserVisibleVersion&lt;/key&gt;
-            \\ &lt;string&gt;10.3.9&lt;/string&gt;
-            \\ &lt;key&gt;ProductVersion&lt;/key&gt;
-            \\ &lt;string&gt;10.3.9&lt;/string&gt;
-            \\&lt;/dict&gt;
-            \\&lt;/plist&gt;
-            ,
-            .{ .major = 10, .minor = 3, .patch = 9 },
-        },
-        .{
-            \\&lt;?xml version="1.0" encoding="UTF-8"?&gt;
-            \\&lt;!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"&gt;
-            \\&lt;plist version="1.0"&gt;
-            \\&lt;dict&gt;
-            \\ &lt;key&gt;ProductBuildVersion&lt;/key&gt;
-            \\ &lt;string&gt;19G68&lt;/string&gt;
-            \\ &lt;key&gt;ProductCopyright&lt;/key&gt;
-            \\ &lt;string&gt;1983-2020 Apple Inc.&lt;/string&gt;
-            \\ &lt;key&gt;ProductName&lt;/key&gt;
-            \\ &lt;string&gt;Mac OS X&lt;/string&gt;
-            \\ &lt;key&gt;ProductUserVisibleVersion&lt;/key&gt;
-            \\ &lt;string&gt;10.15.6&lt;/string&gt;
-            \\ &lt;key&gt;ProductVersion&lt;/key&gt;
-            \\ &lt;string&gt;10.15.6&lt;/string&gt;
-            \\ &lt;key&gt;iOSSupportVersion&lt;/key&gt;
-            \\ &lt;string&gt;13.6&lt;/string&gt;
-            \\&lt;/dict&gt;
-            \\&lt;/plist&gt;
-            ,
-            .{ .major = 10, .minor = 15, .patch = 6 },
-        },
-        .{
-            \\&lt;?xml version="1.0" encoding="UTF-8"?&gt;
-            \\&lt;!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"&gt;
-            \\&lt;plist version="1.0"&gt;
-            \\&lt;dict&gt;
-            \\ &lt;key&gt;ProductBuildVersion&lt;/key&gt;
-            \\ &lt;string&gt;20A2408&lt;/string&gt;
-            \\ &lt;key&gt;ProductCopyright&lt;/key&gt;
-            \\ &lt;string&gt;1983-2020 Apple Inc.&lt;/string&gt;
-            \\ &lt;key&gt;ProductName&lt;/key&gt;
-            \\ &lt;string&gt;macOS&lt;/string&gt;
-            \\ &lt;key&gt;ProductUserVisibleVersion&lt;/key&gt;
-            \\ &lt;string&gt;11.0&lt;/string&gt;
-            \\ &lt;key&gt;ProductVersion&lt;/key&gt;
-            \\ &lt;string&gt;11.0&lt;/string&gt;
-            \\ &lt;key&gt;iOSSupportVersion&lt;/key&gt;
-            \\ &lt;string&gt;14.2&lt;/string&gt;
-            \\&lt;/dict&gt;
-            \\&lt;/plist&gt;
-            ,
-            .{ .major = 11, .minor = 0, .patch = 0 },
-        },
-        .{
-            \\&lt;?xml version="1.0" encoding="UTF-8"?&gt;
-            \\&lt;!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"&gt;
-            \\&lt;plist version="1.0"&gt;
-            \\&lt;dict&gt;
-            \\ &lt;key&gt;ProductBuildVersion&lt;/key&gt;
-            \\ &lt;string&gt;20C63&lt;/string&gt;
-            \\ &lt;key&gt;ProductCopyright&lt;/key&gt;
-            \\ &lt;string&gt;1983-2020 Apple Inc.&lt;/string&gt;
-            \\ &lt;key&gt;ProductName&lt;/key&gt;
-            \\ &lt;string&gt;macOS&lt;/string&gt;
-            \\ &lt;key&gt;ProductUserVisibleVersion&lt;/key&gt;
-            \\ &lt;string&gt;11.1&lt;/string&gt;
-            \\ &lt;key&gt;ProductVersion&lt;/key&gt;
-            \\ &lt;string&gt;11.1&lt;/string&gt;
-            \\ &lt;key&gt;iOSSupportVersion&lt;/key&gt;
-            \\ &lt;string&gt;14.3&lt;/string&gt;
-            \\&lt;/dict&gt;
-            \\&lt;/plist&gt;
-            ,
-            .{ .major = 11, .minor = 1, .patch = 0 },
-        },
-    };
-
-    inline for (cases) |case| {
-        const ver0 = try parseSystemVersion(case[0]);
-        const ver1 = case[1];
-        try testing.expectEqual(std.math.Order.eq, ver0.order(ver1));
-    }
-}
-
-pub fn detectNativeCpuAndFeatures() ?Target.Cpu {
-    var cpu_family: std.c.CPUFAMILY = undefined;
-    var len: usize = @sizeOf(std.c.CPUFAMILY);
-    switch (posix.errno(posix.system.sysctlbyname("hw.cpufamily", &amp;cpu_family, &amp;len, null, 0))) {
-        .SUCCESS =&gt; {},
-        .FAULT =&gt; unreachable, // segmentation fault
-        .PERM =&gt; unreachable, // only when setting values,
-        .NOMEM =&gt; unreachable, // memory already on the stack
-        .NOENT =&gt; unreachable, // constant, known good value
-        else =&gt; unreachable,
-    }
-
-    const current_arch = builtin.cpu.arch;
-    switch (current_arch) {
-        .aarch64, .aarch64_be =&gt; {
-            const model = switch (cpu_family) {
-                .ARM_CYCLONE =&gt; &amp;Target.aarch64.cpu.apple_a7,
-                .ARM_TYPHOON =&gt; &amp;Target.aarch64.cpu.apple_a8,
-                .ARM_TWISTER =&gt; &amp;Target.aarch64.cpu.apple_a9,
-                .ARM_HURRICANE =&gt; &amp;Target.aarch64.cpu.apple_a10,
-                .ARM_MONSOON_MISTRAL =&gt; &amp;Target.aarch64.cpu.apple_a11,
-                .ARM_VORTEX_TEMPEST =&gt; &amp;Target.aarch64.cpu.apple_a12,
-                .ARM_LIGHTNING_THUNDER =&gt; &amp;Target.aarch64.cpu.apple_a13,
-                .ARM_FIRESTORM_ICESTORM =&gt; &amp;Target.aarch64.cpu.apple_m1, // a14
-                .ARM_BLIZZARD_AVALANCHE =&gt; &amp;Target.aarch64.cpu.apple_m2, // a15
-                .ARM_EVEREST_SAWTOOTH =&gt; &amp;Target.aarch64.cpu.apple_m3, // a16
-                .ARM_IBIZA =&gt; &amp;Target.aarch64.cpu.apple_m3, // base
-                .ARM_PALMA =&gt; &amp;Target.aarch64.cpu.apple_m3, // max
-                .ARM_LOBOS =&gt; &amp;Target.aarch64.cpu.apple_m3, // pro
-                .ARM_COLL =&gt; &amp;Target.aarch64.cpu.apple_a17, // a17 pro
-                .ARM_DONAN =&gt; &amp;Target.aarch64.cpu.apple_m4, // base
-                .ARM_BRAVA =&gt; &amp;Target.aarch64.cpu.apple_m4, // pro/max
-                .ARM_TAHITI =&gt; &amp;Target.aarch64.cpu.apple_m4, // a18 pro
-                .ARM_TUPAI =&gt; &amp;Target.aarch64.cpu.apple_m4, // a18
-                else =&gt; return null,
-            };
-
-            return Target.Cpu{
-                .arch = current_arch,
-                .model = model,
-                .features = model.features,
-            };
-        },
-        else =&gt; {},
-    }
-
-    return null;
-}</pre>
+    <pre><a id="L1"></a>const builtin = @import("builtin");
+<a id="L2"></a>
+<a id="L3"></a>const std = @import("std");
+<a id="L4"></a>const Io = std.Io;
+<a id="L5"></a>const posix = std.posix;
+<a id="L6"></a>const assert = std.debug.assert;
+<a id="L7"></a>const mem = std.mem;
+<a id="L8"></a>const testing = std.testing;
+<a id="L9"></a>const Target = std.Target;
+<a id="L10"></a>
+<a id="L11"></a>/// Detect macOS version.
+<a id="L12"></a>/// `target_os` is not modified in case of error.
+<a id="L13"></a>pub fn detect(io: Io, target_os: *Target.Os) !void {
+<a id="L14"></a>    // Drop use of osproductversion sysctl because:
+<a id="L15"></a>    //   1. only available 10.13.4 High Sierra and later
+<a id="L16"></a>    //   2. when used from a binary built against &lt; SDK 11.0 it returns 10.16 and masks Big Sur 11.x version
+<a id="L17"></a>    //
+<a id="L18"></a>    // NEW APPROACH, STEP 1, parse file:
+<a id="L19"></a>    //
+<a id="L20"></a>    //   /System/Library/CoreServices/SystemVersion.plist
+<a id="L21"></a>    //
+<a id="L22"></a>    // NOTE: Historically `SystemVersion.plist` first appeared circa '2003
+<a id="L23"></a>    // with the release of Mac OS X 10.3.0 Panther.
+<a id="L24"></a>    //
+<a id="L25"></a>    // and if it contains a `10.16` value where the `16` is `&gt;= 16` then it is non-canonical,
+<a id="L26"></a>    // discarded, and we move on to next step. Otherwise we accept the version.
+<a id="L27"></a>    //
+<a id="L28"></a>    // BACKGROUND: `10.(16+)` is not a proper version and does not have enough fidelity to
+<a id="L29"></a>    // indicate minor/point version of Big Sur and later. It is a context-sensitive result
+<a id="L30"></a>    // issued by the kernel for backwards compatibility purposes. Likely the kernel checks
+<a id="L31"></a>    // if the executable was linked against an SDK older than Big Sur.
+<a id="L32"></a>    //
+<a id="L33"></a>    // STEP 2, parse next file:
+<a id="L34"></a>    //
+<a id="L35"></a>    //   /System/Library/CoreServices/.SystemVersionPlatform.plist
+<a id="L36"></a>    //
+<a id="L37"></a>    // NOTE: Historically `SystemVersionPlatform.plist` first appeared circa '2020
+<a id="L38"></a>    // with the release of macOS 11.0 Big Sur.
+<a id="L39"></a>    //
+<a id="L40"></a>    // Accessing the content via this path circumvents a context-sensitive result and
+<a id="L41"></a>    // yields a canonical Big Sur version.
+<a id="L42"></a>    //
+<a id="L43"></a>    // At this time there is no other known way for a &lt; SDK 11.0 executable to obtain a
+<a id="L44"></a>    // canonical Big Sur version.
+<a id="L45"></a>    //
+<a id="L46"></a>    // This implementation uses a reasonably simplified approach to parse .plist file
+<a id="L47"></a>    // that while it is an xml document, we have good history on the file and its format
+<a id="L48"></a>    // such that I am comfortable with implementing a minimalistic parser.
+<a id="L49"></a>    // Things like string and general escapes are not supported.
+<a id="L50"></a>    const prefixSlash = "/System/Library/CoreServices/";
+<a id="L51"></a>    const paths = [_][]const u8{
+<a id="L52"></a>        prefixSlash ++ "SystemVersion.plist",
+<a id="L53"></a>        prefixSlash ++ ".SystemVersionPlatform.plist",
+<a id="L54"></a>    };
+<a id="L55"></a>    for (paths) |path| {
+<a id="L56"></a>        // approx. 4 times historical file size
+<a id="L57"></a>        var buf: [2048]u8 = undefined;
+<a id="L58"></a>
+<a id="L59"></a>        if (Io.Dir.cwd().readFile(io, path, &amp;buf)) |bytes| {
+<a id="L60"></a>            if (parseSystemVersion(bytes)) |ver| {
+<a id="L61"></a>                // never return non-canonical `10.(16+)`
+<a id="L62"></a>                if (!(ver.major == 10 and ver.minor &gt;= 16)) {
+<a id="L63"></a>                    assert(ver.pre == null);
+<a id="L64"></a>                    assert(ver.build == null);
+<a id="L65"></a>                    target_os.version_range.semver.min = ver;
+<a id="L66"></a>                    target_os.version_range.semver.max = ver;
+<a id="L67"></a>                    return;
+<a id="L68"></a>                }
+<a id="L69"></a>                continue;
+<a id="L70"></a>            } else |_| {
+<a id="L71"></a>                return error.OSVersionDetectionFail;
+<a id="L72"></a>            }
+<a id="L73"></a>        } else |_| {
+<a id="L74"></a>            return error.OSVersionDetectionFail;
+<a id="L75"></a>        }
+<a id="L76"></a>    }
+<a id="L77"></a>    return error.OSVersionDetectionFail;
+<a id="L78"></a>}
+<a id="L79"></a>
+<a id="L80"></a>fn parseSystemVersion(buf: []const u8) !std.SemanticVersion {
+<a id="L81"></a>    var svt = SystemVersionTokenizer{ .bytes = buf };
+<a id="L82"></a>    try svt.skipUntilTag(.start, "dict");
+<a id="L83"></a>    while (true) {
+<a id="L84"></a>        try svt.skipUntilTag(.start, "key");
+<a id="L85"></a>        const content = try svt.expectContent();
+<a id="L86"></a>        try svt.skipUntilTag(.end, "key");
+<a id="L87"></a>        if (mem.eql(u8, content, "ProductVersion")) break;
+<a id="L88"></a>    }
+<a id="L89"></a>    try svt.skipUntilTag(.start, "string");
+<a id="L90"></a>    const ver = try svt.expectContent();
+<a id="L91"></a>    try svt.skipUntilTag(.end, "string");
+<a id="L92"></a>
+<a id="L93"></a>    return try std.Target.Query.parseVersion(ver);
+<a id="L94"></a>}
+<a id="L95"></a>
+<a id="L96"></a>const SystemVersionTokenizer = struct {
+<a id="L97"></a>    bytes: []const u8,
+<a id="L98"></a>    index: usize = 0,
+<a id="L99"></a>    state: State = .begin,
+<a id="L100"></a>
+<a id="L101"></a>    fn next(self: *@This()) !?Token {
+<a id="L102"></a>        var mark: usize = self.index;
+<a id="L103"></a>        var tag = Tag{};
+<a id="L104"></a>        var content: []const u8 = "";
+<a id="L105"></a>
+<a id="L106"></a>        while (self.index &lt; self.bytes.len) {
+<a id="L107"></a>            const char = self.bytes[self.index];
+<a id="L108"></a>            switch (self.state) {
+<a id="L109"></a>                .begin =&gt; switch (char) {
+<a id="L110"></a>                    '&lt;' =&gt; {
+<a id="L111"></a>                        self.state = .tag0;
+<a id="L112"></a>                        self.index += 1;
+<a id="L113"></a>                        tag = Tag{};
+<a id="L114"></a>                        mark = self.index;
+<a id="L115"></a>                    },
+<a id="L116"></a>                    '&gt;' =&gt; {
+<a id="L117"></a>                        return error.BadToken;
+<a id="L118"></a>                    },
+<a id="L119"></a>                    else =&gt; {
+<a id="L120"></a>                        self.state = .content;
+<a id="L121"></a>                        content = "";
+<a id="L122"></a>                        mark = self.index;
+<a id="L123"></a>                    },
+<a id="L124"></a>                },
+<a id="L125"></a>                .tag0 =&gt; switch (char) {
+<a id="L126"></a>                    '&lt;' =&gt; {
+<a id="L127"></a>                        return error.BadToken;
+<a id="L128"></a>                    },
+<a id="L129"></a>                    '&gt;' =&gt; {
+<a id="L130"></a>                        self.state = .begin;
+<a id="L131"></a>                        self.index += 1;
+<a id="L132"></a>                        tag.name = self.bytes[mark..self.index];
+<a id="L133"></a>                        return Token{ .tag = tag };
+<a id="L134"></a>                    },
+<a id="L135"></a>                    '"' =&gt; {
+<a id="L136"></a>                        self.state = .tag_string;
+<a id="L137"></a>                        self.index += 1;
+<a id="L138"></a>                    },
+<a id="L139"></a>                    '/' =&gt; {
+<a id="L140"></a>                        self.state = .tag0_end_or_empty;
+<a id="L141"></a>                        self.index += 1;
+<a id="L142"></a>                    },
+<a id="L143"></a>                    'A'...'Z', 'a'...'z' =&gt; {
+<a id="L144"></a>                        self.state = .tagN;
+<a id="L145"></a>                        tag.kind = .start;
+<a id="L146"></a>                        self.index += 1;
+<a id="L147"></a>                    },
+<a id="L148"></a>                    else =&gt; {
+<a id="L149"></a>                        self.state = .tagN;
+<a id="L150"></a>                        self.index += 1;
+<a id="L151"></a>                    },
+<a id="L152"></a>                },
+<a id="L153"></a>                .tag0_end_or_empty =&gt; switch (char) {
+<a id="L154"></a>                    '&lt;' =&gt; {
+<a id="L155"></a>                        return error.BadToken;
+<a id="L156"></a>                    },
+<a id="L157"></a>                    '&gt;' =&gt; {
+<a id="L158"></a>                        self.state = .begin;
+<a id="L159"></a>                        tag.kind = .empty;
+<a id="L160"></a>                        tag.name = self.bytes[self.index..self.index];
+<a id="L161"></a>                        self.index += 1;
+<a id="L162"></a>                        return Token{ .tag = tag };
+<a id="L163"></a>                    },
+<a id="L164"></a>                    else =&gt; {
+<a id="L165"></a>                        self.state = .tagN;
+<a id="L166"></a>                        tag.kind = .end;
+<a id="L167"></a>                        mark = self.index;
+<a id="L168"></a>                        self.index += 1;
+<a id="L169"></a>                    },
+<a id="L170"></a>                },
+<a id="L171"></a>                .tagN =&gt; switch (char) {
+<a id="L172"></a>                    '&lt;' =&gt; {
+<a id="L173"></a>                        return error.BadToken;
+<a id="L174"></a>                    },
+<a id="L175"></a>                    '&gt;' =&gt; {
+<a id="L176"></a>                        self.state = .begin;
+<a id="L177"></a>                        tag.name = self.bytes[mark..self.index];
+<a id="L178"></a>                        self.index += 1;
+<a id="L179"></a>                        return Token{ .tag = tag };
+<a id="L180"></a>                    },
+<a id="L181"></a>                    '"' =&gt; {
+<a id="L182"></a>                        self.state = .tag_string;
+<a id="L183"></a>                        self.index += 1;
+<a id="L184"></a>                    },
+<a id="L185"></a>                    '/' =&gt; {
+<a id="L186"></a>                        self.state = .tagN_end;
+<a id="L187"></a>                        tag.kind = .end;
+<a id="L188"></a>                        self.index += 1;
+<a id="L189"></a>                    },
+<a id="L190"></a>                    else =&gt; {
+<a id="L191"></a>                        self.index += 1;
+<a id="L192"></a>                    },
+<a id="L193"></a>                },
+<a id="L194"></a>                .tagN_end =&gt; switch (char) {
+<a id="L195"></a>                    '&gt;' =&gt; {
+<a id="L196"></a>                        self.state = .begin;
+<a id="L197"></a>                        tag.name = self.bytes[mark..self.index];
+<a id="L198"></a>                        self.index += 1;
+<a id="L199"></a>                        return Token{ .tag = tag };
+<a id="L200"></a>                    },
+<a id="L201"></a>                    else =&gt; {
+<a id="L202"></a>                        return error.BadToken;
+<a id="L203"></a>                    },
+<a id="L204"></a>                },
+<a id="L205"></a>                .tag_string =&gt; switch (char) {
+<a id="L206"></a>                    '"' =&gt; {
+<a id="L207"></a>                        self.state = .tagN;
+<a id="L208"></a>                        self.index += 1;
+<a id="L209"></a>                    },
+<a id="L210"></a>                    else =&gt; {
+<a id="L211"></a>                        self.index += 1;
+<a id="L212"></a>                    },
+<a id="L213"></a>                },
+<a id="L214"></a>                .content =&gt; switch (char) {
+<a id="L215"></a>                    '&lt;' =&gt; {
+<a id="L216"></a>                        self.state = .tag0;
+<a id="L217"></a>                        content = self.bytes[mark..self.index];
+<a id="L218"></a>                        self.index += 1;
+<a id="L219"></a>                        tag = Tag{};
+<a id="L220"></a>                        mark = self.index;
+<a id="L221"></a>                        return Token{ .content = content };
+<a id="L222"></a>                    },
+<a id="L223"></a>                    '&gt;' =&gt; {
+<a id="L224"></a>                        return error.BadToken;
+<a id="L225"></a>                    },
+<a id="L226"></a>                    else =&gt; {
+<a id="L227"></a>                        self.index += 1;
+<a id="L228"></a>                    },
+<a id="L229"></a>                },
+<a id="L230"></a>            }
+<a id="L231"></a>        }
+<a id="L232"></a>
+<a id="L233"></a>        return null;
+<a id="L234"></a>    }
+<a id="L235"></a>
+<a id="L236"></a>    fn expectContent(self: *@This()) ![]const u8 {
+<a id="L237"></a>        if (try self.next()) |tok| {
+<a id="L238"></a>            switch (tok) {
+<a id="L239"></a>                .content =&gt; |content| {
+<a id="L240"></a>                    return content;
+<a id="L241"></a>                },
+<a id="L242"></a>                else =&gt; {},
+<a id="L243"></a>            }
+<a id="L244"></a>        }
+<a id="L245"></a>        return error.UnexpectedToken;
+<a id="L246"></a>    }
+<a id="L247"></a>
+<a id="L248"></a>    fn skipUntilTag(self: *@This(), kind: Tag.Kind, name: []const u8) !void {
+<a id="L249"></a>        while (try self.next()) |tok| {
+<a id="L250"></a>            switch (tok) {
+<a id="L251"></a>                .tag =&gt; |tag| {
+<a id="L252"></a>                    if (tag.kind == kind and mem.eql(u8, tag.name, name)) return;
+<a id="L253"></a>                },
+<a id="L254"></a>                else =&gt; {},
+<a id="L255"></a>            }
+<a id="L256"></a>        }
+<a id="L257"></a>        return error.TagNotFound;
+<a id="L258"></a>    }
+<a id="L259"></a>
+<a id="L260"></a>    const State = enum {
+<a id="L261"></a>        begin,
+<a id="L262"></a>        tag0,
+<a id="L263"></a>        tag0_end_or_empty,
+<a id="L264"></a>        tagN,
+<a id="L265"></a>        tagN_end,
+<a id="L266"></a>        tag_string,
+<a id="L267"></a>        content,
+<a id="L268"></a>    };
+<a id="L269"></a>
+<a id="L270"></a>    const Token = union(enum) {
+<a id="L271"></a>        tag: Tag,
+<a id="L272"></a>        content: []const u8,
+<a id="L273"></a>    };
+<a id="L274"></a>
+<a id="L275"></a>    const Tag = struct {
+<a id="L276"></a>        kind: Kind = .unknown,
+<a id="L277"></a>        name: []const u8 = "",
+<a id="L278"></a>
+<a id="L279"></a>        const Kind = enum { unknown, start, end, empty };
+<a id="L280"></a>    };
+<a id="L281"></a>};
+<a id="L282"></a>
+<a id="L283"></a>test "detect" {
+<a id="L284"></a>    const cases: [5]struct { []const u8, std.SemanticVersion } = .{
+<a id="L285"></a>        .{
+<a id="L286"></a>            \\&lt;?xml version="1.0" encoding="UTF-8"?&gt;
+<a id="L287"></a>            \\&lt;!DOCTYPE plist PUBLIC "-//Apple Computer//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"&gt;
+<a id="L288"></a>            \\&lt;plist version="1.0"&gt;
+<a id="L289"></a>            \\&lt;dict&gt;
+<a id="L290"></a>            \\    &lt;key&gt;ProductBuildVersion&lt;/key&gt;
+<a id="L291"></a>            \\    &lt;string&gt;7B85&lt;/string&gt;
+<a id="L292"></a>            \\    &lt;key&gt;ProductCopyright&lt;/key&gt;
+<a id="L293"></a>            \\    &lt;string&gt;Apple Computer, Inc. 1983-2003&lt;/string&gt;
+<a id="L294"></a>            \\    &lt;key&gt;ProductName&lt;/key&gt;
+<a id="L295"></a>            \\    &lt;string&gt;Mac OS X&lt;/string&gt;
+<a id="L296"></a>            \\    &lt;key&gt;ProductUserVisibleVersion&lt;/key&gt;
+<a id="L297"></a>            \\    &lt;string&gt;10.3&lt;/string&gt;
+<a id="L298"></a>            \\    &lt;key&gt;ProductVersion&lt;/key&gt;
+<a id="L299"></a>            \\    &lt;string&gt;10.3&lt;/string&gt;
+<a id="L300"></a>            \\&lt;/dict&gt;
+<a id="L301"></a>            \\&lt;/plist&gt;
+<a id="L302"></a>            ,
+<a id="L303"></a>            .{ .major = 10, .minor = 3, .patch = 0 },
+<a id="L304"></a>        },
+<a id="L305"></a>        .{
+<a id="L306"></a>            \\&lt;?xml version="1.0" encoding="UTF-8"?&gt;
+<a id="L307"></a>            \\&lt;!DOCTYPE plist PUBLIC "-//Apple Computer//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"&gt;
+<a id="L308"></a>            \\&lt;plist version="1.0"&gt;
+<a id="L309"></a>            \\&lt;dict&gt;
+<a id="L310"></a>            \\ &lt;key&gt;ProductBuildVersion&lt;/key&gt;
+<a id="L311"></a>            \\ &lt;string&gt;7W98&lt;/string&gt;
+<a id="L312"></a>            \\ &lt;key&gt;ProductCopyright&lt;/key&gt;
+<a id="L313"></a>            \\ &lt;string&gt;Apple Computer, Inc. 1983-2004&lt;/string&gt;
+<a id="L314"></a>            \\ &lt;key&gt;ProductName&lt;/key&gt;
+<a id="L315"></a>            \\ &lt;string&gt;Mac OS X&lt;/string&gt;
+<a id="L316"></a>            \\ &lt;key&gt;ProductUserVisibleVersion&lt;/key&gt;
+<a id="L317"></a>            \\ &lt;string&gt;10.3.9&lt;/string&gt;
+<a id="L318"></a>            \\ &lt;key&gt;ProductVersion&lt;/key&gt;
+<a id="L319"></a>            \\ &lt;string&gt;10.3.9&lt;/string&gt;
+<a id="L320"></a>            \\&lt;/dict&gt;
+<a id="L321"></a>            \\&lt;/plist&gt;
+<a id="L322"></a>            ,
+<a id="L323"></a>            .{ .major = 10, .minor = 3, .patch = 9 },
+<a id="L324"></a>        },
+<a id="L325"></a>        .{
+<a id="L326"></a>            \\&lt;?xml version="1.0" encoding="UTF-8"?&gt;
+<a id="L327"></a>            \\&lt;!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"&gt;
+<a id="L328"></a>            \\&lt;plist version="1.0"&gt;
+<a id="L329"></a>            \\&lt;dict&gt;
+<a id="L330"></a>            \\ &lt;key&gt;ProductBuildVersion&lt;/key&gt;
+<a id="L331"></a>            \\ &lt;string&gt;19G68&lt;/string&gt;
+<a id="L332"></a>            \\ &lt;key&gt;ProductCopyright&lt;/key&gt;
+<a id="L333"></a>            \\ &lt;string&gt;1983-2020 Apple Inc.&lt;/string&gt;
+<a id="L334"></a>            \\ &lt;key&gt;ProductName&lt;/key&gt;
+<a id="L335"></a>            \\ &lt;string&gt;Mac OS X&lt;/string&gt;
+<a id="L336"></a>            \\ &lt;key&gt;ProductUserVisibleVersion&lt;/key&gt;
+<a id="L337"></a>            \\ &lt;string&gt;10.15.6&lt;/string&gt;
+<a id="L338"></a>            \\ &lt;key&gt;ProductVersion&lt;/key&gt;
+<a id="L339"></a>            \\ &lt;string&gt;10.15.6&lt;/string&gt;
+<a id="L340"></a>            \\ &lt;key&gt;iOSSupportVersion&lt;/key&gt;
+<a id="L341"></a>            \\ &lt;string&gt;13.6&lt;/string&gt;
+<a id="L342"></a>            \\&lt;/dict&gt;
+<a id="L343"></a>            \\&lt;/plist&gt;
+<a id="L344"></a>            ,
+<a id="L345"></a>            .{ .major = 10, .minor = 15, .patch = 6 },
+<a id="L346"></a>        },
+<a id="L347"></a>        .{
+<a id="L348"></a>            \\&lt;?xml version="1.0" encoding="UTF-8"?&gt;
+<a id="L349"></a>            \\&lt;!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"&gt;
+<a id="L350"></a>            \\&lt;plist version="1.0"&gt;
+<a id="L351"></a>            \\&lt;dict&gt;
+<a id="L352"></a>            \\ &lt;key&gt;ProductBuildVersion&lt;/key&gt;
+<a id="L353"></a>            \\ &lt;string&gt;20A2408&lt;/string&gt;
+<a id="L354"></a>            \\ &lt;key&gt;ProductCopyright&lt;/key&gt;
+<a id="L355"></a>            \\ &lt;string&gt;1983-2020 Apple Inc.&lt;/string&gt;
+<a id="L356"></a>            \\ &lt;key&gt;ProductName&lt;/key&gt;
+<a id="L357"></a>            \\ &lt;string&gt;macOS&lt;/string&gt;
+<a id="L358"></a>            \\ &lt;key&gt;ProductUserVisibleVersion&lt;/key&gt;
+<a id="L359"></a>            \\ &lt;string&gt;11.0&lt;/string&gt;
+<a id="L360"></a>            \\ &lt;key&gt;ProductVersion&lt;/key&gt;
+<a id="L361"></a>            \\ &lt;string&gt;11.0&lt;/string&gt;
+<a id="L362"></a>            \\ &lt;key&gt;iOSSupportVersion&lt;/key&gt;
+<a id="L363"></a>            \\ &lt;string&gt;14.2&lt;/string&gt;
+<a id="L364"></a>            \\&lt;/dict&gt;
+<a id="L365"></a>            \\&lt;/plist&gt;
+<a id="L366"></a>            ,
+<a id="L367"></a>            .{ .major = 11, .minor = 0, .patch = 0 },
+<a id="L368"></a>        },
+<a id="L369"></a>        .{
+<a id="L370"></a>            \\&lt;?xml version="1.0" encoding="UTF-8"?&gt;
+<a id="L371"></a>            \\&lt;!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"&gt;
+<a id="L372"></a>            \\&lt;plist version="1.0"&gt;
+<a id="L373"></a>            \\&lt;dict&gt;
+<a id="L374"></a>            \\ &lt;key&gt;ProductBuildVersion&lt;/key&gt;
+<a id="L375"></a>            \\ &lt;string&gt;20C63&lt;/string&gt;
+<a id="L376"></a>            \\ &lt;key&gt;ProductCopyright&lt;/key&gt;
+<a id="L377"></a>            \\ &lt;string&gt;1983-2020 Apple Inc.&lt;/string&gt;
+<a id="L378"></a>            \\ &lt;key&gt;ProductName&lt;/key&gt;
+<a id="L379"></a>            \\ &lt;string&gt;macOS&lt;/string&gt;
+<a id="L380"></a>            \\ &lt;key&gt;ProductUserVisibleVersion&lt;/key&gt;
+<a id="L381"></a>            \\ &lt;string&gt;11.1&lt;/string&gt;
+<a id="L382"></a>            \\ &lt;key&gt;ProductVersion&lt;/key&gt;
+<a id="L383"></a>            \\ &lt;string&gt;11.1&lt;/string&gt;
+<a id="L384"></a>            \\ &lt;key&gt;iOSSupportVersion&lt;/key&gt;
+<a id="L385"></a>            \\ &lt;string&gt;14.3&lt;/string&gt;
+<a id="L386"></a>            \\&lt;/dict&gt;
+<a id="L387"></a>            \\&lt;/plist&gt;
+<a id="L388"></a>            ,
+<a id="L389"></a>            .{ .major = 11, .minor = 1, .patch = 0 },
+<a id="L390"></a>        },
+<a id="L391"></a>    };
+<a id="L392"></a>
+<a id="L393"></a>    inline for (cases) |case| {
+<a id="L394"></a>        const ver0 = try parseSystemVersion(case[0]);
+<a id="L395"></a>        const ver1 = case[1];
+<a id="L396"></a>        try testing.expectEqual(std.math.Order.eq, ver0.order(ver1));
+<a id="L397"></a>    }
+<a id="L398"></a>}
+<a id="L399"></a>
+<a id="L400"></a>pub fn detectNativeCpuAndFeatures() ?Target.Cpu {
+<a id="L401"></a>    var cpu_family: std.c.CPUFAMILY = undefined;
+<a id="L402"></a>    var len: usize = @sizeOf(std.c.CPUFAMILY);
+<a id="L403"></a>    switch (posix.errno(posix.system.sysctlbyname("hw.cpufamily", &amp;cpu_family, &amp;len, null, 0))) {
+<a id="L404"></a>        .SUCCESS =&gt; {},
+<a id="L405"></a>        .FAULT =&gt; unreachable, // segmentation fault
+<a id="L406"></a>        .PERM =&gt; unreachable, // only when setting values,
+<a id="L407"></a>        .NOMEM =&gt; unreachable, // memory already on the stack
+<a id="L408"></a>        .NOENT =&gt; unreachable, // constant, known good value
+<a id="L409"></a>        else =&gt; unreachable,
+<a id="L410"></a>    }
+<a id="L411"></a>
+<a id="L412"></a>    const current_arch = builtin.cpu.arch;
+<a id="L413"></a>    switch (current_arch) {
+<a id="L414"></a>        .aarch64, .aarch64_be =&gt; {
+<a id="L415"></a>            const model = switch (cpu_family) {
+<a id="L416"></a>                .ARM_CYCLONE =&gt; &amp;Target.aarch64.cpu.apple_a7,
+<a id="L417"></a>                .ARM_TYPHOON =&gt; &amp;Target.aarch64.cpu.apple_a8,
+<a id="L418"></a>                .ARM_TWISTER =&gt; &amp;Target.aarch64.cpu.apple_a9,
+<a id="L419"></a>                .ARM_HURRICANE =&gt; &amp;Target.aarch64.cpu.apple_a10,
+<a id="L420"></a>                .ARM_MONSOON_MISTRAL =&gt; &amp;Target.aarch64.cpu.apple_a11,
+<a id="L421"></a>                .ARM_VORTEX_TEMPEST =&gt; &amp;Target.aarch64.cpu.apple_a12,
+<a id="L422"></a>                .ARM_LIGHTNING_THUNDER =&gt; &amp;Target.aarch64.cpu.apple_a13,
+<a id="L423"></a>                .ARM_FIRESTORM_ICESTORM =&gt; &amp;Target.aarch64.cpu.apple_m1, // a14
+<a id="L424"></a>                .ARM_BLIZZARD_AVALANCHE =&gt; &amp;Target.aarch64.cpu.apple_m2, // a15
+<a id="L425"></a>                .ARM_EVEREST_SAWTOOTH =&gt; &amp;Target.aarch64.cpu.apple_m3, // a16
+<a id="L426"></a>                .ARM_IBIZA =&gt; &amp;Target.aarch64.cpu.apple_m3, // base
+<a id="L427"></a>                .ARM_PALMA =&gt; &amp;Target.aarch64.cpu.apple_m3, // max
+<a id="L428"></a>                .ARM_LOBOS =&gt; &amp;Target.aarch64.cpu.apple_m3, // pro
+<a id="L429"></a>                .ARM_COLL =&gt; &amp;Target.aarch64.cpu.apple_a17, // a17 pro
+<a id="L430"></a>                .ARM_DONAN =&gt; &amp;Target.aarch64.cpu.apple_m4, // base
+<a id="L431"></a>                .ARM_BRAVA =&gt; &amp;Target.aarch64.cpu.apple_m4, // pro/max
+<a id="L432"></a>                .ARM_TAHITI =&gt; &amp;Target.aarch64.cpu.apple_m4, // a18 pro
+<a id="L433"></a>                .ARM_TUPAI =&gt; &amp;Target.aarch64.cpu.apple_m4, // a18
+<a id="L434"></a>                else =&gt; return null,
+<a id="L435"></a>            };
+<a id="L436"></a>
+<a id="L437"></a>            return Target.Cpu{
+<a id="L438"></a>                .arch = current_arch,
+<a id="L439"></a>                .model = model,
+<a id="L440"></a>                .features = model.features,
+<a id="L441"></a>            };
+<a id="L442"></a>        },
+<a id="L443"></a>        else =&gt; {},
+<a id="L444"></a>    }
+<a id="L445"></a>
+<a id="L446"></a>    return null;
+<a id="L447"></a>}
+</pre>
 </body>
 </html>

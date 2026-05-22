@@ -2,299 +2,302 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Source: zig-0.16.0-std/compress/lzma2.zig</title>
+    <title>Source: compress/lzma2.zig</title>
     <style>
         body { background: #1e1e1e; color: #d4d4d4; font-family: monospace; padding: 20px; }
         pre { white-space: pre-wrap; word-wrap: break-word; }
         .header { border-bottom: 1px solid #444; padding-bottom: 10px; margin-bottom: 20px; }
         a { color: #569cd6; }
+        a[id] { color: inherit; text-decoration: none; }
+        :target { background: #3a3a00; }
     </style>
 </head>
 <body>
     <div class="header">
-        <a href="/">Index</a> | <strong>File: zig-0.16.0-std/compress/lzma2.zig</strong>
+        <a href="/">Index</a> | <strong>File: compress/lzma2.zig</strong>
     </div>
-    <pre>const std = @import("../std.zig");
-const Allocator = std.mem.Allocator;
-const ArrayList = std.ArrayList;
-const lzma = std.compress.lzma;
-const Writer = std.Io.Writer;
-const Reader = std.Io.Reader;
-
-/// An accumulating buffer for LZ sequences
-pub const AccumBuffer = struct {
-    /// Buffer
-    buf: ArrayList(u8),
-    /// Buffer memory limit
-    memlimit: usize,
-    /// Total number of bytes sent through the buffer
-    len: usize,
-
-    pub fn init(memlimit: usize) AccumBuffer {
-        return .{
-            .buf = .empty,
-            .memlimit = memlimit,
-            .len = 0,
-        };
-    }
-
-    pub fn appendByte(self: *AccumBuffer, allocator: Allocator, byte: u8) !void {
-        try self.buf.append(allocator, byte);
-        self.len += 1;
-    }
-
-    /// Reset the internal dictionary
-    pub fn reset(self: *AccumBuffer, writer: *Writer) !void {
-        try writer.writeAll(self.buf.items);
-        self.buf.clearRetainingCapacity();
-        self.len = 0;
-    }
-
-    /// Retrieve the last byte or return a default
-    pub fn lastOr(self: AccumBuffer, lit: u8) u8 {
-        const buf_len = self.buf.items.len;
-        return if (buf_len == 0)
-            lit
-        else
-            self.buf.items[buf_len - 1];
-    }
-
-    /// Retrieve the n-th last byte
-    pub fn lastN(self: AccumBuffer, dist: usize) !u8 {
-        const buf_len = self.buf.items.len;
-        if (dist &gt; buf_len) {
-            return error.CorruptInput;
-        }
-
-        return self.buf.items[buf_len - dist];
-    }
-
-    /// Append a literal
-    pub fn appendLiteral(
-        self: *AccumBuffer,
-        allocator: Allocator,
-        lit: u8,
-        writer: *Writer,
-    ) !void {
-        _ = writer;
-        if (self.len &gt;= self.memlimit) {
-            return error.CorruptInput;
-        }
-        try self.buf.append(allocator, lit);
-        self.len += 1;
-    }
-
-    /// Fetch an LZ sequence (length, distance) from inside the buffer
-    pub fn appendLz(
-        self: *AccumBuffer,
-        allocator: Allocator,
-        len: usize,
-        dist: usize,
-        writer: *Writer,
-    ) !void {
-        _ = writer;
-
-        const buf_len = self.buf.items.len;
-        if (dist &gt; buf_len) return error.CorruptInput;
-
-        try self.buf.ensureUnusedCapacity(allocator, len);
-        const buffer = self.buf.allocatedSlice();
-        const src = buffer[buf_len - dist ..][0..len];
-        const dst = buffer[buf_len..][0..len];
-
-        // This is not a @memmove; it intentionally repeats patterns caused by
-        // iterating one byte at a time.
-        for (dst, src) |*d, s| d.* = s;
-
-        self.buf.items.len = buf_len + len;
-        self.len += len;
-    }
-
-    pub fn finish(self: *AccumBuffer, writer: *Writer) !void {
-        try writer.writeAll(self.buf.items);
-        self.buf.clearRetainingCapacity();
-    }
-
-    pub fn deinit(self: *AccumBuffer, allocator: Allocator) void {
-        self.buf.deinit(allocator);
-        self.* = undefined;
-    }
-};
-
-pub const Decode = struct {
-    lzma_decode: lzma.Decode,
-
-    pub fn init(gpa: Allocator) !Decode {
-        return .{ .lzma_decode = try lzma.Decode.init(gpa, .{ .lc = 0, .lp = 0, .pb = 0 }) };
-    }
-
-    pub fn deinit(self: *Decode, gpa: Allocator) void {
-        self.lzma_decode.deinit(gpa);
-        self.* = undefined;
-    }
-
-    /// Returns how many compressed bytes were consumed.
-    pub fn decompress(d: *Decode, reader: *Reader, allocating: *Writer.Allocating) !u64 {
-        const gpa = allocating.allocator;
-
-        var accum = AccumBuffer.init(std.math.maxInt(usize));
-        defer accum.deinit(gpa);
-
-        var n_read: u64 = 0;
-
-        while (true) {
-            const status = try reader.takeByte();
-            n_read += 1;
-
-            switch (status) {
-                0 =&gt; break,
-                1 =&gt; n_read += try parseUncompressed(reader, allocating, &amp;accum, true),
-                2 =&gt; n_read += try parseUncompressed(reader, allocating, &amp;accum, false),
-                else =&gt; n_read += try d.parseLzma(reader, allocating, &amp;accum, status),
-            }
-        }
-
-        try accum.finish(&amp;allocating.writer);
-        return n_read;
-    }
-
-    fn parseLzma(
-        d: *Decode,
-        reader: *Reader,
-        allocating: *Writer.Allocating,
-        accum: *AccumBuffer,
-        status: u8,
-    ) !u64 {
-        if (status &amp; 0x80 == 0) return error.CorruptInput;
-
-        const Reset = struct {
-            dict: bool,
-            state: bool,
-            props: bool,
-        };
-
-        const reset: Reset = switch ((status &gt;&gt; 5) &amp; 0x3) {
-            0 =&gt; .{
-                .dict = false,
-                .state = false,
-                .props = false,
-            },
-            1 =&gt; .{
-                .dict = false,
-                .state = true,
-                .props = false,
-            },
-            2 =&gt; .{
-                .dict = false,
-                .state = true,
-                .props = true,
-            },
-            3 =&gt; .{
-                .dict = true,
-                .state = true,
-                .props = true,
-            },
-            else =&gt; unreachable,
-        };
-
-        var n_read: u64 = 0;
-
-        const unpacked_size = blk: {
-            var tmp: u64 = status &amp; 0x1F;
-            tmp &lt;&lt;= 16;
-            tmp |= try reader.takeInt(u16, .big);
-            n_read += 2;
-            break :blk tmp + 1;
-        };
-
-        const packed_size = blk: {
-            const tmp: u17 = try reader.takeInt(u16, .big);
-            n_read += 2;
-            break :blk tmp + 1;
-        };
-
-        if (reset.dict) try accum.reset(&amp;allocating.writer);
-
-        const ld = &amp;d.lzma_decode;
-
-        if (reset.state) {
-            var new_props = ld.properties;
-
-            if (reset.props) {
-                var props = try reader.takeByte();
-                n_read += 1;
-                if (props &gt;= 225) {
-                    return error.CorruptInput;
-                }
-
-                const lc = @as(u4, @intCast(props % 9));
-                props /= 9;
-                const lp = @as(u3, @intCast(props % 5));
-                props /= 5;
-                const pb = @as(u3, @intCast(props));
-
-                if (lc + lp &gt; 4) {
-                    return error.CorruptInput;
-                }
-
-                new_props = .{ .lc = lc, .lp = lp, .pb = pb };
-            }
-
-            try ld.resetState(allocating.allocator, new_props);
-        }
-
-        const expected_unpacked_size = accum.len + unpacked_size;
-        const start_count = n_read;
-        var range_decoder = try lzma.RangeDecoder.initCounting(reader, &amp;n_read);
-
-        while (true) {
-            if (accum.len &gt;= expected_unpacked_size) break;
-            switch (try ld.process(reader, allocating, accum, &amp;range_decoder, &amp;n_read)) {
-                .more =&gt; continue,
-                .finished =&gt; break,
-            }
-        }
-        if (accum.len != expected_unpacked_size) return error.DecompressedSizeMismatch;
-        if (n_read - start_count != packed_size) return error.CompressedSizeMismatch;
-
-        return n_read;
-    }
-
-    fn parseUncompressed(
-        reader: *Reader,
-        allocating: *Writer.Allocating,
-        accum: *AccumBuffer,
-        reset_dict: bool,
-    ) !usize {
-        const unpacked_size = @as(u17, try reader.takeInt(u16, .big)) + 1;
-
-        if (reset_dict) try accum.reset(&amp;allocating.writer);
-
-        const gpa = allocating.allocator;
-
-        for (0..unpacked_size) |_| {
-            try accum.appendByte(gpa, try reader.takeByte());
-        }
-        return 2 + unpacked_size;
-    }
-};
-
-test "decompress hello world stream" {
-    const expected = "Hello\nWorld!\n";
-    const compressed = &amp;[_]u8{ 0x01, 0x00, 0x05, 0x48, 0x65, 0x6C, 0x6C, 0x6F, 0x0A, 0x02, 0x00, 0x06, 0x57, 0x6F, 0x72, 0x6C, 0x64, 0x21, 0x0A, 0x00 };
-
-    const gpa = std.testing.allocator;
-
-    var decode = try Decode.init(gpa);
-    defer decode.deinit(gpa);
-
-    var stream: std.Io.Reader = .fixed(compressed);
-    var result: std.Io.Writer.Allocating = .init(gpa);
-    defer result.deinit();
-
-    const n_read = try decode.decompress(&amp;stream, &amp;result);
-    try std.testing.expectEqual(compressed.len, n_read);
-    try std.testing.expectEqualStrings(expected, result.written());
-}</pre>
+    <pre><a id="L1"></a>const std = @import("../std.zig");
+<a id="L2"></a>const Allocator = std.mem.Allocator;
+<a id="L3"></a>const ArrayList = std.ArrayList;
+<a id="L4"></a>const lzma = std.compress.lzma;
+<a id="L5"></a>const Writer = std.Io.Writer;
+<a id="L6"></a>const Reader = std.Io.Reader;
+<a id="L7"></a>
+<a id="L8"></a>/// An accumulating buffer for LZ sequences
+<a id="L9"></a>pub const AccumBuffer = struct {
+<a id="L10"></a>    /// Buffer
+<a id="L11"></a>    buf: ArrayList(u8),
+<a id="L12"></a>    /// Buffer memory limit
+<a id="L13"></a>    memlimit: usize,
+<a id="L14"></a>    /// Total number of bytes sent through the buffer
+<a id="L15"></a>    len: usize,
+<a id="L16"></a>
+<a id="L17"></a>    pub fn init(memlimit: usize) AccumBuffer {
+<a id="L18"></a>        return .{
+<a id="L19"></a>            .buf = .empty,
+<a id="L20"></a>            .memlimit = memlimit,
+<a id="L21"></a>            .len = 0,
+<a id="L22"></a>        };
+<a id="L23"></a>    }
+<a id="L24"></a>
+<a id="L25"></a>    pub fn appendByte(self: *AccumBuffer, allocator: Allocator, byte: u8) !void {
+<a id="L26"></a>        try self.buf.append(allocator, byte);
+<a id="L27"></a>        self.len += 1;
+<a id="L28"></a>    }
+<a id="L29"></a>
+<a id="L30"></a>    /// Reset the internal dictionary
+<a id="L31"></a>    pub fn reset(self: *AccumBuffer, writer: *Writer) !void {
+<a id="L32"></a>        try writer.writeAll(self.buf.items);
+<a id="L33"></a>        self.buf.clearRetainingCapacity();
+<a id="L34"></a>        self.len = 0;
+<a id="L35"></a>    }
+<a id="L36"></a>
+<a id="L37"></a>    /// Retrieve the last byte or return a default
+<a id="L38"></a>    pub fn lastOr(self: AccumBuffer, lit: u8) u8 {
+<a id="L39"></a>        const buf_len = self.buf.items.len;
+<a id="L40"></a>        return if (buf_len == 0)
+<a id="L41"></a>            lit
+<a id="L42"></a>        else
+<a id="L43"></a>            self.buf.items[buf_len - 1];
+<a id="L44"></a>    }
+<a id="L45"></a>
+<a id="L46"></a>    /// Retrieve the n-th last byte
+<a id="L47"></a>    pub fn lastN(self: AccumBuffer, dist: usize) !u8 {
+<a id="L48"></a>        const buf_len = self.buf.items.len;
+<a id="L49"></a>        if (dist &gt; buf_len) {
+<a id="L50"></a>            return error.CorruptInput;
+<a id="L51"></a>        }
+<a id="L52"></a>
+<a id="L53"></a>        return self.buf.items[buf_len - dist];
+<a id="L54"></a>    }
+<a id="L55"></a>
+<a id="L56"></a>    /// Append a literal
+<a id="L57"></a>    pub fn appendLiteral(
+<a id="L58"></a>        self: *AccumBuffer,
+<a id="L59"></a>        allocator: Allocator,
+<a id="L60"></a>        lit: u8,
+<a id="L61"></a>        writer: *Writer,
+<a id="L62"></a>    ) !void {
+<a id="L63"></a>        _ = writer;
+<a id="L64"></a>        if (self.len &gt;= self.memlimit) {
+<a id="L65"></a>            return error.CorruptInput;
+<a id="L66"></a>        }
+<a id="L67"></a>        try self.buf.append(allocator, lit);
+<a id="L68"></a>        self.len += 1;
+<a id="L69"></a>    }
+<a id="L70"></a>
+<a id="L71"></a>    /// Fetch an LZ sequence (length, distance) from inside the buffer
+<a id="L72"></a>    pub fn appendLz(
+<a id="L73"></a>        self: *AccumBuffer,
+<a id="L74"></a>        allocator: Allocator,
+<a id="L75"></a>        len: usize,
+<a id="L76"></a>        dist: usize,
+<a id="L77"></a>        writer: *Writer,
+<a id="L78"></a>    ) !void {
+<a id="L79"></a>        _ = writer;
+<a id="L80"></a>
+<a id="L81"></a>        const buf_len = self.buf.items.len;
+<a id="L82"></a>        if (dist &gt; buf_len) return error.CorruptInput;
+<a id="L83"></a>
+<a id="L84"></a>        try self.buf.ensureUnusedCapacity(allocator, len);
+<a id="L85"></a>        const buffer = self.buf.allocatedSlice();
+<a id="L86"></a>        const src = buffer[buf_len - dist ..][0..len];
+<a id="L87"></a>        const dst = buffer[buf_len..][0..len];
+<a id="L88"></a>
+<a id="L89"></a>        // This is not a @memmove; it intentionally repeats patterns caused by
+<a id="L90"></a>        // iterating one byte at a time.
+<a id="L91"></a>        for (dst, src) |*d, s| d.* = s;
+<a id="L92"></a>
+<a id="L93"></a>        self.buf.items.len = buf_len + len;
+<a id="L94"></a>        self.len += len;
+<a id="L95"></a>    }
+<a id="L96"></a>
+<a id="L97"></a>    pub fn finish(self: *AccumBuffer, writer: *Writer) !void {
+<a id="L98"></a>        try writer.writeAll(self.buf.items);
+<a id="L99"></a>        self.buf.clearRetainingCapacity();
+<a id="L100"></a>    }
+<a id="L101"></a>
+<a id="L102"></a>    pub fn deinit(self: *AccumBuffer, allocator: Allocator) void {
+<a id="L103"></a>        self.buf.deinit(allocator);
+<a id="L104"></a>        self.* = undefined;
+<a id="L105"></a>    }
+<a id="L106"></a>};
+<a id="L107"></a>
+<a id="L108"></a>pub const Decode = struct {
+<a id="L109"></a>    lzma_decode: lzma.Decode,
+<a id="L110"></a>
+<a id="L111"></a>    pub fn init(gpa: Allocator) !Decode {
+<a id="L112"></a>        return .{ .lzma_decode = try lzma.Decode.init(gpa, .{ .lc = 0, .lp = 0, .pb = 0 }) };
+<a id="L113"></a>    }
+<a id="L114"></a>
+<a id="L115"></a>    pub fn deinit(self: *Decode, gpa: Allocator) void {
+<a id="L116"></a>        self.lzma_decode.deinit(gpa);
+<a id="L117"></a>        self.* = undefined;
+<a id="L118"></a>    }
+<a id="L119"></a>
+<a id="L120"></a>    /// Returns how many compressed bytes were consumed.
+<a id="L121"></a>    pub fn decompress(d: *Decode, reader: *Reader, allocating: *Writer.Allocating) !u64 {
+<a id="L122"></a>        const gpa = allocating.allocator;
+<a id="L123"></a>
+<a id="L124"></a>        var accum = AccumBuffer.init(std.math.maxInt(usize));
+<a id="L125"></a>        defer accum.deinit(gpa);
+<a id="L126"></a>
+<a id="L127"></a>        var n_read: u64 = 0;
+<a id="L128"></a>
+<a id="L129"></a>        while (true) {
+<a id="L130"></a>            const status = try reader.takeByte();
+<a id="L131"></a>            n_read += 1;
+<a id="L132"></a>
+<a id="L133"></a>            switch (status) {
+<a id="L134"></a>                0 =&gt; break,
+<a id="L135"></a>                1 =&gt; n_read += try parseUncompressed(reader, allocating, &amp;accum, true),
+<a id="L136"></a>                2 =&gt; n_read += try parseUncompressed(reader, allocating, &amp;accum, false),
+<a id="L137"></a>                else =&gt; n_read += try d.parseLzma(reader, allocating, &amp;accum, status),
+<a id="L138"></a>            }
+<a id="L139"></a>        }
+<a id="L140"></a>
+<a id="L141"></a>        try accum.finish(&amp;allocating.writer);
+<a id="L142"></a>        return n_read;
+<a id="L143"></a>    }
+<a id="L144"></a>
+<a id="L145"></a>    fn parseLzma(
+<a id="L146"></a>        d: *Decode,
+<a id="L147"></a>        reader: *Reader,
+<a id="L148"></a>        allocating: *Writer.Allocating,
+<a id="L149"></a>        accum: *AccumBuffer,
+<a id="L150"></a>        status: u8,
+<a id="L151"></a>    ) !u64 {
+<a id="L152"></a>        if (status &amp; 0x80 == 0) return error.CorruptInput;
+<a id="L153"></a>
+<a id="L154"></a>        const Reset = struct {
+<a id="L155"></a>            dict: bool,
+<a id="L156"></a>            state: bool,
+<a id="L157"></a>            props: bool,
+<a id="L158"></a>        };
+<a id="L159"></a>
+<a id="L160"></a>        const reset: Reset = switch ((status &gt;&gt; 5) &amp; 0x3) {
+<a id="L161"></a>            0 =&gt; .{
+<a id="L162"></a>                .dict = false,
+<a id="L163"></a>                .state = false,
+<a id="L164"></a>                .props = false,
+<a id="L165"></a>            },
+<a id="L166"></a>            1 =&gt; .{
+<a id="L167"></a>                .dict = false,
+<a id="L168"></a>                .state = true,
+<a id="L169"></a>                .props = false,
+<a id="L170"></a>            },
+<a id="L171"></a>            2 =&gt; .{
+<a id="L172"></a>                .dict = false,
+<a id="L173"></a>                .state = true,
+<a id="L174"></a>                .props = true,
+<a id="L175"></a>            },
+<a id="L176"></a>            3 =&gt; .{
+<a id="L177"></a>                .dict = true,
+<a id="L178"></a>                .state = true,
+<a id="L179"></a>                .props = true,
+<a id="L180"></a>            },
+<a id="L181"></a>            else =&gt; unreachable,
+<a id="L182"></a>        };
+<a id="L183"></a>
+<a id="L184"></a>        var n_read: u64 = 0;
+<a id="L185"></a>
+<a id="L186"></a>        const unpacked_size = blk: {
+<a id="L187"></a>            var tmp: u64 = status &amp; 0x1F;
+<a id="L188"></a>            tmp &lt;&lt;= 16;
+<a id="L189"></a>            tmp |= try reader.takeInt(u16, .big);
+<a id="L190"></a>            n_read += 2;
+<a id="L191"></a>            break :blk tmp + 1;
+<a id="L192"></a>        };
+<a id="L193"></a>
+<a id="L194"></a>        const packed_size = blk: {
+<a id="L195"></a>            const tmp: u17 = try reader.takeInt(u16, .big);
+<a id="L196"></a>            n_read += 2;
+<a id="L197"></a>            break :blk tmp + 1;
+<a id="L198"></a>        };
+<a id="L199"></a>
+<a id="L200"></a>        if (reset.dict) try accum.reset(&amp;allocating.writer);
+<a id="L201"></a>
+<a id="L202"></a>        const ld = &amp;d.lzma_decode;
+<a id="L203"></a>
+<a id="L204"></a>        if (reset.state) {
+<a id="L205"></a>            var new_props = ld.properties;
+<a id="L206"></a>
+<a id="L207"></a>            if (reset.props) {
+<a id="L208"></a>                var props = try reader.takeByte();
+<a id="L209"></a>                n_read += 1;
+<a id="L210"></a>                if (props &gt;= 225) {
+<a id="L211"></a>                    return error.CorruptInput;
+<a id="L212"></a>                }
+<a id="L213"></a>
+<a id="L214"></a>                const lc = @as(u4, @intCast(props % 9));
+<a id="L215"></a>                props /= 9;
+<a id="L216"></a>                const lp = @as(u3, @intCast(props % 5));
+<a id="L217"></a>                props /= 5;
+<a id="L218"></a>                const pb = @as(u3, @intCast(props));
+<a id="L219"></a>
+<a id="L220"></a>                if (lc + lp &gt; 4) {
+<a id="L221"></a>                    return error.CorruptInput;
+<a id="L222"></a>                }
+<a id="L223"></a>
+<a id="L224"></a>                new_props = .{ .lc = lc, .lp = lp, .pb = pb };
+<a id="L225"></a>            }
+<a id="L226"></a>
+<a id="L227"></a>            try ld.resetState(allocating.allocator, new_props);
+<a id="L228"></a>        }
+<a id="L229"></a>
+<a id="L230"></a>        const expected_unpacked_size = accum.len + unpacked_size;
+<a id="L231"></a>        const start_count = n_read;
+<a id="L232"></a>        var range_decoder = try lzma.RangeDecoder.initCounting(reader, &amp;n_read);
+<a id="L233"></a>
+<a id="L234"></a>        while (true) {
+<a id="L235"></a>            if (accum.len &gt;= expected_unpacked_size) break;
+<a id="L236"></a>            switch (try ld.process(reader, allocating, accum, &amp;range_decoder, &amp;n_read)) {
+<a id="L237"></a>                .more =&gt; continue,
+<a id="L238"></a>                .finished =&gt; break,
+<a id="L239"></a>            }
+<a id="L240"></a>        }
+<a id="L241"></a>        if (accum.len != expected_unpacked_size) return error.DecompressedSizeMismatch;
+<a id="L242"></a>        if (n_read - start_count != packed_size) return error.CompressedSizeMismatch;
+<a id="L243"></a>
+<a id="L244"></a>        return n_read;
+<a id="L245"></a>    }
+<a id="L246"></a>
+<a id="L247"></a>    fn parseUncompressed(
+<a id="L248"></a>        reader: *Reader,
+<a id="L249"></a>        allocating: *Writer.Allocating,
+<a id="L250"></a>        accum: *AccumBuffer,
+<a id="L251"></a>        reset_dict: bool,
+<a id="L252"></a>    ) !usize {
+<a id="L253"></a>        const unpacked_size = @as(u17, try reader.takeInt(u16, .big)) + 1;
+<a id="L254"></a>
+<a id="L255"></a>        if (reset_dict) try accum.reset(&amp;allocating.writer);
+<a id="L256"></a>
+<a id="L257"></a>        const gpa = allocating.allocator;
+<a id="L258"></a>
+<a id="L259"></a>        for (0..unpacked_size) |_| {
+<a id="L260"></a>            try accum.appendByte(gpa, try reader.takeByte());
+<a id="L261"></a>        }
+<a id="L262"></a>        return 2 + unpacked_size;
+<a id="L263"></a>    }
+<a id="L264"></a>};
+<a id="L265"></a>
+<a id="L266"></a>test "decompress hello world stream" {
+<a id="L267"></a>    const expected = "Hello\nWorld!\n";
+<a id="L268"></a>    const compressed = &amp;[_]u8{ 0x01, 0x00, 0x05, 0x48, 0x65, 0x6C, 0x6C, 0x6F, 0x0A, 0x02, 0x00, 0x06, 0x57, 0x6F, 0x72, 0x6C, 0x64, 0x21, 0x0A, 0x00 };
+<a id="L269"></a>
+<a id="L270"></a>    const gpa = std.testing.allocator;
+<a id="L271"></a>
+<a id="L272"></a>    var decode = try Decode.init(gpa);
+<a id="L273"></a>    defer decode.deinit(gpa);
+<a id="L274"></a>
+<a id="L275"></a>    var stream: std.Io.Reader = .fixed(compressed);
+<a id="L276"></a>    var result: std.Io.Writer.Allocating = .init(gpa);
+<a id="L277"></a>    defer result.deinit();
+<a id="L278"></a>
+<a id="L279"></a>    const n_read = try decode.decompress(&amp;stream, &amp;result);
+<a id="L280"></a>    try std.testing.expectEqual(compressed.len, n_read);
+<a id="L281"></a>    try std.testing.expectEqualStrings(expected, result.written());
+<a id="L282"></a>}
+</pre>
 </body>
 </html>

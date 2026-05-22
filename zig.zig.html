@@ -2,1207 +2,1210 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Source: zig-0.16.0-std/zig.zig</title>
+    <title>Source: zig.zig</title>
     <style>
         body { background: #1e1e1e; color: #d4d4d4; font-family: monospace; padding: 20px; }
         pre { white-space: pre-wrap; word-wrap: break-word; }
         .header { border-bottom: 1px solid #444; padding-bottom: 10px; margin-bottom: 20px; }
         a { color: #569cd6; }
+        a[id] { color: inherit; text-decoration: none; }
+        :target { background: #3a3a00; }
     </style>
 </head>
 <body>
     <div class="header">
-        <a href="/">Index</a> | <strong>File: zig-0.16.0-std/zig.zig</strong>
+        <a href="/">Index</a> | <strong>File: zig.zig</strong>
     </div>
-    <pre>//! Builds of the Zig compiler are distributed partly in source form. That
-//! source lives here. These APIs are provided as-is and have absolutely no API
-//! guarantees whatsoever.
-
-const std = @import("std.zig");
-const assert = std.debug.assert;
-const mem = std.mem;
-const Allocator = std.mem.Allocator;
-const Io = std.Io;
-const Writer = std.Io.Writer;
-
-const tokenizer = @import("zig/tokenizer.zig");
-
-pub const ErrorBundle = @import("zig/ErrorBundle.zig");
-pub const Server = @import("zig/Server.zig");
-pub const Client = @import("zig/Client.zig");
-pub const Token = tokenizer.Token;
-pub const Tokenizer = tokenizer.Tokenizer;
-pub const TokenSmith = @import("zig/TokenSmith.zig");
-pub const string_literal = @import("zig/string_literal.zig");
-pub const number_literal = @import("zig/number_literal.zig");
-pub const primitives = @import("zig/primitives.zig");
-pub const isPrimitive = primitives.isPrimitive;
-pub const Ast = @import("zig/Ast.zig");
-pub const AstGen = @import("zig/AstGen.zig");
-pub const AstSmith = @import("zig/AstSmith.zig");
-pub const Zir = @import("zig/Zir.zig");
-pub const Zoir = @import("zig/Zoir.zig");
-pub const ZonGen = @import("zig/ZonGen.zig");
-pub const system = @import("zig/system.zig");
-pub const BuiltinFn = @import("zig/BuiltinFn.zig");
-pub const AstRlAnnotate = @import("zig/AstRlAnnotate.zig");
-pub const LibCInstallation = @import("zig/LibCInstallation.zig");
-pub const WindowsSdk = @import("zig/WindowsSdk.zig");
-pub const LibCDirs = @import("zig/LibCDirs.zig");
-pub const target = @import("zig/target.zig");
-pub const llvm = @import("zig/llvm.zig");
-
-// Character literal parsing
-pub const ParsedCharLiteral = string_literal.ParsedCharLiteral;
-pub const parseCharLiteral = string_literal.parseCharLiteral;
-pub const parseNumberLiteral = number_literal.parseNumberLiteral;
-
-pub const c_translation = struct {
-    pub const builtins = @import("zig/c_translation/builtins.zig");
-    pub const helpers = @import("zig/c_translation/helpers.zig");
-};
-
-pub const SrcHasher = std.crypto.hash.Blake3;
-pub const SrcHash = [16]u8;
-
-pub const Color = enum {
-    /// Auto-detect whether stream supports terminal colors.
-    auto,
-    /// Force-enable colors.
-    off,
-    /// Suppress colors.
-    on,
-
-    pub fn terminalMode(color: Color) ?Io.Terminal.Mode {
-        return switch (color) {
-            .auto =&gt; null,
-            .on =&gt; .escape_codes,
-            .off =&gt; .no_color,
-        };
-    }
-};
-
-/// There are many assumptions in the entire codebase that Zig source files can
-/// be byte-indexed with a u32 integer.
-pub const max_src_size = std.math.maxInt(u32);
-
-pub fn hashSrc(src: []const u8) SrcHash {
-    var out: SrcHash = undefined;
-    SrcHasher.hash(src, &amp;out, .{});
-    return out;
-}
-
-pub fn srcHashEql(a: SrcHash, b: SrcHash) bool {
-    return @as(u128, @bitCast(a)) == @as(u128, @bitCast(b));
-}
-
-pub fn hashName(parent_hash: SrcHash, sep: []const u8, name: []const u8) SrcHash {
-    var out: SrcHash = undefined;
-    var hasher = SrcHasher.init(.{});
-    hasher.update(&amp;parent_hash);
-    hasher.update(sep);
-    hasher.update(name);
-    hasher.final(&amp;out);
-    return out;
-}
-
-pub const Loc = struct {
-    line: usize,
-    column: usize,
-    /// Does not include the trailing newline.
-    source_line: []const u8,
-
-    pub fn eql(a: Loc, b: Loc) bool {
-        return a.line == b.line and a.column == b.column and mem.eql(u8, a.source_line, b.source_line);
-    }
-};
-
-pub fn findLineColumn(source: []const u8, byte_offset: usize) Loc {
-    var line: usize = 0;
-    var column: usize = 0;
-    var line_start: usize = 0;
-    var i: usize = 0;
-    while (i &lt; byte_offset) : (i += 1) {
-        switch (source[i]) {
-            '\n' =&gt; {
-                line += 1;
-                column = 0;
-                line_start = i + 1;
-            },
-            else =&gt; {
-                column += 1;
-            },
-        }
-    }
-    while (i &lt; source.len and source[i] != '\n') {
-        i += 1;
-    }
-    return .{
-        .line = line,
-        .column = column,
-        .source_line = source[line_start..i],
-    };
-}
-
-pub fn lineDelta(source: []const u8, start: usize, end: usize) isize {
-    var line: isize = 0;
-    if (end &gt;= start) {
-        for (source[start..end]) |byte| switch (byte) {
-            '\n' =&gt; line += 1,
-            else =&gt; continue,
-        };
-    } else {
-        for (source[end..start]) |byte| switch (byte) {
-            '\n' =&gt; line -= 1,
-            else =&gt; continue,
-        };
-    }
-    return line;
-}
-
-pub const BinNameOptions = struct {
-    root_name: []const u8,
-    target: *const std.Target,
-    output_mode: std.builtin.OutputMode,
-    link_mode: ?std.builtin.LinkMode = null,
-    version: ?std.SemanticVersion = null,
-};
-
-/// Returns the standard file system basename of a binary generated by the Zig compiler.
-pub fn binNameAlloc(allocator: Allocator, options: BinNameOptions) error{OutOfMemory}![]u8 {
-    const root_name = options.root_name;
-    const t = options.target;
-    switch (t.ofmt) {
-        .coff =&gt; switch (options.output_mode) {
-            .Exe =&gt; return std.fmt.allocPrint(allocator, "{s}{s}", .{ root_name, t.exeFileExt() }),
-            .Lib =&gt; {
-                const suffix = switch (options.link_mode orelse .static) {
-                    .static =&gt; ".lib",
-                    .dynamic =&gt; ".dll",
-                };
-                return std.fmt.allocPrint(allocator, "{s}{s}", .{ root_name, suffix });
-            },
-            .Obj =&gt; return std.fmt.allocPrint(allocator, "{s}.obj", .{root_name}),
-        },
-        .elf =&gt; switch (options.output_mode) {
-            .Exe =&gt; return allocator.dupe(u8, root_name),
-            .Lib =&gt; {
-                switch (options.link_mode orelse .static) {
-                    .static =&gt; return std.fmt.allocPrint(allocator, "{s}{s}.a", .{
-                        t.libPrefix(), root_name,
-                    }),
-                    .dynamic =&gt; {
-                        if (options.version) |ver| {
-                            return std.fmt.allocPrint(allocator, "{s}{s}.so.{d}.{d}.{d}", .{
-                                t.libPrefix(), root_name, ver.major, ver.minor, ver.patch,
-                            });
-                        } else {
-                            return std.fmt.allocPrint(allocator, "{s}{s}.so", .{
-                                t.libPrefix(), root_name,
-                            });
-                        }
-                    },
-                }
-            },
-            .Obj =&gt; return std.fmt.allocPrint(allocator, "{s}.o", .{root_name}),
-        },
-        .macho =&gt; switch (options.output_mode) {
-            .Exe =&gt; return allocator.dupe(u8, root_name),
-            .Lib =&gt; {
-                switch (options.link_mode orelse .static) {
-                    .static =&gt; return std.fmt.allocPrint(allocator, "{s}{s}.a", .{
-                        t.libPrefix(), root_name,
-                    }),
-                    .dynamic =&gt; {
-                        if (options.version) |ver| {
-                            return std.fmt.allocPrint(allocator, "{s}{s}.{d}.{d}.{d}.dylib", .{
-                                t.libPrefix(), root_name, ver.major, ver.minor, ver.patch,
-                            });
-                        } else {
-                            return std.fmt.allocPrint(allocator, "{s}{s}.dylib", .{
-                                t.libPrefix(), root_name,
-                            });
-                        }
-                    },
-                }
-            },
-            .Obj =&gt; return std.fmt.allocPrint(allocator, "{s}.o", .{root_name}),
-        },
-        .wasm =&gt; switch (options.output_mode) {
-            .Exe =&gt; return std.fmt.allocPrint(allocator, "{s}{s}", .{ root_name, t.exeFileExt() }),
-            .Lib =&gt; {
-                switch (options.link_mode orelse .static) {
-                    .static =&gt; return std.fmt.allocPrint(allocator, "{s}{s}.a", .{
-                        t.libPrefix(), root_name,
-                    }),
-                    .dynamic =&gt; return std.fmt.allocPrint(allocator, "{s}.wasm", .{root_name}),
-                }
-            },
-            .Obj =&gt; return std.fmt.allocPrint(allocator, "{s}.o", .{root_name}),
-        },
-        .c =&gt; return std.fmt.allocPrint(allocator, "{s}.c", .{root_name}),
-        .spirv =&gt; return std.fmt.allocPrint(allocator, "{s}.spv", .{root_name}),
-        .hex =&gt; return std.fmt.allocPrint(allocator, "{s}.ihex", .{root_name}),
-        .raw =&gt; return std.fmt.allocPrint(allocator, "{s}.bin", .{root_name}),
-        .plan9 =&gt; switch (options.output_mode) {
-            .Exe =&gt; return allocator.dupe(u8, root_name),
-            .Obj =&gt; return std.fmt.allocPrint(allocator, "{s}{s}", .{
-                root_name, t.ofmt.fileExt(t.cpu.arch),
-            }),
-            .Lib =&gt; return std.fmt.allocPrint(allocator, "{s}{s}.a", .{
-                t.libPrefix(), root_name,
-            }),
-        },
-    }
-}
-
-pub const SanitizeC = enum {
-    off,
-    trap,
-    full,
-};
-
-pub const BuildId = union(enum) {
-    none,
-    fast,
-    uuid,
-    sha1,
-    md5,
-    hexstring: HexString,
-
-    pub fn eql(a: BuildId, b: BuildId) bool {
-        const Tag = @typeInfo(BuildId).@"union".tag_type.?;
-        const a_tag: Tag = a;
-        const b_tag: Tag = b;
-        if (a_tag != b_tag) return false;
-        return switch (a) {
-            .none, .fast, .uuid, .sha1, .md5 =&gt; true,
-            .hexstring =&gt; |a_hexstring| mem.eql(u8, a_hexstring.toSlice(), b.hexstring.toSlice()),
-        };
-    }
-
-    pub const HexString = struct {
-        bytes: [32]u8,
-        len: u8,
-
-        /// Result is byte values, *not* hex-encoded.
-        pub fn toSlice(hs: *const HexString) []const u8 {
-            return hs.bytes[0..hs.len];
-        }
-    };
-
-    /// Input is byte values, *not* hex-encoded.
-    /// Asserts `bytes` fits inside `HexString`
-    pub fn initHexString(bytes: []const u8) BuildId {
-        var result: BuildId = .{ .hexstring = .{
-            .bytes = undefined,
-            .len = @intCast(bytes.len),
-        } };
-        @memcpy(result.hexstring.bytes[0..bytes.len], bytes);
-        return result;
-    }
-
-    /// Converts UTF-8 text to a `BuildId`.
-    pub fn parse(text: []const u8) !BuildId {
-        if (mem.eql(u8, text, "none")) {
-            return .none;
-        } else if (mem.eql(u8, text, "fast")) {
-            return .fast;
-        } else if (mem.eql(u8, text, "uuid")) {
-            return .uuid;
-        } else if (mem.eql(u8, text, "sha1") or mem.eql(u8, text, "tree")) {
-            return .sha1;
-        } else if (mem.eql(u8, text, "md5")) {
-            return .md5;
-        } else if (mem.startsWith(u8, text, "0x")) {
-            var result: BuildId = .{ .hexstring = undefined };
-            const slice = try std.fmt.hexToBytes(&amp;result.hexstring.bytes, text[2..]);
-            result.hexstring.len = @as(u8, @intCast(slice.len));
-            return result;
-        }
-        return error.InvalidBuildIdStyle;
-    }
-
-    test parse {
-        try std.testing.expectEqual(BuildId.md5, try parse("md5"));
-        try std.testing.expectEqual(BuildId.none, try parse("none"));
-        try std.testing.expectEqual(BuildId.fast, try parse("fast"));
-        try std.testing.expectEqual(BuildId.uuid, try parse("uuid"));
-        try std.testing.expectEqual(BuildId.sha1, try parse("sha1"));
-        try std.testing.expectEqual(BuildId.sha1, try parse("tree"));
-
-        try std.testing.expect(BuildId.initHexString("").eql(try parse("0x")));
-        try std.testing.expect(BuildId.initHexString("\x12\x34\x56").eql(try parse("0x123456")));
-        try std.testing.expectError(error.InvalidLength, parse("0x12-34"));
-        try std.testing.expectError(error.InvalidCharacter, parse("0xfoobbb"));
-        try std.testing.expectError(error.InvalidBuildIdStyle, parse("yaddaxxx"));
-    }
-
-    pub fn format(id: BuildId, writer: *Writer) Writer.Error!void {
-        switch (id) {
-            .none, .fast, .uuid, .sha1, .md5 =&gt; {
-                try writer.writeAll(@tagName(id));
-            },
-            .hexstring =&gt; |hs| {
-                try writer.print("0x{x}", .{hs.toSlice()});
-            },
-        }
-    }
-
-    test format {
-        try std.testing.expectFmt("none", "{f}", .{@as(BuildId, .none)});
-        try std.testing.expectFmt("fast", "{f}", .{@as(BuildId, .fast)});
-        try std.testing.expectFmt("uuid", "{f}", .{@as(BuildId, .uuid)});
-        try std.testing.expectFmt("sha1", "{f}", .{@as(BuildId, .sha1)});
-        try std.testing.expectFmt("md5", "{f}", .{@as(BuildId, .md5)});
-        try std.testing.expectFmt("0x", "{f}", .{BuildId.initHexString("")});
-        try std.testing.expectFmt("0x1234cdef", "{f}", .{BuildId.initHexString("\x12\x34\xcd\xef")});
-    }
-};
-
-pub const LtoMode = enum { none, full, thin };
-
-pub const Subsystem = enum {
-    console,
-    windows,
-    posix,
-    native,
-    efi_application,
-    efi_boot_service_driver,
-    efi_rom,
-    efi_runtime_driver,
-
-    /// Deprecated; use '.console' instead. To be removed after 0.16.0 is tagged.
-    pub const Console: Subsystem = .console;
-    /// Deprecated; use '.windows' instead. To be removed after 0.16.0 is tagged.
-    pub const Windows: Subsystem = .windows;
-    /// Deprecated; use '.posix' instead. To be removed after 0.16.0 is tagged.
-    pub const Posix: Subsystem = .posix;
-    /// Deprecated; use '.native' instead. To be removed after 0.16.0 is tagged.
-    pub const Native: Subsystem = .native;
-    /// Deprecated; use '.efi_application' instead. To be removed after 0.16.0 is tagged.
-    pub const EfiApplication: Subsystem = .efi_application;
-    /// Deprecated; use '.efi_boot_service_driver' instead. To be removed after 0.16.0 is tagged.
-    pub const EfiBootServiceDriver: Subsystem = .efi_boot_service_driver;
-    /// Deprecated; use '.efi_rom' instead. To be removed after 0.16.0 is tagged.
-    pub const EfiRom: Subsystem = .efi_rom;
-    /// Deprecated; use '.efi_runtime_driver' instead. To be removed after 0.16.0 is tagged.
-    pub const EfiRuntimeDriver: Subsystem = .efi_runtime_driver;
-};
-
-pub const CompressDebugSections = enum { none, zlib, zstd };
-
-pub const RcIncludes = enum {
-    /// Use MSVC if available, fall back to MinGW.
-    any,
-    /// Use MSVC include paths (MSVC install + Windows SDK, must be present on the system).
-    msvc,
-    /// Use MinGW include paths (distributed with Zig).
-    gnu,
-    /// Do not use any autodetected include paths.
-    none,
-};
-
-/// Renders a `std.Target.Cpu` value into a textual representation that can be parsed
-/// via the `-mcpu` flag passed to the Zig compiler.
-/// Appends the result to `buffer`.
-pub fn serializeCpu(buffer: *std.array_list.Managed(u8), cpu: std.Target.Cpu) Allocator.Error!void {
-    const all_features = cpu.arch.allFeaturesList();
-    var populated_cpu_features = cpu.model.features;
-    populated_cpu_features.populateDependencies(all_features);
-
-    try buffer.appendSlice(cpu.model.name);
-
-    if (populated_cpu_features.eql(cpu.features)) {
-        // The CPU name alone is sufficient.
-        return;
-    }
-
-    for (all_features, 0..) |feature, i_usize| {
-        const i: std.Target.Cpu.Feature.Set.Index = @intCast(i_usize);
-        const in_cpu_set = populated_cpu_features.isEnabled(i);
-        const in_actual_set = cpu.features.isEnabled(i);
-        try buffer.ensureUnusedCapacity(feature.name.len + 1);
-        if (in_cpu_set and !in_actual_set) {
-            buffer.appendAssumeCapacity('-');
-            buffer.appendSliceAssumeCapacity(feature.name);
-        } else if (!in_cpu_set and in_actual_set) {
-            buffer.appendAssumeCapacity('+');
-            buffer.appendSliceAssumeCapacity(feature.name);
-        }
-    }
-}
-
-pub fn serializeCpuAlloc(ally: Allocator, cpu: std.Target.Cpu) Allocator.Error![]u8 {
-    var buffer = std.array_list.Managed(u8).init(ally);
-    try serializeCpu(&amp;buffer, cpu);
-    return buffer.toOwnedSlice();
-}
-
-/// Return a Formatter for a Zig identifier, escaping it with `@""` syntax if needed.
-///
-/// See also `fmtIdFlags`.
-pub fn fmtId(bytes: []const u8) FormatId {
-    return .{ .bytes = bytes, .flags = .{} };
-}
-
-/// Return a Formatter for a Zig identifier, escaping it with `@""` syntax if needed.
-///
-/// See also `fmtId`.
-pub fn fmtIdFlags(bytes: []const u8, flags: FormatId.Flags) FormatId {
-    return .{ .bytes = bytes, .flags = flags };
-}
-
-pub fn fmtIdPU(bytes: []const u8) FormatId {
-    return .{ .bytes = bytes, .flags = .{ .allow_primitive = true, .allow_underscore = true } };
-}
-
-pub fn fmtIdP(bytes: []const u8) FormatId {
-    return .{ .bytes = bytes, .flags = .{ .allow_primitive = true } };
-}
-
-test fmtId {
-    const expectFmt = std.testing.expectFmt;
-    try expectFmt("@\"while\"", "{f}", .{fmtId("while")});
-    try expectFmt("@\"while\"", "{f}", .{fmtIdFlags("while", .{ .allow_primitive = true })});
-    try expectFmt("@\"while\"", "{f}", .{fmtIdFlags("while", .{ .allow_underscore = true })});
-    try expectFmt("@\"while\"", "{f}", .{fmtIdFlags("while", .{ .allow_primitive = true, .allow_underscore = true })});
-
-    try expectFmt("hello", "{f}", .{fmtId("hello")});
-    try expectFmt("hello", "{f}", .{fmtIdFlags("hello", .{ .allow_primitive = true })});
-    try expectFmt("hello", "{f}", .{fmtIdFlags("hello", .{ .allow_underscore = true })});
-    try expectFmt("hello", "{f}", .{fmtIdFlags("hello", .{ .allow_primitive = true, .allow_underscore = true })});
-
-    try expectFmt("@\"type\"", "{f}", .{fmtId("type")});
-    try expectFmt("type", "{f}", .{fmtIdFlags("type", .{ .allow_primitive = true })});
-    try expectFmt("@\"type\"", "{f}", .{fmtIdFlags("type", .{ .allow_underscore = true })});
-    try expectFmt("type", "{f}", .{fmtIdFlags("type", .{ .allow_primitive = true, .allow_underscore = true })});
-
-    try expectFmt("@\"_\"", "{f}", .{fmtId("_")});
-    try expectFmt("@\"_\"", "{f}", .{fmtIdFlags("_", .{ .allow_primitive = true })});
-    try expectFmt("_", "{f}", .{fmtIdFlags("_", .{ .allow_underscore = true })});
-    try expectFmt("_", "{f}", .{fmtIdFlags("_", .{ .allow_primitive = true, .allow_underscore = true })});
-
-    try expectFmt("@\"i123\"", "{f}", .{fmtId("i123")});
-    try expectFmt("i123", "{f}", .{fmtIdFlags("i123", .{ .allow_primitive = true })});
-    try expectFmt("@\"4four\"", "{f}", .{fmtId("4four")});
-    try expectFmt("_underscore", "{f}", .{fmtId("_underscore")});
-    try expectFmt("@\"11\\\"23\"", "{f}", .{fmtId("11\"23")});
-    try expectFmt("@\"11\\x0f23\"", "{f}", .{fmtId("11\x0F23")});
-
-    // These are technically not currently legal in Zig.
-    try expectFmt("@\"\"", "{f}", .{fmtId("")});
-    try expectFmt("@\"\\x00\"", "{f}", .{fmtId("\x00")});
-}
-
-pub const FormatId = struct {
-    bytes: []const u8,
-    flags: Flags,
-    pub const Flags = struct {
-        allow_primitive: bool = false,
-        allow_underscore: bool = false,
-    };
-
-    /// Print the string as a Zig identifier, escaping it with `@""` syntax if needed.
-    pub fn format(ctx: FormatId, writer: *Writer) Writer.Error!void {
-        const bytes = ctx.bytes;
-        if (isValidId(bytes) and
-            (ctx.flags.allow_primitive or !std.zig.isPrimitive(bytes)) and
-            (ctx.flags.allow_underscore or !isUnderscore(bytes)))
-        {
-            return writer.writeAll(bytes);
-        }
-        try writer.writeAll("@\"");
-        try stringEscape(bytes, writer);
-        try writer.writeByte('"');
-    }
-};
-
-/// Return a formatter for escaping a double quoted Zig string.
-pub fn fmtString(bytes: []const u8) std.fmt.Alt([]const u8, stringEscape) {
-    return .{ .data = bytes };
-}
-
-/// Return a formatter for escaping a single quoted Zig string.
-pub fn fmtChar(c: u21) std.fmt.Alt(u21, charEscape) {
-    return .{ .data = c };
-}
-
-test fmtString {
-    try std.testing.expectFmt("\\x0f", "{f}", .{fmtString("\x0f")});
-    try std.testing.expectFmt(
-        \\" \\ hi \x07 \x11 \" derp '"
-    , "\"{f}\"", .{fmtString(" \\ hi \x07 \x11 \" derp '")});
-}
-
-test fmtChar {
-    try std.testing.expectFmt("c \\u{26a1}", "{f} {f}", .{ fmtChar('c'), fmtChar('⚡') });
-}
-
-/// Print the string as escaped contents of a double quoted string.
-pub fn stringEscape(bytes: []const u8, w: *Writer) Writer.Error!void {
-    for (bytes) |byte| switch (byte) {
-        '\n' =&gt; try w.writeAll("\\n"),
-        '\r' =&gt; try w.writeAll("\\r"),
-        '\t' =&gt; try w.writeAll("\\t"),
-        '\\' =&gt; try w.writeAll("\\\\"),
-        '"' =&gt; try w.writeAll("\\\""),
-        '\'' =&gt; try w.writeByte('\''),
-        ' ', '!', '#'...'&amp;', '('...'[', ']'...'~' =&gt; try w.writeByte(byte),
-        else =&gt; {
-            try w.writeAll("\\x");
-            try w.printInt(byte, 16, .lower, .{ .width = 2, .fill = '0' });
-        },
-    };
-}
-
-/// Print as escaped contents of a single-quoted string.
-pub fn charEscape(codepoint: u21, w: *Writer) Writer.Error!void {
-    switch (codepoint) {
-        '\n' =&gt; try w.writeAll("\\n"),
-        '\r' =&gt; try w.writeAll("\\r"),
-        '\t' =&gt; try w.writeAll("\\t"),
-        '\\' =&gt; try w.writeAll("\\\\"),
-        '\'' =&gt; try w.writeAll("\\'"),
-        '"', ' ', '!', '#'...'&amp;', '('...'[', ']'...'~' =&gt; try w.writeByte(@intCast(codepoint)),
-        else =&gt; {
-            if (std.math.cast(u8, codepoint)) |byte| {
-                try w.writeAll("\\x");
-                try w.printInt(byte, 16, .lower, .{ .width = 2, .fill = '0' });
-            } else {
-                try w.writeAll("\\u{");
-                try w.printInt(codepoint, 16, .lower, .{});
-                try w.writeByte('}');
-            }
-        },
-    }
-}
-
-pub fn isValidId(bytes: []const u8) bool {
-    if (bytes.len == 0) return false;
-    for (bytes, 0..) |c, i| {
-        switch (c) {
-            '_', 'a'...'z', 'A'...'Z' =&gt; {},
-            '0'...'9' =&gt; if (i == 0) return false,
-            else =&gt; return false,
-        }
-    }
-    return std.zig.Token.getKeyword(bytes) == null;
-}
-
-test isValidId {
-    try std.testing.expect(!isValidId(""));
-    try std.testing.expect(isValidId("foobar"));
-    try std.testing.expect(!isValidId("a b c"));
-    try std.testing.expect(!isValidId("3d"));
-    try std.testing.expect(!isValidId("enum"));
-    try std.testing.expect(isValidId("i386"));
-}
-
-pub fn isUnderscore(bytes: []const u8) bool {
-    return bytes.len == 1 and bytes[0] == '_';
-}
-
-test isUnderscore {
-    try std.testing.expect(isUnderscore("_"));
-    try std.testing.expect(!isUnderscore("__"));
-    try std.testing.expect(!isUnderscore("_foo"));
-    try std.testing.expect(isUnderscore("\x5f"));
-    try std.testing.expect(!isUnderscore("\\x5f"));
-}
-
-/// If the source can be UTF-16LE encoded, this function asserts that `gpa`
-/// will align a byte-sized allocation to at least 2. Allocators that don't do
-/// this are rare.
-pub fn readSourceFileToEndAlloc(gpa: Allocator, file_reader: *Io.File.Reader) ![:0]u8 {
-    var buffer: std.ArrayList(u8) = .empty;
-    defer buffer.deinit(gpa);
-
-    if (file_reader.getSize()) |size| {
-        const casted_size = std.math.cast(u32, size) orelse return error.StreamTooLong;
-        // +1 to avoid resizing for the null byte added in toOwnedSliceSentinel below.
-        try buffer.ensureTotalCapacityPrecise(gpa, casted_size + 1);
-    } else |_| {}
-
-    try file_reader.interface.appendRemaining(gpa, &amp;buffer, .limited(max_src_size));
-
-    // Detect unsupported file types with their Byte Order Mark
-    const unsupported_boms = [_][]const u8{
-        "\xff\xfe\x00\x00", // UTF-32 little endian
-        "\xfe\xff\x00\x00", // UTF-32 big endian
-        "\xfe\xff", // UTF-16 big endian
-    };
-    for (unsupported_boms) |bom| {
-        if (mem.startsWith(u8, buffer.items, bom)) {
-            return error.UnsupportedEncoding;
-        }
-    }
-
-    // If the file starts with a UTF-16 little endian BOM, translate it to UTF-8
-    if (mem.startsWith(u8, buffer.items, "\xff\xfe")) {
-        if (buffer.items.len % 2 != 0) return error.InvalidEncoding;
-        return std.unicode.utf16LeToUtf8AllocZ(gpa, @ptrCast(@alignCast(buffer.items))) catch |err| switch (err) {
-            error.DanglingSurrogateHalf =&gt; error.UnsupportedEncoding,
-            error.ExpectedSecondSurrogateHalf =&gt; error.UnsupportedEncoding,
-            error.UnexpectedSecondSurrogateHalf =&gt; error.UnsupportedEncoding,
-            else =&gt; |e| return e,
-        };
-    }
-
-    return buffer.toOwnedSliceSentinel(gpa, 0);
-}
-
-pub fn printAstErrorsToStderr(gpa: Allocator, io: Io, tree: Ast, path: []const u8, color: Color) !void {
-    var wip_errors: std.zig.ErrorBundle.Wip = undefined;
-    try wip_errors.init(gpa);
-    defer wip_errors.deinit();
-
-    try putAstErrorsIntoBundle(gpa, tree, path, &amp;wip_errors);
-
-    var error_bundle = try wip_errors.toOwnedBundle("");
-    defer error_bundle.deinit(gpa);
-    return error_bundle.renderToStderr(io, .{}, color);
-}
-
-pub fn putAstErrorsIntoBundle(
-    gpa: Allocator,
-    tree: Ast,
-    path: []const u8,
-    wip_errors: *std.zig.ErrorBundle.Wip,
-) Allocator.Error!void {
-    switch (tree.mode) {
-        .zig =&gt; {
-            var zir = try AstGen.generate(gpa, tree);
-            defer zir.deinit(gpa);
-
-            try wip_errors.addZirErrorMessages(zir, tree, tree.source, path);
-        },
-        .zon =&gt; {
-            var zoir = try ZonGen.generate(gpa, tree, .{});
-            defer zoir.deinit(gpa);
-
-            try wip_errors.addZoirErrorMessages(zoir, tree, tree.source, path);
-        },
-    }
-}
-
-pub fn resolveTargetQueryOrFatal(io: Io, target_query: std.Target.Query) std.Target {
-    return std.zig.system.resolveTargetQuery(io, target_query) catch |err|
-        std.process.fatal("unable to resolve target: {s}", .{@errorName(err)});
-}
-
-pub fn parseTargetQueryOrReportFatalError(
-    allocator: Allocator,
-    opts: std.Target.Query.ParseOptions,
-) std.Target.Query {
-    var opts_with_diags = opts;
-    var diags: std.Target.Query.ParseOptions.Diagnostics = .{};
-    if (opts_with_diags.diagnostics == null) {
-        opts_with_diags.diagnostics = &amp;diags;
-    }
-    return std.Target.Query.parse(opts_with_diags) catch |err| switch (err) {
-        error.UnknownCpuModel =&gt; {
-            help: {
-                var help_text = std.array_list.Managed(u8).init(allocator);
-                defer help_text.deinit();
-                for (diags.arch.?.allCpuModels()) |cpu| {
-                    help_text.print(" {s}\n", .{cpu.name}) catch break :help;
-                }
-                std.log.info("available CPUs for architecture '{s}':\n{s}", .{
-                    @tagName(diags.arch.?), help_text.items,
-                });
-            }
-            std.process.fatal("unknown CPU: '{s}'", .{diags.cpu_name.?});
-        },
-        error.UnknownCpuFeature =&gt; {
-            help: {
-                var help_text = std.array_list.Managed(u8).init(allocator);
-                defer help_text.deinit();
-                for (diags.arch.?.allFeaturesList()) |feature| {
-                    help_text.print(" {s}: {s}\n", .{ feature.name, feature.description }) catch break :help;
-                }
-                std.log.info("available CPU features for architecture '{s}':\n{s}", .{
-                    @tagName(diags.arch.?), help_text.items,
-                });
-            }
-            std.process.fatal("unknown CPU feature: '{s}'", .{diags.unknown_feature_name.?});
-        },
-        error.UnknownObjectFormat =&gt; {
-            help: {
-                var help_text = std.array_list.Managed(u8).init(allocator);
-                defer help_text.deinit();
-                inline for (@typeInfo(std.Target.ObjectFormat).@"enum".fields) |field| {
-                    help_text.print(" {s}\n", .{field.name}) catch break :help;
-                }
-                std.log.info("available object formats:\n{s}", .{help_text.items});
-            }
-            std.process.fatal("unknown object format: '{s}'", .{opts.object_format.?});
-        },
-        error.UnknownArchitecture =&gt; {
-            help: {
-                var help_text = std.array_list.Managed(u8).init(allocator);
-                defer help_text.deinit();
-                inline for (@typeInfo(std.Target.Cpu.Arch).@"enum".fields) |field| {
-                    help_text.print(" {s}\n", .{field.name}) catch break :help;
-                }
-                std.log.info("available architectures:\n{s} native\n", .{help_text.items});
-            }
-            std.process.fatal("unknown architecture: '{s}'", .{diags.unknown_architecture_name.?});
-        },
-        else =&gt; |e| std.process.fatal("unable to parse target query '{s}': {s}", .{
-            opts.arch_os_abi, @errorName(e),
-        }),
-    };
-}
-
-/// Collects all the environment variables that Zig could possibly inspect, so
-/// that we can do reflection on this and print them with `zig env`.
-pub const EnvVar = enum {
-    ZIG_GLOBAL_CACHE_DIR,
-    ZIG_LOCAL_CACHE_DIR,
-    ZIG_LIB_DIR,
-    ZIG_LIBC,
-    ZIG_BUILD_RUNNER,
-    ZIG_BUILD_ERROR_STYLE,
-    ZIG_BUILD_MULTILINE_ERRORS,
-    ZIG_VERBOSE_LINK,
-    ZIG_VERBOSE_CC,
-    ZIG_DEBUG_CMD,
-    ZIG_IS_DETECTING_LIBC_PATHS,
-    ZIG_IS_TRYING_TO_NOT_CALL_ITSELF,
-
-    // C toolchain integration
-    NIX_CFLAGS_COMPILE,
-    NIX_CFLAGS_LINK,
-    NIX_LDFLAGS,
-    C_INCLUDE_PATH,
-    CPLUS_INCLUDE_PATH,
-    LIBRARY_PATH,
-    CC,
-
-    // Terminal integration
-    NO_COLOR,
-    CLICOLOR_FORCE,
-
-    // Debug info integration
-    XDG_CACHE_HOME,
-    LOCALAPPDATA,
-    HOME,
-
-    // Windows SDK integration
-    PROGRAMDATA,
-
-    // Homebrew integration
-    HOMEBREW_PREFIX,
-
-    pub fn isSet(ev: EnvVar, map: *const std.process.Environ.Map) bool {
-        return map.contains(@tagName(ev));
-    }
-
-    pub fn get(ev: EnvVar, map: *const std.process.Environ.Map) ?[]const u8 {
-        return map.get(@tagName(ev));
-    }
-};
-
-pub const SimpleComptimeReason = enum(u32) {
-    // Evaluating at comptime because a builtin operand must be comptime-known.
-    // These messages all mention a specific builtin.
-    operand_setEvalBranchQuota,
-    operand_setFloatMode,
-    operand_branchHint,
-    operand_setRuntimeSafety,
-    operand_embedFile,
-    operand_cImport,
-    operand_cDefine_macro_name,
-    operand_cDefine_macro_value,
-    operand_cInclude_file_name,
-    operand_cUndef_macro_name,
-    operand_shuffle_mask,
-    operand_atomicRmw_operation,
-    operand_reduce_operation,
-
-    // Evaluating at comptime because an operand must be comptime-known.
-    // These messages do not mention a specific builtin (and may not be about a builtin at all).
-    export_target,
-    export_options,
-    extern_options,
-    prefetch_options,
-    call_modifier,
-    compile_error_string,
-    inline_assembly_code,
-    atomic_order,
-    array_mul_factor,
-    slice_cat_operand,
-    inline_call_target,
-    generic_call_target,
-    wasm_memory_index,
-    work_group_dim_index,
-    clobber,
-
-    // Evaluating at comptime because types must be comptime-known.
-    // Reasons other than `.type` are just more specific messages.
-    type,
-    int_signedness,
-    int_bit_width,
-    array_sentinel,
-    array_length,
-    pointer_size,
-    pointer_attrs,
-    pointer_sentinel,
-    slice_sentinel,
-    vector_length,
-    fn_ret_ty,
-    fn_param_types,
-    fn_param_attrs,
-    fn_attrs,
-    struct_layout,
-    struct_field_names,
-    struct_field_types,
-    struct_field_attrs,
-    union_layout,
-    union_field_names,
-    union_field_types,
-    union_field_attrs,
-    tuple_field_types,
-    enum_field_names,
-    enum_field_values,
-    union_enum_tag_type,
-    enum_int_tag_type,
-    packed_struct_backing_int_type,
-    packed_union_backing_int_type,
-
-    // Evaluating at comptime because decl/field name must be comptime-known.
-    decl_name,
-    field_name,
-    tuple_field_index,
-
-    // Evaluating at comptime because it is an attribute of a global declaration.
-    container_var_init,
-    @"callconv",
-    @"align",
-    @"addrspace",
-    @"linksection",
-
-    // Miscellaneous reasons.
-    comptime_keyword,
-    comptime_call_modifier,
-    inline_loop_operand,
-    switch_item,
-    tuple_field_default_value,
-    struct_field_default_value,
-    enum_field_tag_value,
-    slice_single_item_ptr_bounds,
-    stored_to_comptime_field,
-    stored_to_comptime_var,
-    casted_to_comptime_enum,
-    casted_to_comptime_int,
-    casted_to_comptime_float,
-    std_builtin_decl,
-
-    pub fn message(r: SimpleComptimeReason) []const u8 {
-        return switch (r) {
-            // zig fmt: off
-            .operand_setEvalBranchQuota  =&gt; "operand to '@setEvalBranchQuota' must be comptime-known",
-            .operand_setFloatMode        =&gt; "operand to '@setFloatMode' must be comptime-known",
-            .operand_branchHint          =&gt; "operand to '@branchHint' must be comptime-known",
-            .operand_setRuntimeSafety    =&gt; "operand to '@setRuntimeSafety' must be comptime-known",
-            .operand_embedFile           =&gt; "operand to '@embedFile' must be comptime-known",
-            .operand_cImport             =&gt; "operand to '@cImport' is evaluated at comptime",
-            .operand_cDefine_macro_name  =&gt; "'@cDefine' macro name must be comptime-known",
-            .operand_cDefine_macro_value =&gt; "'@cDefine' macro value must be comptime-known",
-            .operand_cInclude_file_name  =&gt; "'@cInclude' file name must be comptime-known",
-            .operand_cUndef_macro_name   =&gt; "'@cUndef' macro name must be comptime-known",
-            .operand_shuffle_mask        =&gt; "'@shuffle' mask must be comptime-known",
-            .operand_atomicRmw_operation =&gt; "'@atomicRmw' operation must be comptime-known",
-            .operand_reduce_operation    =&gt; "'@reduce' operation must be comptime-known",
-
-            .export_target        =&gt; "export target must be comptime-known",
-            .export_options       =&gt; "export options must be comptime-known",
-            .extern_options       =&gt; "extern options must be comptime-known",
-            .prefetch_options     =&gt; "prefetch options must be comptime-known",
-            .call_modifier        =&gt; "call modifier must be comptime-known",
-            .compile_error_string =&gt; "compile error string must be comptime-known",
-            .inline_assembly_code =&gt; "inline assembly code must be comptime-known",
-            .atomic_order         =&gt; "atomic order must be comptime-known",
-            .array_mul_factor     =&gt; "array multiplication factor must be comptime-known",
-            .slice_cat_operand    =&gt; "slice being concatenated must be comptime-known",
-            .inline_call_target   =&gt; "function being called inline must be comptime-known",
-            .generic_call_target  =&gt; "generic function being called must be comptime-known",
-            .wasm_memory_index    =&gt; "wasm memory index must be comptime-known",
-            .work_group_dim_index =&gt; "work group dimension index must be comptime-known",
-            .clobber              =&gt; "clobber must be comptime-known",
-
-            .type                =&gt; "types must be comptime-known",
-            .int_signedness      =&gt; "integer signedness must be comptime-known",
-            .int_bit_width       =&gt; "integer bit width must be comptime-known",
-            .array_sentinel      =&gt; "array sentinel value must be comptime-known",
-            .array_length        =&gt; "array length must be comptime-known",
-            .pointer_size        =&gt; "pointer size must be comptime-known",
-            .pointer_attrs       =&gt; "pointer attributes must be comptime-known",
-            .pointer_sentinel    =&gt; "pointer sentinel value must be comptime-known",
-            .slice_sentinel      =&gt; "slice sentinel value must be comptime-known",
-            .vector_length       =&gt; "vector length must be comptime-known",
-            .fn_ret_ty           =&gt; "function return type must be comptime-known",
-            .fn_param_types      =&gt; "function parameter types must be comptime-known",
-            .fn_param_attrs      =&gt; "function parameter attributes must be comptime-known",
-            .fn_attrs            =&gt; "function attributes must be comptime-known",
-            .struct_layout       =&gt; "struct layout must be comptime-known",
-            .struct_field_names  =&gt; "struct field names must be comptime-known",
-            .struct_field_types  =&gt; "struct field types must be comptime-known",
-            .struct_field_attrs  =&gt; "struct field attributes must be comptime-known",
-            .union_layout        =&gt; "union layout must be comptime-known",
-            .union_field_names   =&gt; "union field names must be comptime-known",
-            .union_field_types   =&gt; "union field types must be comptime-known",
-            .union_field_attrs   =&gt; "union field attributes must be comptime-known",
-            .tuple_field_types   =&gt; "tuple field types must be comptime-known",
-            .enum_field_names    =&gt; "enum field names must be comptime-known",
-            .enum_field_values   =&gt; "enum field values must be comptime-known",
-
-            .union_enum_tag_type            =&gt; "enum tag type of union must be comptime-known",
-            .enum_int_tag_type              =&gt; "integer tag type of enum must be comptime-known",
-            .packed_struct_backing_int_type =&gt; "packed struct backing integer type must be comptime-known",
-            .packed_union_backing_int_type  =&gt; "packed struct backing integer type must be comptime-known",
-
-            .decl_name         =&gt; "declaration name must be comptime-known",
-            .field_name        =&gt; "field name must be comptime-known",
-            .tuple_field_index =&gt; "tuple field index must be comptime-known",
-
-            .container_var_init =&gt; "initializer of container-level variable must be comptime-known",
-            .@"callconv"        =&gt; "calling convention must be comptime-known",
-            .@"align"           =&gt; "alignment must be comptime-known",
-            .@"addrspace"       =&gt; "address space must be comptime-known",
-            .@"linksection"     =&gt; "linksection must be comptime-known",
-
-            .comptime_keyword             =&gt; "'comptime' keyword forces comptime evaluation",
-            .comptime_call_modifier       =&gt; "'.compile_time' call modifier forces comptime evaluation",
-            .inline_loop_operand          =&gt; "inline loop condition must be comptime-known",
-            .switch_item                  =&gt; "switch prong values must be comptime-known",
-            .tuple_field_default_value    =&gt; "tuple field default value must be comptime-known",
-            .struct_field_default_value   =&gt; "struct field default value must be comptime-known",
-            .enum_field_tag_value         =&gt; "enum field tag value must be comptime-known",
-            .slice_single_item_ptr_bounds =&gt; "slice of single-item pointer must have comptime-known bounds",
-            .stored_to_comptime_field     =&gt; "value stored to a comptime field must be comptime-known",
-            .stored_to_comptime_var       =&gt; "value stored to a comptime variable must be comptime-known",
-            .casted_to_comptime_enum      =&gt; "value casted to enum with 'comptime_int' tag type must be comptime-known",
-            .casted_to_comptime_int       =&gt; "value casted to 'comptime_int' must be comptime-known",
-            .casted_to_comptime_float     =&gt; "value casted to 'comptime_float' must be comptime-known",
-            .std_builtin_decl             =&gt; "'std.builtin' declaration values must be comptime-known",
-            // zig fmt: on
-        };
-    }
-};
-
-/// Every kind of artifact which the compiler can emit.
-pub const EmitArtifact = enum {
-    bin,
-    @"asm",
-    implib,
-    llvm_ir,
-    llvm_bc,
-    docs,
-    pdb,
-    h,
-    compiler_rt_dyn_lib,
-
-    /// If using `Server` to communicate with the compiler, it will place requested artifacts in
-    /// paths under the output directory, where those paths are named according to this function.
-    /// Returned string is allocated with `gpa` and owned by the caller.
-    pub fn cacheName(ea: EmitArtifact, gpa: Allocator, opts: BinNameOptions) Allocator.Error![]const u8 {
-        // hack for stage2_x86_64 + coff. See Coff.flush.
-        if (ea == .compiler_rt_dyn_lib) return "compiler_rt.dll";
-        const suffix: []const u8 = switch (ea) {
-            .bin =&gt; return binNameAlloc(gpa, opts),
-            .@"asm" =&gt; ".s",
-            .implib =&gt; ".lib",
-            .llvm_ir =&gt; ".ll",
-            .llvm_bc =&gt; ".bc",
-            .docs =&gt; "-docs",
-            .pdb =&gt; ".pdb",
-            .h =&gt; ".h",
-            .compiler_rt_dyn_lib =&gt; unreachable,
-        };
-        return std.fmt.allocPrint(gpa, "{s}{s}", .{ opts.root_name, suffix });
-    }
-};
-
-/// The defaults are chosen here to reduce the size of src/clang_options.zon
-pub const ClangCliParam = struct {
-    name: []const u8,
-    ze: ZigEquivalent = .other,
-    syntax: Syntax = .flag,
-    /// Prefixed by "-"
-    pd1: bool = true,
-    /// Prefixed by "--"
-    pd2: bool = false,
-    /// Prefixed by "/"
-    psl: bool = false,
-
-    pub const Syntax = union(enum) {
-        /// A flag with no values.
-        flag,
-        /// An option which prefixes its (single) value.
-        joined,
-        /// An option which is followed by its value.
-        separate,
-        /// An option which is either joined to its (non-empty) value, or followed by its value.
-        joined_or_separate,
-        /// An option which is both joined to its (first) value, and followed by its (second) value.
-        joined_and_separate,
-        /// An option followed by its values, which are separated by commas.
-        comma_joined,
-        /// An option which consumes an optional joined argument and any other remaining arguments.
-        remaining_args_joined,
-        /// An option which is which takes multiple (separate) arguments.
-        multi_arg: u8,
-    };
-
-    pub const ZigEquivalent = enum {
-        target,
-        o,
-        c,
-        r,
-        m,
-        x,
-        other,
-        positional,
-        l,
-        ignore,
-        driver_punt,
-        pic,
-        no_pic,
-        pie,
-        no_pie,
-        lto,
-        no_lto,
-        unwind_tables,
-        no_unwind_tables,
-        asynchronous_unwind_tables,
-        no_asynchronous_unwind_tables,
-        nostdlib,
-        nostdlib_cpp,
-        shared,
-        rdynamic,
-        wl,
-        wp,
-        preprocess_only,
-        asm_only,
-        optimize,
-        debug,
-        gdwarf32,
-        gdwarf64,
-        sanitize,
-        no_sanitize,
-        sanitize_trap,
-        no_sanitize_trap,
-        linker_script,
-        dry_run,
-        verbose,
-        for_linker,
-        linker_input_z,
-        lib_dir,
-        mcpu,
-        dep_file,
-        dep_file_to_stdout,
-        framework_dir,
-        framework,
-        nostdlibinc,
-        red_zone,
-        no_red_zone,
-        omit_frame_pointer,
-        no_omit_frame_pointer,
-        function_sections,
-        no_function_sections,
-        data_sections,
-        no_data_sections,
-        builtin,
-        no_builtin,
-        color_diagnostics,
-        no_color_diagnostics,
-        stack_check,
-        no_stack_check,
-        stack_protector,
-        no_stack_protector,
-        strip,
-        exec_model,
-        emit_llvm,
-        sysroot,
-        entry,
-        force_undefined_symbol,
-        weak_library,
-        weak_framework,
-        headerpad_max_install_names,
-        compress_debug_sections,
-        install_name,
-        undefined,
-        force_load_objc,
-        mingw_unicode_entry_point,
-        san_cov_trace_pc_guard,
-        san_cov,
-        no_san_cov,
-        rtlib,
-        static,
-        dynamic,
-        version,
-    };
-
-    pub fn matchEql(self: @This(), arg: []const u8) u2 {
-        if (self.pd1 and arg.len &gt;= self.name.len + 1 and
-            mem.startsWith(u8, arg, "-") and mem.eql(u8, arg[1..], self.name))
-        {
-            return 1;
-        }
-        if (self.pd2 and arg.len &gt;= self.name.len + 2 and
-            mem.startsWith(u8, arg, "--") and mem.eql(u8, arg[2..], self.name))
-        {
-            return 2;
-        }
-        if (self.psl and arg.len &gt;= self.name.len + 1 and
-            mem.startsWith(u8, arg, "/") and mem.eql(u8, arg[1..], self.name))
-        {
-            return 1;
-        }
-        return 0;
-    }
-
-    pub fn matchStartsWith(self: @This(), arg: []const u8) usize {
-        if (self.pd1 and arg.len &gt;= self.name.len + 1 and
-            mem.startsWith(u8, arg, "-") and mem.startsWith(u8, arg[1..], self.name))
-        {
-            return self.name.len + 1;
-        }
-        if (self.pd2 and arg.len &gt;= self.name.len + 2 and
-            mem.startsWith(u8, arg, "--") and mem.startsWith(u8, arg[2..], self.name))
-        {
-            return self.name.len + 2;
-        }
-        if (self.psl and arg.len &gt;= self.name.len + 1 and
-            mem.startsWith(u8, arg, "/") and mem.startsWith(u8, arg[1..], self.name))
-        {
-            return self.name.len + 1;
-        }
-        return 0;
-    }
-};
-
-test {
-    _ = Ast;
-    _ = AstRlAnnotate;
-    _ = AstSmith;
-    _ = BuiltinFn;
-    _ = Client;
-    _ = ErrorBundle;
-    _ = LibCDirs;
-    _ = LibCInstallation;
-    _ = Server;
-    _ = TokenSmith;
-    _ = WindowsSdk;
-    _ = number_literal;
-    _ = primitives;
-    _ = string_literal;
-    _ = system;
-    _ = target;
-    _ = c_translation;
-    _ = llvm;
-}</pre>
+    <pre><a id="L1"></a>//! Builds of the Zig compiler are distributed partly in source form. That
+<a id="L2"></a>//! source lives here. These APIs are provided as-is and have absolutely no API
+<a id="L3"></a>//! guarantees whatsoever.
+<a id="L4"></a>
+<a id="L5"></a>const std = @import("std.zig");
+<a id="L6"></a>const assert = std.debug.assert;
+<a id="L7"></a>const mem = std.mem;
+<a id="L8"></a>const Allocator = std.mem.Allocator;
+<a id="L9"></a>const Io = std.Io;
+<a id="L10"></a>const Writer = std.Io.Writer;
+<a id="L11"></a>
+<a id="L12"></a>const tokenizer = @import("zig/tokenizer.zig");
+<a id="L13"></a>
+<a id="L14"></a>pub const ErrorBundle = @import("zig/ErrorBundle.zig");
+<a id="L15"></a>pub const Server = @import("zig/Server.zig");
+<a id="L16"></a>pub const Client = @import("zig/Client.zig");
+<a id="L17"></a>pub const Token = tokenizer.Token;
+<a id="L18"></a>pub const Tokenizer = tokenizer.Tokenizer;
+<a id="L19"></a>pub const TokenSmith = @import("zig/TokenSmith.zig");
+<a id="L20"></a>pub const string_literal = @import("zig/string_literal.zig");
+<a id="L21"></a>pub const number_literal = @import("zig/number_literal.zig");
+<a id="L22"></a>pub const primitives = @import("zig/primitives.zig");
+<a id="L23"></a>pub const isPrimitive = primitives.isPrimitive;
+<a id="L24"></a>pub const Ast = @import("zig/Ast.zig");
+<a id="L25"></a>pub const AstGen = @import("zig/AstGen.zig");
+<a id="L26"></a>pub const AstSmith = @import("zig/AstSmith.zig");
+<a id="L27"></a>pub const Zir = @import("zig/Zir.zig");
+<a id="L28"></a>pub const Zoir = @import("zig/Zoir.zig");
+<a id="L29"></a>pub const ZonGen = @import("zig/ZonGen.zig");
+<a id="L30"></a>pub const system = @import("zig/system.zig");
+<a id="L31"></a>pub const BuiltinFn = @import("zig/BuiltinFn.zig");
+<a id="L32"></a>pub const AstRlAnnotate = @import("zig/AstRlAnnotate.zig");
+<a id="L33"></a>pub const LibCInstallation = @import("zig/LibCInstallation.zig");
+<a id="L34"></a>pub const WindowsSdk = @import("zig/WindowsSdk.zig");
+<a id="L35"></a>pub const LibCDirs = @import("zig/LibCDirs.zig");
+<a id="L36"></a>pub const target = @import("zig/target.zig");
+<a id="L37"></a>pub const llvm = @import("zig/llvm.zig");
+<a id="L38"></a>
+<a id="L39"></a>// Character literal parsing
+<a id="L40"></a>pub const ParsedCharLiteral = string_literal.ParsedCharLiteral;
+<a id="L41"></a>pub const parseCharLiteral = string_literal.parseCharLiteral;
+<a id="L42"></a>pub const parseNumberLiteral = number_literal.parseNumberLiteral;
+<a id="L43"></a>
+<a id="L44"></a>pub const c_translation = struct {
+<a id="L45"></a>    pub const builtins = @import("zig/c_translation/builtins.zig");
+<a id="L46"></a>    pub const helpers = @import("zig/c_translation/helpers.zig");
+<a id="L47"></a>};
+<a id="L48"></a>
+<a id="L49"></a>pub const SrcHasher = std.crypto.hash.Blake3;
+<a id="L50"></a>pub const SrcHash = [16]u8;
+<a id="L51"></a>
+<a id="L52"></a>pub const Color = enum {
+<a id="L53"></a>    /// Auto-detect whether stream supports terminal colors.
+<a id="L54"></a>    auto,
+<a id="L55"></a>    /// Force-enable colors.
+<a id="L56"></a>    off,
+<a id="L57"></a>    /// Suppress colors.
+<a id="L58"></a>    on,
+<a id="L59"></a>
+<a id="L60"></a>    pub fn terminalMode(color: Color) ?Io.Terminal.Mode {
+<a id="L61"></a>        return switch (color) {
+<a id="L62"></a>            .auto =&gt; null,
+<a id="L63"></a>            .on =&gt; .escape_codes,
+<a id="L64"></a>            .off =&gt; .no_color,
+<a id="L65"></a>        };
+<a id="L66"></a>    }
+<a id="L67"></a>};
+<a id="L68"></a>
+<a id="L69"></a>/// There are many assumptions in the entire codebase that Zig source files can
+<a id="L70"></a>/// be byte-indexed with a u32 integer.
+<a id="L71"></a>pub const max_src_size = std.math.maxInt(u32);
+<a id="L72"></a>
+<a id="L73"></a>pub fn hashSrc(src: []const u8) SrcHash {
+<a id="L74"></a>    var out: SrcHash = undefined;
+<a id="L75"></a>    SrcHasher.hash(src, &amp;out, .{});
+<a id="L76"></a>    return out;
+<a id="L77"></a>}
+<a id="L78"></a>
+<a id="L79"></a>pub fn srcHashEql(a: SrcHash, b: SrcHash) bool {
+<a id="L80"></a>    return @as(u128, @bitCast(a)) == @as(u128, @bitCast(b));
+<a id="L81"></a>}
+<a id="L82"></a>
+<a id="L83"></a>pub fn hashName(parent_hash: SrcHash, sep: []const u8, name: []const u8) SrcHash {
+<a id="L84"></a>    var out: SrcHash = undefined;
+<a id="L85"></a>    var hasher = SrcHasher.init(.{});
+<a id="L86"></a>    hasher.update(&amp;parent_hash);
+<a id="L87"></a>    hasher.update(sep);
+<a id="L88"></a>    hasher.update(name);
+<a id="L89"></a>    hasher.final(&amp;out);
+<a id="L90"></a>    return out;
+<a id="L91"></a>}
+<a id="L92"></a>
+<a id="L93"></a>pub const Loc = struct {
+<a id="L94"></a>    line: usize,
+<a id="L95"></a>    column: usize,
+<a id="L96"></a>    /// Does not include the trailing newline.
+<a id="L97"></a>    source_line: []const u8,
+<a id="L98"></a>
+<a id="L99"></a>    pub fn eql(a: Loc, b: Loc) bool {
+<a id="L100"></a>        return a.line == b.line and a.column == b.column and mem.eql(u8, a.source_line, b.source_line);
+<a id="L101"></a>    }
+<a id="L102"></a>};
+<a id="L103"></a>
+<a id="L104"></a>pub fn findLineColumn(source: []const u8, byte_offset: usize) Loc {
+<a id="L105"></a>    var line: usize = 0;
+<a id="L106"></a>    var column: usize = 0;
+<a id="L107"></a>    var line_start: usize = 0;
+<a id="L108"></a>    var i: usize = 0;
+<a id="L109"></a>    while (i &lt; byte_offset) : (i += 1) {
+<a id="L110"></a>        switch (source[i]) {
+<a id="L111"></a>            '\n' =&gt; {
+<a id="L112"></a>                line += 1;
+<a id="L113"></a>                column = 0;
+<a id="L114"></a>                line_start = i + 1;
+<a id="L115"></a>            },
+<a id="L116"></a>            else =&gt; {
+<a id="L117"></a>                column += 1;
+<a id="L118"></a>            },
+<a id="L119"></a>        }
+<a id="L120"></a>    }
+<a id="L121"></a>    while (i &lt; source.len and source[i] != '\n') {
+<a id="L122"></a>        i += 1;
+<a id="L123"></a>    }
+<a id="L124"></a>    return .{
+<a id="L125"></a>        .line = line,
+<a id="L126"></a>        .column = column,
+<a id="L127"></a>        .source_line = source[line_start..i],
+<a id="L128"></a>    };
+<a id="L129"></a>}
+<a id="L130"></a>
+<a id="L131"></a>pub fn lineDelta(source: []const u8, start: usize, end: usize) isize {
+<a id="L132"></a>    var line: isize = 0;
+<a id="L133"></a>    if (end &gt;= start) {
+<a id="L134"></a>        for (source[start..end]) |byte| switch (byte) {
+<a id="L135"></a>            '\n' =&gt; line += 1,
+<a id="L136"></a>            else =&gt; continue,
+<a id="L137"></a>        };
+<a id="L138"></a>    } else {
+<a id="L139"></a>        for (source[end..start]) |byte| switch (byte) {
+<a id="L140"></a>            '\n' =&gt; line -= 1,
+<a id="L141"></a>            else =&gt; continue,
+<a id="L142"></a>        };
+<a id="L143"></a>    }
+<a id="L144"></a>    return line;
+<a id="L145"></a>}
+<a id="L146"></a>
+<a id="L147"></a>pub const BinNameOptions = struct {
+<a id="L148"></a>    root_name: []const u8,
+<a id="L149"></a>    target: *const std.Target,
+<a id="L150"></a>    output_mode: std.builtin.OutputMode,
+<a id="L151"></a>    link_mode: ?std.builtin.LinkMode = null,
+<a id="L152"></a>    version: ?std.SemanticVersion = null,
+<a id="L153"></a>};
+<a id="L154"></a>
+<a id="L155"></a>/// Returns the standard file system basename of a binary generated by the Zig compiler.
+<a id="L156"></a>pub fn binNameAlloc(allocator: Allocator, options: BinNameOptions) error{OutOfMemory}![]u8 {
+<a id="L157"></a>    const root_name = options.root_name;
+<a id="L158"></a>    const t = options.target;
+<a id="L159"></a>    switch (t.ofmt) {
+<a id="L160"></a>        .coff =&gt; switch (options.output_mode) {
+<a id="L161"></a>            .Exe =&gt; return std.fmt.allocPrint(allocator, "{s}{s}", .{ root_name, t.exeFileExt() }),
+<a id="L162"></a>            .Lib =&gt; {
+<a id="L163"></a>                const suffix = switch (options.link_mode orelse .static) {
+<a id="L164"></a>                    .static =&gt; ".lib",
+<a id="L165"></a>                    .dynamic =&gt; ".dll",
+<a id="L166"></a>                };
+<a id="L167"></a>                return std.fmt.allocPrint(allocator, "{s}{s}", .{ root_name, suffix });
+<a id="L168"></a>            },
+<a id="L169"></a>            .Obj =&gt; return std.fmt.allocPrint(allocator, "{s}.obj", .{root_name}),
+<a id="L170"></a>        },
+<a id="L171"></a>        .elf =&gt; switch (options.output_mode) {
+<a id="L172"></a>            .Exe =&gt; return allocator.dupe(u8, root_name),
+<a id="L173"></a>            .Lib =&gt; {
+<a id="L174"></a>                switch (options.link_mode orelse .static) {
+<a id="L175"></a>                    .static =&gt; return std.fmt.allocPrint(allocator, "{s}{s}.a", .{
+<a id="L176"></a>                        t.libPrefix(), root_name,
+<a id="L177"></a>                    }),
+<a id="L178"></a>                    .dynamic =&gt; {
+<a id="L179"></a>                        if (options.version) |ver| {
+<a id="L180"></a>                            return std.fmt.allocPrint(allocator, "{s}{s}.so.{d}.{d}.{d}", .{
+<a id="L181"></a>                                t.libPrefix(), root_name, ver.major, ver.minor, ver.patch,
+<a id="L182"></a>                            });
+<a id="L183"></a>                        } else {
+<a id="L184"></a>                            return std.fmt.allocPrint(allocator, "{s}{s}.so", .{
+<a id="L185"></a>                                t.libPrefix(), root_name,
+<a id="L186"></a>                            });
+<a id="L187"></a>                        }
+<a id="L188"></a>                    },
+<a id="L189"></a>                }
+<a id="L190"></a>            },
+<a id="L191"></a>            .Obj =&gt; return std.fmt.allocPrint(allocator, "{s}.o", .{root_name}),
+<a id="L192"></a>        },
+<a id="L193"></a>        .macho =&gt; switch (options.output_mode) {
+<a id="L194"></a>            .Exe =&gt; return allocator.dupe(u8, root_name),
+<a id="L195"></a>            .Lib =&gt; {
+<a id="L196"></a>                switch (options.link_mode orelse .static) {
+<a id="L197"></a>                    .static =&gt; return std.fmt.allocPrint(allocator, "{s}{s}.a", .{
+<a id="L198"></a>                        t.libPrefix(), root_name,
+<a id="L199"></a>                    }),
+<a id="L200"></a>                    .dynamic =&gt; {
+<a id="L201"></a>                        if (options.version) |ver| {
+<a id="L202"></a>                            return std.fmt.allocPrint(allocator, "{s}{s}.{d}.{d}.{d}.dylib", .{
+<a id="L203"></a>                                t.libPrefix(), root_name, ver.major, ver.minor, ver.patch,
+<a id="L204"></a>                            });
+<a id="L205"></a>                        } else {
+<a id="L206"></a>                            return std.fmt.allocPrint(allocator, "{s}{s}.dylib", .{
+<a id="L207"></a>                                t.libPrefix(), root_name,
+<a id="L208"></a>                            });
+<a id="L209"></a>                        }
+<a id="L210"></a>                    },
+<a id="L211"></a>                }
+<a id="L212"></a>            },
+<a id="L213"></a>            .Obj =&gt; return std.fmt.allocPrint(allocator, "{s}.o", .{root_name}),
+<a id="L214"></a>        },
+<a id="L215"></a>        .wasm =&gt; switch (options.output_mode) {
+<a id="L216"></a>            .Exe =&gt; return std.fmt.allocPrint(allocator, "{s}{s}", .{ root_name, t.exeFileExt() }),
+<a id="L217"></a>            .Lib =&gt; {
+<a id="L218"></a>                switch (options.link_mode orelse .static) {
+<a id="L219"></a>                    .static =&gt; return std.fmt.allocPrint(allocator, "{s}{s}.a", .{
+<a id="L220"></a>                        t.libPrefix(), root_name,
+<a id="L221"></a>                    }),
+<a id="L222"></a>                    .dynamic =&gt; return std.fmt.allocPrint(allocator, "{s}.wasm", .{root_name}),
+<a id="L223"></a>                }
+<a id="L224"></a>            },
+<a id="L225"></a>            .Obj =&gt; return std.fmt.allocPrint(allocator, "{s}.o", .{root_name}),
+<a id="L226"></a>        },
+<a id="L227"></a>        .c =&gt; return std.fmt.allocPrint(allocator, "{s}.c", .{root_name}),
+<a id="L228"></a>        .spirv =&gt; return std.fmt.allocPrint(allocator, "{s}.spv", .{root_name}),
+<a id="L229"></a>        .hex =&gt; return std.fmt.allocPrint(allocator, "{s}.ihex", .{root_name}),
+<a id="L230"></a>        .raw =&gt; return std.fmt.allocPrint(allocator, "{s}.bin", .{root_name}),
+<a id="L231"></a>        .plan9 =&gt; switch (options.output_mode) {
+<a id="L232"></a>            .Exe =&gt; return allocator.dupe(u8, root_name),
+<a id="L233"></a>            .Obj =&gt; return std.fmt.allocPrint(allocator, "{s}{s}", .{
+<a id="L234"></a>                root_name, t.ofmt.fileExt(t.cpu.arch),
+<a id="L235"></a>            }),
+<a id="L236"></a>            .Lib =&gt; return std.fmt.allocPrint(allocator, "{s}{s}.a", .{
+<a id="L237"></a>                t.libPrefix(), root_name,
+<a id="L238"></a>            }),
+<a id="L239"></a>        },
+<a id="L240"></a>    }
+<a id="L241"></a>}
+<a id="L242"></a>
+<a id="L243"></a>pub const SanitizeC = enum {
+<a id="L244"></a>    off,
+<a id="L245"></a>    trap,
+<a id="L246"></a>    full,
+<a id="L247"></a>};
+<a id="L248"></a>
+<a id="L249"></a>pub const BuildId = union(enum) {
+<a id="L250"></a>    none,
+<a id="L251"></a>    fast,
+<a id="L252"></a>    uuid,
+<a id="L253"></a>    sha1,
+<a id="L254"></a>    md5,
+<a id="L255"></a>    hexstring: HexString,
+<a id="L256"></a>
+<a id="L257"></a>    pub fn eql(a: BuildId, b: BuildId) bool {
+<a id="L258"></a>        const Tag = @typeInfo(BuildId).@"union".tag_type.?;
+<a id="L259"></a>        const a_tag: Tag = a;
+<a id="L260"></a>        const b_tag: Tag = b;
+<a id="L261"></a>        if (a_tag != b_tag) return false;
+<a id="L262"></a>        return switch (a) {
+<a id="L263"></a>            .none, .fast, .uuid, .sha1, .md5 =&gt; true,
+<a id="L264"></a>            .hexstring =&gt; |a_hexstring| mem.eql(u8, a_hexstring.toSlice(), b.hexstring.toSlice()),
+<a id="L265"></a>        };
+<a id="L266"></a>    }
+<a id="L267"></a>
+<a id="L268"></a>    pub const HexString = struct {
+<a id="L269"></a>        bytes: [32]u8,
+<a id="L270"></a>        len: u8,
+<a id="L271"></a>
+<a id="L272"></a>        /// Result is byte values, *not* hex-encoded.
+<a id="L273"></a>        pub fn toSlice(hs: *const HexString) []const u8 {
+<a id="L274"></a>            return hs.bytes[0..hs.len];
+<a id="L275"></a>        }
+<a id="L276"></a>    };
+<a id="L277"></a>
+<a id="L278"></a>    /// Input is byte values, *not* hex-encoded.
+<a id="L279"></a>    /// Asserts `bytes` fits inside `HexString`
+<a id="L280"></a>    pub fn initHexString(bytes: []const u8) BuildId {
+<a id="L281"></a>        var result: BuildId = .{ .hexstring = .{
+<a id="L282"></a>            .bytes = undefined,
+<a id="L283"></a>            .len = @intCast(bytes.len),
+<a id="L284"></a>        } };
+<a id="L285"></a>        @memcpy(result.hexstring.bytes[0..bytes.len], bytes);
+<a id="L286"></a>        return result;
+<a id="L287"></a>    }
+<a id="L288"></a>
+<a id="L289"></a>    /// Converts UTF-8 text to a `BuildId`.
+<a id="L290"></a>    pub fn parse(text: []const u8) !BuildId {
+<a id="L291"></a>        if (mem.eql(u8, text, "none")) {
+<a id="L292"></a>            return .none;
+<a id="L293"></a>        } else if (mem.eql(u8, text, "fast")) {
+<a id="L294"></a>            return .fast;
+<a id="L295"></a>        } else if (mem.eql(u8, text, "uuid")) {
+<a id="L296"></a>            return .uuid;
+<a id="L297"></a>        } else if (mem.eql(u8, text, "sha1") or mem.eql(u8, text, "tree")) {
+<a id="L298"></a>            return .sha1;
+<a id="L299"></a>        } else if (mem.eql(u8, text, "md5")) {
+<a id="L300"></a>            return .md5;
+<a id="L301"></a>        } else if (mem.startsWith(u8, text, "0x")) {
+<a id="L302"></a>            var result: BuildId = .{ .hexstring = undefined };
+<a id="L303"></a>            const slice = try std.fmt.hexToBytes(&amp;result.hexstring.bytes, text[2..]);
+<a id="L304"></a>            result.hexstring.len = @as(u8, @intCast(slice.len));
+<a id="L305"></a>            return result;
+<a id="L306"></a>        }
+<a id="L307"></a>        return error.InvalidBuildIdStyle;
+<a id="L308"></a>    }
+<a id="L309"></a>
+<a id="L310"></a>    test parse {
+<a id="L311"></a>        try std.testing.expectEqual(BuildId.md5, try parse("md5"));
+<a id="L312"></a>        try std.testing.expectEqual(BuildId.none, try parse("none"));
+<a id="L313"></a>        try std.testing.expectEqual(BuildId.fast, try parse("fast"));
+<a id="L314"></a>        try std.testing.expectEqual(BuildId.uuid, try parse("uuid"));
+<a id="L315"></a>        try std.testing.expectEqual(BuildId.sha1, try parse("sha1"));
+<a id="L316"></a>        try std.testing.expectEqual(BuildId.sha1, try parse("tree"));
+<a id="L317"></a>
+<a id="L318"></a>        try std.testing.expect(BuildId.initHexString("").eql(try parse("0x")));
+<a id="L319"></a>        try std.testing.expect(BuildId.initHexString("\x12\x34\x56").eql(try parse("0x123456")));
+<a id="L320"></a>        try std.testing.expectError(error.InvalidLength, parse("0x12-34"));
+<a id="L321"></a>        try std.testing.expectError(error.InvalidCharacter, parse("0xfoobbb"));
+<a id="L322"></a>        try std.testing.expectError(error.InvalidBuildIdStyle, parse("yaddaxxx"));
+<a id="L323"></a>    }
+<a id="L324"></a>
+<a id="L325"></a>    pub fn format(id: BuildId, writer: *Writer) Writer.Error!void {
+<a id="L326"></a>        switch (id) {
+<a id="L327"></a>            .none, .fast, .uuid, .sha1, .md5 =&gt; {
+<a id="L328"></a>                try writer.writeAll(@tagName(id));
+<a id="L329"></a>            },
+<a id="L330"></a>            .hexstring =&gt; |hs| {
+<a id="L331"></a>                try writer.print("0x{x}", .{hs.toSlice()});
+<a id="L332"></a>            },
+<a id="L333"></a>        }
+<a id="L334"></a>    }
+<a id="L335"></a>
+<a id="L336"></a>    test format {
+<a id="L337"></a>        try std.testing.expectFmt("none", "{f}", .{@as(BuildId, .none)});
+<a id="L338"></a>        try std.testing.expectFmt("fast", "{f}", .{@as(BuildId, .fast)});
+<a id="L339"></a>        try std.testing.expectFmt("uuid", "{f}", .{@as(BuildId, .uuid)});
+<a id="L340"></a>        try std.testing.expectFmt("sha1", "{f}", .{@as(BuildId, .sha1)});
+<a id="L341"></a>        try std.testing.expectFmt("md5", "{f}", .{@as(BuildId, .md5)});
+<a id="L342"></a>        try std.testing.expectFmt("0x", "{f}", .{BuildId.initHexString("")});
+<a id="L343"></a>        try std.testing.expectFmt("0x1234cdef", "{f}", .{BuildId.initHexString("\x12\x34\xcd\xef")});
+<a id="L344"></a>    }
+<a id="L345"></a>};
+<a id="L346"></a>
+<a id="L347"></a>pub const LtoMode = enum { none, full, thin };
+<a id="L348"></a>
+<a id="L349"></a>pub const Subsystem = enum {
+<a id="L350"></a>    console,
+<a id="L351"></a>    windows,
+<a id="L352"></a>    posix,
+<a id="L353"></a>    native,
+<a id="L354"></a>    efi_application,
+<a id="L355"></a>    efi_boot_service_driver,
+<a id="L356"></a>    efi_rom,
+<a id="L357"></a>    efi_runtime_driver,
+<a id="L358"></a>
+<a id="L359"></a>    /// Deprecated; use '.console' instead. To be removed after 0.16.0 is tagged.
+<a id="L360"></a>    pub const Console: Subsystem = .console;
+<a id="L361"></a>    /// Deprecated; use '.windows' instead. To be removed after 0.16.0 is tagged.
+<a id="L362"></a>    pub const Windows: Subsystem = .windows;
+<a id="L363"></a>    /// Deprecated; use '.posix' instead. To be removed after 0.16.0 is tagged.
+<a id="L364"></a>    pub const Posix: Subsystem = .posix;
+<a id="L365"></a>    /// Deprecated; use '.native' instead. To be removed after 0.16.0 is tagged.
+<a id="L366"></a>    pub const Native: Subsystem = .native;
+<a id="L367"></a>    /// Deprecated; use '.efi_application' instead. To be removed after 0.16.0 is tagged.
+<a id="L368"></a>    pub const EfiApplication: Subsystem = .efi_application;
+<a id="L369"></a>    /// Deprecated; use '.efi_boot_service_driver' instead. To be removed after 0.16.0 is tagged.
+<a id="L370"></a>    pub const EfiBootServiceDriver: Subsystem = .efi_boot_service_driver;
+<a id="L371"></a>    /// Deprecated; use '.efi_rom' instead. To be removed after 0.16.0 is tagged.
+<a id="L372"></a>    pub const EfiRom: Subsystem = .efi_rom;
+<a id="L373"></a>    /// Deprecated; use '.efi_runtime_driver' instead. To be removed after 0.16.0 is tagged.
+<a id="L374"></a>    pub const EfiRuntimeDriver: Subsystem = .efi_runtime_driver;
+<a id="L375"></a>};
+<a id="L376"></a>
+<a id="L377"></a>pub const CompressDebugSections = enum { none, zlib, zstd };
+<a id="L378"></a>
+<a id="L379"></a>pub const RcIncludes = enum {
+<a id="L380"></a>    /// Use MSVC if available, fall back to MinGW.
+<a id="L381"></a>    any,
+<a id="L382"></a>    /// Use MSVC include paths (MSVC install + Windows SDK, must be present on the system).
+<a id="L383"></a>    msvc,
+<a id="L384"></a>    /// Use MinGW include paths (distributed with Zig).
+<a id="L385"></a>    gnu,
+<a id="L386"></a>    /// Do not use any autodetected include paths.
+<a id="L387"></a>    none,
+<a id="L388"></a>};
+<a id="L389"></a>
+<a id="L390"></a>/// Renders a `std.Target.Cpu` value into a textual representation that can be parsed
+<a id="L391"></a>/// via the `-mcpu` flag passed to the Zig compiler.
+<a id="L392"></a>/// Appends the result to `buffer`.
+<a id="L393"></a>pub fn serializeCpu(buffer: *std.array_list.Managed(u8), cpu: std.Target.Cpu) Allocator.Error!void {
+<a id="L394"></a>    const all_features = cpu.arch.allFeaturesList();
+<a id="L395"></a>    var populated_cpu_features = cpu.model.features;
+<a id="L396"></a>    populated_cpu_features.populateDependencies(all_features);
+<a id="L397"></a>
+<a id="L398"></a>    try buffer.appendSlice(cpu.model.name);
+<a id="L399"></a>
+<a id="L400"></a>    if (populated_cpu_features.eql(cpu.features)) {
+<a id="L401"></a>        // The CPU name alone is sufficient.
+<a id="L402"></a>        return;
+<a id="L403"></a>    }
+<a id="L404"></a>
+<a id="L405"></a>    for (all_features, 0..) |feature, i_usize| {
+<a id="L406"></a>        const i: std.Target.Cpu.Feature.Set.Index = @intCast(i_usize);
+<a id="L407"></a>        const in_cpu_set = populated_cpu_features.isEnabled(i);
+<a id="L408"></a>        const in_actual_set = cpu.features.isEnabled(i);
+<a id="L409"></a>        try buffer.ensureUnusedCapacity(feature.name.len + 1);
+<a id="L410"></a>        if (in_cpu_set and !in_actual_set) {
+<a id="L411"></a>            buffer.appendAssumeCapacity('-');
+<a id="L412"></a>            buffer.appendSliceAssumeCapacity(feature.name);
+<a id="L413"></a>        } else if (!in_cpu_set and in_actual_set) {
+<a id="L414"></a>            buffer.appendAssumeCapacity('+');
+<a id="L415"></a>            buffer.appendSliceAssumeCapacity(feature.name);
+<a id="L416"></a>        }
+<a id="L417"></a>    }
+<a id="L418"></a>}
+<a id="L419"></a>
+<a id="L420"></a>pub fn serializeCpuAlloc(ally: Allocator, cpu: std.Target.Cpu) Allocator.Error![]u8 {
+<a id="L421"></a>    var buffer = std.array_list.Managed(u8).init(ally);
+<a id="L422"></a>    try serializeCpu(&amp;buffer, cpu);
+<a id="L423"></a>    return buffer.toOwnedSlice();
+<a id="L424"></a>}
+<a id="L425"></a>
+<a id="L426"></a>/// Return a Formatter for a Zig identifier, escaping it with `@""` syntax if needed.
+<a id="L427"></a>///
+<a id="L428"></a>/// See also `fmtIdFlags`.
+<a id="L429"></a>pub fn fmtId(bytes: []const u8) FormatId {
+<a id="L430"></a>    return .{ .bytes = bytes, .flags = .{} };
+<a id="L431"></a>}
+<a id="L432"></a>
+<a id="L433"></a>/// Return a Formatter for a Zig identifier, escaping it with `@""` syntax if needed.
+<a id="L434"></a>///
+<a id="L435"></a>/// See also `fmtId`.
+<a id="L436"></a>pub fn fmtIdFlags(bytes: []const u8, flags: FormatId.Flags) FormatId {
+<a id="L437"></a>    return .{ .bytes = bytes, .flags = flags };
+<a id="L438"></a>}
+<a id="L439"></a>
+<a id="L440"></a>pub fn fmtIdPU(bytes: []const u8) FormatId {
+<a id="L441"></a>    return .{ .bytes = bytes, .flags = .{ .allow_primitive = true, .allow_underscore = true } };
+<a id="L442"></a>}
+<a id="L443"></a>
+<a id="L444"></a>pub fn fmtIdP(bytes: []const u8) FormatId {
+<a id="L445"></a>    return .{ .bytes = bytes, .flags = .{ .allow_primitive = true } };
+<a id="L446"></a>}
+<a id="L447"></a>
+<a id="L448"></a>test fmtId {
+<a id="L449"></a>    const expectFmt = std.testing.expectFmt;
+<a id="L450"></a>    try expectFmt("@\"while\"", "{f}", .{fmtId("while")});
+<a id="L451"></a>    try expectFmt("@\"while\"", "{f}", .{fmtIdFlags("while", .{ .allow_primitive = true })});
+<a id="L452"></a>    try expectFmt("@\"while\"", "{f}", .{fmtIdFlags("while", .{ .allow_underscore = true })});
+<a id="L453"></a>    try expectFmt("@\"while\"", "{f}", .{fmtIdFlags("while", .{ .allow_primitive = true, .allow_underscore = true })});
+<a id="L454"></a>
+<a id="L455"></a>    try expectFmt("hello", "{f}", .{fmtId("hello")});
+<a id="L456"></a>    try expectFmt("hello", "{f}", .{fmtIdFlags("hello", .{ .allow_primitive = true })});
+<a id="L457"></a>    try expectFmt("hello", "{f}", .{fmtIdFlags("hello", .{ .allow_underscore = true })});
+<a id="L458"></a>    try expectFmt("hello", "{f}", .{fmtIdFlags("hello", .{ .allow_primitive = true, .allow_underscore = true })});
+<a id="L459"></a>
+<a id="L460"></a>    try expectFmt("@\"type\"", "{f}", .{fmtId("type")});
+<a id="L461"></a>    try expectFmt("type", "{f}", .{fmtIdFlags("type", .{ .allow_primitive = true })});
+<a id="L462"></a>    try expectFmt("@\"type\"", "{f}", .{fmtIdFlags("type", .{ .allow_underscore = true })});
+<a id="L463"></a>    try expectFmt("type", "{f}", .{fmtIdFlags("type", .{ .allow_primitive = true, .allow_underscore = true })});
+<a id="L464"></a>
+<a id="L465"></a>    try expectFmt("@\"_\"", "{f}", .{fmtId("_")});
+<a id="L466"></a>    try expectFmt("@\"_\"", "{f}", .{fmtIdFlags("_", .{ .allow_primitive = true })});
+<a id="L467"></a>    try expectFmt("_", "{f}", .{fmtIdFlags("_", .{ .allow_underscore = true })});
+<a id="L468"></a>    try expectFmt("_", "{f}", .{fmtIdFlags("_", .{ .allow_primitive = true, .allow_underscore = true })});
+<a id="L469"></a>
+<a id="L470"></a>    try expectFmt("@\"i123\"", "{f}", .{fmtId("i123")});
+<a id="L471"></a>    try expectFmt("i123", "{f}", .{fmtIdFlags("i123", .{ .allow_primitive = true })});
+<a id="L472"></a>    try expectFmt("@\"4four\"", "{f}", .{fmtId("4four")});
+<a id="L473"></a>    try expectFmt("_underscore", "{f}", .{fmtId("_underscore")});
+<a id="L474"></a>    try expectFmt("@\"11\\\"23\"", "{f}", .{fmtId("11\"23")});
+<a id="L475"></a>    try expectFmt("@\"11\\x0f23\"", "{f}", .{fmtId("11\x0F23")});
+<a id="L476"></a>
+<a id="L477"></a>    // These are technically not currently legal in Zig.
+<a id="L478"></a>    try expectFmt("@\"\"", "{f}", .{fmtId("")});
+<a id="L479"></a>    try expectFmt("@\"\\x00\"", "{f}", .{fmtId("\x00")});
+<a id="L480"></a>}
+<a id="L481"></a>
+<a id="L482"></a>pub const FormatId = struct {
+<a id="L483"></a>    bytes: []const u8,
+<a id="L484"></a>    flags: Flags,
+<a id="L485"></a>    pub const Flags = struct {
+<a id="L486"></a>        allow_primitive: bool = false,
+<a id="L487"></a>        allow_underscore: bool = false,
+<a id="L488"></a>    };
+<a id="L489"></a>
+<a id="L490"></a>    /// Print the string as a Zig identifier, escaping it with `@""` syntax if needed.
+<a id="L491"></a>    pub fn format(ctx: FormatId, writer: *Writer) Writer.Error!void {
+<a id="L492"></a>        const bytes = ctx.bytes;
+<a id="L493"></a>        if (isValidId(bytes) and
+<a id="L494"></a>            (ctx.flags.allow_primitive or !std.zig.isPrimitive(bytes)) and
+<a id="L495"></a>            (ctx.flags.allow_underscore or !isUnderscore(bytes)))
+<a id="L496"></a>        {
+<a id="L497"></a>            return writer.writeAll(bytes);
+<a id="L498"></a>        }
+<a id="L499"></a>        try writer.writeAll("@\"");
+<a id="L500"></a>        try stringEscape(bytes, writer);
+<a id="L501"></a>        try writer.writeByte('"');
+<a id="L502"></a>    }
+<a id="L503"></a>};
+<a id="L504"></a>
+<a id="L505"></a>/// Return a formatter for escaping a double quoted Zig string.
+<a id="L506"></a>pub fn fmtString(bytes: []const u8) std.fmt.Alt([]const u8, stringEscape) {
+<a id="L507"></a>    return .{ .data = bytes };
+<a id="L508"></a>}
+<a id="L509"></a>
+<a id="L510"></a>/// Return a formatter for escaping a single quoted Zig string.
+<a id="L511"></a>pub fn fmtChar(c: u21) std.fmt.Alt(u21, charEscape) {
+<a id="L512"></a>    return .{ .data = c };
+<a id="L513"></a>}
+<a id="L514"></a>
+<a id="L515"></a>test fmtString {
+<a id="L516"></a>    try std.testing.expectFmt("\\x0f", "{f}", .{fmtString("\x0f")});
+<a id="L517"></a>    try std.testing.expectFmt(
+<a id="L518"></a>        \\" \\ hi \x07 \x11 \" derp '"
+<a id="L519"></a>    , "\"{f}\"", .{fmtString(" \\ hi \x07 \x11 \" derp '")});
+<a id="L520"></a>}
+<a id="L521"></a>
+<a id="L522"></a>test fmtChar {
+<a id="L523"></a>    try std.testing.expectFmt("c \\u{26a1}", "{f} {f}", .{ fmtChar('c'), fmtChar('⚡') });
+<a id="L524"></a>}
+<a id="L525"></a>
+<a id="L526"></a>/// Print the string as escaped contents of a double quoted string.
+<a id="L527"></a>pub fn stringEscape(bytes: []const u8, w: *Writer) Writer.Error!void {
+<a id="L528"></a>    for (bytes) |byte| switch (byte) {
+<a id="L529"></a>        '\n' =&gt; try w.writeAll("\\n"),
+<a id="L530"></a>        '\r' =&gt; try w.writeAll("\\r"),
+<a id="L531"></a>        '\t' =&gt; try w.writeAll("\\t"),
+<a id="L532"></a>        '\\' =&gt; try w.writeAll("\\\\"),
+<a id="L533"></a>        '"' =&gt; try w.writeAll("\\\""),
+<a id="L534"></a>        '\'' =&gt; try w.writeByte('\''),
+<a id="L535"></a>        ' ', '!', '#'...'&amp;', '('...'[', ']'...'~' =&gt; try w.writeByte(byte),
+<a id="L536"></a>        else =&gt; {
+<a id="L537"></a>            try w.writeAll("\\x");
+<a id="L538"></a>            try w.printInt(byte, 16, .lower, .{ .width = 2, .fill = '0' });
+<a id="L539"></a>        },
+<a id="L540"></a>    };
+<a id="L541"></a>}
+<a id="L542"></a>
+<a id="L543"></a>/// Print as escaped contents of a single-quoted string.
+<a id="L544"></a>pub fn charEscape(codepoint: u21, w: *Writer) Writer.Error!void {
+<a id="L545"></a>    switch (codepoint) {
+<a id="L546"></a>        '\n' =&gt; try w.writeAll("\\n"),
+<a id="L547"></a>        '\r' =&gt; try w.writeAll("\\r"),
+<a id="L548"></a>        '\t' =&gt; try w.writeAll("\\t"),
+<a id="L549"></a>        '\\' =&gt; try w.writeAll("\\\\"),
+<a id="L550"></a>        '\'' =&gt; try w.writeAll("\\'"),
+<a id="L551"></a>        '"', ' ', '!', '#'...'&amp;', '('...'[', ']'...'~' =&gt; try w.writeByte(@intCast(codepoint)),
+<a id="L552"></a>        else =&gt; {
+<a id="L553"></a>            if (std.math.cast(u8, codepoint)) |byte| {
+<a id="L554"></a>                try w.writeAll("\\x");
+<a id="L555"></a>                try w.printInt(byte, 16, .lower, .{ .width = 2, .fill = '0' });
+<a id="L556"></a>            } else {
+<a id="L557"></a>                try w.writeAll("\\u{");
+<a id="L558"></a>                try w.printInt(codepoint, 16, .lower, .{});
+<a id="L559"></a>                try w.writeByte('}');
+<a id="L560"></a>            }
+<a id="L561"></a>        },
+<a id="L562"></a>    }
+<a id="L563"></a>}
+<a id="L564"></a>
+<a id="L565"></a>pub fn isValidId(bytes: []const u8) bool {
+<a id="L566"></a>    if (bytes.len == 0) return false;
+<a id="L567"></a>    for (bytes, 0..) |c, i| {
+<a id="L568"></a>        switch (c) {
+<a id="L569"></a>            '_', 'a'...'z', 'A'...'Z' =&gt; {},
+<a id="L570"></a>            '0'...'9' =&gt; if (i == 0) return false,
+<a id="L571"></a>            else =&gt; return false,
+<a id="L572"></a>        }
+<a id="L573"></a>    }
+<a id="L574"></a>    return std.zig.Token.getKeyword(bytes) == null;
+<a id="L575"></a>}
+<a id="L576"></a>
+<a id="L577"></a>test isValidId {
+<a id="L578"></a>    try std.testing.expect(!isValidId(""));
+<a id="L579"></a>    try std.testing.expect(isValidId("foobar"));
+<a id="L580"></a>    try std.testing.expect(!isValidId("a b c"));
+<a id="L581"></a>    try std.testing.expect(!isValidId("3d"));
+<a id="L582"></a>    try std.testing.expect(!isValidId("enum"));
+<a id="L583"></a>    try std.testing.expect(isValidId("i386"));
+<a id="L584"></a>}
+<a id="L585"></a>
+<a id="L586"></a>pub fn isUnderscore(bytes: []const u8) bool {
+<a id="L587"></a>    return bytes.len == 1 and bytes[0] == '_';
+<a id="L588"></a>}
+<a id="L589"></a>
+<a id="L590"></a>test isUnderscore {
+<a id="L591"></a>    try std.testing.expect(isUnderscore("_"));
+<a id="L592"></a>    try std.testing.expect(!isUnderscore("__"));
+<a id="L593"></a>    try std.testing.expect(!isUnderscore("_foo"));
+<a id="L594"></a>    try std.testing.expect(isUnderscore("\x5f"));
+<a id="L595"></a>    try std.testing.expect(!isUnderscore("\\x5f"));
+<a id="L596"></a>}
+<a id="L597"></a>
+<a id="L598"></a>/// If the source can be UTF-16LE encoded, this function asserts that `gpa`
+<a id="L599"></a>/// will align a byte-sized allocation to at least 2. Allocators that don't do
+<a id="L600"></a>/// this are rare.
+<a id="L601"></a>pub fn readSourceFileToEndAlloc(gpa: Allocator, file_reader: *Io.File.Reader) ![:0]u8 {
+<a id="L602"></a>    var buffer: std.ArrayList(u8) = .empty;
+<a id="L603"></a>    defer buffer.deinit(gpa);
+<a id="L604"></a>
+<a id="L605"></a>    if (file_reader.getSize()) |size| {
+<a id="L606"></a>        const casted_size = std.math.cast(u32, size) orelse return error.StreamTooLong;
+<a id="L607"></a>        // +1 to avoid resizing for the null byte added in toOwnedSliceSentinel below.
+<a id="L608"></a>        try buffer.ensureTotalCapacityPrecise(gpa, casted_size + 1);
+<a id="L609"></a>    } else |_| {}
+<a id="L610"></a>
+<a id="L611"></a>    try file_reader.interface.appendRemaining(gpa, &amp;buffer, .limited(max_src_size));
+<a id="L612"></a>
+<a id="L613"></a>    // Detect unsupported file types with their Byte Order Mark
+<a id="L614"></a>    const unsupported_boms = [_][]const u8{
+<a id="L615"></a>        "\xff\xfe\x00\x00", // UTF-32 little endian
+<a id="L616"></a>        "\xfe\xff\x00\x00", // UTF-32 big endian
+<a id="L617"></a>        "\xfe\xff", // UTF-16 big endian
+<a id="L618"></a>    };
+<a id="L619"></a>    for (unsupported_boms) |bom| {
+<a id="L620"></a>        if (mem.startsWith(u8, buffer.items, bom)) {
+<a id="L621"></a>            return error.UnsupportedEncoding;
+<a id="L622"></a>        }
+<a id="L623"></a>    }
+<a id="L624"></a>
+<a id="L625"></a>    // If the file starts with a UTF-16 little endian BOM, translate it to UTF-8
+<a id="L626"></a>    if (mem.startsWith(u8, buffer.items, "\xff\xfe")) {
+<a id="L627"></a>        if (buffer.items.len % 2 != 0) return error.InvalidEncoding;
+<a id="L628"></a>        return std.unicode.utf16LeToUtf8AllocZ(gpa, @ptrCast(@alignCast(buffer.items))) catch |err| switch (err) {
+<a id="L629"></a>            error.DanglingSurrogateHalf =&gt; error.UnsupportedEncoding,
+<a id="L630"></a>            error.ExpectedSecondSurrogateHalf =&gt; error.UnsupportedEncoding,
+<a id="L631"></a>            error.UnexpectedSecondSurrogateHalf =&gt; error.UnsupportedEncoding,
+<a id="L632"></a>            else =&gt; |e| return e,
+<a id="L633"></a>        };
+<a id="L634"></a>    }
+<a id="L635"></a>
+<a id="L636"></a>    return buffer.toOwnedSliceSentinel(gpa, 0);
+<a id="L637"></a>}
+<a id="L638"></a>
+<a id="L639"></a>pub fn printAstErrorsToStderr(gpa: Allocator, io: Io, tree: Ast, path: []const u8, color: Color) !void {
+<a id="L640"></a>    var wip_errors: std.zig.ErrorBundle.Wip = undefined;
+<a id="L641"></a>    try wip_errors.init(gpa);
+<a id="L642"></a>    defer wip_errors.deinit();
+<a id="L643"></a>
+<a id="L644"></a>    try putAstErrorsIntoBundle(gpa, tree, path, &amp;wip_errors);
+<a id="L645"></a>
+<a id="L646"></a>    var error_bundle = try wip_errors.toOwnedBundle("");
+<a id="L647"></a>    defer error_bundle.deinit(gpa);
+<a id="L648"></a>    return error_bundle.renderToStderr(io, .{}, color);
+<a id="L649"></a>}
+<a id="L650"></a>
+<a id="L651"></a>pub fn putAstErrorsIntoBundle(
+<a id="L652"></a>    gpa: Allocator,
+<a id="L653"></a>    tree: Ast,
+<a id="L654"></a>    path: []const u8,
+<a id="L655"></a>    wip_errors: *std.zig.ErrorBundle.Wip,
+<a id="L656"></a>) Allocator.Error!void {
+<a id="L657"></a>    switch (tree.mode) {
+<a id="L658"></a>        .zig =&gt; {
+<a id="L659"></a>            var zir = try AstGen.generate(gpa, tree);
+<a id="L660"></a>            defer zir.deinit(gpa);
+<a id="L661"></a>
+<a id="L662"></a>            try wip_errors.addZirErrorMessages(zir, tree, tree.source, path);
+<a id="L663"></a>        },
+<a id="L664"></a>        .zon =&gt; {
+<a id="L665"></a>            var zoir = try ZonGen.generate(gpa, tree, .{});
+<a id="L666"></a>            defer zoir.deinit(gpa);
+<a id="L667"></a>
+<a id="L668"></a>            try wip_errors.addZoirErrorMessages(zoir, tree, tree.source, path);
+<a id="L669"></a>        },
+<a id="L670"></a>    }
+<a id="L671"></a>}
+<a id="L672"></a>
+<a id="L673"></a>pub fn resolveTargetQueryOrFatal(io: Io, target_query: std.Target.Query) std.Target {
+<a id="L674"></a>    return std.zig.system.resolveTargetQuery(io, target_query) catch |err|
+<a id="L675"></a>        std.process.fatal("unable to resolve target: {s}", .{@errorName(err)});
+<a id="L676"></a>}
+<a id="L677"></a>
+<a id="L678"></a>pub fn parseTargetQueryOrReportFatalError(
+<a id="L679"></a>    allocator: Allocator,
+<a id="L680"></a>    opts: std.Target.Query.ParseOptions,
+<a id="L681"></a>) std.Target.Query {
+<a id="L682"></a>    var opts_with_diags = opts;
+<a id="L683"></a>    var diags: std.Target.Query.ParseOptions.Diagnostics = .{};
+<a id="L684"></a>    if (opts_with_diags.diagnostics == null) {
+<a id="L685"></a>        opts_with_diags.diagnostics = &amp;diags;
+<a id="L686"></a>    }
+<a id="L687"></a>    return std.Target.Query.parse(opts_with_diags) catch |err| switch (err) {
+<a id="L688"></a>        error.UnknownCpuModel =&gt; {
+<a id="L689"></a>            help: {
+<a id="L690"></a>                var help_text = std.array_list.Managed(u8).init(allocator);
+<a id="L691"></a>                defer help_text.deinit();
+<a id="L692"></a>                for (diags.arch.?.allCpuModels()) |cpu| {
+<a id="L693"></a>                    help_text.print(" {s}\n", .{cpu.name}) catch break :help;
+<a id="L694"></a>                }
+<a id="L695"></a>                std.log.info("available CPUs for architecture '{s}':\n{s}", .{
+<a id="L696"></a>                    @tagName(diags.arch.?), help_text.items,
+<a id="L697"></a>                });
+<a id="L698"></a>            }
+<a id="L699"></a>            std.process.fatal("unknown CPU: '{s}'", .{diags.cpu_name.?});
+<a id="L700"></a>        },
+<a id="L701"></a>        error.UnknownCpuFeature =&gt; {
+<a id="L702"></a>            help: {
+<a id="L703"></a>                var help_text = std.array_list.Managed(u8).init(allocator);
+<a id="L704"></a>                defer help_text.deinit();
+<a id="L705"></a>                for (diags.arch.?.allFeaturesList()) |feature| {
+<a id="L706"></a>                    help_text.print(" {s}: {s}\n", .{ feature.name, feature.description }) catch break :help;
+<a id="L707"></a>                }
+<a id="L708"></a>                std.log.info("available CPU features for architecture '{s}':\n{s}", .{
+<a id="L709"></a>                    @tagName(diags.arch.?), help_text.items,
+<a id="L710"></a>                });
+<a id="L711"></a>            }
+<a id="L712"></a>            std.process.fatal("unknown CPU feature: '{s}'", .{diags.unknown_feature_name.?});
+<a id="L713"></a>        },
+<a id="L714"></a>        error.UnknownObjectFormat =&gt; {
+<a id="L715"></a>            help: {
+<a id="L716"></a>                var help_text = std.array_list.Managed(u8).init(allocator);
+<a id="L717"></a>                defer help_text.deinit();
+<a id="L718"></a>                inline for (@typeInfo(std.Target.ObjectFormat).@"enum".fields) |field| {
+<a id="L719"></a>                    help_text.print(" {s}\n", .{field.name}) catch break :help;
+<a id="L720"></a>                }
+<a id="L721"></a>                std.log.info("available object formats:\n{s}", .{help_text.items});
+<a id="L722"></a>            }
+<a id="L723"></a>            std.process.fatal("unknown object format: '{s}'", .{opts.object_format.?});
+<a id="L724"></a>        },
+<a id="L725"></a>        error.UnknownArchitecture =&gt; {
+<a id="L726"></a>            help: {
+<a id="L727"></a>                var help_text = std.array_list.Managed(u8).init(allocator);
+<a id="L728"></a>                defer help_text.deinit();
+<a id="L729"></a>                inline for (@typeInfo(std.Target.Cpu.Arch).@"enum".fields) |field| {
+<a id="L730"></a>                    help_text.print(" {s}\n", .{field.name}) catch break :help;
+<a id="L731"></a>                }
+<a id="L732"></a>                std.log.info("available architectures:\n{s} native\n", .{help_text.items});
+<a id="L733"></a>            }
+<a id="L734"></a>            std.process.fatal("unknown architecture: '{s}'", .{diags.unknown_architecture_name.?});
+<a id="L735"></a>        },
+<a id="L736"></a>        else =&gt; |e| std.process.fatal("unable to parse target query '{s}': {s}", .{
+<a id="L737"></a>            opts.arch_os_abi, @errorName(e),
+<a id="L738"></a>        }),
+<a id="L739"></a>    };
+<a id="L740"></a>}
+<a id="L741"></a>
+<a id="L742"></a>/// Collects all the environment variables that Zig could possibly inspect, so
+<a id="L743"></a>/// that we can do reflection on this and print them with `zig env`.
+<a id="L744"></a>pub const EnvVar = enum {
+<a id="L745"></a>    ZIG_GLOBAL_CACHE_DIR,
+<a id="L746"></a>    ZIG_LOCAL_CACHE_DIR,
+<a id="L747"></a>    ZIG_LIB_DIR,
+<a id="L748"></a>    ZIG_LIBC,
+<a id="L749"></a>    ZIG_BUILD_RUNNER,
+<a id="L750"></a>    ZIG_BUILD_ERROR_STYLE,
+<a id="L751"></a>    ZIG_BUILD_MULTILINE_ERRORS,
+<a id="L752"></a>    ZIG_VERBOSE_LINK,
+<a id="L753"></a>    ZIG_VERBOSE_CC,
+<a id="L754"></a>    ZIG_DEBUG_CMD,
+<a id="L755"></a>    ZIG_IS_DETECTING_LIBC_PATHS,
+<a id="L756"></a>    ZIG_IS_TRYING_TO_NOT_CALL_ITSELF,
+<a id="L757"></a>
+<a id="L758"></a>    // C toolchain integration
+<a id="L759"></a>    NIX_CFLAGS_COMPILE,
+<a id="L760"></a>    NIX_CFLAGS_LINK,
+<a id="L761"></a>    NIX_LDFLAGS,
+<a id="L762"></a>    C_INCLUDE_PATH,
+<a id="L763"></a>    CPLUS_INCLUDE_PATH,
+<a id="L764"></a>    LIBRARY_PATH,
+<a id="L765"></a>    CC,
+<a id="L766"></a>
+<a id="L767"></a>    // Terminal integration
+<a id="L768"></a>    NO_COLOR,
+<a id="L769"></a>    CLICOLOR_FORCE,
+<a id="L770"></a>
+<a id="L771"></a>    // Debug info integration
+<a id="L772"></a>    XDG_CACHE_HOME,
+<a id="L773"></a>    LOCALAPPDATA,
+<a id="L774"></a>    HOME,
+<a id="L775"></a>
+<a id="L776"></a>    // Windows SDK integration
+<a id="L777"></a>    PROGRAMDATA,
+<a id="L778"></a>
+<a id="L779"></a>    // Homebrew integration
+<a id="L780"></a>    HOMEBREW_PREFIX,
+<a id="L781"></a>
+<a id="L782"></a>    pub fn isSet(ev: EnvVar, map: *const std.process.Environ.Map) bool {
+<a id="L783"></a>        return map.contains(@tagName(ev));
+<a id="L784"></a>    }
+<a id="L785"></a>
+<a id="L786"></a>    pub fn get(ev: EnvVar, map: *const std.process.Environ.Map) ?[]const u8 {
+<a id="L787"></a>        return map.get(@tagName(ev));
+<a id="L788"></a>    }
+<a id="L789"></a>};
+<a id="L790"></a>
+<a id="L791"></a>pub const SimpleComptimeReason = enum(u32) {
+<a id="L792"></a>    // Evaluating at comptime because a builtin operand must be comptime-known.
+<a id="L793"></a>    // These messages all mention a specific builtin.
+<a id="L794"></a>    operand_setEvalBranchQuota,
+<a id="L795"></a>    operand_setFloatMode,
+<a id="L796"></a>    operand_branchHint,
+<a id="L797"></a>    operand_setRuntimeSafety,
+<a id="L798"></a>    operand_embedFile,
+<a id="L799"></a>    operand_cImport,
+<a id="L800"></a>    operand_cDefine_macro_name,
+<a id="L801"></a>    operand_cDefine_macro_value,
+<a id="L802"></a>    operand_cInclude_file_name,
+<a id="L803"></a>    operand_cUndef_macro_name,
+<a id="L804"></a>    operand_shuffle_mask,
+<a id="L805"></a>    operand_atomicRmw_operation,
+<a id="L806"></a>    operand_reduce_operation,
+<a id="L807"></a>
+<a id="L808"></a>    // Evaluating at comptime because an operand must be comptime-known.
+<a id="L809"></a>    // These messages do not mention a specific builtin (and may not be about a builtin at all).
+<a id="L810"></a>    export_target,
+<a id="L811"></a>    export_options,
+<a id="L812"></a>    extern_options,
+<a id="L813"></a>    prefetch_options,
+<a id="L814"></a>    call_modifier,
+<a id="L815"></a>    compile_error_string,
+<a id="L816"></a>    inline_assembly_code,
+<a id="L817"></a>    atomic_order,
+<a id="L818"></a>    array_mul_factor,
+<a id="L819"></a>    slice_cat_operand,
+<a id="L820"></a>    inline_call_target,
+<a id="L821"></a>    generic_call_target,
+<a id="L822"></a>    wasm_memory_index,
+<a id="L823"></a>    work_group_dim_index,
+<a id="L824"></a>    clobber,
+<a id="L825"></a>
+<a id="L826"></a>    // Evaluating at comptime because types must be comptime-known.
+<a id="L827"></a>    // Reasons other than `.type` are just more specific messages.
+<a id="L828"></a>    type,
+<a id="L829"></a>    int_signedness,
+<a id="L830"></a>    int_bit_width,
+<a id="L831"></a>    array_sentinel,
+<a id="L832"></a>    array_length,
+<a id="L833"></a>    pointer_size,
+<a id="L834"></a>    pointer_attrs,
+<a id="L835"></a>    pointer_sentinel,
+<a id="L836"></a>    slice_sentinel,
+<a id="L837"></a>    vector_length,
+<a id="L838"></a>    fn_ret_ty,
+<a id="L839"></a>    fn_param_types,
+<a id="L840"></a>    fn_param_attrs,
+<a id="L841"></a>    fn_attrs,
+<a id="L842"></a>    struct_layout,
+<a id="L843"></a>    struct_field_names,
+<a id="L844"></a>    struct_field_types,
+<a id="L845"></a>    struct_field_attrs,
+<a id="L846"></a>    union_layout,
+<a id="L847"></a>    union_field_names,
+<a id="L848"></a>    union_field_types,
+<a id="L849"></a>    union_field_attrs,
+<a id="L850"></a>    tuple_field_types,
+<a id="L851"></a>    enum_field_names,
+<a id="L852"></a>    enum_field_values,
+<a id="L853"></a>    union_enum_tag_type,
+<a id="L854"></a>    enum_int_tag_type,
+<a id="L855"></a>    packed_struct_backing_int_type,
+<a id="L856"></a>    packed_union_backing_int_type,
+<a id="L857"></a>
+<a id="L858"></a>    // Evaluating at comptime because decl/field name must be comptime-known.
+<a id="L859"></a>    decl_name,
+<a id="L860"></a>    field_name,
+<a id="L861"></a>    tuple_field_index,
+<a id="L862"></a>
+<a id="L863"></a>    // Evaluating at comptime because it is an attribute of a global declaration.
+<a id="L864"></a>    container_var_init,
+<a id="L865"></a>    @"callconv",
+<a id="L866"></a>    @"align",
+<a id="L867"></a>    @"addrspace",
+<a id="L868"></a>    @"linksection",
+<a id="L869"></a>
+<a id="L870"></a>    // Miscellaneous reasons.
+<a id="L871"></a>    comptime_keyword,
+<a id="L872"></a>    comptime_call_modifier,
+<a id="L873"></a>    inline_loop_operand,
+<a id="L874"></a>    switch_item,
+<a id="L875"></a>    tuple_field_default_value,
+<a id="L876"></a>    struct_field_default_value,
+<a id="L877"></a>    enum_field_tag_value,
+<a id="L878"></a>    slice_single_item_ptr_bounds,
+<a id="L879"></a>    stored_to_comptime_field,
+<a id="L880"></a>    stored_to_comptime_var,
+<a id="L881"></a>    casted_to_comptime_enum,
+<a id="L882"></a>    casted_to_comptime_int,
+<a id="L883"></a>    casted_to_comptime_float,
+<a id="L884"></a>    std_builtin_decl,
+<a id="L885"></a>
+<a id="L886"></a>    pub fn message(r: SimpleComptimeReason) []const u8 {
+<a id="L887"></a>        return switch (r) {
+<a id="L888"></a>            // zig fmt: off
+<a id="L889"></a>            .operand_setEvalBranchQuota  =&gt; "operand to '@setEvalBranchQuota' must be comptime-known",
+<a id="L890"></a>            .operand_setFloatMode        =&gt; "operand to '@setFloatMode' must be comptime-known",
+<a id="L891"></a>            .operand_branchHint          =&gt; "operand to '@branchHint' must be comptime-known",
+<a id="L892"></a>            .operand_setRuntimeSafety    =&gt; "operand to '@setRuntimeSafety' must be comptime-known",
+<a id="L893"></a>            .operand_embedFile           =&gt; "operand to '@embedFile' must be comptime-known",
+<a id="L894"></a>            .operand_cImport             =&gt; "operand to '@cImport' is evaluated at comptime",
+<a id="L895"></a>            .operand_cDefine_macro_name  =&gt; "'@cDefine' macro name must be comptime-known",
+<a id="L896"></a>            .operand_cDefine_macro_value =&gt; "'@cDefine' macro value must be comptime-known",
+<a id="L897"></a>            .operand_cInclude_file_name  =&gt; "'@cInclude' file name must be comptime-known",
+<a id="L898"></a>            .operand_cUndef_macro_name   =&gt; "'@cUndef' macro name must be comptime-known",
+<a id="L899"></a>            .operand_shuffle_mask        =&gt; "'@shuffle' mask must be comptime-known",
+<a id="L900"></a>            .operand_atomicRmw_operation =&gt; "'@atomicRmw' operation must be comptime-known",
+<a id="L901"></a>            .operand_reduce_operation    =&gt; "'@reduce' operation must be comptime-known",
+<a id="L902"></a>
+<a id="L903"></a>            .export_target        =&gt; "export target must be comptime-known",
+<a id="L904"></a>            .export_options       =&gt; "export options must be comptime-known",
+<a id="L905"></a>            .extern_options       =&gt; "extern options must be comptime-known",
+<a id="L906"></a>            .prefetch_options     =&gt; "prefetch options must be comptime-known",
+<a id="L907"></a>            .call_modifier        =&gt; "call modifier must be comptime-known",
+<a id="L908"></a>            .compile_error_string =&gt; "compile error string must be comptime-known",
+<a id="L909"></a>            .inline_assembly_code =&gt; "inline assembly code must be comptime-known",
+<a id="L910"></a>            .atomic_order         =&gt; "atomic order must be comptime-known",
+<a id="L911"></a>            .array_mul_factor     =&gt; "array multiplication factor must be comptime-known",
+<a id="L912"></a>            .slice_cat_operand    =&gt; "slice being concatenated must be comptime-known",
+<a id="L913"></a>            .inline_call_target   =&gt; "function being called inline must be comptime-known",
+<a id="L914"></a>            .generic_call_target  =&gt; "generic function being called must be comptime-known",
+<a id="L915"></a>            .wasm_memory_index    =&gt; "wasm memory index must be comptime-known",
+<a id="L916"></a>            .work_group_dim_index =&gt; "work group dimension index must be comptime-known",
+<a id="L917"></a>            .clobber              =&gt; "clobber must be comptime-known",
+<a id="L918"></a>
+<a id="L919"></a>            .type                =&gt; "types must be comptime-known",
+<a id="L920"></a>            .int_signedness      =&gt; "integer signedness must be comptime-known",
+<a id="L921"></a>            .int_bit_width       =&gt; "integer bit width must be comptime-known",
+<a id="L922"></a>            .array_sentinel      =&gt; "array sentinel value must be comptime-known",
+<a id="L923"></a>            .array_length        =&gt; "array length must be comptime-known",
+<a id="L924"></a>            .pointer_size        =&gt; "pointer size must be comptime-known",
+<a id="L925"></a>            .pointer_attrs       =&gt; "pointer attributes must be comptime-known",
+<a id="L926"></a>            .pointer_sentinel    =&gt; "pointer sentinel value must be comptime-known",
+<a id="L927"></a>            .slice_sentinel      =&gt; "slice sentinel value must be comptime-known",
+<a id="L928"></a>            .vector_length       =&gt; "vector length must be comptime-known",
+<a id="L929"></a>            .fn_ret_ty           =&gt; "function return type must be comptime-known",
+<a id="L930"></a>            .fn_param_types      =&gt; "function parameter types must be comptime-known",
+<a id="L931"></a>            .fn_param_attrs      =&gt; "function parameter attributes must be comptime-known",
+<a id="L932"></a>            .fn_attrs            =&gt; "function attributes must be comptime-known",
+<a id="L933"></a>            .struct_layout       =&gt; "struct layout must be comptime-known",
+<a id="L934"></a>            .struct_field_names  =&gt; "struct field names must be comptime-known",
+<a id="L935"></a>            .struct_field_types  =&gt; "struct field types must be comptime-known",
+<a id="L936"></a>            .struct_field_attrs  =&gt; "struct field attributes must be comptime-known",
+<a id="L937"></a>            .union_layout        =&gt; "union layout must be comptime-known",
+<a id="L938"></a>            .union_field_names   =&gt; "union field names must be comptime-known",
+<a id="L939"></a>            .union_field_types   =&gt; "union field types must be comptime-known",
+<a id="L940"></a>            .union_field_attrs   =&gt; "union field attributes must be comptime-known",
+<a id="L941"></a>            .tuple_field_types   =&gt; "tuple field types must be comptime-known",
+<a id="L942"></a>            .enum_field_names    =&gt; "enum field names must be comptime-known",
+<a id="L943"></a>            .enum_field_values   =&gt; "enum field values must be comptime-known",
+<a id="L944"></a>
+<a id="L945"></a>            .union_enum_tag_type            =&gt; "enum tag type of union must be comptime-known",
+<a id="L946"></a>            .enum_int_tag_type              =&gt; "integer tag type of enum must be comptime-known",
+<a id="L947"></a>            .packed_struct_backing_int_type =&gt; "packed struct backing integer type must be comptime-known",
+<a id="L948"></a>            .packed_union_backing_int_type  =&gt; "packed struct backing integer type must be comptime-known",
+<a id="L949"></a>
+<a id="L950"></a>            .decl_name         =&gt; "declaration name must be comptime-known",
+<a id="L951"></a>            .field_name        =&gt; "field name must be comptime-known",
+<a id="L952"></a>            .tuple_field_index =&gt; "tuple field index must be comptime-known",
+<a id="L953"></a>
+<a id="L954"></a>            .container_var_init =&gt; "initializer of container-level variable must be comptime-known",
+<a id="L955"></a>            .@"callconv"        =&gt; "calling convention must be comptime-known",
+<a id="L956"></a>            .@"align"           =&gt; "alignment must be comptime-known",
+<a id="L957"></a>            .@"addrspace"       =&gt; "address space must be comptime-known",
+<a id="L958"></a>            .@"linksection"     =&gt; "linksection must be comptime-known",
+<a id="L959"></a>
+<a id="L960"></a>            .comptime_keyword             =&gt; "'comptime' keyword forces comptime evaluation",
+<a id="L961"></a>            .comptime_call_modifier       =&gt; "'.compile_time' call modifier forces comptime evaluation",
+<a id="L962"></a>            .inline_loop_operand          =&gt; "inline loop condition must be comptime-known",
+<a id="L963"></a>            .switch_item                  =&gt; "switch prong values must be comptime-known",
+<a id="L964"></a>            .tuple_field_default_value    =&gt; "tuple field default value must be comptime-known",
+<a id="L965"></a>            .struct_field_default_value   =&gt; "struct field default value must be comptime-known",
+<a id="L966"></a>            .enum_field_tag_value         =&gt; "enum field tag value must be comptime-known",
+<a id="L967"></a>            .slice_single_item_ptr_bounds =&gt; "slice of single-item pointer must have comptime-known bounds",
+<a id="L968"></a>            .stored_to_comptime_field     =&gt; "value stored to a comptime field must be comptime-known",
+<a id="L969"></a>            .stored_to_comptime_var       =&gt; "value stored to a comptime variable must be comptime-known",
+<a id="L970"></a>            .casted_to_comptime_enum      =&gt; "value casted to enum with 'comptime_int' tag type must be comptime-known",
+<a id="L971"></a>            .casted_to_comptime_int       =&gt; "value casted to 'comptime_int' must be comptime-known",
+<a id="L972"></a>            .casted_to_comptime_float     =&gt; "value casted to 'comptime_float' must be comptime-known",
+<a id="L973"></a>            .std_builtin_decl             =&gt; "'std.builtin' declaration values must be comptime-known",
+<a id="L974"></a>            // zig fmt: on
+<a id="L975"></a>        };
+<a id="L976"></a>    }
+<a id="L977"></a>};
+<a id="L978"></a>
+<a id="L979"></a>/// Every kind of artifact which the compiler can emit.
+<a id="L980"></a>pub const EmitArtifact = enum {
+<a id="L981"></a>    bin,
+<a id="L982"></a>    @"asm",
+<a id="L983"></a>    implib,
+<a id="L984"></a>    llvm_ir,
+<a id="L985"></a>    llvm_bc,
+<a id="L986"></a>    docs,
+<a id="L987"></a>    pdb,
+<a id="L988"></a>    h,
+<a id="L989"></a>    compiler_rt_dyn_lib,
+<a id="L990"></a>
+<a id="L991"></a>    /// If using `Server` to communicate with the compiler, it will place requested artifacts in
+<a id="L992"></a>    /// paths under the output directory, where those paths are named according to this function.
+<a id="L993"></a>    /// Returned string is allocated with `gpa` and owned by the caller.
+<a id="L994"></a>    pub fn cacheName(ea: EmitArtifact, gpa: Allocator, opts: BinNameOptions) Allocator.Error![]const u8 {
+<a id="L995"></a>        // hack for stage2_x86_64 + coff. See Coff.flush.
+<a id="L996"></a>        if (ea == .compiler_rt_dyn_lib) return "compiler_rt.dll";
+<a id="L997"></a>        const suffix: []const u8 = switch (ea) {
+<a id="L998"></a>            .bin =&gt; return binNameAlloc(gpa, opts),
+<a id="L999"></a>            .@"asm" =&gt; ".s",
+<a id="L1000"></a>            .implib =&gt; ".lib",
+<a id="L1001"></a>            .llvm_ir =&gt; ".ll",
+<a id="L1002"></a>            .llvm_bc =&gt; ".bc",
+<a id="L1003"></a>            .docs =&gt; "-docs",
+<a id="L1004"></a>            .pdb =&gt; ".pdb",
+<a id="L1005"></a>            .h =&gt; ".h",
+<a id="L1006"></a>            .compiler_rt_dyn_lib =&gt; unreachable,
+<a id="L1007"></a>        };
+<a id="L1008"></a>        return std.fmt.allocPrint(gpa, "{s}{s}", .{ opts.root_name, suffix });
+<a id="L1009"></a>    }
+<a id="L1010"></a>};
+<a id="L1011"></a>
+<a id="L1012"></a>/// The defaults are chosen here to reduce the size of src/clang_options.zon
+<a id="L1013"></a>pub const ClangCliParam = struct {
+<a id="L1014"></a>    name: []const u8,
+<a id="L1015"></a>    ze: ZigEquivalent = .other,
+<a id="L1016"></a>    syntax: Syntax = .flag,
+<a id="L1017"></a>    /// Prefixed by "-"
+<a id="L1018"></a>    pd1: bool = true,
+<a id="L1019"></a>    /// Prefixed by "--"
+<a id="L1020"></a>    pd2: bool = false,
+<a id="L1021"></a>    /// Prefixed by "/"
+<a id="L1022"></a>    psl: bool = false,
+<a id="L1023"></a>
+<a id="L1024"></a>    pub const Syntax = union(enum) {
+<a id="L1025"></a>        /// A flag with no values.
+<a id="L1026"></a>        flag,
+<a id="L1027"></a>        /// An option which prefixes its (single) value.
+<a id="L1028"></a>        joined,
+<a id="L1029"></a>        /// An option which is followed by its value.
+<a id="L1030"></a>        separate,
+<a id="L1031"></a>        /// An option which is either joined to its (non-empty) value, or followed by its value.
+<a id="L1032"></a>        joined_or_separate,
+<a id="L1033"></a>        /// An option which is both joined to its (first) value, and followed by its (second) value.
+<a id="L1034"></a>        joined_and_separate,
+<a id="L1035"></a>        /// An option followed by its values, which are separated by commas.
+<a id="L1036"></a>        comma_joined,
+<a id="L1037"></a>        /// An option which consumes an optional joined argument and any other remaining arguments.
+<a id="L1038"></a>        remaining_args_joined,
+<a id="L1039"></a>        /// An option which is which takes multiple (separate) arguments.
+<a id="L1040"></a>        multi_arg: u8,
+<a id="L1041"></a>    };
+<a id="L1042"></a>
+<a id="L1043"></a>    pub const ZigEquivalent = enum {
+<a id="L1044"></a>        target,
+<a id="L1045"></a>        o,
+<a id="L1046"></a>        c,
+<a id="L1047"></a>        r,
+<a id="L1048"></a>        m,
+<a id="L1049"></a>        x,
+<a id="L1050"></a>        other,
+<a id="L1051"></a>        positional,
+<a id="L1052"></a>        l,
+<a id="L1053"></a>        ignore,
+<a id="L1054"></a>        driver_punt,
+<a id="L1055"></a>        pic,
+<a id="L1056"></a>        no_pic,
+<a id="L1057"></a>        pie,
+<a id="L1058"></a>        no_pie,
+<a id="L1059"></a>        lto,
+<a id="L1060"></a>        no_lto,
+<a id="L1061"></a>        unwind_tables,
+<a id="L1062"></a>        no_unwind_tables,
+<a id="L1063"></a>        asynchronous_unwind_tables,
+<a id="L1064"></a>        no_asynchronous_unwind_tables,
+<a id="L1065"></a>        nostdlib,
+<a id="L1066"></a>        nostdlib_cpp,
+<a id="L1067"></a>        shared,
+<a id="L1068"></a>        rdynamic,
+<a id="L1069"></a>        wl,
+<a id="L1070"></a>        wp,
+<a id="L1071"></a>        preprocess_only,
+<a id="L1072"></a>        asm_only,
+<a id="L1073"></a>        optimize,
+<a id="L1074"></a>        debug,
+<a id="L1075"></a>        gdwarf32,
+<a id="L1076"></a>        gdwarf64,
+<a id="L1077"></a>        sanitize,
+<a id="L1078"></a>        no_sanitize,
+<a id="L1079"></a>        sanitize_trap,
+<a id="L1080"></a>        no_sanitize_trap,
+<a id="L1081"></a>        linker_script,
+<a id="L1082"></a>        dry_run,
+<a id="L1083"></a>        verbose,
+<a id="L1084"></a>        for_linker,
+<a id="L1085"></a>        linker_input_z,
+<a id="L1086"></a>        lib_dir,
+<a id="L1087"></a>        mcpu,
+<a id="L1088"></a>        dep_file,
+<a id="L1089"></a>        dep_file_to_stdout,
+<a id="L1090"></a>        framework_dir,
+<a id="L1091"></a>        framework,
+<a id="L1092"></a>        nostdlibinc,
+<a id="L1093"></a>        red_zone,
+<a id="L1094"></a>        no_red_zone,
+<a id="L1095"></a>        omit_frame_pointer,
+<a id="L1096"></a>        no_omit_frame_pointer,
+<a id="L1097"></a>        function_sections,
+<a id="L1098"></a>        no_function_sections,
+<a id="L1099"></a>        data_sections,
+<a id="L1100"></a>        no_data_sections,
+<a id="L1101"></a>        builtin,
+<a id="L1102"></a>        no_builtin,
+<a id="L1103"></a>        color_diagnostics,
+<a id="L1104"></a>        no_color_diagnostics,
+<a id="L1105"></a>        stack_check,
+<a id="L1106"></a>        no_stack_check,
+<a id="L1107"></a>        stack_protector,
+<a id="L1108"></a>        no_stack_protector,
+<a id="L1109"></a>        strip,
+<a id="L1110"></a>        exec_model,
+<a id="L1111"></a>        emit_llvm,
+<a id="L1112"></a>        sysroot,
+<a id="L1113"></a>        entry,
+<a id="L1114"></a>        force_undefined_symbol,
+<a id="L1115"></a>        weak_library,
+<a id="L1116"></a>        weak_framework,
+<a id="L1117"></a>        headerpad_max_install_names,
+<a id="L1118"></a>        compress_debug_sections,
+<a id="L1119"></a>        install_name,
+<a id="L1120"></a>        undefined,
+<a id="L1121"></a>        force_load_objc,
+<a id="L1122"></a>        mingw_unicode_entry_point,
+<a id="L1123"></a>        san_cov_trace_pc_guard,
+<a id="L1124"></a>        san_cov,
+<a id="L1125"></a>        no_san_cov,
+<a id="L1126"></a>        rtlib,
+<a id="L1127"></a>        static,
+<a id="L1128"></a>        dynamic,
+<a id="L1129"></a>        version,
+<a id="L1130"></a>    };
+<a id="L1131"></a>
+<a id="L1132"></a>    pub fn matchEql(self: @This(), arg: []const u8) u2 {
+<a id="L1133"></a>        if (self.pd1 and arg.len &gt;= self.name.len + 1 and
+<a id="L1134"></a>            mem.startsWith(u8, arg, "-") and mem.eql(u8, arg[1..], self.name))
+<a id="L1135"></a>        {
+<a id="L1136"></a>            return 1;
+<a id="L1137"></a>        }
+<a id="L1138"></a>        if (self.pd2 and arg.len &gt;= self.name.len + 2 and
+<a id="L1139"></a>            mem.startsWith(u8, arg, "--") and mem.eql(u8, arg[2..], self.name))
+<a id="L1140"></a>        {
+<a id="L1141"></a>            return 2;
+<a id="L1142"></a>        }
+<a id="L1143"></a>        if (self.psl and arg.len &gt;= self.name.len + 1 and
+<a id="L1144"></a>            mem.startsWith(u8, arg, "/") and mem.eql(u8, arg[1..], self.name))
+<a id="L1145"></a>        {
+<a id="L1146"></a>            return 1;
+<a id="L1147"></a>        }
+<a id="L1148"></a>        return 0;
+<a id="L1149"></a>    }
+<a id="L1150"></a>
+<a id="L1151"></a>    pub fn matchStartsWith(self: @This(), arg: []const u8) usize {
+<a id="L1152"></a>        if (self.pd1 and arg.len &gt;= self.name.len + 1 and
+<a id="L1153"></a>            mem.startsWith(u8, arg, "-") and mem.startsWith(u8, arg[1..], self.name))
+<a id="L1154"></a>        {
+<a id="L1155"></a>            return self.name.len + 1;
+<a id="L1156"></a>        }
+<a id="L1157"></a>        if (self.pd2 and arg.len &gt;= self.name.len + 2 and
+<a id="L1158"></a>            mem.startsWith(u8, arg, "--") and mem.startsWith(u8, arg[2..], self.name))
+<a id="L1159"></a>        {
+<a id="L1160"></a>            return self.name.len + 2;
+<a id="L1161"></a>        }
+<a id="L1162"></a>        if (self.psl and arg.len &gt;= self.name.len + 1 and
+<a id="L1163"></a>            mem.startsWith(u8, arg, "/") and mem.startsWith(u8, arg[1..], self.name))
+<a id="L1164"></a>        {
+<a id="L1165"></a>            return self.name.len + 1;
+<a id="L1166"></a>        }
+<a id="L1167"></a>        return 0;
+<a id="L1168"></a>    }
+<a id="L1169"></a>};
+<a id="L1170"></a>
+<a id="L1171"></a>test {
+<a id="L1172"></a>    _ = Ast;
+<a id="L1173"></a>    _ = AstRlAnnotate;
+<a id="L1174"></a>    _ = AstSmith;
+<a id="L1175"></a>    _ = BuiltinFn;
+<a id="L1176"></a>    _ = Client;
+<a id="L1177"></a>    _ = ErrorBundle;
+<a id="L1178"></a>    _ = LibCDirs;
+<a id="L1179"></a>    _ = LibCInstallation;
+<a id="L1180"></a>    _ = Server;
+<a id="L1181"></a>    _ = TokenSmith;
+<a id="L1182"></a>    _ = WindowsSdk;
+<a id="L1183"></a>    _ = number_literal;
+<a id="L1184"></a>    _ = primitives;
+<a id="L1185"></a>    _ = string_literal;
+<a id="L1186"></a>    _ = system;
+<a id="L1187"></a>    _ = target;
+<a id="L1188"></a>    _ = c_translation;
+<a id="L1189"></a>    _ = llvm;
+<a id="L1190"></a>}
+</pre>
 </body>
 </html>

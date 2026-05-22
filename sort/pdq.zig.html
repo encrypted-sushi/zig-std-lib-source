@@ -2,394 +2,397 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Source: zig-0.16.0-std/sort/pdq.zig</title>
+    <title>Source: sort/pdq.zig</title>
     <style>
         body { background: #1e1e1e; color: #d4d4d4; font-family: monospace; padding: 20px; }
         pre { white-space: pre-wrap; word-wrap: break-word; }
         .header { border-bottom: 1px solid #444; padding-bottom: 10px; margin-bottom: 20px; }
         a { color: #569cd6; }
+        a[id] { color: inherit; text-decoration: none; }
+        :target { background: #3a3a00; }
     </style>
 </head>
 <body>
     <div class="header">
-        <a href="/">Index</a> | <strong>File: zig-0.16.0-std/sort/pdq.zig</strong>
+        <a href="/">Index</a> | <strong>File: sort/pdq.zig</strong>
     </div>
-    <pre>const std = @import("../std.zig");
-const sort = std.sort;
-const mem = std.mem;
-const math = std.math;
-const testing = std.testing;
-
-/// Unstable in-place sort. n best case, n*log(n) worst case and average case.
-/// log(n) memory (no allocator required).
-///
-/// Sorts in ascending order with respect to the given `lessThan` function.
-pub fn pdq(
-    comptime T: type,
-    items: []T,
-    context: anytype,
-    comptime lessThanFn: fn (context: @TypeOf(context), lhs: T, rhs: T) bool,
-) void {
-    const Context = struct {
-        items: []T,
-        sub_ctx: @TypeOf(context),
-
-        pub fn lessThan(ctx: @This(), a: usize, b: usize) bool {
-            return lessThanFn(ctx.sub_ctx, ctx.items[a], ctx.items[b]);
-        }
-
-        pub fn swap(ctx: @This(), a: usize, b: usize) void {
-            return mem.swap(T, &amp;ctx.items[a], &amp;ctx.items[b]);
-        }
-    };
-    pdqContext(0, items.len, Context{ .items = items, .sub_ctx = context });
-}
-
-const Hint = enum {
-    increasing,
-    decreasing,
-    unknown,
-};
-
-/// Unstable in-place sort. O(n) best case, O(n*log(n)) worst case and average case.
-/// O(log(n)) memory (no allocator required).
-/// `context` must have methods `swap` and `lessThan`,
-/// which each take 2 `usize` parameters indicating the index of an item.
-/// Sorts in ascending order with respect to `lessThan`.
-pub fn pdqContext(a: usize, b: usize, context: anytype) void {
-    // slices of up to this length get sorted using insertion sort.
-    const max_insertion = 24;
-    // number of allowed imbalanced partitions before switching to heap sort.
-    const max_limit = std.math.floorPowerOfTwo(usize, b - a) + 1;
-
-    // set upper bound on stack memory usage.
-    const Range = struct { a: usize, b: usize, limit: usize };
-    const stack_size = math.log2(math.maxInt(usize) + 1);
-    var stack: [stack_size]Range = undefined;
-    var range = Range{ .a = a, .b = b, .limit = max_limit };
-    var top: usize = 0;
-
-    while (true) {
-        var was_balanced = true;
-        var was_partitioned = true;
-
-        while (true) {
-            const len = range.b - range.a;
-
-            // very short slices get sorted using insertion sort.
-            if (len &lt;= max_insertion) {
-                break sort.insertionContext(range.a, range.b, context);
-            }
-
-            // if too many bad pivot choices were made, simply fall back to heapsort in order to
-            // guarantee O(n*log(n)) worst-case.
-            if (range.limit == 0) {
-                break sort.heapContext(range.a, range.b, context);
-            }
-
-            // if the last partitioning was imbalanced, try breaking patterns in the slice by shuffling
-            // some elements around. Hopefully we'll choose a better pivot this time.
-            if (!was_balanced) {
-                breakPatterns(range.a, range.b, context);
-                range.limit -= 1;
-            }
-
-            // choose a pivot and try guessing whether the slice is already sorted.
-            var pivot: usize = 0;
-            var hint = chosePivot(range.a, range.b, &amp;pivot, context);
-
-            if (hint == .decreasing) {
-                // The maximum number of swaps was performed, so items are likely
-                // in reverse order. Reverse it to make sorting faster.
-                reverseRange(range.a, range.b, context);
-                pivot = (range.b - 1) - (pivot - range.a);
-                hint = .increasing;
-            }
-
-            // if the last partitioning was decently balanced and didn't shuffle elements, and if pivot
-            // selection predicts the slice is likely already sorted...
-            if (was_balanced and was_partitioned and hint == .increasing) {
-                // try identifying several out-of-order elements and shifting them to correct
-                // positions. If the slice ends up being completely sorted, we're done.
-                if (partialInsertionSort(range.a, range.b, context)) break;
-            }
-
-            // if the chosen pivot is equal to the predecessor, then it's the smallest element in the
-            // slice. Partition the slice into elements equal to and elements greater than the pivot.
-            // This case is usually hit when the slice contains many duplicate elements.
-            if (range.a &gt; a and !context.lessThan(range.a - 1, pivot)) {
-                range.a = partitionEqual(range.a, range.b, pivot, context);
-                continue;
-            }
-
-            // partition the slice.
-            var mid = pivot;
-            was_partitioned = partition(range.a, range.b, &amp;mid, context);
-
-            const left_len = mid - range.a;
-            const right_len = range.b - mid;
-            const balanced_threshold = len / 8;
-            if (left_len &lt; right_len) {
-                was_balanced = left_len &gt;= balanced_threshold;
-                stack[top] = .{ .a = range.a, .b = mid, .limit = range.limit };
-                top += 1;
-                range.a = mid + 1;
-            } else {
-                was_balanced = right_len &gt;= balanced_threshold;
-                stack[top] = .{ .a = mid + 1, .b = range.b, .limit = range.limit };
-                top += 1;
-                range.b = mid;
-            }
-        }
-
-        top = math.sub(usize, top, 1) catch break;
-        range = stack[top];
-    }
-}
-
-/// partitions `items[a..b]` into elements smaller than `items[pivot]`,
-/// followed by elements greater than or equal to `items[pivot]`.
-///
-/// sets the new pivot.
-/// returns `true` if already partitioned.
-fn partition(a: usize, b: usize, pivot: *usize, context: anytype) bool {
-    // move pivot to the first place
-    context.swap(a, pivot.*);
-
-    var i = a + 1;
-    var j = b - 1;
-
-    while (i &lt;= j and context.lessThan(i, a)) i += 1;
-    while (i &lt;= j and !context.lessThan(j, a)) j -= 1;
-
-    // check if items are already partitioned (no item to swap)
-    if (i &gt; j) {
-        // put pivot back to the middle
-        context.swap(j, a);
-        pivot.* = j;
-        return true;
-    }
-
-    context.swap(i, j);
-    i += 1;
-    j -= 1;
-
-    while (true) {
-        while (i &lt;= j and context.lessThan(i, a)) i += 1;
-        while (i &lt;= j and !context.lessThan(j, a)) j -= 1;
-        if (i &gt; j) break;
-
-        context.swap(i, j);
-        i += 1;
-        j -= 1;
-    }
-
-    // TODO: Enable the BlockQuicksort optimization
-
-    context.swap(j, a);
-    pivot.* = j;
-    return false;
-}
-
-/// partitions items into elements equal to `items[pivot]`
-/// followed by elements greater than `items[pivot]`.
-///
-/// it assumed that `items[a..b]` does not contain elements smaller than the `items[pivot]`.
-fn partitionEqual(a: usize, b: usize, pivot: usize, context: anytype) usize {
-    // move pivot to the first place
-    context.swap(a, pivot);
-
-    var i = a + 1;
-    var j = b - 1;
-
-    while (true) {
-        while (i &lt;= j and !context.lessThan(a, i)) i += 1;
-        while (i &lt;= j and context.lessThan(a, j)) j -= 1;
-        if (i &gt; j) break;
-
-        context.swap(i, j);
-        i += 1;
-        j -= 1;
-    }
-
-    return i;
-}
-
-/// partially sorts a slice by shifting several out-of-order elements around.
-///
-/// returns `true` if the slice is sorted at the end. This function is `O(n)` worst-case.
-fn partialInsertionSort(a: usize, b: usize, context: anytype) bool {
-    @branchHint(.cold);
-
-    // maximum number of adjacent out-of-order pairs that will get shifted
-    const max_steps = 5;
-    // if the slice is shorter than this, don't shift any elements
-    const shortest_shifting = 50;
-
-    var i = a + 1;
-    for (0..max_steps) |_| {
-        // find the next pair of adjacent out-of-order elements.
-        while (i &lt; b and !context.lessThan(i, i - 1)) i += 1;
-
-        // are we done?
-        if (i == b) return true;
-
-        // don't shift elements on short arrays, that has a performance cost.
-        if (b - a &lt; shortest_shifting) return false;
-
-        // swap the found pair of elements. This puts them in correct order.
-        context.swap(i, i - 1);
-
-        // shift the smaller element to the left.
-        if (i - a &gt;= 2) {
-            var j = i - 1;
-            while (j &gt; a) : (j -= 1) {
-                if (!context.lessThan(j, j - 1)) break;
-                context.swap(j, j - 1);
-            }
-        }
-
-        // shift the greater element to the right.
-        if (b - i &gt;= 2) {
-            var j = i + 1;
-            while (j &lt; b) : (j += 1) {
-                if (!context.lessThan(j, j - 1)) break;
-                context.swap(j, j - 1);
-            }
-        }
-    }
-
-    return false;
-}
-
-fn breakPatterns(a: usize, b: usize, context: anytype) void {
-    @branchHint(.cold);
-
-    const len = b - a;
-    if (len &lt; 8) return;
-
-    var rand = @as(u64, @intCast(len));
-    const modulus = math.ceilPowerOfTwoAssert(u64, len);
-
-    var i = a + (len / 4) * 2 - 1;
-    while (i &lt;= a + (len / 4) * 2 + 1) : (i += 1) {
-        // xorshift64
-        rand ^= rand &lt;&lt; 13;
-        rand ^= rand &gt;&gt; 7;
-        rand ^= rand &lt;&lt; 17;
-
-        var other = @as(usize, @intCast(rand &amp; (modulus - 1)));
-        if (other &gt;= len) other -= len;
-        context.swap(i, a + other);
-    }
-}
-
-/// chooses a pivot in `items[a..b]`.
-/// swaps likely_sorted when `items[a..b]` seems to be already sorted.
-fn chosePivot(a: usize, b: usize, pivot: *usize, context: anytype) Hint {
-    // minimum length for using the Tukey's ninther method
-    const shortest_ninther = 50;
-    // max_swaps is the maximum number of swaps allowed in this function
-    const max_swaps = 4 * 3;
-
-    const len = b - a;
-    const i = a + len / 4 * 1;
-    const j = a + len / 4 * 2;
-    const k = a + len / 4 * 3;
-    var swaps: usize = 0;
-
-    if (len &gt;= 8) {
-        if (len &gt;= shortest_ninther) {
-            // find medians in the neighborhoods of `i`, `j` and `k`
-            sort3(i - 1, i, i + 1, &amp;swaps, context);
-            sort3(j - 1, j, j + 1, &amp;swaps, context);
-            sort3(k - 1, k, k + 1, &amp;swaps, context);
-        }
-
-        // find the median among `i`, `j` and `k` and stores it in `j`
-        sort3(i, j, k, &amp;swaps, context);
-    }
-
-    pivot.* = j;
-    return switch (swaps) {
-        0 =&gt; .increasing,
-        max_swaps =&gt; .decreasing,
-        else =&gt; .unknown,
-    };
-}
-
-fn sort3(a: usize, b: usize, c: usize, swaps: *usize, context: anytype) void {
-    if (context.lessThan(b, a)) {
-        swaps.* += 1;
-        context.swap(b, a);
-    }
-
-    if (context.lessThan(c, b)) {
-        swaps.* += 1;
-        context.swap(c, b);
-    }
-
-    if (context.lessThan(b, a)) {
-        swaps.* += 1;
-        context.swap(b, a);
-    }
-}
-
-fn reverseRange(a: usize, b: usize, context: anytype) void {
-    var i = a;
-    var j = b - 1;
-    while (i &lt; j) {
-        context.swap(i, j);
-        i += 1;
-        j -= 1;
-    }
-}
-
-test "pdqContext respects arbitrary range boundaries" {
-    // Regression test for issue #25250
-    // pdqsort should never access indices outside the specified [a, b) range
-    var data: [2000]i32 = @splat(0);
-
-    // Fill with data that triggers the partialInsertionSort path
-    for (0..data.len) |i| {
-        data[i] = @intCast(@mod(@as(i32, @intCast(i)) * 7, 100));
-    }
-
-    const TestContext = struct {
-        items: []i32,
-        range_start: usize,
-        range_end: usize,
-
-        pub fn lessThan(ctx: @This(), a: usize, b: usize) bool {
-            // Assert indices are within the expected range
-            testing.expect(a &gt;= ctx.range_start and a &lt; ctx.range_end) catch @panic("index a out of range");
-            testing.expect(b &gt;= ctx.range_start and b &lt; ctx.range_end) catch @panic("index b out of range");
-            return ctx.items[a] &lt; ctx.items[b];
-        }
-
-        pub fn swap(ctx: @This(), a: usize, b: usize) void {
-            // Assert indices are within the expected range
-            testing.expect(a &gt;= ctx.range_start and a &lt; ctx.range_end) catch @panic("index a out of range");
-            testing.expect(b &gt;= ctx.range_start and b &lt; ctx.range_end) catch @panic("index b out of range");
-            mem.swap(i32, &amp;ctx.items[a], &amp;ctx.items[b]);
-        }
-    };
-
-    // Test sorting a sub-range that doesn't start at 0
-    const start = 1118;
-    const end = 1764;
-    const ctx = TestContext{
-        .items = &amp;data,
-        .range_start = start,
-        .range_end = end,
-    };
-
-    pdqContext(start, end, ctx);
-
-    // Verify the range is sorted
-    for ((start + 1)..end) |i| {
-        try testing.expect(data[i - 1] &lt;= data[i]);
-    }
-}</pre>
+    <pre><a id="L1"></a>const std = @import("../std.zig");
+<a id="L2"></a>const sort = std.sort;
+<a id="L3"></a>const mem = std.mem;
+<a id="L4"></a>const math = std.math;
+<a id="L5"></a>const testing = std.testing;
+<a id="L6"></a>
+<a id="L7"></a>/// Unstable in-place sort. n best case, n*log(n) worst case and average case.
+<a id="L8"></a>/// log(n) memory (no allocator required).
+<a id="L9"></a>///
+<a id="L10"></a>/// Sorts in ascending order with respect to the given `lessThan` function.
+<a id="L11"></a>pub fn pdq(
+<a id="L12"></a>    comptime T: type,
+<a id="L13"></a>    items: []T,
+<a id="L14"></a>    context: anytype,
+<a id="L15"></a>    comptime lessThanFn: fn (context: @TypeOf(context), lhs: T, rhs: T) bool,
+<a id="L16"></a>) void {
+<a id="L17"></a>    const Context = struct {
+<a id="L18"></a>        items: []T,
+<a id="L19"></a>        sub_ctx: @TypeOf(context),
+<a id="L20"></a>
+<a id="L21"></a>        pub fn lessThan(ctx: @This(), a: usize, b: usize) bool {
+<a id="L22"></a>            return lessThanFn(ctx.sub_ctx, ctx.items[a], ctx.items[b]);
+<a id="L23"></a>        }
+<a id="L24"></a>
+<a id="L25"></a>        pub fn swap(ctx: @This(), a: usize, b: usize) void {
+<a id="L26"></a>            return mem.swap(T, &amp;ctx.items[a], &amp;ctx.items[b]);
+<a id="L27"></a>        }
+<a id="L28"></a>    };
+<a id="L29"></a>    pdqContext(0, items.len, Context{ .items = items, .sub_ctx = context });
+<a id="L30"></a>}
+<a id="L31"></a>
+<a id="L32"></a>const Hint = enum {
+<a id="L33"></a>    increasing,
+<a id="L34"></a>    decreasing,
+<a id="L35"></a>    unknown,
+<a id="L36"></a>};
+<a id="L37"></a>
+<a id="L38"></a>/// Unstable in-place sort. O(n) best case, O(n*log(n)) worst case and average case.
+<a id="L39"></a>/// O(log(n)) memory (no allocator required).
+<a id="L40"></a>/// `context` must have methods `swap` and `lessThan`,
+<a id="L41"></a>/// which each take 2 `usize` parameters indicating the index of an item.
+<a id="L42"></a>/// Sorts in ascending order with respect to `lessThan`.
+<a id="L43"></a>pub fn pdqContext(a: usize, b: usize, context: anytype) void {
+<a id="L44"></a>    // slices of up to this length get sorted using insertion sort.
+<a id="L45"></a>    const max_insertion = 24;
+<a id="L46"></a>    // number of allowed imbalanced partitions before switching to heap sort.
+<a id="L47"></a>    const max_limit = std.math.floorPowerOfTwo(usize, b - a) + 1;
+<a id="L48"></a>
+<a id="L49"></a>    // set upper bound on stack memory usage.
+<a id="L50"></a>    const Range = struct { a: usize, b: usize, limit: usize };
+<a id="L51"></a>    const stack_size = math.log2(math.maxInt(usize) + 1);
+<a id="L52"></a>    var stack: [stack_size]Range = undefined;
+<a id="L53"></a>    var range = Range{ .a = a, .b = b, .limit = max_limit };
+<a id="L54"></a>    var top: usize = 0;
+<a id="L55"></a>
+<a id="L56"></a>    while (true) {
+<a id="L57"></a>        var was_balanced = true;
+<a id="L58"></a>        var was_partitioned = true;
+<a id="L59"></a>
+<a id="L60"></a>        while (true) {
+<a id="L61"></a>            const len = range.b - range.a;
+<a id="L62"></a>
+<a id="L63"></a>            // very short slices get sorted using insertion sort.
+<a id="L64"></a>            if (len &lt;= max_insertion) {
+<a id="L65"></a>                break sort.insertionContext(range.a, range.b, context);
+<a id="L66"></a>            }
+<a id="L67"></a>
+<a id="L68"></a>            // if too many bad pivot choices were made, simply fall back to heapsort in order to
+<a id="L69"></a>            // guarantee O(n*log(n)) worst-case.
+<a id="L70"></a>            if (range.limit == 0) {
+<a id="L71"></a>                break sort.heapContext(range.a, range.b, context);
+<a id="L72"></a>            }
+<a id="L73"></a>
+<a id="L74"></a>            // if the last partitioning was imbalanced, try breaking patterns in the slice by shuffling
+<a id="L75"></a>            // some elements around. Hopefully we'll choose a better pivot this time.
+<a id="L76"></a>            if (!was_balanced) {
+<a id="L77"></a>                breakPatterns(range.a, range.b, context);
+<a id="L78"></a>                range.limit -= 1;
+<a id="L79"></a>            }
+<a id="L80"></a>
+<a id="L81"></a>            // choose a pivot and try guessing whether the slice is already sorted.
+<a id="L82"></a>            var pivot: usize = 0;
+<a id="L83"></a>            var hint = chosePivot(range.a, range.b, &amp;pivot, context);
+<a id="L84"></a>
+<a id="L85"></a>            if (hint == .decreasing) {
+<a id="L86"></a>                // The maximum number of swaps was performed, so items are likely
+<a id="L87"></a>                // in reverse order. Reverse it to make sorting faster.
+<a id="L88"></a>                reverseRange(range.a, range.b, context);
+<a id="L89"></a>                pivot = (range.b - 1) - (pivot - range.a);
+<a id="L90"></a>                hint = .increasing;
+<a id="L91"></a>            }
+<a id="L92"></a>
+<a id="L93"></a>            // if the last partitioning was decently balanced and didn't shuffle elements, and if pivot
+<a id="L94"></a>            // selection predicts the slice is likely already sorted...
+<a id="L95"></a>            if (was_balanced and was_partitioned and hint == .increasing) {
+<a id="L96"></a>                // try identifying several out-of-order elements and shifting them to correct
+<a id="L97"></a>                // positions. If the slice ends up being completely sorted, we're done.
+<a id="L98"></a>                if (partialInsertionSort(range.a, range.b, context)) break;
+<a id="L99"></a>            }
+<a id="L100"></a>
+<a id="L101"></a>            // if the chosen pivot is equal to the predecessor, then it's the smallest element in the
+<a id="L102"></a>            // slice. Partition the slice into elements equal to and elements greater than the pivot.
+<a id="L103"></a>            // This case is usually hit when the slice contains many duplicate elements.
+<a id="L104"></a>            if (range.a &gt; a and !context.lessThan(range.a - 1, pivot)) {
+<a id="L105"></a>                range.a = partitionEqual(range.a, range.b, pivot, context);
+<a id="L106"></a>                continue;
+<a id="L107"></a>            }
+<a id="L108"></a>
+<a id="L109"></a>            // partition the slice.
+<a id="L110"></a>            var mid = pivot;
+<a id="L111"></a>            was_partitioned = partition(range.a, range.b, &amp;mid, context);
+<a id="L112"></a>
+<a id="L113"></a>            const left_len = mid - range.a;
+<a id="L114"></a>            const right_len = range.b - mid;
+<a id="L115"></a>            const balanced_threshold = len / 8;
+<a id="L116"></a>            if (left_len &lt; right_len) {
+<a id="L117"></a>                was_balanced = left_len &gt;= balanced_threshold;
+<a id="L118"></a>                stack[top] = .{ .a = range.a, .b = mid, .limit = range.limit };
+<a id="L119"></a>                top += 1;
+<a id="L120"></a>                range.a = mid + 1;
+<a id="L121"></a>            } else {
+<a id="L122"></a>                was_balanced = right_len &gt;= balanced_threshold;
+<a id="L123"></a>                stack[top] = .{ .a = mid + 1, .b = range.b, .limit = range.limit };
+<a id="L124"></a>                top += 1;
+<a id="L125"></a>                range.b = mid;
+<a id="L126"></a>            }
+<a id="L127"></a>        }
+<a id="L128"></a>
+<a id="L129"></a>        top = math.sub(usize, top, 1) catch break;
+<a id="L130"></a>        range = stack[top];
+<a id="L131"></a>    }
+<a id="L132"></a>}
+<a id="L133"></a>
+<a id="L134"></a>/// partitions `items[a..b]` into elements smaller than `items[pivot]`,
+<a id="L135"></a>/// followed by elements greater than or equal to `items[pivot]`.
+<a id="L136"></a>///
+<a id="L137"></a>/// sets the new pivot.
+<a id="L138"></a>/// returns `true` if already partitioned.
+<a id="L139"></a>fn partition(a: usize, b: usize, pivot: *usize, context: anytype) bool {
+<a id="L140"></a>    // move pivot to the first place
+<a id="L141"></a>    context.swap(a, pivot.*);
+<a id="L142"></a>
+<a id="L143"></a>    var i = a + 1;
+<a id="L144"></a>    var j = b - 1;
+<a id="L145"></a>
+<a id="L146"></a>    while (i &lt;= j and context.lessThan(i, a)) i += 1;
+<a id="L147"></a>    while (i &lt;= j and !context.lessThan(j, a)) j -= 1;
+<a id="L148"></a>
+<a id="L149"></a>    // check if items are already partitioned (no item to swap)
+<a id="L150"></a>    if (i &gt; j) {
+<a id="L151"></a>        // put pivot back to the middle
+<a id="L152"></a>        context.swap(j, a);
+<a id="L153"></a>        pivot.* = j;
+<a id="L154"></a>        return true;
+<a id="L155"></a>    }
+<a id="L156"></a>
+<a id="L157"></a>    context.swap(i, j);
+<a id="L158"></a>    i += 1;
+<a id="L159"></a>    j -= 1;
+<a id="L160"></a>
+<a id="L161"></a>    while (true) {
+<a id="L162"></a>        while (i &lt;= j and context.lessThan(i, a)) i += 1;
+<a id="L163"></a>        while (i &lt;= j and !context.lessThan(j, a)) j -= 1;
+<a id="L164"></a>        if (i &gt; j) break;
+<a id="L165"></a>
+<a id="L166"></a>        context.swap(i, j);
+<a id="L167"></a>        i += 1;
+<a id="L168"></a>        j -= 1;
+<a id="L169"></a>    }
+<a id="L170"></a>
+<a id="L171"></a>    // TODO: Enable the BlockQuicksort optimization
+<a id="L172"></a>
+<a id="L173"></a>    context.swap(j, a);
+<a id="L174"></a>    pivot.* = j;
+<a id="L175"></a>    return false;
+<a id="L176"></a>}
+<a id="L177"></a>
+<a id="L178"></a>/// partitions items into elements equal to `items[pivot]`
+<a id="L179"></a>/// followed by elements greater than `items[pivot]`.
+<a id="L180"></a>///
+<a id="L181"></a>/// it assumed that `items[a..b]` does not contain elements smaller than the `items[pivot]`.
+<a id="L182"></a>fn partitionEqual(a: usize, b: usize, pivot: usize, context: anytype) usize {
+<a id="L183"></a>    // move pivot to the first place
+<a id="L184"></a>    context.swap(a, pivot);
+<a id="L185"></a>
+<a id="L186"></a>    var i = a + 1;
+<a id="L187"></a>    var j = b - 1;
+<a id="L188"></a>
+<a id="L189"></a>    while (true) {
+<a id="L190"></a>        while (i &lt;= j and !context.lessThan(a, i)) i += 1;
+<a id="L191"></a>        while (i &lt;= j and context.lessThan(a, j)) j -= 1;
+<a id="L192"></a>        if (i &gt; j) break;
+<a id="L193"></a>
+<a id="L194"></a>        context.swap(i, j);
+<a id="L195"></a>        i += 1;
+<a id="L196"></a>        j -= 1;
+<a id="L197"></a>    }
+<a id="L198"></a>
+<a id="L199"></a>    return i;
+<a id="L200"></a>}
+<a id="L201"></a>
+<a id="L202"></a>/// partially sorts a slice by shifting several out-of-order elements around.
+<a id="L203"></a>///
+<a id="L204"></a>/// returns `true` if the slice is sorted at the end. This function is `O(n)` worst-case.
+<a id="L205"></a>fn partialInsertionSort(a: usize, b: usize, context: anytype) bool {
+<a id="L206"></a>    @branchHint(.cold);
+<a id="L207"></a>
+<a id="L208"></a>    // maximum number of adjacent out-of-order pairs that will get shifted
+<a id="L209"></a>    const max_steps = 5;
+<a id="L210"></a>    // if the slice is shorter than this, don't shift any elements
+<a id="L211"></a>    const shortest_shifting = 50;
+<a id="L212"></a>
+<a id="L213"></a>    var i = a + 1;
+<a id="L214"></a>    for (0..max_steps) |_| {
+<a id="L215"></a>        // find the next pair of adjacent out-of-order elements.
+<a id="L216"></a>        while (i &lt; b and !context.lessThan(i, i - 1)) i += 1;
+<a id="L217"></a>
+<a id="L218"></a>        // are we done?
+<a id="L219"></a>        if (i == b) return true;
+<a id="L220"></a>
+<a id="L221"></a>        // don't shift elements on short arrays, that has a performance cost.
+<a id="L222"></a>        if (b - a &lt; shortest_shifting) return false;
+<a id="L223"></a>
+<a id="L224"></a>        // swap the found pair of elements. This puts them in correct order.
+<a id="L225"></a>        context.swap(i, i - 1);
+<a id="L226"></a>
+<a id="L227"></a>        // shift the smaller element to the left.
+<a id="L228"></a>        if (i - a &gt;= 2) {
+<a id="L229"></a>            var j = i - 1;
+<a id="L230"></a>            while (j &gt; a) : (j -= 1) {
+<a id="L231"></a>                if (!context.lessThan(j, j - 1)) break;
+<a id="L232"></a>                context.swap(j, j - 1);
+<a id="L233"></a>            }
+<a id="L234"></a>        }
+<a id="L235"></a>
+<a id="L236"></a>        // shift the greater element to the right.
+<a id="L237"></a>        if (b - i &gt;= 2) {
+<a id="L238"></a>            var j = i + 1;
+<a id="L239"></a>            while (j &lt; b) : (j += 1) {
+<a id="L240"></a>                if (!context.lessThan(j, j - 1)) break;
+<a id="L241"></a>                context.swap(j, j - 1);
+<a id="L242"></a>            }
+<a id="L243"></a>        }
+<a id="L244"></a>    }
+<a id="L245"></a>
+<a id="L246"></a>    return false;
+<a id="L247"></a>}
+<a id="L248"></a>
+<a id="L249"></a>fn breakPatterns(a: usize, b: usize, context: anytype) void {
+<a id="L250"></a>    @branchHint(.cold);
+<a id="L251"></a>
+<a id="L252"></a>    const len = b - a;
+<a id="L253"></a>    if (len &lt; 8) return;
+<a id="L254"></a>
+<a id="L255"></a>    var rand = @as(u64, @intCast(len));
+<a id="L256"></a>    const modulus = math.ceilPowerOfTwoAssert(u64, len);
+<a id="L257"></a>
+<a id="L258"></a>    var i = a + (len / 4) * 2 - 1;
+<a id="L259"></a>    while (i &lt;= a + (len / 4) * 2 + 1) : (i += 1) {
+<a id="L260"></a>        // xorshift64
+<a id="L261"></a>        rand ^= rand &lt;&lt; 13;
+<a id="L262"></a>        rand ^= rand &gt;&gt; 7;
+<a id="L263"></a>        rand ^= rand &lt;&lt; 17;
+<a id="L264"></a>
+<a id="L265"></a>        var other = @as(usize, @intCast(rand &amp; (modulus - 1)));
+<a id="L266"></a>        if (other &gt;= len) other -= len;
+<a id="L267"></a>        context.swap(i, a + other);
+<a id="L268"></a>    }
+<a id="L269"></a>}
+<a id="L270"></a>
+<a id="L271"></a>/// chooses a pivot in `items[a..b]`.
+<a id="L272"></a>/// swaps likely_sorted when `items[a..b]` seems to be already sorted.
+<a id="L273"></a>fn chosePivot(a: usize, b: usize, pivot: *usize, context: anytype) Hint {
+<a id="L274"></a>    // minimum length for using the Tukey's ninther method
+<a id="L275"></a>    const shortest_ninther = 50;
+<a id="L276"></a>    // max_swaps is the maximum number of swaps allowed in this function
+<a id="L277"></a>    const max_swaps = 4 * 3;
+<a id="L278"></a>
+<a id="L279"></a>    const len = b - a;
+<a id="L280"></a>    const i = a + len / 4 * 1;
+<a id="L281"></a>    const j = a + len / 4 * 2;
+<a id="L282"></a>    const k = a + len / 4 * 3;
+<a id="L283"></a>    var swaps: usize = 0;
+<a id="L284"></a>
+<a id="L285"></a>    if (len &gt;= 8) {
+<a id="L286"></a>        if (len &gt;= shortest_ninther) {
+<a id="L287"></a>            // find medians in the neighborhoods of `i`, `j` and `k`
+<a id="L288"></a>            sort3(i - 1, i, i + 1, &amp;swaps, context);
+<a id="L289"></a>            sort3(j - 1, j, j + 1, &amp;swaps, context);
+<a id="L290"></a>            sort3(k - 1, k, k + 1, &amp;swaps, context);
+<a id="L291"></a>        }
+<a id="L292"></a>
+<a id="L293"></a>        // find the median among `i`, `j` and `k` and stores it in `j`
+<a id="L294"></a>        sort3(i, j, k, &amp;swaps, context);
+<a id="L295"></a>    }
+<a id="L296"></a>
+<a id="L297"></a>    pivot.* = j;
+<a id="L298"></a>    return switch (swaps) {
+<a id="L299"></a>        0 =&gt; .increasing,
+<a id="L300"></a>        max_swaps =&gt; .decreasing,
+<a id="L301"></a>        else =&gt; .unknown,
+<a id="L302"></a>    };
+<a id="L303"></a>}
+<a id="L304"></a>
+<a id="L305"></a>fn sort3(a: usize, b: usize, c: usize, swaps: *usize, context: anytype) void {
+<a id="L306"></a>    if (context.lessThan(b, a)) {
+<a id="L307"></a>        swaps.* += 1;
+<a id="L308"></a>        context.swap(b, a);
+<a id="L309"></a>    }
+<a id="L310"></a>
+<a id="L311"></a>    if (context.lessThan(c, b)) {
+<a id="L312"></a>        swaps.* += 1;
+<a id="L313"></a>        context.swap(c, b);
+<a id="L314"></a>    }
+<a id="L315"></a>
+<a id="L316"></a>    if (context.lessThan(b, a)) {
+<a id="L317"></a>        swaps.* += 1;
+<a id="L318"></a>        context.swap(b, a);
+<a id="L319"></a>    }
+<a id="L320"></a>}
+<a id="L321"></a>
+<a id="L322"></a>fn reverseRange(a: usize, b: usize, context: anytype) void {
+<a id="L323"></a>    var i = a;
+<a id="L324"></a>    var j = b - 1;
+<a id="L325"></a>    while (i &lt; j) {
+<a id="L326"></a>        context.swap(i, j);
+<a id="L327"></a>        i += 1;
+<a id="L328"></a>        j -= 1;
+<a id="L329"></a>    }
+<a id="L330"></a>}
+<a id="L331"></a>
+<a id="L332"></a>test "pdqContext respects arbitrary range boundaries" {
+<a id="L333"></a>    // Regression test for issue #25250
+<a id="L334"></a>    // pdqsort should never access indices outside the specified [a, b) range
+<a id="L335"></a>    var data: [2000]i32 = @splat(0);
+<a id="L336"></a>
+<a id="L337"></a>    // Fill with data that triggers the partialInsertionSort path
+<a id="L338"></a>    for (0..data.len) |i| {
+<a id="L339"></a>        data[i] = @intCast(@mod(@as(i32, @intCast(i)) * 7, 100));
+<a id="L340"></a>    }
+<a id="L341"></a>
+<a id="L342"></a>    const TestContext = struct {
+<a id="L343"></a>        items: []i32,
+<a id="L344"></a>        range_start: usize,
+<a id="L345"></a>        range_end: usize,
+<a id="L346"></a>
+<a id="L347"></a>        pub fn lessThan(ctx: @This(), a: usize, b: usize) bool {
+<a id="L348"></a>            // Assert indices are within the expected range
+<a id="L349"></a>            testing.expect(a &gt;= ctx.range_start and a &lt; ctx.range_end) catch @panic("index a out of range");
+<a id="L350"></a>            testing.expect(b &gt;= ctx.range_start and b &lt; ctx.range_end) catch @panic("index b out of range");
+<a id="L351"></a>            return ctx.items[a] &lt; ctx.items[b];
+<a id="L352"></a>        }
+<a id="L353"></a>
+<a id="L354"></a>        pub fn swap(ctx: @This(), a: usize, b: usize) void {
+<a id="L355"></a>            // Assert indices are within the expected range
+<a id="L356"></a>            testing.expect(a &gt;= ctx.range_start and a &lt; ctx.range_end) catch @panic("index a out of range");
+<a id="L357"></a>            testing.expect(b &gt;= ctx.range_start and b &lt; ctx.range_end) catch @panic("index b out of range");
+<a id="L358"></a>            mem.swap(i32, &amp;ctx.items[a], &amp;ctx.items[b]);
+<a id="L359"></a>        }
+<a id="L360"></a>    };
+<a id="L361"></a>
+<a id="L362"></a>    // Test sorting a sub-range that doesn't start at 0
+<a id="L363"></a>    const start = 1118;
+<a id="L364"></a>    const end = 1764;
+<a id="L365"></a>    const ctx = TestContext{
+<a id="L366"></a>        .items = &amp;data,
+<a id="L367"></a>        .range_start = start,
+<a id="L368"></a>        .range_end = end,
+<a id="L369"></a>    };
+<a id="L370"></a>
+<a id="L371"></a>    pdqContext(start, end, ctx);
+<a id="L372"></a>
+<a id="L373"></a>    // Verify the range is sorted
+<a id="L374"></a>    for ((start + 1)..end) |i| {
+<a id="L375"></a>        try testing.expect(data[i - 1] &lt;= data[i]);
+<a id="L376"></a>    }
+<a id="L377"></a>}
+</pre>
 </body>
 </html>

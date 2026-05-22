@@ -2,614 +2,617 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Source: zig-0.16.0-std/Build/Fuzz.zig</title>
+    <title>Source: Build/Fuzz.zig</title>
     <style>
         body { background: #1e1e1e; color: #d4d4d4; font-family: monospace; padding: 20px; }
         pre { white-space: pre-wrap; word-wrap: break-word; }
         .header { border-bottom: 1px solid #444; padding-bottom: 10px; margin-bottom: 20px; }
         a { color: #569cd6; }
+        a[id] { color: inherit; text-decoration: none; }
+        :target { background: #3a3a00; }
     </style>
 </head>
 <body>
     <div class="header">
-        <a href="/">Index</a> | <strong>File: zig-0.16.0-std/Build/Fuzz.zig</strong>
+        <a href="/">Index</a> | <strong>File: Build/Fuzz.zig</strong>
     </div>
-    <pre>const std = @import("../std.zig");
-const Io = std.Io;
-const Build = std.Build;
-const Cache = Build.Cache;
-const Step = std.Build.Step;
-const assert = std.debug.assert;
-const fatal = std.process.fatal;
-const Allocator = std.mem.Allocator;
-const log = std.log;
-const Coverage = std.debug.Coverage;
-const abi = Build.abi.fuzz;
-
-const Fuzz = @This();
-const build_runner = @import("root");
-
-gpa: Allocator,
-io: Io,
-mode: Mode,
-
-/// Allocated into `gpa`.
-run_steps: []const *Step.Run,
-
-group: Io.Group,
-root_prog_node: std.Progress.Node,
-prog_node: std.Progress.Node,
-
-/// Protects `coverage_files`.
-coverage_mutex: Io.Mutex,
-coverage_files: std.AutoArrayHashMapUnmanaged(u64, CoverageMap),
-
-queue_mutex: Io.Mutex,
-queue_cond: Io.Condition,
-msg_queue: std.ArrayList(Msg),
-
-pub const Mode = union(enum) {
-    forever: struct { ws: *Build.WebServer },
-    limit: Limited,
-
-    pub const Limited = struct {
-        amount: u64,
-    };
-};
-
-const Msg = union(enum) {
-    coverage: struct {
-        id: u64,
-        cumulative: struct {
-            runs: u64,
-            unique: u64,
-            coverage: u64,
-        },
-        run: *Step.Run,
-    },
-    entry_point: struct {
-        coverage_id: u64,
-        addr: u64,
-    },
-};
-
-const CoverageMap = struct {
-    mapped_memory: []align(std.heap.page_size_min) const u8,
-    coverage: Coverage,
-    source_locations: []Coverage.SourceLocation,
-    /// Elements are indexes into `source_locations` pointing to the unit tests that are being fuzz tested.
-    entry_points: std.ArrayList(u32),
-    start_timestamp: i64,
-    start_n_runs: u64,
-
-    fn deinit(cm: *CoverageMap, gpa: Allocator) void {
-        std.posix.munmap(cm.mapped_memory);
-        cm.coverage.deinit(gpa);
-        cm.* = undefined;
-    }
-};
-
-pub fn init(
-    gpa: Allocator,
-    io: Io,
-    all_steps: []const *Build.Step,
-    root_prog_node: std.Progress.Node,
-    mode: Mode,
-) error{ OutOfMemory, Canceled }!Fuzz {
-    const run_steps: []const *Step.Run = steps: {
-        var steps: std.ArrayList(*Step.Run) = .empty;
-        defer steps.deinit(gpa);
-        const rebuild_node = root_prog_node.start("Rebuilding Unit Tests", 0);
-        defer rebuild_node.end();
-        var rebuild_group: Io.Group = .init;
-        defer rebuild_group.cancel(io);
-
-        for (all_steps) |step| {
-            const run = step.cast(Step.Run) orelse continue;
-            if (run.producer == null) continue;
-            if (run.fuzz_tests.items.len == 0) continue;
-            try steps.append(gpa, run);
-            rebuild_group.async(io, rebuildTestsWorkerRun, .{ run, gpa, rebuild_node });
-        }
-
-        if (steps.items.len == 0) fatal("no fuzz tests found", .{});
-        rebuild_node.setEstimatedTotalItems(steps.items.len);
-        const run_steps = try gpa.dupe(*Step.Run, steps.items);
-        try rebuild_group.await(io);
-        break :steps run_steps;
-    };
-    errdefer gpa.free(run_steps);
-
-    for (run_steps) |run| {
-        assert(run.fuzz_tests.items.len &gt; 0);
-        if (run.rebuilt_executable == null)
-            fatal("one or more unit tests failed to be rebuilt in fuzz mode", .{});
-    }
-
-    return .{
-        .gpa = gpa,
-        .io = io,
-        .mode = mode,
-        .run_steps = run_steps,
-        .group = .init,
-        .root_prog_node = root_prog_node,
-        .prog_node = .none,
-        .coverage_files = .empty,
-        .coverage_mutex = .init,
-        .queue_mutex = .init,
-        .queue_cond = .init,
-        .msg_queue = .empty,
-    };
-}
-
-pub fn start(fuzz: *Fuzz) void {
-    const io = fuzz.io;
-    fuzz.prog_node = fuzz.root_prog_node.start("Fuzzing", 0);
-
-    if (fuzz.mode == .forever) {
-        // For polling messages and sending updates to subscribers.
-        fuzz.group.concurrent(io, coverageRun, .{fuzz}) catch |err|
-            fatal("unable to spawn coverage task: {t}", .{err});
-    }
-
-    for (fuzz.run_steps) |run| {
-        assert(run.rebuilt_executable != null);
-        fuzz.group.async(io, fuzzWorkerRun, .{ fuzz, run });
-    }
-}
-
-pub fn deinit(fuzz: *Fuzz) void {
-    const io = fuzz.io;
-    fuzz.group.cancel(io);
-    fuzz.prog_node.end();
-    fuzz.gpa.free(fuzz.run_steps);
-}
-
-fn rebuildTestsWorkerRun(run: *Step.Run, gpa: Allocator, parent_prog_node: std.Progress.Node) void {
-    rebuildTestsWorkerRunFallible(run, gpa, parent_prog_node) catch |err| {
-        const compile = run.producer.?;
-        log.err("step '{s}': failed to rebuild in fuzz mode: {t}", .{ compile.step.name, err });
-    };
-}
-
-fn rebuildTestsWorkerRunFallible(run: *Step.Run, gpa: Allocator, parent_prog_node: std.Progress.Node) !void {
-    const graph = run.step.owner.graph;
-    const io = graph.io;
-    const compile = run.producer.?;
-    const prog_node = parent_prog_node.start(compile.step.name, 0);
-    defer prog_node.end();
-
-    const result = compile.rebuildInFuzzMode(gpa, prog_node);
-
-    const show_compile_errors = compile.step.result_error_bundle.errorMessageCount() &gt; 0;
-    const show_error_msgs = compile.step.result_error_msgs.items.len &gt; 0;
-    const show_stderr = compile.step.result_stderr.len &gt; 0;
-
-    if (show_error_msgs or show_compile_errors or show_stderr) {
-        var buf: [256]u8 = undefined;
-        const stderr = try io.lockStderr(&amp;buf, graph.stderr_mode);
-        defer io.unlockStderr();
-        build_runner.printErrorMessages(gpa, &amp;compile.step, .{}, stderr.terminal(), .verbose, .indent) catch {};
-    }
-
-    const rebuilt_bin_path = result catch |err| switch (err) {
-        error.MakeFailed =&gt; return,
-        else =&gt; |other| return other,
-    };
-    run.rebuilt_executable = try rebuilt_bin_path.join(gpa, compile.out_filename);
-}
-
-fn fuzzWorkerRun(fuzz: *Fuzz, run: *Step.Run) void {
-    const owner = run.step.owner;
-    const gpa = owner.allocator;
-    const graph = owner.graph;
-    const io = graph.io;
-
-    run.rerunInFuzzMode(fuzz, fuzz.prog_node) catch |err| switch (err) {
-        error.MakeFailed =&gt; {
-            var buf: [256]u8 = undefined;
-            const stderr = io.lockStderr(&amp;buf, graph.stderr_mode) catch |e| switch (e) {
-                error.Canceled =&gt; return,
-            };
-            defer io.unlockStderr();
-            build_runner.printErrorMessages(gpa, &amp;run.step, .{}, stderr.terminal(), .verbose, .indent) catch {};
-            return;
-        },
-        else =&gt; {
-            log.err("step '{s}': failed to rerun in fuzz mode: {t}", .{ run.step.name, err });
-            return;
-        },
-    };
-}
-
-pub fn serveSourcesTar(fuzz: *Fuzz, req: *std.http.Server.Request) !void {
-    assert(fuzz.mode == .forever);
-
-    var arena_state: std.heap.ArenaAllocator = .init(fuzz.gpa);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    const DedupTable = std.ArrayHashMapUnmanaged(Build.Cache.Path, void, Build.Cache.Path.TableAdapter, false);
-    var dedup_table: DedupTable = .empty;
-    defer dedup_table.deinit(fuzz.gpa);
-
-    for (fuzz.run_steps) |run_step| {
-        const compile_inputs = run_step.producer.?.step.inputs.table;
-        for (compile_inputs.keys(), compile_inputs.values()) |dir_path, *file_list| {
-            try dedup_table.ensureUnusedCapacity(fuzz.gpa, file_list.items.len);
-            for (file_list.items) |sub_path| {
-                if (!std.mem.endsWith(u8, sub_path, ".zig")) continue;
-                const joined_path = try dir_path.join(arena, sub_path);
-                dedup_table.putAssumeCapacity(joined_path, {});
-            }
-        }
-    }
-
-    const deduped_paths = dedup_table.keys();
-    const SortContext = struct {
-        pub fn lessThan(this: @This(), lhs: Build.Cache.Path, rhs: Build.Cache.Path) bool {
-            _ = this;
-            return switch (std.mem.order(u8, lhs.root_dir.path orelse ".", rhs.root_dir.path orelse ".")) {
-                .lt =&gt; true,
-                .gt =&gt; false,
-                .eq =&gt; std.mem.lessThan(u8, lhs.sub_path, rhs.sub_path),
-            };
-        }
-    };
-    std.mem.sortUnstable(Build.Cache.Path, deduped_paths, SortContext{}, SortContext.lessThan);
-    return fuzz.mode.forever.ws.serveTarFile(req, deduped_paths);
-}
-
-pub const Previous = struct {
-    unique_runs: usize,
-    entry_points: usize,
-    sent_source_index: bool,
-    pub const init: Previous = .{
-        .unique_runs = 0,
-        .entry_points = 0,
-        .sent_source_index = false,
-    };
-};
-pub fn sendUpdate(
-    fuzz: *Fuzz,
-    socket: *std.http.Server.WebSocket,
-    prev: *Previous,
-) !void {
-    const io = fuzz.io;
-
-    try fuzz.coverage_mutex.lock(io);
-    defer fuzz.coverage_mutex.unlock(io);
-
-    const coverage_maps = fuzz.coverage_files.values();
-    if (coverage_maps.len == 0) return;
-    // TODO: handle multiple fuzz steps in the WebSocket packets
-    const coverage_map = &amp;coverage_maps[0];
-    const cov_header: *const abi.SeenPcsHeader = @ptrCast(coverage_map.mapped_memory[0..@sizeOf(abi.SeenPcsHeader)]);
-    // TODO: this isn't sound! We need to do volatile reads of these bits rather than handing the
-    // buffer off to the kernel, because we might race with the fuzzer process[es]. This brings the
-    // whole mmap strategy into question. Incidentally, I wonder if post-writergate we could pass
-    // this data straight to the socket with sendfile...
-    const seen_pcs = cov_header.seenBits();
-    const n_runs = @atomicLoad(usize, &amp;cov_header.n_runs, .monotonic);
-    const unique_runs = @atomicLoad(usize, &amp;cov_header.unique_runs, .monotonic);
-    {
-        if (!prev.sent_source_index) {
-            prev.sent_source_index = true;
-            // We need to send initial context.
-            const header: abi.SourceIndexHeader = .{
-                .directories_len = @intCast(coverage_map.coverage.directories.entries.len),
-                .files_len = @intCast(coverage_map.coverage.files.entries.len),
-                .source_locations_len = @intCast(coverage_map.source_locations.len),
-                .string_bytes_len = @intCast(coverage_map.coverage.string_bytes.items.len),
-                .start_timestamp = coverage_map.start_timestamp,
-                .start_n_runs = coverage_map.start_n_runs,
-            };
-            var iovecs: [5][]const u8 = .{
-                @ptrCast(&amp;header),
-                @ptrCast(coverage_map.coverage.directories.keys()),
-                @ptrCast(coverage_map.coverage.files.keys()),
-                @ptrCast(coverage_map.source_locations),
-                coverage_map.coverage.string_bytes.items,
-            };
-            try socket.writeMessageVec(&amp;iovecs, .binary);
-        }
-
-        const header: abi.CoverageUpdateHeader = .{
-            .n_runs = n_runs,
-            .unique_runs = unique_runs,
-        };
-        var iovecs: [2][]const u8 = .{
-            @ptrCast(&amp;header),
-            @ptrCast(seen_pcs),
-        };
-        try socket.writeMessageVec(&amp;iovecs, .binary);
-
-        prev.unique_runs = unique_runs;
-    }
-
-    if (prev.entry_points != coverage_map.entry_points.items.len) {
-        const header: abi.EntryPointHeader = .init(@intCast(coverage_map.entry_points.items.len));
-        var iovecs: [2][]const u8 = .{
-            @ptrCast(&amp;header),
-            @ptrCast(coverage_map.entry_points.items),
-        };
-        try socket.writeMessageVec(&amp;iovecs, .binary);
-
-        prev.entry_points = coverage_map.entry_points.items.len;
-    }
-}
-
-fn coverageRun(fuzz: *Fuzz) void {
-    coverageRunCancelable(fuzz) catch |err| switch (err) {
-        error.Canceled =&gt; return,
-    };
-}
-
-fn coverageRunCancelable(fuzz: *Fuzz) Io.Cancelable!void {
-    const io = fuzz.io;
-
-    try fuzz.queue_mutex.lock(io);
-    defer fuzz.queue_mutex.unlock(io);
-
-    while (true) {
-        try fuzz.queue_cond.wait(io, &amp;fuzz.queue_mutex);
-        for (fuzz.msg_queue.items) |msg| switch (msg) {
-            .coverage =&gt; |coverage| prepareTables(fuzz, coverage.run, coverage.id) catch |err| switch (err) {
-                error.AlreadyReported =&gt; continue,
-                error.Canceled =&gt; return,
-                else =&gt; |e| log.err("failed to prepare code coverage tables: {t}", .{e}),
-            },
-            .entry_point =&gt; |entry_point| addEntryPoint(fuzz, entry_point.coverage_id, entry_point.addr) catch |err| switch (err) {
-                error.AlreadyReported =&gt; continue,
-                error.Canceled =&gt; return,
-                else =&gt; |e| log.err("failed to prepare code coverage tables: {t}", .{e}),
-            },
-        };
-        fuzz.msg_queue.clearRetainingCapacity();
-    }
-}
-fn prepareTables(fuzz: *Fuzz, run_step: *Step.Run, coverage_id: u64) error{ OutOfMemory, AlreadyReported, Canceled }!void {
-    assert(fuzz.mode == .forever);
-    const ws = fuzz.mode.forever.ws;
-    const gpa = fuzz.gpa;
-    const io = fuzz.io;
-
-    try fuzz.coverage_mutex.lock(io);
-    defer fuzz.coverage_mutex.unlock(io);
-
-    const gop = try fuzz.coverage_files.getOrPut(gpa, coverage_id);
-    if (gop.found_existing) {
-        // We are fuzzing the same executable with multiple threads.
-        // Perhaps the same unit test; perhaps a different one. In any
-        // case, since the coverage file is the same, we only have to
-        // notice changes to that one file in order to learn coverage for
-        // this particular executable.
-        return;
-    }
-    errdefer _ = fuzz.coverage_files.pop();
-
-    gop.value_ptr.* = .{
-        .coverage = std.debug.Coverage.init,
-        .mapped_memory = undefined, // populated below
-        .source_locations = undefined, // populated below
-        .entry_points = .empty,
-        .start_timestamp = ws.now(),
-        .start_n_runs = undefined, // populated below
-    };
-    errdefer gop.value_ptr.coverage.deinit(gpa);
-
-    const rebuilt_exe_path = run_step.rebuilt_executable.?;
-    const target = run_step.producer.?.rootModuleTarget();
-    var debug_info = std.debug.Info.load(
-        gpa,
-        io,
-        rebuilt_exe_path,
-        &amp;gop.value_ptr.coverage,
-        target.ofmt,
-        target.cpu.arch,
-    ) catch |err| {
-        log.err("step '{s}': failed to load debug information for '{f}': {t}", .{
-            run_step.step.name, rebuilt_exe_path, err,
-        });
-        return error.AlreadyReported;
-    };
-    defer debug_info.deinit(gpa);
-
-    const coverage_file_path: Build.Cache.Path = .{
-        .root_dir = run_step.step.owner.cache_root,
-        .sub_path = "v/" ++ std.fmt.hex(coverage_id),
-    };
-    var coverage_file = coverage_file_path.root_dir.handle.openFile(io, coverage_file_path.sub_path, .{}) catch |err| {
-        log.err("step '{s}': failed to load coverage file '{f}': {t}", .{
-            run_step.step.name, coverage_file_path, err,
-        });
-        return error.AlreadyReported;
-    };
-    defer coverage_file.close(io);
-
-    const file_size = coverage_file.length(io) catch |err| {
-        log.err("unable to check len of coverage file '{f}': {t}", .{ coverage_file_path, err });
-        return error.AlreadyReported;
-    };
-
-    const mapped_memory = std.posix.mmap(
-        null,
-        file_size,
-        .{ .READ = true },
-        .{ .TYPE = .SHARED },
-        coverage_file.handle,
-        0,
-    ) catch |err| {
-        log.err("failed to map coverage file '{f}': {t}", .{ coverage_file_path, err });
-        return error.AlreadyReported;
-    };
-    gop.value_ptr.mapped_memory = mapped_memory;
-
-    const header: *const abi.SeenPcsHeader = @ptrCast(mapped_memory[0..@sizeOf(abi.SeenPcsHeader)]);
-    const pcs = header.pcAddrs();
-    const source_locations = try gpa.alloc(Coverage.SourceLocation, pcs.len);
-    errdefer gpa.free(source_locations);
-
-    // Unfortunately the PCs array that LLVM gives us from the 8-bit PC
-    // counters feature is not sorted.
-    var sorted_pcs: std.MultiArrayList(struct { pc: u64, index: u32, sl: Coverage.SourceLocation }) = .empty;
-    defer sorted_pcs.deinit(gpa);
-    try sorted_pcs.resize(gpa, pcs.len);
-    @memcpy(sorted_pcs.items(.pc), pcs);
-    for (sorted_pcs.items(.index), 0..) |*v, i| v.* = @intCast(i);
-    sorted_pcs.sortUnstable(struct {
-        addrs: []const u64,
-
-        pub fn lessThan(ctx: @This(), a_index: usize, b_index: usize) bool {
-            return ctx.addrs[a_index] &lt; ctx.addrs[b_index];
-        }
-    }{ .addrs = sorted_pcs.items(.pc) });
-
-    debug_info.resolveAddresses(gpa, io, sorted_pcs.items(.pc), sorted_pcs.items(.sl)) catch |err| {
-        log.err("failed to resolve addresses to source locations: {t}", .{err});
-        return error.AlreadyReported;
-    };
-
-    for (sorted_pcs.items(.index), sorted_pcs.items(.sl)) |i, sl| source_locations[i] = sl;
-    gop.value_ptr.source_locations = source_locations;
-    gop.value_ptr.start_n_runs = header.n_runs;
-
-    ws.notifyUpdate();
-}
-
-fn addEntryPoint(fuzz: *Fuzz, coverage_id: u64, addr: u64) error{ AlreadyReported, OutOfMemory, Canceled }!void {
-    const io = fuzz.io;
-
-    try fuzz.coverage_mutex.lock(io);
-    defer fuzz.coverage_mutex.unlock(io);
-
-    const coverage_map = fuzz.coverage_files.getPtr(coverage_id).?;
-    const header: *const abi.SeenPcsHeader = @ptrCast(coverage_map.mapped_memory[0..@sizeOf(abi.SeenPcsHeader)]);
-    const pcs = header.pcAddrs();
-
-    // Since this pcs list is unsorted, we must linear scan for the best index.
-    const index = i: {
-        var best: usize = 0;
-        for (pcs[1..], 1..) |elem_addr, i| {
-            if (elem_addr == addr) break :i i;
-            if (elem_addr &gt; addr) continue;
-            if (elem_addr &gt; pcs[best]) best = i;
-        }
-        break :i best;
-    };
-    if (index &gt;= pcs.len) {
-        log.err("unable to find unit test entry address 0x{x} in source locations (range: 0x{x} to 0x{x})", .{
-            addr, pcs[0], pcs[pcs.len - 1],
-        });
-        return error.AlreadyReported;
-    }
-    if (false) {
-        const sl = coverage_map.source_locations[index];
-        const file_name = coverage_map.coverage.stringAt(coverage_map.coverage.fileAt(sl.file).basename);
-        if (pcs.len == 1) {
-            log.debug("server found entry point for 0x{x} at {s}:{d}:{d} - index 0 (final)", .{
-                addr, file_name, sl.line, sl.column,
-            });
-        } else if (index == 0) {
-            log.debug("server found entry point for 0x{x} at {s}:{d}:{d} - index 0 before {x}", .{
-                addr, file_name, sl.line, sl.column, pcs[index + 1],
-            });
-        } else if (index == pcs.len - 1) {
-            log.debug("server found entry point for 0x{x} at {s}:{d}:{d} - index {d} (final) after {x}", .{
-                addr, file_name, sl.line, sl.column, index, pcs[index - 1],
-            });
-        } else {
-            log.debug("server found entry point for 0x{x} at {s}:{d}:{d} - index {d} between {x} and {x}", .{
-                addr, file_name, sl.line, sl.column, index, pcs[index - 1], pcs[index + 1],
-            });
-        }
-    }
-    try coverage_map.entry_points.append(fuzz.gpa, @intCast(index));
-}
-
-pub fn waitAndPrintReport(fuzz: *Fuzz) Io.Cancelable!void {
-    assert(fuzz.mode == .limit);
-    const io = fuzz.io;
-
-    try fuzz.group.await(io);
-    fuzz.group = .init;
-
-    std.debug.print("======= FUZZING REPORT =======\n", .{});
-    for (fuzz.msg_queue.items) |msg| {
-        if (msg != .coverage) continue;
-
-        const cov = msg.coverage;
-        const coverage_file_path: std.Build.Cache.Path = .{
-            .root_dir = cov.run.step.owner.cache_root,
-            .sub_path = "v/" ++ std.fmt.hex(cov.id),
-        };
-        var coverage_file = coverage_file_path.root_dir.handle.openFile(io, coverage_file_path.sub_path, .{}) catch |err| {
-            fatal("step '{s}': failed to load coverage file '{f}': {t}", .{
-                cov.run.step.name, coverage_file_path, err,
-            });
-        };
-        defer coverage_file.close(io);
-
-        const fuzz_abi = std.Build.abi.fuzz;
-        var rbuf: [0x1000]u8 = undefined;
-        var r = coverage_file.reader(io, &amp;rbuf);
-
-        var header: fuzz_abi.SeenPcsHeader = undefined;
-        r.interface.readSliceAll(std.mem.asBytes(&amp;header)) catch |err| {
-            fatal("step '{s}': failed to read from coverage file '{f}': {t}", .{
-                cov.run.step.name, coverage_file_path, err,
-            });
-        };
-
-        if (header.pcs_len == 0) {
-            fatal("step '{s}': corrupted coverage file '{f}': pcs_len was zero", .{
-                cov.run.step.name, coverage_file_path,
-            });
-        }
-
-        var seen_count: usize = 0;
-        const chunk_count = fuzz_abi.SeenPcsHeader.seenElemsLen(header.pcs_len);
-        for (0..chunk_count) |_| {
-            const seen = r.interface.takeInt(usize, .little) catch |err| {
-                fatal("step '{s}': failed to read from coverage file '{f}': {t}", .{
-                    cov.run.step.name, coverage_file_path, err,
-                });
-            };
-            seen_count += @popCount(seen);
-        }
-
-        const seen_f: f64 = @floatFromInt(seen_count);
-        const total_f: f64 = @floatFromInt(header.pcs_len);
-        const ratio = seen_f / total_f;
-        std.debug.print(
-            \\Step: {s}
-            \\Fuzz test: "{s}" ({x})
-            \\Runs: {} -&gt; {}
-            \\Unique runs: {} -&gt; {}
-            \\Coverage: {}/{} -&gt; {}/{} ({:.02}%)
-            \\
-        , .{
-            cov.run.step.name,
-            cov.run.fuzz_tests.items[0],
-            cov.id,
-            cov.cumulative.runs,
-            header.n_runs,
-            cov.cumulative.unique,
-            header.unique_runs,
-            cov.cumulative.coverage,
-            header.pcs_len,
-            seen_count,
-            header.pcs_len,
-            ratio * 100,
-        });
-
-        std.debug.print("------------------------------\n", .{});
-    }
-    std.debug.print(
-        \\Values are accumulated across multiple runs when preserving the cache.
-        \\==============================
-        \\
-    , .{});
-}</pre>
+    <pre><a id="L1"></a>const std = @import("../std.zig");
+<a id="L2"></a>const Io = std.Io;
+<a id="L3"></a>const Build = std.Build;
+<a id="L4"></a>const Cache = Build.Cache;
+<a id="L5"></a>const Step = std.Build.Step;
+<a id="L6"></a>const assert = std.debug.assert;
+<a id="L7"></a>const fatal = std.process.fatal;
+<a id="L8"></a>const Allocator = std.mem.Allocator;
+<a id="L9"></a>const log = std.log;
+<a id="L10"></a>const Coverage = std.debug.Coverage;
+<a id="L11"></a>const abi = Build.abi.fuzz;
+<a id="L12"></a>
+<a id="L13"></a>const Fuzz = @This();
+<a id="L14"></a>const build_runner = @import("root");
+<a id="L15"></a>
+<a id="L16"></a>gpa: Allocator,
+<a id="L17"></a>io: Io,
+<a id="L18"></a>mode: Mode,
+<a id="L19"></a>
+<a id="L20"></a>/// Allocated into `gpa`.
+<a id="L21"></a>run_steps: []const *Step.Run,
+<a id="L22"></a>
+<a id="L23"></a>group: Io.Group,
+<a id="L24"></a>root_prog_node: std.Progress.Node,
+<a id="L25"></a>prog_node: std.Progress.Node,
+<a id="L26"></a>
+<a id="L27"></a>/// Protects `coverage_files`.
+<a id="L28"></a>coverage_mutex: Io.Mutex,
+<a id="L29"></a>coverage_files: std.AutoArrayHashMapUnmanaged(u64, CoverageMap),
+<a id="L30"></a>
+<a id="L31"></a>queue_mutex: Io.Mutex,
+<a id="L32"></a>queue_cond: Io.Condition,
+<a id="L33"></a>msg_queue: std.ArrayList(Msg),
+<a id="L34"></a>
+<a id="L35"></a>pub const Mode = union(enum) {
+<a id="L36"></a>    forever: struct { ws: *Build.WebServer },
+<a id="L37"></a>    limit: Limited,
+<a id="L38"></a>
+<a id="L39"></a>    pub const Limited = struct {
+<a id="L40"></a>        amount: u64,
+<a id="L41"></a>    };
+<a id="L42"></a>};
+<a id="L43"></a>
+<a id="L44"></a>const Msg = union(enum) {
+<a id="L45"></a>    coverage: struct {
+<a id="L46"></a>        id: u64,
+<a id="L47"></a>        cumulative: struct {
+<a id="L48"></a>            runs: u64,
+<a id="L49"></a>            unique: u64,
+<a id="L50"></a>            coverage: u64,
+<a id="L51"></a>        },
+<a id="L52"></a>        run: *Step.Run,
+<a id="L53"></a>    },
+<a id="L54"></a>    entry_point: struct {
+<a id="L55"></a>        coverage_id: u64,
+<a id="L56"></a>        addr: u64,
+<a id="L57"></a>    },
+<a id="L58"></a>};
+<a id="L59"></a>
+<a id="L60"></a>const CoverageMap = struct {
+<a id="L61"></a>    mapped_memory: []align(std.heap.page_size_min) const u8,
+<a id="L62"></a>    coverage: Coverage,
+<a id="L63"></a>    source_locations: []Coverage.SourceLocation,
+<a id="L64"></a>    /// Elements are indexes into `source_locations` pointing to the unit tests that are being fuzz tested.
+<a id="L65"></a>    entry_points: std.ArrayList(u32),
+<a id="L66"></a>    start_timestamp: i64,
+<a id="L67"></a>    start_n_runs: u64,
+<a id="L68"></a>
+<a id="L69"></a>    fn deinit(cm: *CoverageMap, gpa: Allocator) void {
+<a id="L70"></a>        std.posix.munmap(cm.mapped_memory);
+<a id="L71"></a>        cm.coverage.deinit(gpa);
+<a id="L72"></a>        cm.* = undefined;
+<a id="L73"></a>    }
+<a id="L74"></a>};
+<a id="L75"></a>
+<a id="L76"></a>pub fn init(
+<a id="L77"></a>    gpa: Allocator,
+<a id="L78"></a>    io: Io,
+<a id="L79"></a>    all_steps: []const *Build.Step,
+<a id="L80"></a>    root_prog_node: std.Progress.Node,
+<a id="L81"></a>    mode: Mode,
+<a id="L82"></a>) error{ OutOfMemory, Canceled }!Fuzz {
+<a id="L83"></a>    const run_steps: []const *Step.Run = steps: {
+<a id="L84"></a>        var steps: std.ArrayList(*Step.Run) = .empty;
+<a id="L85"></a>        defer steps.deinit(gpa);
+<a id="L86"></a>        const rebuild_node = root_prog_node.start("Rebuilding Unit Tests", 0);
+<a id="L87"></a>        defer rebuild_node.end();
+<a id="L88"></a>        var rebuild_group: Io.Group = .init;
+<a id="L89"></a>        defer rebuild_group.cancel(io);
+<a id="L90"></a>
+<a id="L91"></a>        for (all_steps) |step| {
+<a id="L92"></a>            const run = step.cast(Step.Run) orelse continue;
+<a id="L93"></a>            if (run.producer == null) continue;
+<a id="L94"></a>            if (run.fuzz_tests.items.len == 0) continue;
+<a id="L95"></a>            try steps.append(gpa, run);
+<a id="L96"></a>            rebuild_group.async(io, rebuildTestsWorkerRun, .{ run, gpa, rebuild_node });
+<a id="L97"></a>        }
+<a id="L98"></a>
+<a id="L99"></a>        if (steps.items.len == 0) fatal("no fuzz tests found", .{});
+<a id="L100"></a>        rebuild_node.setEstimatedTotalItems(steps.items.len);
+<a id="L101"></a>        const run_steps = try gpa.dupe(*Step.Run, steps.items);
+<a id="L102"></a>        try rebuild_group.await(io);
+<a id="L103"></a>        break :steps run_steps;
+<a id="L104"></a>    };
+<a id="L105"></a>    errdefer gpa.free(run_steps);
+<a id="L106"></a>
+<a id="L107"></a>    for (run_steps) |run| {
+<a id="L108"></a>        assert(run.fuzz_tests.items.len &gt; 0);
+<a id="L109"></a>        if (run.rebuilt_executable == null)
+<a id="L110"></a>            fatal("one or more unit tests failed to be rebuilt in fuzz mode", .{});
+<a id="L111"></a>    }
+<a id="L112"></a>
+<a id="L113"></a>    return .{
+<a id="L114"></a>        .gpa = gpa,
+<a id="L115"></a>        .io = io,
+<a id="L116"></a>        .mode = mode,
+<a id="L117"></a>        .run_steps = run_steps,
+<a id="L118"></a>        .group = .init,
+<a id="L119"></a>        .root_prog_node = root_prog_node,
+<a id="L120"></a>        .prog_node = .none,
+<a id="L121"></a>        .coverage_files = .empty,
+<a id="L122"></a>        .coverage_mutex = .init,
+<a id="L123"></a>        .queue_mutex = .init,
+<a id="L124"></a>        .queue_cond = .init,
+<a id="L125"></a>        .msg_queue = .empty,
+<a id="L126"></a>    };
+<a id="L127"></a>}
+<a id="L128"></a>
+<a id="L129"></a>pub fn start(fuzz: *Fuzz) void {
+<a id="L130"></a>    const io = fuzz.io;
+<a id="L131"></a>    fuzz.prog_node = fuzz.root_prog_node.start("Fuzzing", 0);
+<a id="L132"></a>
+<a id="L133"></a>    if (fuzz.mode == .forever) {
+<a id="L134"></a>        // For polling messages and sending updates to subscribers.
+<a id="L135"></a>        fuzz.group.concurrent(io, coverageRun, .{fuzz}) catch |err|
+<a id="L136"></a>            fatal("unable to spawn coverage task: {t}", .{err});
+<a id="L137"></a>    }
+<a id="L138"></a>
+<a id="L139"></a>    for (fuzz.run_steps) |run| {
+<a id="L140"></a>        assert(run.rebuilt_executable != null);
+<a id="L141"></a>        fuzz.group.async(io, fuzzWorkerRun, .{ fuzz, run });
+<a id="L142"></a>    }
+<a id="L143"></a>}
+<a id="L144"></a>
+<a id="L145"></a>pub fn deinit(fuzz: *Fuzz) void {
+<a id="L146"></a>    const io = fuzz.io;
+<a id="L147"></a>    fuzz.group.cancel(io);
+<a id="L148"></a>    fuzz.prog_node.end();
+<a id="L149"></a>    fuzz.gpa.free(fuzz.run_steps);
+<a id="L150"></a>}
+<a id="L151"></a>
+<a id="L152"></a>fn rebuildTestsWorkerRun(run: *Step.Run, gpa: Allocator, parent_prog_node: std.Progress.Node) void {
+<a id="L153"></a>    rebuildTestsWorkerRunFallible(run, gpa, parent_prog_node) catch |err| {
+<a id="L154"></a>        const compile = run.producer.?;
+<a id="L155"></a>        log.err("step '{s}': failed to rebuild in fuzz mode: {t}", .{ compile.step.name, err });
+<a id="L156"></a>    };
+<a id="L157"></a>}
+<a id="L158"></a>
+<a id="L159"></a>fn rebuildTestsWorkerRunFallible(run: *Step.Run, gpa: Allocator, parent_prog_node: std.Progress.Node) !void {
+<a id="L160"></a>    const graph = run.step.owner.graph;
+<a id="L161"></a>    const io = graph.io;
+<a id="L162"></a>    const compile = run.producer.?;
+<a id="L163"></a>    const prog_node = parent_prog_node.start(compile.step.name, 0);
+<a id="L164"></a>    defer prog_node.end();
+<a id="L165"></a>
+<a id="L166"></a>    const result = compile.rebuildInFuzzMode(gpa, prog_node);
+<a id="L167"></a>
+<a id="L168"></a>    const show_compile_errors = compile.step.result_error_bundle.errorMessageCount() &gt; 0;
+<a id="L169"></a>    const show_error_msgs = compile.step.result_error_msgs.items.len &gt; 0;
+<a id="L170"></a>    const show_stderr = compile.step.result_stderr.len &gt; 0;
+<a id="L171"></a>
+<a id="L172"></a>    if (show_error_msgs or show_compile_errors or show_stderr) {
+<a id="L173"></a>        var buf: [256]u8 = undefined;
+<a id="L174"></a>        const stderr = try io.lockStderr(&amp;buf, graph.stderr_mode);
+<a id="L175"></a>        defer io.unlockStderr();
+<a id="L176"></a>        build_runner.printErrorMessages(gpa, &amp;compile.step, .{}, stderr.terminal(), .verbose, .indent) catch {};
+<a id="L177"></a>    }
+<a id="L178"></a>
+<a id="L179"></a>    const rebuilt_bin_path = result catch |err| switch (err) {
+<a id="L180"></a>        error.MakeFailed =&gt; return,
+<a id="L181"></a>        else =&gt; |other| return other,
+<a id="L182"></a>    };
+<a id="L183"></a>    run.rebuilt_executable = try rebuilt_bin_path.join(gpa, compile.out_filename);
+<a id="L184"></a>}
+<a id="L185"></a>
+<a id="L186"></a>fn fuzzWorkerRun(fuzz: *Fuzz, run: *Step.Run) void {
+<a id="L187"></a>    const owner = run.step.owner;
+<a id="L188"></a>    const gpa = owner.allocator;
+<a id="L189"></a>    const graph = owner.graph;
+<a id="L190"></a>    const io = graph.io;
+<a id="L191"></a>
+<a id="L192"></a>    run.rerunInFuzzMode(fuzz, fuzz.prog_node) catch |err| switch (err) {
+<a id="L193"></a>        error.MakeFailed =&gt; {
+<a id="L194"></a>            var buf: [256]u8 = undefined;
+<a id="L195"></a>            const stderr = io.lockStderr(&amp;buf, graph.stderr_mode) catch |e| switch (e) {
+<a id="L196"></a>                error.Canceled =&gt; return,
+<a id="L197"></a>            };
+<a id="L198"></a>            defer io.unlockStderr();
+<a id="L199"></a>            build_runner.printErrorMessages(gpa, &amp;run.step, .{}, stderr.terminal(), .verbose, .indent) catch {};
+<a id="L200"></a>            return;
+<a id="L201"></a>        },
+<a id="L202"></a>        else =&gt; {
+<a id="L203"></a>            log.err("step '{s}': failed to rerun in fuzz mode: {t}", .{ run.step.name, err });
+<a id="L204"></a>            return;
+<a id="L205"></a>        },
+<a id="L206"></a>    };
+<a id="L207"></a>}
+<a id="L208"></a>
+<a id="L209"></a>pub fn serveSourcesTar(fuzz: *Fuzz, req: *std.http.Server.Request) !void {
+<a id="L210"></a>    assert(fuzz.mode == .forever);
+<a id="L211"></a>
+<a id="L212"></a>    var arena_state: std.heap.ArenaAllocator = .init(fuzz.gpa);
+<a id="L213"></a>    defer arena_state.deinit();
+<a id="L214"></a>    const arena = arena_state.allocator();
+<a id="L215"></a>
+<a id="L216"></a>    const DedupTable = std.ArrayHashMapUnmanaged(Build.Cache.Path, void, Build.Cache.Path.TableAdapter, false);
+<a id="L217"></a>    var dedup_table: DedupTable = .empty;
+<a id="L218"></a>    defer dedup_table.deinit(fuzz.gpa);
+<a id="L219"></a>
+<a id="L220"></a>    for (fuzz.run_steps) |run_step| {
+<a id="L221"></a>        const compile_inputs = run_step.producer.?.step.inputs.table;
+<a id="L222"></a>        for (compile_inputs.keys(), compile_inputs.values()) |dir_path, *file_list| {
+<a id="L223"></a>            try dedup_table.ensureUnusedCapacity(fuzz.gpa, file_list.items.len);
+<a id="L224"></a>            for (file_list.items) |sub_path| {
+<a id="L225"></a>                if (!std.mem.endsWith(u8, sub_path, ".zig")) continue;
+<a id="L226"></a>                const joined_path = try dir_path.join(arena, sub_path);
+<a id="L227"></a>                dedup_table.putAssumeCapacity(joined_path, {});
+<a id="L228"></a>            }
+<a id="L229"></a>        }
+<a id="L230"></a>    }
+<a id="L231"></a>
+<a id="L232"></a>    const deduped_paths = dedup_table.keys();
+<a id="L233"></a>    const SortContext = struct {
+<a id="L234"></a>        pub fn lessThan(this: @This(), lhs: Build.Cache.Path, rhs: Build.Cache.Path) bool {
+<a id="L235"></a>            _ = this;
+<a id="L236"></a>            return switch (std.mem.order(u8, lhs.root_dir.path orelse ".", rhs.root_dir.path orelse ".")) {
+<a id="L237"></a>                .lt =&gt; true,
+<a id="L238"></a>                .gt =&gt; false,
+<a id="L239"></a>                .eq =&gt; std.mem.lessThan(u8, lhs.sub_path, rhs.sub_path),
+<a id="L240"></a>            };
+<a id="L241"></a>        }
+<a id="L242"></a>    };
+<a id="L243"></a>    std.mem.sortUnstable(Build.Cache.Path, deduped_paths, SortContext{}, SortContext.lessThan);
+<a id="L244"></a>    return fuzz.mode.forever.ws.serveTarFile(req, deduped_paths);
+<a id="L245"></a>}
+<a id="L246"></a>
+<a id="L247"></a>pub const Previous = struct {
+<a id="L248"></a>    unique_runs: usize,
+<a id="L249"></a>    entry_points: usize,
+<a id="L250"></a>    sent_source_index: bool,
+<a id="L251"></a>    pub const init: Previous = .{
+<a id="L252"></a>        .unique_runs = 0,
+<a id="L253"></a>        .entry_points = 0,
+<a id="L254"></a>        .sent_source_index = false,
+<a id="L255"></a>    };
+<a id="L256"></a>};
+<a id="L257"></a>pub fn sendUpdate(
+<a id="L258"></a>    fuzz: *Fuzz,
+<a id="L259"></a>    socket: *std.http.Server.WebSocket,
+<a id="L260"></a>    prev: *Previous,
+<a id="L261"></a>) !void {
+<a id="L262"></a>    const io = fuzz.io;
+<a id="L263"></a>
+<a id="L264"></a>    try fuzz.coverage_mutex.lock(io);
+<a id="L265"></a>    defer fuzz.coverage_mutex.unlock(io);
+<a id="L266"></a>
+<a id="L267"></a>    const coverage_maps = fuzz.coverage_files.values();
+<a id="L268"></a>    if (coverage_maps.len == 0) return;
+<a id="L269"></a>    // TODO: handle multiple fuzz steps in the WebSocket packets
+<a id="L270"></a>    const coverage_map = &amp;coverage_maps[0];
+<a id="L271"></a>    const cov_header: *const abi.SeenPcsHeader = @ptrCast(coverage_map.mapped_memory[0..@sizeOf(abi.SeenPcsHeader)]);
+<a id="L272"></a>    // TODO: this isn't sound! We need to do volatile reads of these bits rather than handing the
+<a id="L273"></a>    // buffer off to the kernel, because we might race with the fuzzer process[es]. This brings the
+<a id="L274"></a>    // whole mmap strategy into question. Incidentally, I wonder if post-writergate we could pass
+<a id="L275"></a>    // this data straight to the socket with sendfile...
+<a id="L276"></a>    const seen_pcs = cov_header.seenBits();
+<a id="L277"></a>    const n_runs = @atomicLoad(usize, &amp;cov_header.n_runs, .monotonic);
+<a id="L278"></a>    const unique_runs = @atomicLoad(usize, &amp;cov_header.unique_runs, .monotonic);
+<a id="L279"></a>    {
+<a id="L280"></a>        if (!prev.sent_source_index) {
+<a id="L281"></a>            prev.sent_source_index = true;
+<a id="L282"></a>            // We need to send initial context.
+<a id="L283"></a>            const header: abi.SourceIndexHeader = .{
+<a id="L284"></a>                .directories_len = @intCast(coverage_map.coverage.directories.entries.len),
+<a id="L285"></a>                .files_len = @intCast(coverage_map.coverage.files.entries.len),
+<a id="L286"></a>                .source_locations_len = @intCast(coverage_map.source_locations.len),
+<a id="L287"></a>                .string_bytes_len = @intCast(coverage_map.coverage.string_bytes.items.len),
+<a id="L288"></a>                .start_timestamp = coverage_map.start_timestamp,
+<a id="L289"></a>                .start_n_runs = coverage_map.start_n_runs,
+<a id="L290"></a>            };
+<a id="L291"></a>            var iovecs: [5][]const u8 = .{
+<a id="L292"></a>                @ptrCast(&amp;header),
+<a id="L293"></a>                @ptrCast(coverage_map.coverage.directories.keys()),
+<a id="L294"></a>                @ptrCast(coverage_map.coverage.files.keys()),
+<a id="L295"></a>                @ptrCast(coverage_map.source_locations),
+<a id="L296"></a>                coverage_map.coverage.string_bytes.items,
+<a id="L297"></a>            };
+<a id="L298"></a>            try socket.writeMessageVec(&amp;iovecs, .binary);
+<a id="L299"></a>        }
+<a id="L300"></a>
+<a id="L301"></a>        const header: abi.CoverageUpdateHeader = .{
+<a id="L302"></a>            .n_runs = n_runs,
+<a id="L303"></a>            .unique_runs = unique_runs,
+<a id="L304"></a>        };
+<a id="L305"></a>        var iovecs: [2][]const u8 = .{
+<a id="L306"></a>            @ptrCast(&amp;header),
+<a id="L307"></a>            @ptrCast(seen_pcs),
+<a id="L308"></a>        };
+<a id="L309"></a>        try socket.writeMessageVec(&amp;iovecs, .binary);
+<a id="L310"></a>
+<a id="L311"></a>        prev.unique_runs = unique_runs;
+<a id="L312"></a>    }
+<a id="L313"></a>
+<a id="L314"></a>    if (prev.entry_points != coverage_map.entry_points.items.len) {
+<a id="L315"></a>        const header: abi.EntryPointHeader = .init(@intCast(coverage_map.entry_points.items.len));
+<a id="L316"></a>        var iovecs: [2][]const u8 = .{
+<a id="L317"></a>            @ptrCast(&amp;header),
+<a id="L318"></a>            @ptrCast(coverage_map.entry_points.items),
+<a id="L319"></a>        };
+<a id="L320"></a>        try socket.writeMessageVec(&amp;iovecs, .binary);
+<a id="L321"></a>
+<a id="L322"></a>        prev.entry_points = coverage_map.entry_points.items.len;
+<a id="L323"></a>    }
+<a id="L324"></a>}
+<a id="L325"></a>
+<a id="L326"></a>fn coverageRun(fuzz: *Fuzz) void {
+<a id="L327"></a>    coverageRunCancelable(fuzz) catch |err| switch (err) {
+<a id="L328"></a>        error.Canceled =&gt; return,
+<a id="L329"></a>    };
+<a id="L330"></a>}
+<a id="L331"></a>
+<a id="L332"></a>fn coverageRunCancelable(fuzz: *Fuzz) Io.Cancelable!void {
+<a id="L333"></a>    const io = fuzz.io;
+<a id="L334"></a>
+<a id="L335"></a>    try fuzz.queue_mutex.lock(io);
+<a id="L336"></a>    defer fuzz.queue_mutex.unlock(io);
+<a id="L337"></a>
+<a id="L338"></a>    while (true) {
+<a id="L339"></a>        try fuzz.queue_cond.wait(io, &amp;fuzz.queue_mutex);
+<a id="L340"></a>        for (fuzz.msg_queue.items) |msg| switch (msg) {
+<a id="L341"></a>            .coverage =&gt; |coverage| prepareTables(fuzz, coverage.run, coverage.id) catch |err| switch (err) {
+<a id="L342"></a>                error.AlreadyReported =&gt; continue,
+<a id="L343"></a>                error.Canceled =&gt; return,
+<a id="L344"></a>                else =&gt; |e| log.err("failed to prepare code coverage tables: {t}", .{e}),
+<a id="L345"></a>            },
+<a id="L346"></a>            .entry_point =&gt; |entry_point| addEntryPoint(fuzz, entry_point.coverage_id, entry_point.addr) catch |err| switch (err) {
+<a id="L347"></a>                error.AlreadyReported =&gt; continue,
+<a id="L348"></a>                error.Canceled =&gt; return,
+<a id="L349"></a>                else =&gt; |e| log.err("failed to prepare code coverage tables: {t}", .{e}),
+<a id="L350"></a>            },
+<a id="L351"></a>        };
+<a id="L352"></a>        fuzz.msg_queue.clearRetainingCapacity();
+<a id="L353"></a>    }
+<a id="L354"></a>}
+<a id="L355"></a>fn prepareTables(fuzz: *Fuzz, run_step: *Step.Run, coverage_id: u64) error{ OutOfMemory, AlreadyReported, Canceled }!void {
+<a id="L356"></a>    assert(fuzz.mode == .forever);
+<a id="L357"></a>    const ws = fuzz.mode.forever.ws;
+<a id="L358"></a>    const gpa = fuzz.gpa;
+<a id="L359"></a>    const io = fuzz.io;
+<a id="L360"></a>
+<a id="L361"></a>    try fuzz.coverage_mutex.lock(io);
+<a id="L362"></a>    defer fuzz.coverage_mutex.unlock(io);
+<a id="L363"></a>
+<a id="L364"></a>    const gop = try fuzz.coverage_files.getOrPut(gpa, coverage_id);
+<a id="L365"></a>    if (gop.found_existing) {
+<a id="L366"></a>        // We are fuzzing the same executable with multiple threads.
+<a id="L367"></a>        // Perhaps the same unit test; perhaps a different one. In any
+<a id="L368"></a>        // case, since the coverage file is the same, we only have to
+<a id="L369"></a>        // notice changes to that one file in order to learn coverage for
+<a id="L370"></a>        // this particular executable.
+<a id="L371"></a>        return;
+<a id="L372"></a>    }
+<a id="L373"></a>    errdefer _ = fuzz.coverage_files.pop();
+<a id="L374"></a>
+<a id="L375"></a>    gop.value_ptr.* = .{
+<a id="L376"></a>        .coverage = std.debug.Coverage.init,
+<a id="L377"></a>        .mapped_memory = undefined, // populated below
+<a id="L378"></a>        .source_locations = undefined, // populated below
+<a id="L379"></a>        .entry_points = .empty,
+<a id="L380"></a>        .start_timestamp = ws.now(),
+<a id="L381"></a>        .start_n_runs = undefined, // populated below
+<a id="L382"></a>    };
+<a id="L383"></a>    errdefer gop.value_ptr.coverage.deinit(gpa);
+<a id="L384"></a>
+<a id="L385"></a>    const rebuilt_exe_path = run_step.rebuilt_executable.?;
+<a id="L386"></a>    const target = run_step.producer.?.rootModuleTarget();
+<a id="L387"></a>    var debug_info = std.debug.Info.load(
+<a id="L388"></a>        gpa,
+<a id="L389"></a>        io,
+<a id="L390"></a>        rebuilt_exe_path,
+<a id="L391"></a>        &amp;gop.value_ptr.coverage,
+<a id="L392"></a>        target.ofmt,
+<a id="L393"></a>        target.cpu.arch,
+<a id="L394"></a>    ) catch |err| {
+<a id="L395"></a>        log.err("step '{s}': failed to load debug information for '{f}': {t}", .{
+<a id="L396"></a>            run_step.step.name, rebuilt_exe_path, err,
+<a id="L397"></a>        });
+<a id="L398"></a>        return error.AlreadyReported;
+<a id="L399"></a>    };
+<a id="L400"></a>    defer debug_info.deinit(gpa);
+<a id="L401"></a>
+<a id="L402"></a>    const coverage_file_path: Build.Cache.Path = .{
+<a id="L403"></a>        .root_dir = run_step.step.owner.cache_root,
+<a id="L404"></a>        .sub_path = "v/" ++ std.fmt.hex(coverage_id),
+<a id="L405"></a>    };
+<a id="L406"></a>    var coverage_file = coverage_file_path.root_dir.handle.openFile(io, coverage_file_path.sub_path, .{}) catch |err| {
+<a id="L407"></a>        log.err("step '{s}': failed to load coverage file '{f}': {t}", .{
+<a id="L408"></a>            run_step.step.name, coverage_file_path, err,
+<a id="L409"></a>        });
+<a id="L410"></a>        return error.AlreadyReported;
+<a id="L411"></a>    };
+<a id="L412"></a>    defer coverage_file.close(io);
+<a id="L413"></a>
+<a id="L414"></a>    const file_size = coverage_file.length(io) catch |err| {
+<a id="L415"></a>        log.err("unable to check len of coverage file '{f}': {t}", .{ coverage_file_path, err });
+<a id="L416"></a>        return error.AlreadyReported;
+<a id="L417"></a>    };
+<a id="L418"></a>
+<a id="L419"></a>    const mapped_memory = std.posix.mmap(
+<a id="L420"></a>        null,
+<a id="L421"></a>        file_size,
+<a id="L422"></a>        .{ .READ = true },
+<a id="L423"></a>        .{ .TYPE = .SHARED },
+<a id="L424"></a>        coverage_file.handle,
+<a id="L425"></a>        0,
+<a id="L426"></a>    ) catch |err| {
+<a id="L427"></a>        log.err("failed to map coverage file '{f}': {t}", .{ coverage_file_path, err });
+<a id="L428"></a>        return error.AlreadyReported;
+<a id="L429"></a>    };
+<a id="L430"></a>    gop.value_ptr.mapped_memory = mapped_memory;
+<a id="L431"></a>
+<a id="L432"></a>    const header: *const abi.SeenPcsHeader = @ptrCast(mapped_memory[0..@sizeOf(abi.SeenPcsHeader)]);
+<a id="L433"></a>    const pcs = header.pcAddrs();
+<a id="L434"></a>    const source_locations = try gpa.alloc(Coverage.SourceLocation, pcs.len);
+<a id="L435"></a>    errdefer gpa.free(source_locations);
+<a id="L436"></a>
+<a id="L437"></a>    // Unfortunately the PCs array that LLVM gives us from the 8-bit PC
+<a id="L438"></a>    // counters feature is not sorted.
+<a id="L439"></a>    var sorted_pcs: std.MultiArrayList(struct { pc: u64, index: u32, sl: Coverage.SourceLocation }) = .empty;
+<a id="L440"></a>    defer sorted_pcs.deinit(gpa);
+<a id="L441"></a>    try sorted_pcs.resize(gpa, pcs.len);
+<a id="L442"></a>    @memcpy(sorted_pcs.items(.pc), pcs);
+<a id="L443"></a>    for (sorted_pcs.items(.index), 0..) |*v, i| v.* = @intCast(i);
+<a id="L444"></a>    sorted_pcs.sortUnstable(struct {
+<a id="L445"></a>        addrs: []const u64,
+<a id="L446"></a>
+<a id="L447"></a>        pub fn lessThan(ctx: @This(), a_index: usize, b_index: usize) bool {
+<a id="L448"></a>            return ctx.addrs[a_index] &lt; ctx.addrs[b_index];
+<a id="L449"></a>        }
+<a id="L450"></a>    }{ .addrs = sorted_pcs.items(.pc) });
+<a id="L451"></a>
+<a id="L452"></a>    debug_info.resolveAddresses(gpa, io, sorted_pcs.items(.pc), sorted_pcs.items(.sl)) catch |err| {
+<a id="L453"></a>        log.err("failed to resolve addresses to source locations: {t}", .{err});
+<a id="L454"></a>        return error.AlreadyReported;
+<a id="L455"></a>    };
+<a id="L456"></a>
+<a id="L457"></a>    for (sorted_pcs.items(.index), sorted_pcs.items(.sl)) |i, sl| source_locations[i] = sl;
+<a id="L458"></a>    gop.value_ptr.source_locations = source_locations;
+<a id="L459"></a>    gop.value_ptr.start_n_runs = header.n_runs;
+<a id="L460"></a>
+<a id="L461"></a>    ws.notifyUpdate();
+<a id="L462"></a>}
+<a id="L463"></a>
+<a id="L464"></a>fn addEntryPoint(fuzz: *Fuzz, coverage_id: u64, addr: u64) error{ AlreadyReported, OutOfMemory, Canceled }!void {
+<a id="L465"></a>    const io = fuzz.io;
+<a id="L466"></a>
+<a id="L467"></a>    try fuzz.coverage_mutex.lock(io);
+<a id="L468"></a>    defer fuzz.coverage_mutex.unlock(io);
+<a id="L469"></a>
+<a id="L470"></a>    const coverage_map = fuzz.coverage_files.getPtr(coverage_id).?;
+<a id="L471"></a>    const header: *const abi.SeenPcsHeader = @ptrCast(coverage_map.mapped_memory[0..@sizeOf(abi.SeenPcsHeader)]);
+<a id="L472"></a>    const pcs = header.pcAddrs();
+<a id="L473"></a>
+<a id="L474"></a>    // Since this pcs list is unsorted, we must linear scan for the best index.
+<a id="L475"></a>    const index = i: {
+<a id="L476"></a>        var best: usize = 0;
+<a id="L477"></a>        for (pcs[1..], 1..) |elem_addr, i| {
+<a id="L478"></a>            if (elem_addr == addr) break :i i;
+<a id="L479"></a>            if (elem_addr &gt; addr) continue;
+<a id="L480"></a>            if (elem_addr &gt; pcs[best]) best = i;
+<a id="L481"></a>        }
+<a id="L482"></a>        break :i best;
+<a id="L483"></a>    };
+<a id="L484"></a>    if (index &gt;= pcs.len) {
+<a id="L485"></a>        log.err("unable to find unit test entry address 0x{x} in source locations (range: 0x{x} to 0x{x})", .{
+<a id="L486"></a>            addr, pcs[0], pcs[pcs.len - 1],
+<a id="L487"></a>        });
+<a id="L488"></a>        return error.AlreadyReported;
+<a id="L489"></a>    }
+<a id="L490"></a>    if (false) {
+<a id="L491"></a>        const sl = coverage_map.source_locations[index];
+<a id="L492"></a>        const file_name = coverage_map.coverage.stringAt(coverage_map.coverage.fileAt(sl.file).basename);
+<a id="L493"></a>        if (pcs.len == 1) {
+<a id="L494"></a>            log.debug("server found entry point for 0x{x} at {s}:{d}:{d} - index 0 (final)", .{
+<a id="L495"></a>                addr, file_name, sl.line, sl.column,
+<a id="L496"></a>            });
+<a id="L497"></a>        } else if (index == 0) {
+<a id="L498"></a>            log.debug("server found entry point for 0x{x} at {s}:{d}:{d} - index 0 before {x}", .{
+<a id="L499"></a>                addr, file_name, sl.line, sl.column, pcs[index + 1],
+<a id="L500"></a>            });
+<a id="L501"></a>        } else if (index == pcs.len - 1) {
+<a id="L502"></a>            log.debug("server found entry point for 0x{x} at {s}:{d}:{d} - index {d} (final) after {x}", .{
+<a id="L503"></a>                addr, file_name, sl.line, sl.column, index, pcs[index - 1],
+<a id="L504"></a>            });
+<a id="L505"></a>        } else {
+<a id="L506"></a>            log.debug("server found entry point for 0x{x} at {s}:{d}:{d} - index {d} between {x} and {x}", .{
+<a id="L507"></a>                addr, file_name, sl.line, sl.column, index, pcs[index - 1], pcs[index + 1],
+<a id="L508"></a>            });
+<a id="L509"></a>        }
+<a id="L510"></a>    }
+<a id="L511"></a>    try coverage_map.entry_points.append(fuzz.gpa, @intCast(index));
+<a id="L512"></a>}
+<a id="L513"></a>
+<a id="L514"></a>pub fn waitAndPrintReport(fuzz: *Fuzz) Io.Cancelable!void {
+<a id="L515"></a>    assert(fuzz.mode == .limit);
+<a id="L516"></a>    const io = fuzz.io;
+<a id="L517"></a>
+<a id="L518"></a>    try fuzz.group.await(io);
+<a id="L519"></a>    fuzz.group = .init;
+<a id="L520"></a>
+<a id="L521"></a>    std.debug.print("======= FUZZING REPORT =======\n", .{});
+<a id="L522"></a>    for (fuzz.msg_queue.items) |msg| {
+<a id="L523"></a>        if (msg != .coverage) continue;
+<a id="L524"></a>
+<a id="L525"></a>        const cov = msg.coverage;
+<a id="L526"></a>        const coverage_file_path: std.Build.Cache.Path = .{
+<a id="L527"></a>            .root_dir = cov.run.step.owner.cache_root,
+<a id="L528"></a>            .sub_path = "v/" ++ std.fmt.hex(cov.id),
+<a id="L529"></a>        };
+<a id="L530"></a>        var coverage_file = coverage_file_path.root_dir.handle.openFile(io, coverage_file_path.sub_path, .{}) catch |err| {
+<a id="L531"></a>            fatal("step '{s}': failed to load coverage file '{f}': {t}", .{
+<a id="L532"></a>                cov.run.step.name, coverage_file_path, err,
+<a id="L533"></a>            });
+<a id="L534"></a>        };
+<a id="L535"></a>        defer coverage_file.close(io);
+<a id="L536"></a>
+<a id="L537"></a>        const fuzz_abi = std.Build.abi.fuzz;
+<a id="L538"></a>        var rbuf: [0x1000]u8 = undefined;
+<a id="L539"></a>        var r = coverage_file.reader(io, &amp;rbuf);
+<a id="L540"></a>
+<a id="L541"></a>        var header: fuzz_abi.SeenPcsHeader = undefined;
+<a id="L542"></a>        r.interface.readSliceAll(std.mem.asBytes(&amp;header)) catch |err| {
+<a id="L543"></a>            fatal("step '{s}': failed to read from coverage file '{f}': {t}", .{
+<a id="L544"></a>                cov.run.step.name, coverage_file_path, err,
+<a id="L545"></a>            });
+<a id="L546"></a>        };
+<a id="L547"></a>
+<a id="L548"></a>        if (header.pcs_len == 0) {
+<a id="L549"></a>            fatal("step '{s}': corrupted coverage file '{f}': pcs_len was zero", .{
+<a id="L550"></a>                cov.run.step.name, coverage_file_path,
+<a id="L551"></a>            });
+<a id="L552"></a>        }
+<a id="L553"></a>
+<a id="L554"></a>        var seen_count: usize = 0;
+<a id="L555"></a>        const chunk_count = fuzz_abi.SeenPcsHeader.seenElemsLen(header.pcs_len);
+<a id="L556"></a>        for (0..chunk_count) |_| {
+<a id="L557"></a>            const seen = r.interface.takeInt(usize, .little) catch |err| {
+<a id="L558"></a>                fatal("step '{s}': failed to read from coverage file '{f}': {t}", .{
+<a id="L559"></a>                    cov.run.step.name, coverage_file_path, err,
+<a id="L560"></a>                });
+<a id="L561"></a>            };
+<a id="L562"></a>            seen_count += @popCount(seen);
+<a id="L563"></a>        }
+<a id="L564"></a>
+<a id="L565"></a>        const seen_f: f64 = @floatFromInt(seen_count);
+<a id="L566"></a>        const total_f: f64 = @floatFromInt(header.pcs_len);
+<a id="L567"></a>        const ratio = seen_f / total_f;
+<a id="L568"></a>        std.debug.print(
+<a id="L569"></a>            \\Step: {s}
+<a id="L570"></a>            \\Fuzz test: "{s}" ({x})
+<a id="L571"></a>            \\Runs: {} -&gt; {}
+<a id="L572"></a>            \\Unique runs: {} -&gt; {}
+<a id="L573"></a>            \\Coverage: {}/{} -&gt; {}/{} ({:.02}%)
+<a id="L574"></a>            \\
+<a id="L575"></a>        , .{
+<a id="L576"></a>            cov.run.step.name,
+<a id="L577"></a>            cov.run.fuzz_tests.items[0],
+<a id="L578"></a>            cov.id,
+<a id="L579"></a>            cov.cumulative.runs,
+<a id="L580"></a>            header.n_runs,
+<a id="L581"></a>            cov.cumulative.unique,
+<a id="L582"></a>            header.unique_runs,
+<a id="L583"></a>            cov.cumulative.coverage,
+<a id="L584"></a>            header.pcs_len,
+<a id="L585"></a>            seen_count,
+<a id="L586"></a>            header.pcs_len,
+<a id="L587"></a>            ratio * 100,
+<a id="L588"></a>        });
+<a id="L589"></a>
+<a id="L590"></a>        std.debug.print("------------------------------\n", .{});
+<a id="L591"></a>    }
+<a id="L592"></a>    std.debug.print(
+<a id="L593"></a>        \\Values are accumulated across multiple runs when preserving the cache.
+<a id="L594"></a>        \\==============================
+<a id="L595"></a>        \\
+<a id="L596"></a>    , .{});
+<a id="L597"></a>}
+</pre>
 </body>
 </html>

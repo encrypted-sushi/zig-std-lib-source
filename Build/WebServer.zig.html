@@ -2,943 +2,946 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Source: zig-0.16.0-std/Build/WebServer.zig</title>
+    <title>Source: Build/WebServer.zig</title>
     <style>
         body { background: #1e1e1e; color: #d4d4d4; font-family: monospace; padding: 20px; }
         pre { white-space: pre-wrap; word-wrap: break-word; }
         .header { border-bottom: 1px solid #444; padding-bottom: 10px; margin-bottom: 20px; }
         a { color: #569cd6; }
+        a[id] { color: inherit; text-decoration: none; }
+        :target { background: #3a3a00; }
     </style>
 </head>
 <body>
     <div class="header">
-        <a href="/">Index</a> | <strong>File: zig-0.16.0-std/Build/WebServer.zig</strong>
+        <a href="/">Index</a> | <strong>File: Build/WebServer.zig</strong>
     </div>
-    <pre>gpa: Allocator,
-graph: *const Build.Graph,
-all_steps: []const *Build.Step,
-listen_address: net.IpAddress,
-root_prog_node: std.Progress.Node,
-watch: bool,
-
-tcp_server: ?net.Server,
-serve_task: ?Io.Future(Io.Cancelable!void),
-
-/// Uses `Io.Clock.awake`.
-base_timestamp: Io.Timestamp,
-/// The "step name" data which trails `abi.Hello`, for the steps in `all_steps`.
-step_names_trailing: []u8,
-
-/// The bit-packed "step status" data. Values are `abi.StepUpdate.Status`. LSBs are earlier steps.
-/// Accessed atomically.
-step_status_bits: []u8,
-
-fuzz: ?Fuzz,
-time_report_mutex: Io.Mutex,
-time_report_msgs: [][]u8,
-time_report_update_times: []i64,
-
-build_status: std.atomic.Value(abi.BuildStatus),
-/// When an event occurs which means WebSocket clients should be sent updates, call `notifyUpdate`
-/// to increment this value. Each client thread waits for this increment with `Io.futexWaitTimeout`, so
-/// `notifyUpdate` will wake those threads. Updates are sent on a short interval regardless, so it
-/// is recommended to only use `notifyUpdate` for changes which the user should see immediately. For
-/// instance, we do not call `notifyUpdate` when the number of "unique runs" in the fuzzer changes,
-/// because this value changes quickly so this would result in constantly spamming all clients with
-/// an unreasonable number of packets.
-update_id: std.atomic.Value(u32),
-
-runner_request_mutex: Io.Mutex,
-runner_request_ready_cond: Io.Condition,
-runner_request_empty_cond: Io.Condition,
-runner_request: ?RunnerRequest,
-
-/// If a client is not explicitly notified of changes with `notifyUpdate`, it will be sent updates
-/// on a fixed interval of this many milliseconds.
-const default_update_interval_ms = 500;
-
-pub const base_clock: Io.Clock = .awake;
-
-/// Thread-safe. Triggers updates to be sent to connected WebSocket clients; see `update_id`.
-pub fn notifyUpdate(ws: *WebServer) void {
-    _ = ws.update_id.rmw(.Add, 1, .release);
-    ws.graph.io.futexWake(u32, &amp;ws.update_id.raw, 16);
-}
-
-pub const Options = struct {
-    gpa: Allocator,
-    graph: *const std.Build.Graph,
-    all_steps: []const *Build.Step,
-    root_prog_node: std.Progress.Node,
-    watch: bool,
-    listen_address: net.IpAddress,
-    base_timestamp: Io.Clock.Timestamp,
-};
-pub fn init(opts: Options) WebServer {
-    // The upcoming `Io` interface should allow us to use `Io.async` and `Io.concurrent`
-    // instead of threads, so that the web server can function in single-threaded builds.
-    comptime assert(!builtin.single_threaded);
-    assert(opts.base_timestamp.clock == base_clock);
-
-    const all_steps = opts.all_steps;
-
-    const step_names_trailing = opts.gpa.alloc(u8, len: {
-        var name_bytes: usize = 0;
-        for (all_steps) |step| name_bytes += step.name.len;
-        break :len name_bytes + all_steps.len * 4;
-    }) catch @panic("out of memory");
-    {
-        const step_name_lens: []align(1) u32 = @ptrCast(step_names_trailing[0 .. all_steps.len * 4]);
-        var idx: usize = all_steps.len * 4;
-        for (all_steps, step_name_lens) |step, *name_len| {
-            name_len.* = @intCast(step.name.len);
-            @memcpy(step_names_trailing[idx..][0..step.name.len], step.name);
-            idx += step.name.len;
-        }
-        assert(idx == step_names_trailing.len);
-    }
-
-    const step_status_bits = opts.gpa.alloc(
-        u8,
-        std.math.divCeil(usize, all_steps.len, 4) catch unreachable,
-    ) catch @panic("out of memory");
-    @memset(step_status_bits, 0);
-
-    const time_reports_len: usize = if (opts.graph.time_report) all_steps.len else 0;
-    const time_report_msgs = opts.gpa.alloc([]u8, time_reports_len) catch @panic("out of memory");
-    const time_report_update_times = opts.gpa.alloc(i64, time_reports_len) catch @panic("out of memory");
-    @memset(time_report_msgs, &amp;.{});
-    @memset(time_report_update_times, std.math.minInt(i64));
-
-    return .{
-        .gpa = opts.gpa,
-        .graph = opts.graph,
-        .all_steps = all_steps,
-        .listen_address = opts.listen_address,
-        .root_prog_node = opts.root_prog_node,
-        .watch = opts.watch,
-
-        .tcp_server = null,
-        .serve_task = null,
-
-        .base_timestamp = opts.base_timestamp.raw,
-        .step_names_trailing = step_names_trailing,
-
-        .step_status_bits = step_status_bits,
-
-        .fuzz = null,
-        .time_report_mutex = .init,
-        .time_report_msgs = time_report_msgs,
-        .time_report_update_times = time_report_update_times,
-
-        .build_status = .init(.idle),
-        .update_id = .init(0),
-
-        .runner_request_mutex = .init,
-        .runner_request_ready_cond = .init,
-        .runner_request_empty_cond = .init,
-        .runner_request = null,
-    };
-}
-pub fn deinit(ws: *WebServer) void {
-    const gpa = ws.gpa;
-    const io = ws.graph.io;
-
-    gpa.free(ws.step_names_trailing);
-    gpa.free(ws.step_status_bits);
-
-    if (ws.fuzz) |*f| f.deinit();
-    for (ws.time_report_msgs) |msg| gpa.free(msg);
-    gpa.free(ws.time_report_msgs);
-    gpa.free(ws.time_report_update_times);
-
-    if (ws.serve_task) |t| {
-        if (ws.tcp_server) |*s| s.stream.close(io);
-        t.await();
-    }
-    if (ws.tcp_server) |*s| s.deinit();
-
-    gpa.free(ws.step_names_trailing);
-}
-pub fn start(ws: *WebServer) error{AlreadyReported}!void {
-    assert(ws.tcp_server == null);
-    assert(ws.serve_task == null);
-    const io = ws.graph.io;
-
-    ws.tcp_server = ws.listen_address.listen(io, .{ .reuse_address = true }) catch |err| {
-        log.err("failed to listen to port {d}: {t}", .{ ws.listen_address.getPort(), err });
-        return error.AlreadyReported;
-    };
-    ws.serve_task = io.concurrent(serve, .{ws}) catch |err| {
-        log.err("unable to spawn web server thread: {t}", .{err});
-        ws.tcp_server.?.deinit(io);
-        ws.tcp_server = null;
-        return error.AlreadyReported;
-    };
-
-    log.info("web interface listening at http://{f}/", .{ws.tcp_server.?.socket.address});
-    if (ws.listen_address.getPort() == 0) {
-        log.info("hint: pass '--webui={f}' to use the same port next time", .{ws.tcp_server.?.socket.address});
-    }
-}
-fn serve(ws: *WebServer) Io.Cancelable!void {
-    const io = ws.graph.io;
-    var group: Io.Group = .init;
-    defer group.cancel(io);
-    while (true) {
-        var stream = ws.tcp_server.?.accept(io) catch |err| switch (err) {
-            error.Canceled =&gt; |e| return e,
-            else =&gt; |e| {
-                log.err("failed to accept connection: {t}", .{e});
-                return;
-            },
-        };
-        group.concurrent(io, accept, .{ ws, stream }) catch |err| {
-            log.err("unable to spawn connection thread: {t}", .{err});
-            stream.close(io);
-            continue;
-        };
-    }
-}
-
-pub fn startBuild(ws: *WebServer) void {
-    if (ws.fuzz) |*fuzz| {
-        fuzz.deinit();
-        ws.fuzz = null;
-    }
-    for (ws.step_status_bits) |*bits| @atomicStore(u8, bits, 0, .monotonic);
-    ws.build_status.store(.running, .monotonic);
-    ws.notifyUpdate();
-}
-
-pub fn updateStepStatus(ws: *WebServer, step: *Build.Step, new_status: abi.StepUpdate.Status) void {
-    const step_idx: u32 = for (ws.all_steps, 0..) |s, i| {
-        if (s == step) break @intCast(i);
-    } else unreachable;
-    const ptr = &amp;ws.step_status_bits[step_idx / 4];
-    const bit_offset: u3 = @intCast((step_idx % 4) * 2);
-    const old_bits: u2 = @truncate(@atomicLoad(u8, ptr, .monotonic) &gt;&gt; bit_offset);
-    const mask = @as(u8, @intFromEnum(new_status) ^ old_bits) &lt;&lt; bit_offset;
-    _ = @atomicRmw(u8, ptr, .Xor, mask, .monotonic);
-    ws.notifyUpdate();
-}
-
-pub fn finishBuild(ws: *WebServer, opts: struct {
-    fuzz: bool,
-}) void {
-    if (opts.fuzz) {
-        switch (builtin.os.tag) {
-            // Current implementation depends on two things that need to be ported to Windows:
-            // * Memory-mapping to share data between the fuzzer and build runner.
-            // * COFF/PE support added to `std.debug.Info` (it needs a batching API for resolving
-            //   many addresses to source locations).
-            .windows =&gt; std.process.fatal("--fuzz not yet implemented for {s}", .{@tagName(builtin.os.tag)}),
-            else =&gt; {},
-        }
-        if (@bitSizeOf(usize) != 64) {
-            // Current implementation depends on posix.mmap()'s second
-            // parameter, `length: usize`, being compatible with file system's
-            // u64 return value. This is not the case on 32-bit platforms.
-            // Affects or affected by issues #5185, #22523, and #22464.
-            std.process.fatal("--fuzz not yet implemented on {d}-bit platforms", .{@bitSizeOf(usize)});
-        }
-
-        assert(ws.fuzz == null);
-
-        ws.build_status.store(.fuzz_init, .monotonic);
-        ws.notifyUpdate();
-
-        ws.fuzz = Fuzz.init(
-            ws.gpa,
-            ws.graph.io,
-            ws.all_steps,
-            ws.root_prog_node,
-            .{ .forever = .{ .ws = ws } },
-        ) catch |err| std.process.fatal("failed to start fuzzer: {s}", .{@errorName(err)});
-        ws.fuzz.?.start();
-    }
-
-    ws.build_status.store(if (ws.watch) .watching else .idle, .monotonic);
-    ws.notifyUpdate();
-}
-
-pub fn now(s: *const WebServer) i64 {
-    const io = s.graph.io;
-    const ts = base_clock.now(io);
-    return @intCast(s.base_timestamp.durationTo(ts).toNanoseconds());
-}
-
-fn accept(ws: *WebServer, stream: net.Stream) void {
-    const io = ws.graph.io;
-    defer {
-        // `net.Stream.close` wants to helpfully overwrite `stream` with
-        // `undefined`, but it cannot do so since it is an immutable parameter.
-        var copy = stream;
-        copy.close(io);
-    }
-    var send_buffer: [4096]u8 = undefined;
-    var recv_buffer: [4096]u8 = undefined;
-    var connection_reader = stream.reader(io, &amp;recv_buffer);
-    var connection_writer = stream.writer(io, &amp;send_buffer);
-    var server: http.Server = .init(&amp;connection_reader.interface, &amp;connection_writer.interface);
-
-    while (true) {
-        var request = server.receiveHead() catch |err| switch (err) {
-            error.HttpConnectionClosing =&gt; return,
-            else =&gt; return log.err("failed to receive http request: {t}", .{err}),
-        };
-        switch (request.upgradeRequested()) {
-            .websocket =&gt; |opt_key| {
-                const key = opt_key orelse return log.err("missing websocket key", .{});
-                var web_socket = request.respondWebSocket(.{ .key = key }) catch {
-                    return log.err("failed to respond web socket: {t}", .{connection_writer.err.?});
-                };
-                ws.serveWebSocket(&amp;web_socket) catch |err| {
-                    log.err("failed to serve websocket: {t}", .{err});
-                    return;
-                };
-                comptime unreachable;
-            },
-            .other =&gt; |name| return log.err("unknown upgrade request: {s}", .{name}),
-            .none =&gt; {
-                ws.serveRequest(&amp;request) catch |err| switch (err) {
-                    error.AlreadyReported =&gt; return,
-                    else =&gt; {
-                        log.err("failed to serve '{s}': {t}", .{ request.head.target, err });
-                        return;
-                    },
-                };
-            },
-        }
-    }
-}
-
-fn serveWebSocket(ws: *WebServer, sock: *http.Server.WebSocket) !noreturn {
-    const io = ws.graph.io;
-
-    var prev_build_status = ws.build_status.load(.monotonic);
-
-    const prev_step_status_bits = try ws.gpa.alloc(u8, ws.step_status_bits.len);
-    defer ws.gpa.free(prev_step_status_bits);
-    for (prev_step_status_bits, ws.step_status_bits) |*copy, *shared| {
-        copy.* = @atomicLoad(u8, shared, .monotonic);
-    }
-
-    var recv_thread = try io.concurrent(recvWebSocketMessages, .{ ws, sock });
-    defer recv_thread.cancel(io);
-
-    {
-        const hello_header: abi.Hello = .{
-            .status = prev_build_status,
-            .flags = .{
-                .time_report = ws.graph.time_report,
-            },
-            .timestamp = ws.now(),
-            .steps_len = @intCast(ws.all_steps.len),
-        };
-        var bufs: [3][]const u8 = .{ @ptrCast(&amp;hello_header), ws.step_names_trailing, prev_step_status_bits };
-        try sock.writeMessageVec(&amp;bufs, .binary);
-    }
-
-    var prev_fuzz: Fuzz.Previous = .init;
-    var prev_time: i64 = std.math.minInt(i64);
-    while (true) {
-        const start_time = ws.now();
-        const start_update_id = ws.update_id.load(.acquire);
-
-        if (ws.fuzz) |*fuzz| {
-            try fuzz.sendUpdate(sock, &amp;prev_fuzz);
-        }
-
-        {
-            try ws.time_report_mutex.lock(io);
-            defer ws.time_report_mutex.unlock(io);
-            for (ws.time_report_msgs, ws.time_report_update_times) |msg, update_time| {
-                if (update_time &lt;= prev_time) continue;
-                // We want to send `msg`, but shouldn't block `ws.time_report_mutex` while we do, so
-                // that we don't hold up the build system on the client accepting this packet.
-                const owned_msg = try ws.gpa.dupe(u8, msg);
-                defer ws.gpa.free(owned_msg);
-                // Temporarily unlock, then re-lock after the message is sent.
-                ws.time_report_mutex.unlock(io);
-                defer ws.time_report_mutex.lockUncancelable(io);
-                try sock.writeMessage(owned_msg, .binary);
-            }
-        }
-
-        {
-            const build_status = ws.build_status.load(.monotonic);
-            if (build_status != prev_build_status) {
-                prev_build_status = build_status;
-                const msg: abi.StatusUpdate = .{ .new = build_status };
-                try sock.writeMessage(@ptrCast(&amp;msg), .binary);
-            }
-        }
-
-        for (prev_step_status_bits, ws.step_status_bits, 0..) |*prev_byte, *shared, byte_idx| {
-            const cur_byte = @atomicLoad(u8, shared, .monotonic);
-            if (prev_byte.* == cur_byte) continue;
-            const cur: [4]abi.StepUpdate.Status = .{
-                @enumFromInt(@as(u2, @truncate(cur_byte &gt;&gt; 0))),
-                @enumFromInt(@as(u2, @truncate(cur_byte &gt;&gt; 2))),
-                @enumFromInt(@as(u2, @truncate(cur_byte &gt;&gt; 4))),
-                @enumFromInt(@as(u2, @truncate(cur_byte &gt;&gt; 6))),
-            };
-            const prev: [4]abi.StepUpdate.Status = .{
-                @enumFromInt(@as(u2, @truncate(prev_byte.* &gt;&gt; 0))),
-                @enumFromInt(@as(u2, @truncate(prev_byte.* &gt;&gt; 2))),
-                @enumFromInt(@as(u2, @truncate(prev_byte.* &gt;&gt; 4))),
-                @enumFromInt(@as(u2, @truncate(prev_byte.* &gt;&gt; 6))),
-            };
-            for (cur, prev, byte_idx * 4..) |cur_status, prev_status, step_idx| {
-                const msg: abi.StepUpdate = .{ .step_idx = @intCast(step_idx), .bits = .{ .status = cur_status } };
-                if (cur_status != prev_status) try sock.writeMessage(@ptrCast(&amp;msg), .binary);
-            }
-            prev_byte.* = cur_byte;
-        }
-
-        prev_time = start_time;
-
-        const old_cp = io.swapCancelProtection(.blocked);
-        defer _ = io.swapCancelProtection(old_cp);
-        io.futexWaitTimeout(
-            u32,
-            &amp;ws.update_id.raw,
-            start_update_id,
-            .{ .duration = .{
-                .clock = .awake,
-                .raw = .fromMilliseconds(default_update_interval_ms),
-            } },
-        ) catch |err| switch (err) {
-            error.Canceled =&gt; unreachable,
-        };
-    }
-}
-fn recvWebSocketMessages(ws: *WebServer, sock: *http.Server.WebSocket) void {
-    const io = ws.graph.io;
-
-    while (true) {
-        const msg = sock.readSmallMessage() catch return;
-        if (msg.opcode != .binary) continue;
-        if (msg.data.len == 0) continue;
-        const tag: abi.ToServerTag = @enumFromInt(msg.data[0]);
-        switch (tag) {
-            _ =&gt; continue,
-            .rebuild =&gt; while (true) {
-                ws.runner_request_mutex.lock(io) catch |err| switch (err) {
-                    error.Canceled =&gt; return,
-                };
-                defer ws.runner_request_mutex.unlock(io);
-                if (ws.runner_request == null) {
-                    ws.runner_request = .rebuild;
-                    ws.runner_request_ready_cond.signal(io);
-                    break;
-                }
-                ws.runner_request_empty_cond.wait(io, &amp;ws.runner_request_mutex) catch return;
-            },
-        }
-    }
-}
-
-fn serveRequest(ws: *WebServer, req: *http.Server.Request) !void {
-    // Strip an optional leading '/debug' component from the request.
-    const target: []const u8, const debug: bool = target: {
-        if (mem.eql(u8, req.head.target, "/debug")) break :target .{ "/", true };
-        if (mem.eql(u8, req.head.target, "/debug/")) break :target .{ "/", true };
-        if (mem.startsWith(u8, req.head.target, "/debug/")) break :target .{ req.head.target["/debug".len..], true };
-        break :target .{ req.head.target, false };
-    };
-
-    if (mem.eql(u8, target, "/")) return serveLibFile(ws, req, "build-web/index.html", "text/html");
-    if (mem.eql(u8, target, "/main.js")) return serveLibFile(ws, req, "build-web/main.js", "application/javascript");
-    if (mem.eql(u8, target, "/style.css")) return serveLibFile(ws, req, "build-web/style.css", "text/css");
-    if (mem.eql(u8, target, "/time_report.css")) return serveLibFile(ws, req, "build-web/time_report.css", "text/css");
-    if (mem.eql(u8, target, "/main.wasm")) return serveClientWasm(ws, req, if (debug) .Debug else .ReleaseFast);
-
-    if (ws.fuzz) |*fuzz| {
-        if (mem.eql(u8, target, "/sources.tar")) return fuzz.serveSourcesTar(req);
-    }
-
-    try req.respond("not found", .{
-        .status = .not_found,
-        .extra_headers = &amp;.{
-            .{ .name = "Content-Type", .value = "text/plain" },
-        },
-    });
-}
-
-fn serveLibFile(
-    ws: *WebServer,
-    request: *http.Server.Request,
-    sub_path: []const u8,
-    content_type: []const u8,
-) !void {
-    return serveFile(ws, request, .{
-        .root_dir = ws.graph.zig_lib_directory,
-        .sub_path = sub_path,
-    }, content_type);
-}
-fn serveClientWasm(
-    ws: *WebServer,
-    req: *http.Server.Request,
-    optimize_mode: std.builtin.OptimizeMode,
-) !void {
-    var arena_state: std.heap.ArenaAllocator = .init(ws.gpa);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    // We always rebuild the wasm on-the-fly, so that if it is edited the user can just refresh the page.
-    const bin_path = try buildClientWasm(ws, arena, optimize_mode);
-    return serveFile(ws, req, bin_path, "application/wasm");
-}
-
-pub fn serveFile(
-    ws: *WebServer,
-    request: *http.Server.Request,
-    path: Cache.Path,
-    content_type: []const u8,
-) !void {
-    const gpa = ws.gpa;
-    const io = ws.graph.io;
-    // The desired API is actually sendfile, which will require enhancing http.Server.
-    // We load the file with every request so that the user can make changes to the file
-    // and refresh the HTML page without restarting this server.
-    const file_contents = path.root_dir.handle.readFileAlloc(io, path.sub_path, gpa, .limited(10 * 1024 * 1024)) catch |err| {
-        log.err("failed to read '{f}': {t}", .{ path, err });
-        return error.AlreadyReported;
-    };
-    defer gpa.free(file_contents);
-    try request.respond(file_contents, .{
-        .extra_headers = &amp;.{
-            .{ .name = "Content-Type", .value = content_type },
-            cache_control_header,
-        },
-    });
-}
-pub fn serveTarFile(ws: *WebServer, request: *http.Server.Request, paths: []const Cache.Path) !void {
-    const graph = ws.graph;
-    const io = graph.io;
-
-    var send_buffer: [0x4000]u8 = undefined;
-    var response = try request.respondStreaming(&amp;send_buffer, .{
-        .respond_options = .{
-            .extra_headers = &amp;.{
-                .{ .name = "Content-Type", .value = "application/x-tar" },
-                cache_control_header,
-            },
-        },
-    });
-
-    var archiver: std.tar.Writer = .{ .underlying_writer = &amp;response.writer };
-
-    for (paths) |path| {
-        var file = path.root_dir.handle.openFile(io, path.sub_path, .{}) catch |err| {
-            log.err("failed to open '{f}': {s}", .{ path, @errorName(err) });
-            continue;
-        };
-        defer file.close(io);
-        const stat = try file.stat(io);
-        var read_buffer: [1024]u8 = undefined;
-        var file_reader: Io.File.Reader = .initSize(file, io, &amp;read_buffer, stat.size);
-
-        // TODO: this logic is completely bogus -- obviously so, because `path.root_dir.path` can
-        // be cwd-relative. This is also related to why linkification doesn't work in the fuzzer UI:
-        // it turns out the WASM treats the first path component as the module name, typically
-        // resulting in modules named "" and "src". The compiler needs to tell the build system
-        // about the module graph so that the build system can correctly encode this information in
-        // the tar file.
-        //
-        // Additionally, this needs to ensure that all path separators for both prefix and
-        // sub_path are using the POSIX-style `/` on platforms that don't use it as their native
-        // path separator.
-        archiver.prefix = path.root_dir.path orelse graph.cache.cwd;
-        try archiver.writeFile(path.sub_path, &amp;file_reader, @intCast(stat.mtime.toSeconds()));
-    }
-
-    // intentionally not calling `archiver.finishPedantically`
-    try response.end();
-}
-
-fn buildClientWasm(ws: *WebServer, arena: Allocator, optimize: std.builtin.OptimizeMode) !Cache.Path {
-    const root_name = "build-web";
-    const arch_os_abi = "wasm32-freestanding";
-    const cpu_features = "baseline+atomics+bulk_memory+multivalue+mutable_globals+nontrapping_fptoint+reference_types+sign_ext";
-
-    const gpa = ws.gpa;
-    const graph = ws.graph;
-    const io = graph.io;
-
-    const main_src_path: Cache.Path = .{
-        .root_dir = graph.zig_lib_directory,
-        .sub_path = "build-web/main.zig",
-    };
-    const walk_src_path: Cache.Path = .{
-        .root_dir = graph.zig_lib_directory,
-        .sub_path = "docs/wasm/Walk.zig",
-    };
-    const html_render_src_path: Cache.Path = .{
-        .root_dir = graph.zig_lib_directory,
-        .sub_path = "docs/wasm/html_render.zig",
-    };
-
-    var argv: std.ArrayList([]const u8) = .empty;
-
-    try argv.appendSlice(arena, &amp;.{
-        graph.zig_exe, "build-exe", //
-        "-fno-entry", //
-        "-O", @tagName(optimize), //
-        "-target", arch_os_abi, //
-        "-mcpu", cpu_features, //
-        "--cache-dir", graph.global_cache_root.path orelse ".", //
-        "--global-cache-dir", graph.global_cache_root.path orelse ".", //
-        "--zig-lib-dir", graph.zig_lib_directory.path orelse ".", //
-        "--name", root_name, //
-        "-rdynamic", //
-        "-fsingle-threaded", //
-        "--dep", "Walk", //
-        "--dep", "html_render", //
-        try std.fmt.allocPrint(arena, "-Mroot={f}", .{main_src_path}), //
-        try std.fmt.allocPrint(arena, "-MWalk={f}", .{walk_src_path}), //
-        "--dep", "Walk", //
-        try std.fmt.allocPrint(arena, "-Mhtml_render={f}", .{html_render_src_path}), //
-        "--listen=-",
-    });
-
-    var child = try std.process.spawn(io, .{
-        .argv = argv.items,
-        .environ_map = &amp;graph.environ_map,
-        .stdin = .pipe,
-        .stdout = .pipe,
-        .stderr = .pipe,
-    });
-    defer child.kill(io);
-
-    var stderr_task = try io.concurrent(readStreamAlloc, .{ gpa, io, child.stderr.?, .unlimited });
-    defer if (stderr_task.cancel(io)) |slice| gpa.free(slice) else |_| {};
-
-    var stdout_buffer: [512]u8 = undefined;
-    var stdout_reader: Io.File.Reader = .initStreaming(child.stdout.?, io, &amp;stdout_buffer);
-    const stdout = &amp;stdout_reader.interface;
-
-    {
-        var w = child.stdin.?.writer(io, &amp;.{});
-        w.interface.writeStruct(std.zig.Client.Message.Header{ .tag = .update, .bytes_len = 0 }, .little) catch |err| switch (err) {
-            error.WriteFailed =&gt; return w.err.?,
-        };
-        w.interface.writeStruct(std.zig.Client.Message.Header{ .tag = .exit, .bytes_len = 0 }, .little) catch |err| switch (err) {
-            error.WriteFailed =&gt; return w.err.?,
-        };
-    }
-
-    const Header = std.zig.Server.Message.Header;
-
-    var result: ?Cache.Path = null;
-    var result_error_bundle = std.zig.ErrorBundle.empty;
-    var body_buffer: std.ArrayList(u8) = .empty;
-    defer body_buffer.deinit(gpa);
-
-    while (true) {
-        const header = stdout.takeStruct(Header, .little) catch |e| switch (e) {
-            error.ReadFailed =&gt; return error.ReadFailed,
-            error.EndOfStream =&gt; break,
-        };
-        body_buffer.clearRetainingCapacity();
-        try stdout.appendExact(gpa, &amp;body_buffer, header.bytes_len);
-        const body = body_buffer.items;
-
-        switch (header.tag) {
-            .zig_version =&gt; {
-                if (!std.mem.eql(u8, builtin.zig_version_string, body)) {
-                    return error.ZigProtocolVersionMismatch;
-                }
-            },
-            .error_bundle =&gt; {
-                result_error_bundle = try std.zig.Server.allocErrorBundle(arena, body);
-            },
-            .emit_digest =&gt; {
-                const EmitDigest = std.zig.Server.Message.EmitDigest;
-                const ebp_hdr: *align(1) const EmitDigest = @ptrCast(body);
-                if (!ebp_hdr.flags.cache_hit) {
-                    log.info("source changes detected; rebuilt wasm component", .{});
-                }
-                const digest = body[@sizeOf(EmitDigest)..][0..Cache.bin_digest_len];
-                result = .{
-                    .root_dir = graph.global_cache_root,
-                    .sub_path = try arena.dupe(u8, "o" ++ std.fs.path.sep_str ++ Cache.binToHex(digest.*)),
-                };
-            },
-            else =&gt; {}, // ignore other messages
-        }
-    }
-
-    const stderr_contents = try stderr_task.await(io);
-    if (stderr_contents.len &gt; 0) {
-        std.debug.print("{s}", .{stderr_contents});
-    }
-
-    // Send EOF to stdin.
-    child.stdin.?.close(io);
-    child.stdin = null;
-
-    switch (try child.wait(io)) {
-        .exited =&gt; |code| {
-            if (code != 0) {
-                log.err(
-                    "the following command exited with error code {d}:\n{s}",
-                    .{ code, try Build.Step.allocPrintCmd(arena, .inherit, null, argv.items) },
-                );
-                return error.WasmCompilationFailed;
-            }
-        },
-        .signal =&gt; |sig| {
-            log.err(
-                "the following command terminated with signal {t}:\n{s}",
-                .{ sig, try Build.Step.allocPrintCmd(arena, .inherit, null, argv.items) },
-            );
-            return error.WasmCompilationFailed;
-        },
-        .stopped =&gt; |sig| {
-            log.err(
-                "the following command stopped unexpectedly with signal {t}:\n{s}",
-                .{ sig, try Build.Step.allocPrintCmd(arena, .inherit, null, argv.items) },
-            );
-            return error.WasmCompilationFailed;
-        },
-        .unknown =&gt; {
-            log.err(
-                "the following command terminated unexpectedly:\n{s}",
-                .{try Build.Step.allocPrintCmd(arena, .inherit, null, argv.items)},
-            );
-            return error.WasmCompilationFailed;
-        },
-    }
-
-    if (result_error_bundle.errorMessageCount() &gt; 0) {
-        try result_error_bundle.renderToStderr(io, .{}, .auto);
-        log.err("the following command failed with {d} compilation errors:\n{s}", .{
-            result_error_bundle.errorMessageCount(),
-            try Build.Step.allocPrintCmd(arena, .inherit, null, argv.items),
-        });
-        return error.WasmCompilationFailed;
-    }
-
-    const base_path = result orelse {
-        log.err("child process failed to report result\n{s}", .{
-            try Build.Step.allocPrintCmd(arena, .inherit, null, argv.items),
-        });
-        return error.WasmCompilationFailed;
-    };
-    const bin_name = try std.zig.binNameAlloc(arena, .{
-        .root_name = root_name,
-        .target = &amp;(std.zig.system.resolveTargetQuery(io, std.Build.parseTargetQuery(.{
-            .arch_os_abi = arch_os_abi,
-            .cpu_features = cpu_features,
-        }) catch unreachable) catch unreachable),
-        .output_mode = .Exe,
-    });
-    return base_path.join(arena, bin_name);
-}
-
-fn readStreamAlloc(gpa: Allocator, io: Io, file: Io.File, limit: Io.Limit) ![]u8 {
-    var file_reader: Io.File.Reader = .initStreaming(file, io, &amp;.{});
-    return file_reader.interface.allocRemaining(gpa, limit) catch |err| switch (err) {
-        error.ReadFailed =&gt; return file_reader.err.?,
-        else =&gt; |e| return e,
-    };
-}
-
-pub fn updateTimeReportCompile(ws: *WebServer, opts: struct {
-    compile: *Build.Step.Compile,
-
-    use_llvm: bool,
-    stats: abi.time_report.CompileResult.Stats,
-    ns_total: u64,
-
-    llvm_pass_timings_len: u32,
-    files_len: u32,
-    decls_len: u32,
-
-    /// The trailing data of `abi.time_report.CompileResult`, except the step name.
-    trailing: []const u8,
-}) void {
-    const gpa = ws.gpa;
-    const io = ws.graph.io;
-
-    const step_idx: u32 = for (ws.all_steps, 0..) |s, i| {
-        if (s == &amp;opts.compile.step) break @intCast(i);
-    } else unreachable;
-
-    const old_buf = old: {
-        ws.time_report_mutex.lock(io) catch return;
-        defer ws.time_report_mutex.unlock(io);
-        const old = ws.time_report_msgs[step_idx];
-        ws.time_report_msgs[step_idx] = &amp;.{};
-        break :old old;
-    };
-    const buf = gpa.realloc(old_buf, @sizeOf(abi.time_report.CompileResult) + opts.trailing.len) catch @panic("out of memory");
-
-    const out_header: *align(1) abi.time_report.CompileResult = @ptrCast(buf[0..@sizeOf(abi.time_report.CompileResult)]);
-    out_header.* = .{
-        .step_idx = step_idx,
-        .flags = .{
-            .use_llvm = opts.use_llvm,
-        },
-        .stats = opts.stats,
-        .ns_total = opts.ns_total,
-        .llvm_pass_timings_len = opts.llvm_pass_timings_len,
-        .files_len = opts.files_len,
-        .decls_len = opts.decls_len,
-    };
-    @memcpy(buf[@sizeOf(abi.time_report.CompileResult)..], opts.trailing);
-
-    {
-        ws.time_report_mutex.lock(io) catch return;
-        defer ws.time_report_mutex.unlock(io);
-        assert(ws.time_report_msgs[step_idx].len == 0);
-        ws.time_report_msgs[step_idx] = buf;
-        ws.time_report_update_times[step_idx] = ws.now();
-    }
-    ws.notifyUpdate();
-}
-
-pub fn updateTimeReportGeneric(ws: *WebServer, step: *Build.Step, duration: Io.Duration) void {
-    const gpa = ws.gpa;
-    const io = ws.graph.io;
-
-    const step_idx: u32 = for (ws.all_steps, 0..) |s, i| {
-        if (s == step) break @intCast(i);
-    } else unreachable;
-
-    const old_buf = old: {
-        ws.time_report_mutex.lock(io) catch return;
-        defer ws.time_report_mutex.unlock(io);
-        const old = ws.time_report_msgs[step_idx];
-        ws.time_report_msgs[step_idx] = &amp;.{};
-        break :old old;
-    };
-    const buf = gpa.realloc(old_buf, @sizeOf(abi.time_report.GenericResult)) catch @panic("out of memory");
-    const out: *align(1) abi.time_report.GenericResult = @ptrCast(buf);
-    out.* = .{
-        .step_idx = step_idx,
-        .ns_total = @intCast(duration.toNanoseconds()),
-    };
-    {
-        ws.time_report_mutex.lock(io) catch return;
-        defer ws.time_report_mutex.unlock(io);
-        assert(ws.time_report_msgs[step_idx].len == 0);
-        ws.time_report_msgs[step_idx] = buf;
-        ws.time_report_update_times[step_idx] = ws.now();
-    }
-    ws.notifyUpdate();
-}
-
-pub fn updateTimeReportRunTest(
-    ws: *WebServer,
-    run: *Build.Step.Run,
-    tests: *const Build.Step.Run.CachedTestMetadata,
-    ns_per_test: []const u64,
-) void {
-    const gpa = ws.gpa;
-    const io = ws.graph.io;
-
-    const step_idx: u32 = for (ws.all_steps, 0..) |s, i| {
-        if (s == &amp;run.step) break @intCast(i);
-    } else unreachable;
-
-    assert(tests.names.len == ns_per_test.len);
-    const tests_len: u32 = @intCast(tests.names.len);
-
-    const new_len: u64 = len: {
-        var names_len: u64 = 0;
-        for (0..tests_len) |i| {
-            names_len += tests.testName(@intCast(i)).len + 1;
-        }
-        break :len @sizeOf(abi.time_report.RunTestResult) + names_len + 8 * tests_len;
-    };
-    const old_buf = old: {
-        ws.time_report_mutex.lock(io) catch return;
-        defer ws.time_report_mutex.unlock(io);
-        const old = ws.time_report_msgs[step_idx];
-        ws.time_report_msgs[step_idx] = &amp;.{};
-        break :old old;
-    };
-    const buf = gpa.realloc(old_buf, new_len) catch @panic("out of memory");
-
-    const out_header: *align(1) abi.time_report.RunTestResult = @ptrCast(buf[0..@sizeOf(abi.time_report.RunTestResult)]);
-    out_header.* = .{
-        .step_idx = step_idx,
-        .tests_len = tests_len,
-    };
-    var offset: usize = @sizeOf(abi.time_report.RunTestResult);
-    const ns_per_test_out: []align(1) u64 = @ptrCast(buf[offset..][0 .. tests_len * 8]);
-    @memcpy(ns_per_test_out, ns_per_test);
-    offset += tests_len * 8;
-    for (0..tests_len) |i| {
-        const name = tests.testName(@intCast(i));
-        @memcpy(buf[offset..][0..name.len], name);
-        buf[offset..][name.len] = 0;
-        offset += name.len + 1;
-    }
-    assert(offset == buf.len);
-
-    {
-        ws.time_report_mutex.lock(io) catch return;
-        defer ws.time_report_mutex.unlock(io);
-        assert(ws.time_report_msgs[step_idx].len == 0);
-        ws.time_report_msgs[step_idx] = buf;
-        ws.time_report_update_times[step_idx] = ws.now();
-    }
-    ws.notifyUpdate();
-}
-
-const RunnerRequest = union(enum) {
-    rebuild,
-};
-pub fn getRunnerRequest(ws: *WebServer) ?RunnerRequest {
-    const io = ws.graph.io;
-    ws.runner_request_mutex.lock(io) catch return;
-    defer ws.runner_request_mutex.unlock(io);
-    if (ws.runner_request) |req| {
-        ws.runner_request = null;
-        ws.runner_request_empty_cond.signal();
-        return req;
-    }
-    return null;
-}
-pub fn wait(ws: *WebServer) Io.Cancelable!RunnerRequest {
-    const io = ws.graph.io;
-    try ws.runner_request_mutex.lock(io);
-    defer ws.runner_request_mutex.unlock(io);
-    while (true) {
-        if (ws.runner_request) |req| {
-            ws.runner_request = null;
-            ws.runner_request_empty_cond.signal(io);
-            return req;
-        }
-        try ws.runner_request_ready_cond.wait(io, &amp;ws.runner_request_mutex);
-    }
-}
-
-const cache_control_header: http.Header = .{
-    .name = "Cache-Control",
-    .value = "max-age=0, must-revalidate",
-};
-
-const builtin = @import("builtin");
-
-const std = @import("std");
-const Io = std.Io;
-const net = std.Io.net;
-const assert = std.debug.assert;
-const mem = std.mem;
-const log = std.log.scoped(.web_server);
-const Allocator = std.mem.Allocator;
-const Build = std.Build;
-const Cache = Build.Cache;
-const Fuzz = Build.Fuzz;
-const abi = Build.abi;
-const http = std.http;
-
-const WebServer = @This();</pre>
+    <pre><a id="L1"></a>gpa: Allocator,
+<a id="L2"></a>graph: *const Build.Graph,
+<a id="L3"></a>all_steps: []const *Build.Step,
+<a id="L4"></a>listen_address: net.IpAddress,
+<a id="L5"></a>root_prog_node: std.Progress.Node,
+<a id="L6"></a>watch: bool,
+<a id="L7"></a>
+<a id="L8"></a>tcp_server: ?net.Server,
+<a id="L9"></a>serve_task: ?Io.Future(Io.Cancelable!void),
+<a id="L10"></a>
+<a id="L11"></a>/// Uses `Io.Clock.awake`.
+<a id="L12"></a>base_timestamp: Io.Timestamp,
+<a id="L13"></a>/// The "step name" data which trails `abi.Hello`, for the steps in `all_steps`.
+<a id="L14"></a>step_names_trailing: []u8,
+<a id="L15"></a>
+<a id="L16"></a>/// The bit-packed "step status" data. Values are `abi.StepUpdate.Status`. LSBs are earlier steps.
+<a id="L17"></a>/// Accessed atomically.
+<a id="L18"></a>step_status_bits: []u8,
+<a id="L19"></a>
+<a id="L20"></a>fuzz: ?Fuzz,
+<a id="L21"></a>time_report_mutex: Io.Mutex,
+<a id="L22"></a>time_report_msgs: [][]u8,
+<a id="L23"></a>time_report_update_times: []i64,
+<a id="L24"></a>
+<a id="L25"></a>build_status: std.atomic.Value(abi.BuildStatus),
+<a id="L26"></a>/// When an event occurs which means WebSocket clients should be sent updates, call `notifyUpdate`
+<a id="L27"></a>/// to increment this value. Each client thread waits for this increment with `Io.futexWaitTimeout`, so
+<a id="L28"></a>/// `notifyUpdate` will wake those threads. Updates are sent on a short interval regardless, so it
+<a id="L29"></a>/// is recommended to only use `notifyUpdate` for changes which the user should see immediately. For
+<a id="L30"></a>/// instance, we do not call `notifyUpdate` when the number of "unique runs" in the fuzzer changes,
+<a id="L31"></a>/// because this value changes quickly so this would result in constantly spamming all clients with
+<a id="L32"></a>/// an unreasonable number of packets.
+<a id="L33"></a>update_id: std.atomic.Value(u32),
+<a id="L34"></a>
+<a id="L35"></a>runner_request_mutex: Io.Mutex,
+<a id="L36"></a>runner_request_ready_cond: Io.Condition,
+<a id="L37"></a>runner_request_empty_cond: Io.Condition,
+<a id="L38"></a>runner_request: ?RunnerRequest,
+<a id="L39"></a>
+<a id="L40"></a>/// If a client is not explicitly notified of changes with `notifyUpdate`, it will be sent updates
+<a id="L41"></a>/// on a fixed interval of this many milliseconds.
+<a id="L42"></a>const default_update_interval_ms = 500;
+<a id="L43"></a>
+<a id="L44"></a>pub const base_clock: Io.Clock = .awake;
+<a id="L45"></a>
+<a id="L46"></a>/// Thread-safe. Triggers updates to be sent to connected WebSocket clients; see `update_id`.
+<a id="L47"></a>pub fn notifyUpdate(ws: *WebServer) void {
+<a id="L48"></a>    _ = ws.update_id.rmw(.Add, 1, .release);
+<a id="L49"></a>    ws.graph.io.futexWake(u32, &amp;ws.update_id.raw, 16);
+<a id="L50"></a>}
+<a id="L51"></a>
+<a id="L52"></a>pub const Options = struct {
+<a id="L53"></a>    gpa: Allocator,
+<a id="L54"></a>    graph: *const std.Build.Graph,
+<a id="L55"></a>    all_steps: []const *Build.Step,
+<a id="L56"></a>    root_prog_node: std.Progress.Node,
+<a id="L57"></a>    watch: bool,
+<a id="L58"></a>    listen_address: net.IpAddress,
+<a id="L59"></a>    base_timestamp: Io.Clock.Timestamp,
+<a id="L60"></a>};
+<a id="L61"></a>pub fn init(opts: Options) WebServer {
+<a id="L62"></a>    // The upcoming `Io` interface should allow us to use `Io.async` and `Io.concurrent`
+<a id="L63"></a>    // instead of threads, so that the web server can function in single-threaded builds.
+<a id="L64"></a>    comptime assert(!builtin.single_threaded);
+<a id="L65"></a>    assert(opts.base_timestamp.clock == base_clock);
+<a id="L66"></a>
+<a id="L67"></a>    const all_steps = opts.all_steps;
+<a id="L68"></a>
+<a id="L69"></a>    const step_names_trailing = opts.gpa.alloc(u8, len: {
+<a id="L70"></a>        var name_bytes: usize = 0;
+<a id="L71"></a>        for (all_steps) |step| name_bytes += step.name.len;
+<a id="L72"></a>        break :len name_bytes + all_steps.len * 4;
+<a id="L73"></a>    }) catch @panic("out of memory");
+<a id="L74"></a>    {
+<a id="L75"></a>        const step_name_lens: []align(1) u32 = @ptrCast(step_names_trailing[0 .. all_steps.len * 4]);
+<a id="L76"></a>        var idx: usize = all_steps.len * 4;
+<a id="L77"></a>        for (all_steps, step_name_lens) |step, *name_len| {
+<a id="L78"></a>            name_len.* = @intCast(step.name.len);
+<a id="L79"></a>            @memcpy(step_names_trailing[idx..][0..step.name.len], step.name);
+<a id="L80"></a>            idx += step.name.len;
+<a id="L81"></a>        }
+<a id="L82"></a>        assert(idx == step_names_trailing.len);
+<a id="L83"></a>    }
+<a id="L84"></a>
+<a id="L85"></a>    const step_status_bits = opts.gpa.alloc(
+<a id="L86"></a>        u8,
+<a id="L87"></a>        std.math.divCeil(usize, all_steps.len, 4) catch unreachable,
+<a id="L88"></a>    ) catch @panic("out of memory");
+<a id="L89"></a>    @memset(step_status_bits, 0);
+<a id="L90"></a>
+<a id="L91"></a>    const time_reports_len: usize = if (opts.graph.time_report) all_steps.len else 0;
+<a id="L92"></a>    const time_report_msgs = opts.gpa.alloc([]u8, time_reports_len) catch @panic("out of memory");
+<a id="L93"></a>    const time_report_update_times = opts.gpa.alloc(i64, time_reports_len) catch @panic("out of memory");
+<a id="L94"></a>    @memset(time_report_msgs, &amp;.{});
+<a id="L95"></a>    @memset(time_report_update_times, std.math.minInt(i64));
+<a id="L96"></a>
+<a id="L97"></a>    return .{
+<a id="L98"></a>        .gpa = opts.gpa,
+<a id="L99"></a>        .graph = opts.graph,
+<a id="L100"></a>        .all_steps = all_steps,
+<a id="L101"></a>        .listen_address = opts.listen_address,
+<a id="L102"></a>        .root_prog_node = opts.root_prog_node,
+<a id="L103"></a>        .watch = opts.watch,
+<a id="L104"></a>
+<a id="L105"></a>        .tcp_server = null,
+<a id="L106"></a>        .serve_task = null,
+<a id="L107"></a>
+<a id="L108"></a>        .base_timestamp = opts.base_timestamp.raw,
+<a id="L109"></a>        .step_names_trailing = step_names_trailing,
+<a id="L110"></a>
+<a id="L111"></a>        .step_status_bits = step_status_bits,
+<a id="L112"></a>
+<a id="L113"></a>        .fuzz = null,
+<a id="L114"></a>        .time_report_mutex = .init,
+<a id="L115"></a>        .time_report_msgs = time_report_msgs,
+<a id="L116"></a>        .time_report_update_times = time_report_update_times,
+<a id="L117"></a>
+<a id="L118"></a>        .build_status = .init(.idle),
+<a id="L119"></a>        .update_id = .init(0),
+<a id="L120"></a>
+<a id="L121"></a>        .runner_request_mutex = .init,
+<a id="L122"></a>        .runner_request_ready_cond = .init,
+<a id="L123"></a>        .runner_request_empty_cond = .init,
+<a id="L124"></a>        .runner_request = null,
+<a id="L125"></a>    };
+<a id="L126"></a>}
+<a id="L127"></a>pub fn deinit(ws: *WebServer) void {
+<a id="L128"></a>    const gpa = ws.gpa;
+<a id="L129"></a>    const io = ws.graph.io;
+<a id="L130"></a>
+<a id="L131"></a>    gpa.free(ws.step_names_trailing);
+<a id="L132"></a>    gpa.free(ws.step_status_bits);
+<a id="L133"></a>
+<a id="L134"></a>    if (ws.fuzz) |*f| f.deinit();
+<a id="L135"></a>    for (ws.time_report_msgs) |msg| gpa.free(msg);
+<a id="L136"></a>    gpa.free(ws.time_report_msgs);
+<a id="L137"></a>    gpa.free(ws.time_report_update_times);
+<a id="L138"></a>
+<a id="L139"></a>    if (ws.serve_task) |t| {
+<a id="L140"></a>        if (ws.tcp_server) |*s| s.stream.close(io);
+<a id="L141"></a>        t.await();
+<a id="L142"></a>    }
+<a id="L143"></a>    if (ws.tcp_server) |*s| s.deinit();
+<a id="L144"></a>
+<a id="L145"></a>    gpa.free(ws.step_names_trailing);
+<a id="L146"></a>}
+<a id="L147"></a>pub fn start(ws: *WebServer) error{AlreadyReported}!void {
+<a id="L148"></a>    assert(ws.tcp_server == null);
+<a id="L149"></a>    assert(ws.serve_task == null);
+<a id="L150"></a>    const io = ws.graph.io;
+<a id="L151"></a>
+<a id="L152"></a>    ws.tcp_server = ws.listen_address.listen(io, .{ .reuse_address = true }) catch |err| {
+<a id="L153"></a>        log.err("failed to listen to port {d}: {t}", .{ ws.listen_address.getPort(), err });
+<a id="L154"></a>        return error.AlreadyReported;
+<a id="L155"></a>    };
+<a id="L156"></a>    ws.serve_task = io.concurrent(serve, .{ws}) catch |err| {
+<a id="L157"></a>        log.err("unable to spawn web server thread: {t}", .{err});
+<a id="L158"></a>        ws.tcp_server.?.deinit(io);
+<a id="L159"></a>        ws.tcp_server = null;
+<a id="L160"></a>        return error.AlreadyReported;
+<a id="L161"></a>    };
+<a id="L162"></a>
+<a id="L163"></a>    log.info("web interface listening at http://{f}/", .{ws.tcp_server.?.socket.address});
+<a id="L164"></a>    if (ws.listen_address.getPort() == 0) {
+<a id="L165"></a>        log.info("hint: pass '--webui={f}' to use the same port next time", .{ws.tcp_server.?.socket.address});
+<a id="L166"></a>    }
+<a id="L167"></a>}
+<a id="L168"></a>fn serve(ws: *WebServer) Io.Cancelable!void {
+<a id="L169"></a>    const io = ws.graph.io;
+<a id="L170"></a>    var group: Io.Group = .init;
+<a id="L171"></a>    defer group.cancel(io);
+<a id="L172"></a>    while (true) {
+<a id="L173"></a>        var stream = ws.tcp_server.?.accept(io) catch |err| switch (err) {
+<a id="L174"></a>            error.Canceled =&gt; |e| return e,
+<a id="L175"></a>            else =&gt; |e| {
+<a id="L176"></a>                log.err("failed to accept connection: {t}", .{e});
+<a id="L177"></a>                return;
+<a id="L178"></a>            },
+<a id="L179"></a>        };
+<a id="L180"></a>        group.concurrent(io, accept, .{ ws, stream }) catch |err| {
+<a id="L181"></a>            log.err("unable to spawn connection thread: {t}", .{err});
+<a id="L182"></a>            stream.close(io);
+<a id="L183"></a>            continue;
+<a id="L184"></a>        };
+<a id="L185"></a>    }
+<a id="L186"></a>}
+<a id="L187"></a>
+<a id="L188"></a>pub fn startBuild(ws: *WebServer) void {
+<a id="L189"></a>    if (ws.fuzz) |*fuzz| {
+<a id="L190"></a>        fuzz.deinit();
+<a id="L191"></a>        ws.fuzz = null;
+<a id="L192"></a>    }
+<a id="L193"></a>    for (ws.step_status_bits) |*bits| @atomicStore(u8, bits, 0, .monotonic);
+<a id="L194"></a>    ws.build_status.store(.running, .monotonic);
+<a id="L195"></a>    ws.notifyUpdate();
+<a id="L196"></a>}
+<a id="L197"></a>
+<a id="L198"></a>pub fn updateStepStatus(ws: *WebServer, step: *Build.Step, new_status: abi.StepUpdate.Status) void {
+<a id="L199"></a>    const step_idx: u32 = for (ws.all_steps, 0..) |s, i| {
+<a id="L200"></a>        if (s == step) break @intCast(i);
+<a id="L201"></a>    } else unreachable;
+<a id="L202"></a>    const ptr = &amp;ws.step_status_bits[step_idx / 4];
+<a id="L203"></a>    const bit_offset: u3 = @intCast((step_idx % 4) * 2);
+<a id="L204"></a>    const old_bits: u2 = @truncate(@atomicLoad(u8, ptr, .monotonic) &gt;&gt; bit_offset);
+<a id="L205"></a>    const mask = @as(u8, @intFromEnum(new_status) ^ old_bits) &lt;&lt; bit_offset;
+<a id="L206"></a>    _ = @atomicRmw(u8, ptr, .Xor, mask, .monotonic);
+<a id="L207"></a>    ws.notifyUpdate();
+<a id="L208"></a>}
+<a id="L209"></a>
+<a id="L210"></a>pub fn finishBuild(ws: *WebServer, opts: struct {
+<a id="L211"></a>    fuzz: bool,
+<a id="L212"></a>}) void {
+<a id="L213"></a>    if (opts.fuzz) {
+<a id="L214"></a>        switch (builtin.os.tag) {
+<a id="L215"></a>            // Current implementation depends on two things that need to be ported to Windows:
+<a id="L216"></a>            // * Memory-mapping to share data between the fuzzer and build runner.
+<a id="L217"></a>            // * COFF/PE support added to `std.debug.Info` (it needs a batching API for resolving
+<a id="L218"></a>            //   many addresses to source locations).
+<a id="L219"></a>            .windows =&gt; std.process.fatal("--fuzz not yet implemented for {s}", .{@tagName(builtin.os.tag)}),
+<a id="L220"></a>            else =&gt; {},
+<a id="L221"></a>        }
+<a id="L222"></a>        if (@bitSizeOf(usize) != 64) {
+<a id="L223"></a>            // Current implementation depends on posix.mmap()'s second
+<a id="L224"></a>            // parameter, `length: usize`, being compatible with file system's
+<a id="L225"></a>            // u64 return value. This is not the case on 32-bit platforms.
+<a id="L226"></a>            // Affects or affected by issues #5185, #22523, and #22464.
+<a id="L227"></a>            std.process.fatal("--fuzz not yet implemented on {d}-bit platforms", .{@bitSizeOf(usize)});
+<a id="L228"></a>        }
+<a id="L229"></a>
+<a id="L230"></a>        assert(ws.fuzz == null);
+<a id="L231"></a>
+<a id="L232"></a>        ws.build_status.store(.fuzz_init, .monotonic);
+<a id="L233"></a>        ws.notifyUpdate();
+<a id="L234"></a>
+<a id="L235"></a>        ws.fuzz = Fuzz.init(
+<a id="L236"></a>            ws.gpa,
+<a id="L237"></a>            ws.graph.io,
+<a id="L238"></a>            ws.all_steps,
+<a id="L239"></a>            ws.root_prog_node,
+<a id="L240"></a>            .{ .forever = .{ .ws = ws } },
+<a id="L241"></a>        ) catch |err| std.process.fatal("failed to start fuzzer: {s}", .{@errorName(err)});
+<a id="L242"></a>        ws.fuzz.?.start();
+<a id="L243"></a>    }
+<a id="L244"></a>
+<a id="L245"></a>    ws.build_status.store(if (ws.watch) .watching else .idle, .monotonic);
+<a id="L246"></a>    ws.notifyUpdate();
+<a id="L247"></a>}
+<a id="L248"></a>
+<a id="L249"></a>pub fn now(s: *const WebServer) i64 {
+<a id="L250"></a>    const io = s.graph.io;
+<a id="L251"></a>    const ts = base_clock.now(io);
+<a id="L252"></a>    return @intCast(s.base_timestamp.durationTo(ts).toNanoseconds());
+<a id="L253"></a>}
+<a id="L254"></a>
+<a id="L255"></a>fn accept(ws: *WebServer, stream: net.Stream) void {
+<a id="L256"></a>    const io = ws.graph.io;
+<a id="L257"></a>    defer {
+<a id="L258"></a>        // `net.Stream.close` wants to helpfully overwrite `stream` with
+<a id="L259"></a>        // `undefined`, but it cannot do so since it is an immutable parameter.
+<a id="L260"></a>        var copy = stream;
+<a id="L261"></a>        copy.close(io);
+<a id="L262"></a>    }
+<a id="L263"></a>    var send_buffer: [4096]u8 = undefined;
+<a id="L264"></a>    var recv_buffer: [4096]u8 = undefined;
+<a id="L265"></a>    var connection_reader = stream.reader(io, &amp;recv_buffer);
+<a id="L266"></a>    var connection_writer = stream.writer(io, &amp;send_buffer);
+<a id="L267"></a>    var server: http.Server = .init(&amp;connection_reader.interface, &amp;connection_writer.interface);
+<a id="L268"></a>
+<a id="L269"></a>    while (true) {
+<a id="L270"></a>        var request = server.receiveHead() catch |err| switch (err) {
+<a id="L271"></a>            error.HttpConnectionClosing =&gt; return,
+<a id="L272"></a>            else =&gt; return log.err("failed to receive http request: {t}", .{err}),
+<a id="L273"></a>        };
+<a id="L274"></a>        switch (request.upgradeRequested()) {
+<a id="L275"></a>            .websocket =&gt; |opt_key| {
+<a id="L276"></a>                const key = opt_key orelse return log.err("missing websocket key", .{});
+<a id="L277"></a>                var web_socket = request.respondWebSocket(.{ .key = key }) catch {
+<a id="L278"></a>                    return log.err("failed to respond web socket: {t}", .{connection_writer.err.?});
+<a id="L279"></a>                };
+<a id="L280"></a>                ws.serveWebSocket(&amp;web_socket) catch |err| {
+<a id="L281"></a>                    log.err("failed to serve websocket: {t}", .{err});
+<a id="L282"></a>                    return;
+<a id="L283"></a>                };
+<a id="L284"></a>                comptime unreachable;
+<a id="L285"></a>            },
+<a id="L286"></a>            .other =&gt; |name| return log.err("unknown upgrade request: {s}", .{name}),
+<a id="L287"></a>            .none =&gt; {
+<a id="L288"></a>                ws.serveRequest(&amp;request) catch |err| switch (err) {
+<a id="L289"></a>                    error.AlreadyReported =&gt; return,
+<a id="L290"></a>                    else =&gt; {
+<a id="L291"></a>                        log.err("failed to serve '{s}': {t}", .{ request.head.target, err });
+<a id="L292"></a>                        return;
+<a id="L293"></a>                    },
+<a id="L294"></a>                };
+<a id="L295"></a>            },
+<a id="L296"></a>        }
+<a id="L297"></a>    }
+<a id="L298"></a>}
+<a id="L299"></a>
+<a id="L300"></a>fn serveWebSocket(ws: *WebServer, sock: *http.Server.WebSocket) !noreturn {
+<a id="L301"></a>    const io = ws.graph.io;
+<a id="L302"></a>
+<a id="L303"></a>    var prev_build_status = ws.build_status.load(.monotonic);
+<a id="L304"></a>
+<a id="L305"></a>    const prev_step_status_bits = try ws.gpa.alloc(u8, ws.step_status_bits.len);
+<a id="L306"></a>    defer ws.gpa.free(prev_step_status_bits);
+<a id="L307"></a>    for (prev_step_status_bits, ws.step_status_bits) |*copy, *shared| {
+<a id="L308"></a>        copy.* = @atomicLoad(u8, shared, .monotonic);
+<a id="L309"></a>    }
+<a id="L310"></a>
+<a id="L311"></a>    var recv_thread = try io.concurrent(recvWebSocketMessages, .{ ws, sock });
+<a id="L312"></a>    defer recv_thread.cancel(io);
+<a id="L313"></a>
+<a id="L314"></a>    {
+<a id="L315"></a>        const hello_header: abi.Hello = .{
+<a id="L316"></a>            .status = prev_build_status,
+<a id="L317"></a>            .flags = .{
+<a id="L318"></a>                .time_report = ws.graph.time_report,
+<a id="L319"></a>            },
+<a id="L320"></a>            .timestamp = ws.now(),
+<a id="L321"></a>            .steps_len = @intCast(ws.all_steps.len),
+<a id="L322"></a>        };
+<a id="L323"></a>        var bufs: [3][]const u8 = .{ @ptrCast(&amp;hello_header), ws.step_names_trailing, prev_step_status_bits };
+<a id="L324"></a>        try sock.writeMessageVec(&amp;bufs, .binary);
+<a id="L325"></a>    }
+<a id="L326"></a>
+<a id="L327"></a>    var prev_fuzz: Fuzz.Previous = .init;
+<a id="L328"></a>    var prev_time: i64 = std.math.minInt(i64);
+<a id="L329"></a>    while (true) {
+<a id="L330"></a>        const start_time = ws.now();
+<a id="L331"></a>        const start_update_id = ws.update_id.load(.acquire);
+<a id="L332"></a>
+<a id="L333"></a>        if (ws.fuzz) |*fuzz| {
+<a id="L334"></a>            try fuzz.sendUpdate(sock, &amp;prev_fuzz);
+<a id="L335"></a>        }
+<a id="L336"></a>
+<a id="L337"></a>        {
+<a id="L338"></a>            try ws.time_report_mutex.lock(io);
+<a id="L339"></a>            defer ws.time_report_mutex.unlock(io);
+<a id="L340"></a>            for (ws.time_report_msgs, ws.time_report_update_times) |msg, update_time| {
+<a id="L341"></a>                if (update_time &lt;= prev_time) continue;
+<a id="L342"></a>                // We want to send `msg`, but shouldn't block `ws.time_report_mutex` while we do, so
+<a id="L343"></a>                // that we don't hold up the build system on the client accepting this packet.
+<a id="L344"></a>                const owned_msg = try ws.gpa.dupe(u8, msg);
+<a id="L345"></a>                defer ws.gpa.free(owned_msg);
+<a id="L346"></a>                // Temporarily unlock, then re-lock after the message is sent.
+<a id="L347"></a>                ws.time_report_mutex.unlock(io);
+<a id="L348"></a>                defer ws.time_report_mutex.lockUncancelable(io);
+<a id="L349"></a>                try sock.writeMessage(owned_msg, .binary);
+<a id="L350"></a>            }
+<a id="L351"></a>        }
+<a id="L352"></a>
+<a id="L353"></a>        {
+<a id="L354"></a>            const build_status = ws.build_status.load(.monotonic);
+<a id="L355"></a>            if (build_status != prev_build_status) {
+<a id="L356"></a>                prev_build_status = build_status;
+<a id="L357"></a>                const msg: abi.StatusUpdate = .{ .new = build_status };
+<a id="L358"></a>                try sock.writeMessage(@ptrCast(&amp;msg), .binary);
+<a id="L359"></a>            }
+<a id="L360"></a>        }
+<a id="L361"></a>
+<a id="L362"></a>        for (prev_step_status_bits, ws.step_status_bits, 0..) |*prev_byte, *shared, byte_idx| {
+<a id="L363"></a>            const cur_byte = @atomicLoad(u8, shared, .monotonic);
+<a id="L364"></a>            if (prev_byte.* == cur_byte) continue;
+<a id="L365"></a>            const cur: [4]abi.StepUpdate.Status = .{
+<a id="L366"></a>                @enumFromInt(@as(u2, @truncate(cur_byte &gt;&gt; 0))),
+<a id="L367"></a>                @enumFromInt(@as(u2, @truncate(cur_byte &gt;&gt; 2))),
+<a id="L368"></a>                @enumFromInt(@as(u2, @truncate(cur_byte &gt;&gt; 4))),
+<a id="L369"></a>                @enumFromInt(@as(u2, @truncate(cur_byte &gt;&gt; 6))),
+<a id="L370"></a>            };
+<a id="L371"></a>            const prev: [4]abi.StepUpdate.Status = .{
+<a id="L372"></a>                @enumFromInt(@as(u2, @truncate(prev_byte.* &gt;&gt; 0))),
+<a id="L373"></a>                @enumFromInt(@as(u2, @truncate(prev_byte.* &gt;&gt; 2))),
+<a id="L374"></a>                @enumFromInt(@as(u2, @truncate(prev_byte.* &gt;&gt; 4))),
+<a id="L375"></a>                @enumFromInt(@as(u2, @truncate(prev_byte.* &gt;&gt; 6))),
+<a id="L376"></a>            };
+<a id="L377"></a>            for (cur, prev, byte_idx * 4..) |cur_status, prev_status, step_idx| {
+<a id="L378"></a>                const msg: abi.StepUpdate = .{ .step_idx = @intCast(step_idx), .bits = .{ .status = cur_status } };
+<a id="L379"></a>                if (cur_status != prev_status) try sock.writeMessage(@ptrCast(&amp;msg), .binary);
+<a id="L380"></a>            }
+<a id="L381"></a>            prev_byte.* = cur_byte;
+<a id="L382"></a>        }
+<a id="L383"></a>
+<a id="L384"></a>        prev_time = start_time;
+<a id="L385"></a>
+<a id="L386"></a>        const old_cp = io.swapCancelProtection(.blocked);
+<a id="L387"></a>        defer _ = io.swapCancelProtection(old_cp);
+<a id="L388"></a>        io.futexWaitTimeout(
+<a id="L389"></a>            u32,
+<a id="L390"></a>            &amp;ws.update_id.raw,
+<a id="L391"></a>            start_update_id,
+<a id="L392"></a>            .{ .duration = .{
+<a id="L393"></a>                .clock = .awake,
+<a id="L394"></a>                .raw = .fromMilliseconds(default_update_interval_ms),
+<a id="L395"></a>            } },
+<a id="L396"></a>        ) catch |err| switch (err) {
+<a id="L397"></a>            error.Canceled =&gt; unreachable,
+<a id="L398"></a>        };
+<a id="L399"></a>    }
+<a id="L400"></a>}
+<a id="L401"></a>fn recvWebSocketMessages(ws: *WebServer, sock: *http.Server.WebSocket) void {
+<a id="L402"></a>    const io = ws.graph.io;
+<a id="L403"></a>
+<a id="L404"></a>    while (true) {
+<a id="L405"></a>        const msg = sock.readSmallMessage() catch return;
+<a id="L406"></a>        if (msg.opcode != .binary) continue;
+<a id="L407"></a>        if (msg.data.len == 0) continue;
+<a id="L408"></a>        const tag: abi.ToServerTag = @enumFromInt(msg.data[0]);
+<a id="L409"></a>        switch (tag) {
+<a id="L410"></a>            _ =&gt; continue,
+<a id="L411"></a>            .rebuild =&gt; while (true) {
+<a id="L412"></a>                ws.runner_request_mutex.lock(io) catch |err| switch (err) {
+<a id="L413"></a>                    error.Canceled =&gt; return,
+<a id="L414"></a>                };
+<a id="L415"></a>                defer ws.runner_request_mutex.unlock(io);
+<a id="L416"></a>                if (ws.runner_request == null) {
+<a id="L417"></a>                    ws.runner_request = .rebuild;
+<a id="L418"></a>                    ws.runner_request_ready_cond.signal(io);
+<a id="L419"></a>                    break;
+<a id="L420"></a>                }
+<a id="L421"></a>                ws.runner_request_empty_cond.wait(io, &amp;ws.runner_request_mutex) catch return;
+<a id="L422"></a>            },
+<a id="L423"></a>        }
+<a id="L424"></a>    }
+<a id="L425"></a>}
+<a id="L426"></a>
+<a id="L427"></a>fn serveRequest(ws: *WebServer, req: *http.Server.Request) !void {
+<a id="L428"></a>    // Strip an optional leading '/debug' component from the request.
+<a id="L429"></a>    const target: []const u8, const debug: bool = target: {
+<a id="L430"></a>        if (mem.eql(u8, req.head.target, "/debug")) break :target .{ "/", true };
+<a id="L431"></a>        if (mem.eql(u8, req.head.target, "/debug/")) break :target .{ "/", true };
+<a id="L432"></a>        if (mem.startsWith(u8, req.head.target, "/debug/")) break :target .{ req.head.target["/debug".len..], true };
+<a id="L433"></a>        break :target .{ req.head.target, false };
+<a id="L434"></a>    };
+<a id="L435"></a>
+<a id="L436"></a>    if (mem.eql(u8, target, "/")) return serveLibFile(ws, req, "build-web/index.html", "text/html");
+<a id="L437"></a>    if (mem.eql(u8, target, "/main.js")) return serveLibFile(ws, req, "build-web/main.js", "application/javascript");
+<a id="L438"></a>    if (mem.eql(u8, target, "/style.css")) return serveLibFile(ws, req, "build-web/style.css", "text/css");
+<a id="L439"></a>    if (mem.eql(u8, target, "/time_report.css")) return serveLibFile(ws, req, "build-web/time_report.css", "text/css");
+<a id="L440"></a>    if (mem.eql(u8, target, "/main.wasm")) return serveClientWasm(ws, req, if (debug) .Debug else .ReleaseFast);
+<a id="L441"></a>
+<a id="L442"></a>    if (ws.fuzz) |*fuzz| {
+<a id="L443"></a>        if (mem.eql(u8, target, "/sources.tar")) return fuzz.serveSourcesTar(req);
+<a id="L444"></a>    }
+<a id="L445"></a>
+<a id="L446"></a>    try req.respond("not found", .{
+<a id="L447"></a>        .status = .not_found,
+<a id="L448"></a>        .extra_headers = &amp;.{
+<a id="L449"></a>            .{ .name = "Content-Type", .value = "text/plain" },
+<a id="L450"></a>        },
+<a id="L451"></a>    });
+<a id="L452"></a>}
+<a id="L453"></a>
+<a id="L454"></a>fn serveLibFile(
+<a id="L455"></a>    ws: *WebServer,
+<a id="L456"></a>    request: *http.Server.Request,
+<a id="L457"></a>    sub_path: []const u8,
+<a id="L458"></a>    content_type: []const u8,
+<a id="L459"></a>) !void {
+<a id="L460"></a>    return serveFile(ws, request, .{
+<a id="L461"></a>        .root_dir = ws.graph.zig_lib_directory,
+<a id="L462"></a>        .sub_path = sub_path,
+<a id="L463"></a>    }, content_type);
+<a id="L464"></a>}
+<a id="L465"></a>fn serveClientWasm(
+<a id="L466"></a>    ws: *WebServer,
+<a id="L467"></a>    req: *http.Server.Request,
+<a id="L468"></a>    optimize_mode: std.builtin.OptimizeMode,
+<a id="L469"></a>) !void {
+<a id="L470"></a>    var arena_state: std.heap.ArenaAllocator = .init(ws.gpa);
+<a id="L471"></a>    defer arena_state.deinit();
+<a id="L472"></a>    const arena = arena_state.allocator();
+<a id="L473"></a>
+<a id="L474"></a>    // We always rebuild the wasm on-the-fly, so that if it is edited the user can just refresh the page.
+<a id="L475"></a>    const bin_path = try buildClientWasm(ws, arena, optimize_mode);
+<a id="L476"></a>    return serveFile(ws, req, bin_path, "application/wasm");
+<a id="L477"></a>}
+<a id="L478"></a>
+<a id="L479"></a>pub fn serveFile(
+<a id="L480"></a>    ws: *WebServer,
+<a id="L481"></a>    request: *http.Server.Request,
+<a id="L482"></a>    path: Cache.Path,
+<a id="L483"></a>    content_type: []const u8,
+<a id="L484"></a>) !void {
+<a id="L485"></a>    const gpa = ws.gpa;
+<a id="L486"></a>    const io = ws.graph.io;
+<a id="L487"></a>    // The desired API is actually sendfile, which will require enhancing http.Server.
+<a id="L488"></a>    // We load the file with every request so that the user can make changes to the file
+<a id="L489"></a>    // and refresh the HTML page without restarting this server.
+<a id="L490"></a>    const file_contents = path.root_dir.handle.readFileAlloc(io, path.sub_path, gpa, .limited(10 * 1024 * 1024)) catch |err| {
+<a id="L491"></a>        log.err("failed to read '{f}': {t}", .{ path, err });
+<a id="L492"></a>        return error.AlreadyReported;
+<a id="L493"></a>    };
+<a id="L494"></a>    defer gpa.free(file_contents);
+<a id="L495"></a>    try request.respond(file_contents, .{
+<a id="L496"></a>        .extra_headers = &amp;.{
+<a id="L497"></a>            .{ .name = "Content-Type", .value = content_type },
+<a id="L498"></a>            cache_control_header,
+<a id="L499"></a>        },
+<a id="L500"></a>    });
+<a id="L501"></a>}
+<a id="L502"></a>pub fn serveTarFile(ws: *WebServer, request: *http.Server.Request, paths: []const Cache.Path) !void {
+<a id="L503"></a>    const graph = ws.graph;
+<a id="L504"></a>    const io = graph.io;
+<a id="L505"></a>
+<a id="L506"></a>    var send_buffer: [0x4000]u8 = undefined;
+<a id="L507"></a>    var response = try request.respondStreaming(&amp;send_buffer, .{
+<a id="L508"></a>        .respond_options = .{
+<a id="L509"></a>            .extra_headers = &amp;.{
+<a id="L510"></a>                .{ .name = "Content-Type", .value = "application/x-tar" },
+<a id="L511"></a>                cache_control_header,
+<a id="L512"></a>            },
+<a id="L513"></a>        },
+<a id="L514"></a>    });
+<a id="L515"></a>
+<a id="L516"></a>    var archiver: std.tar.Writer = .{ .underlying_writer = &amp;response.writer };
+<a id="L517"></a>
+<a id="L518"></a>    for (paths) |path| {
+<a id="L519"></a>        var file = path.root_dir.handle.openFile(io, path.sub_path, .{}) catch |err| {
+<a id="L520"></a>            log.err("failed to open '{f}': {s}", .{ path, @errorName(err) });
+<a id="L521"></a>            continue;
+<a id="L522"></a>        };
+<a id="L523"></a>        defer file.close(io);
+<a id="L524"></a>        const stat = try file.stat(io);
+<a id="L525"></a>        var read_buffer: [1024]u8 = undefined;
+<a id="L526"></a>        var file_reader: Io.File.Reader = .initSize(file, io, &amp;read_buffer, stat.size);
+<a id="L527"></a>
+<a id="L528"></a>        // TODO: this logic is completely bogus -- obviously so, because `path.root_dir.path` can
+<a id="L529"></a>        // be cwd-relative. This is also related to why linkification doesn't work in the fuzzer UI:
+<a id="L530"></a>        // it turns out the WASM treats the first path component as the module name, typically
+<a id="L531"></a>        // resulting in modules named "" and "src". The compiler needs to tell the build system
+<a id="L532"></a>        // about the module graph so that the build system can correctly encode this information in
+<a id="L533"></a>        // the tar file.
+<a id="L534"></a>        //
+<a id="L535"></a>        // Additionally, this needs to ensure that all path separators for both prefix and
+<a id="L536"></a>        // sub_path are using the POSIX-style `/` on platforms that don't use it as their native
+<a id="L537"></a>        // path separator.
+<a id="L538"></a>        archiver.prefix = path.root_dir.path orelse graph.cache.cwd;
+<a id="L539"></a>        try archiver.writeFile(path.sub_path, &amp;file_reader, @intCast(stat.mtime.toSeconds()));
+<a id="L540"></a>    }
+<a id="L541"></a>
+<a id="L542"></a>    // intentionally not calling `archiver.finishPedantically`
+<a id="L543"></a>    try response.end();
+<a id="L544"></a>}
+<a id="L545"></a>
+<a id="L546"></a>fn buildClientWasm(ws: *WebServer, arena: Allocator, optimize: std.builtin.OptimizeMode) !Cache.Path {
+<a id="L547"></a>    const root_name = "build-web";
+<a id="L548"></a>    const arch_os_abi = "wasm32-freestanding";
+<a id="L549"></a>    const cpu_features = "baseline+atomics+bulk_memory+multivalue+mutable_globals+nontrapping_fptoint+reference_types+sign_ext";
+<a id="L550"></a>
+<a id="L551"></a>    const gpa = ws.gpa;
+<a id="L552"></a>    const graph = ws.graph;
+<a id="L553"></a>    const io = graph.io;
+<a id="L554"></a>
+<a id="L555"></a>    const main_src_path: Cache.Path = .{
+<a id="L556"></a>        .root_dir = graph.zig_lib_directory,
+<a id="L557"></a>        .sub_path = "build-web/main.zig",
+<a id="L558"></a>    };
+<a id="L559"></a>    const walk_src_path: Cache.Path = .{
+<a id="L560"></a>        .root_dir = graph.zig_lib_directory,
+<a id="L561"></a>        .sub_path = "docs/wasm/Walk.zig",
+<a id="L562"></a>    };
+<a id="L563"></a>    const html_render_src_path: Cache.Path = .{
+<a id="L564"></a>        .root_dir = graph.zig_lib_directory,
+<a id="L565"></a>        .sub_path = "docs/wasm/html_render.zig",
+<a id="L566"></a>    };
+<a id="L567"></a>
+<a id="L568"></a>    var argv: std.ArrayList([]const u8) = .empty;
+<a id="L569"></a>
+<a id="L570"></a>    try argv.appendSlice(arena, &amp;.{
+<a id="L571"></a>        graph.zig_exe, "build-exe", //
+<a id="L572"></a>        "-fno-entry", //
+<a id="L573"></a>        "-O", @tagName(optimize), //
+<a id="L574"></a>        "-target", arch_os_abi, //
+<a id="L575"></a>        "-mcpu", cpu_features, //
+<a id="L576"></a>        "--cache-dir", graph.global_cache_root.path orelse ".", //
+<a id="L577"></a>        "--global-cache-dir", graph.global_cache_root.path orelse ".", //
+<a id="L578"></a>        "--zig-lib-dir", graph.zig_lib_directory.path orelse ".", //
+<a id="L579"></a>        "--name", root_name, //
+<a id="L580"></a>        "-rdynamic", //
+<a id="L581"></a>        "-fsingle-threaded", //
+<a id="L582"></a>        "--dep", "Walk", //
+<a id="L583"></a>        "--dep", "html_render", //
+<a id="L584"></a>        try std.fmt.allocPrint(arena, "-Mroot={f}", .{main_src_path}), //
+<a id="L585"></a>        try std.fmt.allocPrint(arena, "-MWalk={f}", .{walk_src_path}), //
+<a id="L586"></a>        "--dep", "Walk", //
+<a id="L587"></a>        try std.fmt.allocPrint(arena, "-Mhtml_render={f}", .{html_render_src_path}), //
+<a id="L588"></a>        "--listen=-",
+<a id="L589"></a>    });
+<a id="L590"></a>
+<a id="L591"></a>    var child = try std.process.spawn(io, .{
+<a id="L592"></a>        .argv = argv.items,
+<a id="L593"></a>        .environ_map = &amp;graph.environ_map,
+<a id="L594"></a>        .stdin = .pipe,
+<a id="L595"></a>        .stdout = .pipe,
+<a id="L596"></a>        .stderr = .pipe,
+<a id="L597"></a>    });
+<a id="L598"></a>    defer child.kill(io);
+<a id="L599"></a>
+<a id="L600"></a>    var stderr_task = try io.concurrent(readStreamAlloc, .{ gpa, io, child.stderr.?, .unlimited });
+<a id="L601"></a>    defer if (stderr_task.cancel(io)) |slice| gpa.free(slice) else |_| {};
+<a id="L602"></a>
+<a id="L603"></a>    var stdout_buffer: [512]u8 = undefined;
+<a id="L604"></a>    var stdout_reader: Io.File.Reader = .initStreaming(child.stdout.?, io, &amp;stdout_buffer);
+<a id="L605"></a>    const stdout = &amp;stdout_reader.interface;
+<a id="L606"></a>
+<a id="L607"></a>    {
+<a id="L608"></a>        var w = child.stdin.?.writer(io, &amp;.{});
+<a id="L609"></a>        w.interface.writeStruct(std.zig.Client.Message.Header{ .tag = .update, .bytes_len = 0 }, .little) catch |err| switch (err) {
+<a id="L610"></a>            error.WriteFailed =&gt; return w.err.?,
+<a id="L611"></a>        };
+<a id="L612"></a>        w.interface.writeStruct(std.zig.Client.Message.Header{ .tag = .exit, .bytes_len = 0 }, .little) catch |err| switch (err) {
+<a id="L613"></a>            error.WriteFailed =&gt; return w.err.?,
+<a id="L614"></a>        };
+<a id="L615"></a>    }
+<a id="L616"></a>
+<a id="L617"></a>    const Header = std.zig.Server.Message.Header;
+<a id="L618"></a>
+<a id="L619"></a>    var result: ?Cache.Path = null;
+<a id="L620"></a>    var result_error_bundle = std.zig.ErrorBundle.empty;
+<a id="L621"></a>    var body_buffer: std.ArrayList(u8) = .empty;
+<a id="L622"></a>    defer body_buffer.deinit(gpa);
+<a id="L623"></a>
+<a id="L624"></a>    while (true) {
+<a id="L625"></a>        const header = stdout.takeStruct(Header, .little) catch |e| switch (e) {
+<a id="L626"></a>            error.ReadFailed =&gt; return error.ReadFailed,
+<a id="L627"></a>            error.EndOfStream =&gt; break,
+<a id="L628"></a>        };
+<a id="L629"></a>        body_buffer.clearRetainingCapacity();
+<a id="L630"></a>        try stdout.appendExact(gpa, &amp;body_buffer, header.bytes_len);
+<a id="L631"></a>        const body = body_buffer.items;
+<a id="L632"></a>
+<a id="L633"></a>        switch (header.tag) {
+<a id="L634"></a>            .zig_version =&gt; {
+<a id="L635"></a>                if (!std.mem.eql(u8, builtin.zig_version_string, body)) {
+<a id="L636"></a>                    return error.ZigProtocolVersionMismatch;
+<a id="L637"></a>                }
+<a id="L638"></a>            },
+<a id="L639"></a>            .error_bundle =&gt; {
+<a id="L640"></a>                result_error_bundle = try std.zig.Server.allocErrorBundle(arena, body);
+<a id="L641"></a>            },
+<a id="L642"></a>            .emit_digest =&gt; {
+<a id="L643"></a>                const EmitDigest = std.zig.Server.Message.EmitDigest;
+<a id="L644"></a>                const ebp_hdr: *align(1) const EmitDigest = @ptrCast(body);
+<a id="L645"></a>                if (!ebp_hdr.flags.cache_hit) {
+<a id="L646"></a>                    log.info("source changes detected; rebuilt wasm component", .{});
+<a id="L647"></a>                }
+<a id="L648"></a>                const digest = body[@sizeOf(EmitDigest)..][0..Cache.bin_digest_len];
+<a id="L649"></a>                result = .{
+<a id="L650"></a>                    .root_dir = graph.global_cache_root,
+<a id="L651"></a>                    .sub_path = try arena.dupe(u8, "o" ++ std.fs.path.sep_str ++ Cache.binToHex(digest.*)),
+<a id="L652"></a>                };
+<a id="L653"></a>            },
+<a id="L654"></a>            else =&gt; {}, // ignore other messages
+<a id="L655"></a>        }
+<a id="L656"></a>    }
+<a id="L657"></a>
+<a id="L658"></a>    const stderr_contents = try stderr_task.await(io);
+<a id="L659"></a>    if (stderr_contents.len &gt; 0) {
+<a id="L660"></a>        std.debug.print("{s}", .{stderr_contents});
+<a id="L661"></a>    }
+<a id="L662"></a>
+<a id="L663"></a>    // Send EOF to stdin.
+<a id="L664"></a>    child.stdin.?.close(io);
+<a id="L665"></a>    child.stdin = null;
+<a id="L666"></a>
+<a id="L667"></a>    switch (try child.wait(io)) {
+<a id="L668"></a>        .exited =&gt; |code| {
+<a id="L669"></a>            if (code != 0) {
+<a id="L670"></a>                log.err(
+<a id="L671"></a>                    "the following command exited with error code {d}:\n{s}",
+<a id="L672"></a>                    .{ code, try Build.Step.allocPrintCmd(arena, .inherit, null, argv.items) },
+<a id="L673"></a>                );
+<a id="L674"></a>                return error.WasmCompilationFailed;
+<a id="L675"></a>            }
+<a id="L676"></a>        },
+<a id="L677"></a>        .signal =&gt; |sig| {
+<a id="L678"></a>            log.err(
+<a id="L679"></a>                "the following command terminated with signal {t}:\n{s}",
+<a id="L680"></a>                .{ sig, try Build.Step.allocPrintCmd(arena, .inherit, null, argv.items) },
+<a id="L681"></a>            );
+<a id="L682"></a>            return error.WasmCompilationFailed;
+<a id="L683"></a>        },
+<a id="L684"></a>        .stopped =&gt; |sig| {
+<a id="L685"></a>            log.err(
+<a id="L686"></a>                "the following command stopped unexpectedly with signal {t}:\n{s}",
+<a id="L687"></a>                .{ sig, try Build.Step.allocPrintCmd(arena, .inherit, null, argv.items) },
+<a id="L688"></a>            );
+<a id="L689"></a>            return error.WasmCompilationFailed;
+<a id="L690"></a>        },
+<a id="L691"></a>        .unknown =&gt; {
+<a id="L692"></a>            log.err(
+<a id="L693"></a>                "the following command terminated unexpectedly:\n{s}",
+<a id="L694"></a>                .{try Build.Step.allocPrintCmd(arena, .inherit, null, argv.items)},
+<a id="L695"></a>            );
+<a id="L696"></a>            return error.WasmCompilationFailed;
+<a id="L697"></a>        },
+<a id="L698"></a>    }
+<a id="L699"></a>
+<a id="L700"></a>    if (result_error_bundle.errorMessageCount() &gt; 0) {
+<a id="L701"></a>        try result_error_bundle.renderToStderr(io, .{}, .auto);
+<a id="L702"></a>        log.err("the following command failed with {d} compilation errors:\n{s}", .{
+<a id="L703"></a>            result_error_bundle.errorMessageCount(),
+<a id="L704"></a>            try Build.Step.allocPrintCmd(arena, .inherit, null, argv.items),
+<a id="L705"></a>        });
+<a id="L706"></a>        return error.WasmCompilationFailed;
+<a id="L707"></a>    }
+<a id="L708"></a>
+<a id="L709"></a>    const base_path = result orelse {
+<a id="L710"></a>        log.err("child process failed to report result\n{s}", .{
+<a id="L711"></a>            try Build.Step.allocPrintCmd(arena, .inherit, null, argv.items),
+<a id="L712"></a>        });
+<a id="L713"></a>        return error.WasmCompilationFailed;
+<a id="L714"></a>    };
+<a id="L715"></a>    const bin_name = try std.zig.binNameAlloc(arena, .{
+<a id="L716"></a>        .root_name = root_name,
+<a id="L717"></a>        .target = &amp;(std.zig.system.resolveTargetQuery(io, std.Build.parseTargetQuery(.{
+<a id="L718"></a>            .arch_os_abi = arch_os_abi,
+<a id="L719"></a>            .cpu_features = cpu_features,
+<a id="L720"></a>        }) catch unreachable) catch unreachable),
+<a id="L721"></a>        .output_mode = .Exe,
+<a id="L722"></a>    });
+<a id="L723"></a>    return base_path.join(arena, bin_name);
+<a id="L724"></a>}
+<a id="L725"></a>
+<a id="L726"></a>fn readStreamAlloc(gpa: Allocator, io: Io, file: Io.File, limit: Io.Limit) ![]u8 {
+<a id="L727"></a>    var file_reader: Io.File.Reader = .initStreaming(file, io, &amp;.{});
+<a id="L728"></a>    return file_reader.interface.allocRemaining(gpa, limit) catch |err| switch (err) {
+<a id="L729"></a>        error.ReadFailed =&gt; return file_reader.err.?,
+<a id="L730"></a>        else =&gt; |e| return e,
+<a id="L731"></a>    };
+<a id="L732"></a>}
+<a id="L733"></a>
+<a id="L734"></a>pub fn updateTimeReportCompile(ws: *WebServer, opts: struct {
+<a id="L735"></a>    compile: *Build.Step.Compile,
+<a id="L736"></a>
+<a id="L737"></a>    use_llvm: bool,
+<a id="L738"></a>    stats: abi.time_report.CompileResult.Stats,
+<a id="L739"></a>    ns_total: u64,
+<a id="L740"></a>
+<a id="L741"></a>    llvm_pass_timings_len: u32,
+<a id="L742"></a>    files_len: u32,
+<a id="L743"></a>    decls_len: u32,
+<a id="L744"></a>
+<a id="L745"></a>    /// The trailing data of `abi.time_report.CompileResult`, except the step name.
+<a id="L746"></a>    trailing: []const u8,
+<a id="L747"></a>}) void {
+<a id="L748"></a>    const gpa = ws.gpa;
+<a id="L749"></a>    const io = ws.graph.io;
+<a id="L750"></a>
+<a id="L751"></a>    const step_idx: u32 = for (ws.all_steps, 0..) |s, i| {
+<a id="L752"></a>        if (s == &amp;opts.compile.step) break @intCast(i);
+<a id="L753"></a>    } else unreachable;
+<a id="L754"></a>
+<a id="L755"></a>    const old_buf = old: {
+<a id="L756"></a>        ws.time_report_mutex.lock(io) catch return;
+<a id="L757"></a>        defer ws.time_report_mutex.unlock(io);
+<a id="L758"></a>        const old = ws.time_report_msgs[step_idx];
+<a id="L759"></a>        ws.time_report_msgs[step_idx] = &amp;.{};
+<a id="L760"></a>        break :old old;
+<a id="L761"></a>    };
+<a id="L762"></a>    const buf = gpa.realloc(old_buf, @sizeOf(abi.time_report.CompileResult) + opts.trailing.len) catch @panic("out of memory");
+<a id="L763"></a>
+<a id="L764"></a>    const out_header: *align(1) abi.time_report.CompileResult = @ptrCast(buf[0..@sizeOf(abi.time_report.CompileResult)]);
+<a id="L765"></a>    out_header.* = .{
+<a id="L766"></a>        .step_idx = step_idx,
+<a id="L767"></a>        .flags = .{
+<a id="L768"></a>            .use_llvm = opts.use_llvm,
+<a id="L769"></a>        },
+<a id="L770"></a>        .stats = opts.stats,
+<a id="L771"></a>        .ns_total = opts.ns_total,
+<a id="L772"></a>        .llvm_pass_timings_len = opts.llvm_pass_timings_len,
+<a id="L773"></a>        .files_len = opts.files_len,
+<a id="L774"></a>        .decls_len = opts.decls_len,
+<a id="L775"></a>    };
+<a id="L776"></a>    @memcpy(buf[@sizeOf(abi.time_report.CompileResult)..], opts.trailing);
+<a id="L777"></a>
+<a id="L778"></a>    {
+<a id="L779"></a>        ws.time_report_mutex.lock(io) catch return;
+<a id="L780"></a>        defer ws.time_report_mutex.unlock(io);
+<a id="L781"></a>        assert(ws.time_report_msgs[step_idx].len == 0);
+<a id="L782"></a>        ws.time_report_msgs[step_idx] = buf;
+<a id="L783"></a>        ws.time_report_update_times[step_idx] = ws.now();
+<a id="L784"></a>    }
+<a id="L785"></a>    ws.notifyUpdate();
+<a id="L786"></a>}
+<a id="L787"></a>
+<a id="L788"></a>pub fn updateTimeReportGeneric(ws: *WebServer, step: *Build.Step, duration: Io.Duration) void {
+<a id="L789"></a>    const gpa = ws.gpa;
+<a id="L790"></a>    const io = ws.graph.io;
+<a id="L791"></a>
+<a id="L792"></a>    const step_idx: u32 = for (ws.all_steps, 0..) |s, i| {
+<a id="L793"></a>        if (s == step) break @intCast(i);
+<a id="L794"></a>    } else unreachable;
+<a id="L795"></a>
+<a id="L796"></a>    const old_buf = old: {
+<a id="L797"></a>        ws.time_report_mutex.lock(io) catch return;
+<a id="L798"></a>        defer ws.time_report_mutex.unlock(io);
+<a id="L799"></a>        const old = ws.time_report_msgs[step_idx];
+<a id="L800"></a>        ws.time_report_msgs[step_idx] = &amp;.{};
+<a id="L801"></a>        break :old old;
+<a id="L802"></a>    };
+<a id="L803"></a>    const buf = gpa.realloc(old_buf, @sizeOf(abi.time_report.GenericResult)) catch @panic("out of memory");
+<a id="L804"></a>    const out: *align(1) abi.time_report.GenericResult = @ptrCast(buf);
+<a id="L805"></a>    out.* = .{
+<a id="L806"></a>        .step_idx = step_idx,
+<a id="L807"></a>        .ns_total = @intCast(duration.toNanoseconds()),
+<a id="L808"></a>    };
+<a id="L809"></a>    {
+<a id="L810"></a>        ws.time_report_mutex.lock(io) catch return;
+<a id="L811"></a>        defer ws.time_report_mutex.unlock(io);
+<a id="L812"></a>        assert(ws.time_report_msgs[step_idx].len == 0);
+<a id="L813"></a>        ws.time_report_msgs[step_idx] = buf;
+<a id="L814"></a>        ws.time_report_update_times[step_idx] = ws.now();
+<a id="L815"></a>    }
+<a id="L816"></a>    ws.notifyUpdate();
+<a id="L817"></a>}
+<a id="L818"></a>
+<a id="L819"></a>pub fn updateTimeReportRunTest(
+<a id="L820"></a>    ws: *WebServer,
+<a id="L821"></a>    run: *Build.Step.Run,
+<a id="L822"></a>    tests: *const Build.Step.Run.CachedTestMetadata,
+<a id="L823"></a>    ns_per_test: []const u64,
+<a id="L824"></a>) void {
+<a id="L825"></a>    const gpa = ws.gpa;
+<a id="L826"></a>    const io = ws.graph.io;
+<a id="L827"></a>
+<a id="L828"></a>    const step_idx: u32 = for (ws.all_steps, 0..) |s, i| {
+<a id="L829"></a>        if (s == &amp;run.step) break @intCast(i);
+<a id="L830"></a>    } else unreachable;
+<a id="L831"></a>
+<a id="L832"></a>    assert(tests.names.len == ns_per_test.len);
+<a id="L833"></a>    const tests_len: u32 = @intCast(tests.names.len);
+<a id="L834"></a>
+<a id="L835"></a>    const new_len: u64 = len: {
+<a id="L836"></a>        var names_len: u64 = 0;
+<a id="L837"></a>        for (0..tests_len) |i| {
+<a id="L838"></a>            names_len += tests.testName(@intCast(i)).len + 1;
+<a id="L839"></a>        }
+<a id="L840"></a>        break :len @sizeOf(abi.time_report.RunTestResult) + names_len + 8 * tests_len;
+<a id="L841"></a>    };
+<a id="L842"></a>    const old_buf = old: {
+<a id="L843"></a>        ws.time_report_mutex.lock(io) catch return;
+<a id="L844"></a>        defer ws.time_report_mutex.unlock(io);
+<a id="L845"></a>        const old = ws.time_report_msgs[step_idx];
+<a id="L846"></a>        ws.time_report_msgs[step_idx] = &amp;.{};
+<a id="L847"></a>        break :old old;
+<a id="L848"></a>    };
+<a id="L849"></a>    const buf = gpa.realloc(old_buf, new_len) catch @panic("out of memory");
+<a id="L850"></a>
+<a id="L851"></a>    const out_header: *align(1) abi.time_report.RunTestResult = @ptrCast(buf[0..@sizeOf(abi.time_report.RunTestResult)]);
+<a id="L852"></a>    out_header.* = .{
+<a id="L853"></a>        .step_idx = step_idx,
+<a id="L854"></a>        .tests_len = tests_len,
+<a id="L855"></a>    };
+<a id="L856"></a>    var offset: usize = @sizeOf(abi.time_report.RunTestResult);
+<a id="L857"></a>    const ns_per_test_out: []align(1) u64 = @ptrCast(buf[offset..][0 .. tests_len * 8]);
+<a id="L858"></a>    @memcpy(ns_per_test_out, ns_per_test);
+<a id="L859"></a>    offset += tests_len * 8;
+<a id="L860"></a>    for (0..tests_len) |i| {
+<a id="L861"></a>        const name = tests.testName(@intCast(i));
+<a id="L862"></a>        @memcpy(buf[offset..][0..name.len], name);
+<a id="L863"></a>        buf[offset..][name.len] = 0;
+<a id="L864"></a>        offset += name.len + 1;
+<a id="L865"></a>    }
+<a id="L866"></a>    assert(offset == buf.len);
+<a id="L867"></a>
+<a id="L868"></a>    {
+<a id="L869"></a>        ws.time_report_mutex.lock(io) catch return;
+<a id="L870"></a>        defer ws.time_report_mutex.unlock(io);
+<a id="L871"></a>        assert(ws.time_report_msgs[step_idx].len == 0);
+<a id="L872"></a>        ws.time_report_msgs[step_idx] = buf;
+<a id="L873"></a>        ws.time_report_update_times[step_idx] = ws.now();
+<a id="L874"></a>    }
+<a id="L875"></a>    ws.notifyUpdate();
+<a id="L876"></a>}
+<a id="L877"></a>
+<a id="L878"></a>const RunnerRequest = union(enum) {
+<a id="L879"></a>    rebuild,
+<a id="L880"></a>};
+<a id="L881"></a>pub fn getRunnerRequest(ws: *WebServer) ?RunnerRequest {
+<a id="L882"></a>    const io = ws.graph.io;
+<a id="L883"></a>    ws.runner_request_mutex.lock(io) catch return;
+<a id="L884"></a>    defer ws.runner_request_mutex.unlock(io);
+<a id="L885"></a>    if (ws.runner_request) |req| {
+<a id="L886"></a>        ws.runner_request = null;
+<a id="L887"></a>        ws.runner_request_empty_cond.signal();
+<a id="L888"></a>        return req;
+<a id="L889"></a>    }
+<a id="L890"></a>    return null;
+<a id="L891"></a>}
+<a id="L892"></a>pub fn wait(ws: *WebServer) Io.Cancelable!RunnerRequest {
+<a id="L893"></a>    const io = ws.graph.io;
+<a id="L894"></a>    try ws.runner_request_mutex.lock(io);
+<a id="L895"></a>    defer ws.runner_request_mutex.unlock(io);
+<a id="L896"></a>    while (true) {
+<a id="L897"></a>        if (ws.runner_request) |req| {
+<a id="L898"></a>            ws.runner_request = null;
+<a id="L899"></a>            ws.runner_request_empty_cond.signal(io);
+<a id="L900"></a>            return req;
+<a id="L901"></a>        }
+<a id="L902"></a>        try ws.runner_request_ready_cond.wait(io, &amp;ws.runner_request_mutex);
+<a id="L903"></a>    }
+<a id="L904"></a>}
+<a id="L905"></a>
+<a id="L906"></a>const cache_control_header: http.Header = .{
+<a id="L907"></a>    .name = "Cache-Control",
+<a id="L908"></a>    .value = "max-age=0, must-revalidate",
+<a id="L909"></a>};
+<a id="L910"></a>
+<a id="L911"></a>const builtin = @import("builtin");
+<a id="L912"></a>
+<a id="L913"></a>const std = @import("std");
+<a id="L914"></a>const Io = std.Io;
+<a id="L915"></a>const net = std.Io.net;
+<a id="L916"></a>const assert = std.debug.assert;
+<a id="L917"></a>const mem = std.mem;
+<a id="L918"></a>const log = std.log.scoped(.web_server);
+<a id="L919"></a>const Allocator = std.mem.Allocator;
+<a id="L920"></a>const Build = std.Build;
+<a id="L921"></a>const Cache = Build.Cache;
+<a id="L922"></a>const Fuzz = Build.Fuzz;
+<a id="L923"></a>const abi = Build.abi;
+<a id="L924"></a>const http = std.http;
+<a id="L925"></a>
+<a id="L926"></a>const WebServer = @This();
+</pre>
 </body>
 </html>

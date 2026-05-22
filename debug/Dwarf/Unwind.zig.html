@@ -2,719 +2,722 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Source: zig-0.16.0-std/debug/Dwarf/Unwind.zig</title>
+    <title>Source: debug/Dwarf/Unwind.zig</title>
     <style>
         body { background: #1e1e1e; color: #d4d4d4; font-family: monospace; padding: 20px; }
         pre { white-space: pre-wrap; word-wrap: break-word; }
         .header { border-bottom: 1px solid #444; padding-bottom: 10px; margin-bottom: 20px; }
         a { color: #569cd6; }
+        a[id] { color: inherit; text-decoration: none; }
+        :target { background: #3a3a00; }
     </style>
 </head>
 <body>
     <div class="header">
-        <a href="/">Index</a> | <strong>File: zig-0.16.0-std/debug/Dwarf/Unwind.zig</strong>
+        <a href="/">Index</a> | <strong>File: debug/Dwarf/Unwind.zig</strong>
     </div>
-    <pre>//! Contains state relevant to stack unwinding through the DWARF `.debug_frame` section, or the
-//! `.eh_frame` section which is an extension of the former specified by Linux Standard Base Core.
-//! Like `Dwarf`, no assumptions are made about the host's relationship to the target of the unwind
-//! information -- unwind data for any target can be read by any host.
-//!
-//! `Unwind` specifically deals with loading the data from CIEs and FDEs in the section, and with
-//! performing fast lookups of a program counter's corresponding FDE. The CFI instructions in the
-//! CIEs and FDEs can be interpreted by `VirtualMachine`.
-//!
-//! The typical usage of `Unwind` is as follows:
-//!
-//! * Initialize with `initEhFrameHdr` or `initSection`, depending on the available data
-//! * Call `prepare` to scan CIEs and, if necessary, construct a search table
-//! * Call `lookupPc` to find the section offset of the FDE corresponding to a PC
-//! * Call `getFde` to load the corresponding FDE and CIE
-//! * Check that the PC does indeed fall in that range (`lookupPc` may return a false positive)
-//! * Interpret the embedded CFI instructions using `VirtualMachine`
-//!
-//! In some cases, such as when using the "compact unwind" data in Mach-O binaries, the FDE offsets
-//! may already be known. In that case, no call to `lookupPc` is necessary, which means the call to
-//! `prepare` can be optimized to only scan CIEs.
-
-pub const VirtualMachine = @import("Unwind/VirtualMachine.zig");
-
-frame_section: struct {
-    id: Section,
-    /// The virtual address of the start of the section. "Virtual address" refers to the address in
-    /// the binary (e.g. `sh_addr` in an ELF file); the equivalent runtime address may be relocated
-    /// in position-independent binaries.
-    vaddr: u64,
-    /// The full contents of the section. May have imprecise bounds depending on `section`. This
-    /// memory is externally managed.
-    ///
-    /// For `.debug_frame`, the slice length is exactly equal to the section length. This is needed
-    /// to know the number of CIEs and FDEs.
-    ///
-    /// For `.eh_frame`, the slice length may exceed the section length, i.e. the slice may refer to
-    /// more bytes than are in the second. This restriction exists because `.eh_frame_hdr` only
-    /// includes the address of the loaded `.eh_frame` data, not its length. It is not a problem
-    /// because unlike `.debug_frame`, the end of the CIE/FDE list is signaled through a sentinel
-    /// value. If this slice does have bounds, they will still be checked, preventing crashes when
-    /// reading potentially-invalid `.eh_frame` data from files.
-    bytes: []const u8,
-},
-
-/// A structure allowing fast lookups of the FDE corresponding to a particular PC. We use a binary
-/// search table for the lookup; essentially, a list of all FDEs ordered by PC range. `null` means
-/// the lookup data is not yet populated, so `prepare` must be called before `lookupPc`.
-lookup: ?union(enum) {
-    /// The `.eh_frame_hdr` section contains a pre-computed search table which we can use.
-    eh_frame_hdr: struct {
-        /// Virtual address of the `.eh_frame_hdr` section.
-        vaddr: u64,
-        table: EhFrameHeader.SearchTable,
-    },
-    /// There is no pre-computed search table, so we have built one ourselves.
-    /// Allocated into `gpa` and freed by `deinit`.
-    sorted_fdes: []SortedFdeEntry,
-},
-
-/// Initially empty; populated by `prepare`.
-cie_list: std.MultiArrayList(struct {
-    offset: u64,
-    cie: CommonInformationEntry,
-}),
-
-const SortedFdeEntry = struct {
-    /// This FDE's value of `pc_begin`.
-    pc_begin: u64,
-    /// Offset into the section of the corresponding FDE, including the entry header.
-    fde_offset: u64,
-};
-
-pub const Section = enum { debug_frame, eh_frame };
-
-/// Initialize with unwind information from a header loaded from an `.eh_frame_hdr` section, and a
-/// pointer to the contents of the `.eh_frame` section.
-///
-/// `.eh_frame_hdr` may embed a binary search table of FDEs. If it does, we will use that table for
-/// PC lookups rather than spending time constructing our own search table.
-pub fn initEhFrameHdr(header: EhFrameHeader, section_vaddr: u64, section_bytes_ptr: [*]const u8) Unwind {
-    return .{
-        .frame_section = .{
-            .id = .eh_frame,
-            .bytes = maxSlice(section_bytes_ptr),
-            .vaddr = header.eh_frame_vaddr,
-        },
-        .lookup = if (header.search_table) |table| .{ .eh_frame_hdr = .{
-            .vaddr = section_vaddr,
-            .table = table,
-        } } else null,
-        .cie_list = .empty,
-    };
-}
-
-/// Initialize with unwind information from the contents of a `.debug_frame` or `.eh_frame` section.
-///
-/// If the `.eh_frame_hdr` section is available, consider instead using `initEhFrameHdr`, which
-/// allows the implementation to use a search table embedded in that section if it is available.
-pub fn initSection(section: Section, section_vaddr: u64, section_bytes: []const u8) Unwind {
-    return .{
-        .frame_section = .{
-            .id = section,
-            .bytes = section_bytes,
-            .vaddr = section_vaddr,
-        },
-        .lookup = null,
-        .cie_list = .empty,
-    };
-}
-
-pub fn deinit(unwind: *Unwind, gpa: Allocator) void {
-    if (unwind.lookup) |lookup| switch (lookup) {
-        .eh_frame_hdr =&gt; {},
-        .sorted_fdes =&gt; |fdes| gpa.free(fdes),
-    };
-    for (unwind.cie_list.items(.cie)) |*cie| {
-        if (cie.last_row) |*lr| {
-            gpa.free(lr.cols);
-        }
-    }
-    unwind.cie_list.deinit(gpa);
-}
-
-/// Decoded version of the `.eh_frame_hdr` section.
-pub const EhFrameHeader = struct {
-    /// The virtual address (i.e. as given in the binary, before relocations) of the `.eh_frame`
-    /// section. This value is important when using `.eh_frame_hdr` to find debug information for
-    /// the current binary, because it allows locating where the `.eh_frame` section is loaded in
-    /// memory (by adding it to the ELF module's base address).
-    eh_frame_vaddr: u64,
-    search_table: ?SearchTable,
-
-    pub const SearchTable = struct {
-        /// The byte offset of the search table into the `.eh_frame_hdr` section.
-        offset: u8,
-        encoding: EH.PE,
-        fde_count: usize,
-        /// The actual table entries are viewed as a plain byte slice because `encoding` causes the
-        /// size of entries in the table to vary.
-        entries: []const u8,
-
-        /// Returns the vaddr of the FDE for `pc`, or `null` if no matching FDE was found.
-        fn findEntry(
-            table: *const SearchTable,
-            eh_frame_hdr_vaddr: u64,
-            pc: u64,
-            addr_size_bytes: u8,
-            endian: Endian,
-        ) !?u64 {
-            const table_vaddr = eh_frame_hdr_vaddr + table.offset;
-            const entry_size = try entrySize(table.encoding, addr_size_bytes);
-            var left: usize = 0;
-            var len: usize = table.fde_count;
-            while (len &gt; 1) {
-                const mid = left + len / 2;
-                var entry_reader: Reader = .fixed(table.entries[mid * entry_size ..][0..entry_size]);
-                const pc_begin = try readEhPointer(&amp;entry_reader, table.encoding, addr_size_bytes, .{
-                    .pc_rel_base = table_vaddr + left * entry_size,
-                    .data_rel_base = eh_frame_hdr_vaddr,
-                }, endian);
-                if (pc &lt; pc_begin) {
-                    len /= 2;
-                } else {
-                    left = mid;
-                    len -= len / 2;
-                }
-            }
-            if (len == 0) return null;
-            var entry_reader: Reader = .fixed(table.entries[left * entry_size ..][0..entry_size]);
-            // Skip past `pc_begin`; we're now interested in the fde offset
-            _ = try readEhPointerAbs(&amp;entry_reader, table.encoding.type, addr_size_bytes, endian);
-            const fde_ptr = try readEhPointer(&amp;entry_reader, table.encoding, addr_size_bytes, .{
-                .pc_rel_base = table_vaddr + left * entry_size,
-                .data_rel_base = eh_frame_hdr_vaddr,
-            }, endian);
-            return fde_ptr;
-        }
-
-        fn entrySize(table_enc: EH.PE, addr_size_bytes: u8) !u8 {
-            return switch (table_enc.type) {
-                .absptr =&gt; 2 * addr_size_bytes,
-                .udata2, .sdata2 =&gt; 4,
-                .udata4, .sdata4 =&gt; 8,
-                .udata8, .sdata8 =&gt; 16,
-                .uleb128, .sleb128 =&gt; return bad(), // this is a binary search table; all entries must be the same size
-                _ =&gt; return bad(),
-            };
-        }
-    };
-
-    pub fn parse(
-        eh_frame_hdr_vaddr: u64,
-        eh_frame_hdr_bytes: []const u8,
-        addr_size_bytes: u8,
-        endian: Endian,
-    ) !EhFrameHeader {
-        var r: Reader = .fixed(eh_frame_hdr_bytes);
-
-        const version = try r.takeByte();
-        if (version != 1) return bad();
-
-        const eh_frame_ptr_enc: EH.PE = @bitCast(try r.takeByte());
-        const fde_count_enc: EH.PE = @bitCast(try r.takeByte());
-        const table_enc: EH.PE = @bitCast(try r.takeByte());
-
-        const eh_frame_ptr = try readEhPointer(&amp;r, eh_frame_ptr_enc, addr_size_bytes, .{
-            .pc_rel_base = eh_frame_hdr_vaddr + r.seek,
-        }, endian);
-
-        const table: ?SearchTable = table: {
-            if (fde_count_enc == EH.PE.omit) break :table null;
-            if (table_enc == EH.PE.omit) break :table null;
-            const fde_count = try readEhPointer(&amp;r, fde_count_enc, addr_size_bytes, .{
-                .pc_rel_base = eh_frame_hdr_vaddr + r.seek,
-            }, endian);
-            const entry_size = try SearchTable.entrySize(table_enc, addr_size_bytes);
-            const bytes_offset = r.seek;
-            const bytes_len = cast(usize, fde_count * entry_size) orelse return error.EndOfStream;
-            const bytes = try r.take(bytes_len);
-            break :table .{
-                .encoding = table_enc,
-                .fde_count = @intCast(fde_count),
-                .entries = bytes,
-                .offset = @intCast(bytes_offset),
-            };
-        };
-
-        return .{
-            .eh_frame_vaddr = eh_frame_ptr,
-            .search_table = table,
-        };
-    }
-};
-
-/// The shared header of an FDE/CIE, containing a length in bytes (DWARF's "initial length field")
-/// and a value which differentiates CIEs from FDEs and maps FDEs to their corresponding CIEs. The
-/// `.eh_frame` format also includes a third variation, here called `.terminator`, which acts as a
-/// sentinel for the whole section.
-///
-/// `CommonInformationEntry.parse` and `FrameDescriptionEntry.parse` expect the `EntryHeader` to
-/// have been parsed first: they accept data stored in the `EntryHeader`, and only read the bytes
-/// following this header.
-const EntryHeader = union(enum) {
-    cie: struct {
-        format: Format,
-        /// Remaining bytes in the CIE. These are parseable by `CommonInformationEntry.parse`.
-        bytes_len: u64,
-    },
-    fde: struct {
-        /// Offset into the section of the corresponding CIE, *including* its entry header.
-        cie_offset: u64,
-        /// Remaining bytes in the FDE. These are parseable by `FrameDescriptionEntry.parse`.
-        bytes_len: u64,
-    },
-    /// The `.eh_frame` format includes terminators which indicate that the last CIE/FDE has been
-    /// reached. However, `.debug_frame` does not include such a terminator, so the caller must
-    /// keep track of how many section bytes remain when parsing all entries in `.debug_frame`.
-    terminator,
-
-    fn read(r: *Reader, header_section_offset: u64, section: Section, endian: Endian) !EntryHeader {
-        const unit_header = try Dwarf.readUnitHeader(r, endian);
-        if (unit_header.unit_length == 0) return .terminator;
-
-        // Next is a value which will disambiguate CIEs and FDEs. Annoyingly, LSB Core makes this
-        // value always 4-byte, whereas DWARF makes it depend on the `dwarf.Format`.
-        const cie_ptr_or_id_size: u8 = switch (section) {
-            .eh_frame =&gt; 4,
-            .debug_frame =&gt; switch (unit_header.format) {
-                .@"32" =&gt; 4,
-                .@"64" =&gt; 8,
-            },
-        };
-        const cie_ptr_or_id = switch (cie_ptr_or_id_size) {
-            4 =&gt; try r.takeInt(u32, endian),
-            8 =&gt; try r.takeInt(u64, endian),
-            else =&gt; unreachable,
-        };
-        const remaining_bytes = unit_header.unit_length - cie_ptr_or_id_size;
-
-        // If this entry is a CIE, then `cie_ptr_or_id` will have this value, which is different
-        // between the DWARF `.debug_frame` section and the LSB Core `.eh_frame` section.
-        const cie_id: u64 = switch (section) {
-            .eh_frame =&gt; 0,
-            .debug_frame =&gt; switch (unit_header.format) {
-                .@"32" =&gt; maxInt(u32),
-                .@"64" =&gt; maxInt(u64),
-            },
-        };
-        if (cie_ptr_or_id == cie_id) {
-            return .{ .cie = .{
-                .format = unit_header.format,
-                .bytes_len = remaining_bytes,
-            } };
-        }
-
-        // This is an FDE -- `cie_ptr_or_id` points to the associated CIE. Unfortunately, the format
-        // of that pointer again differs between `.debug_frame` and `.eh_frame`.
-        const cie_offset = switch (section) {
-            .eh_frame =&gt; try std.math.sub(u64, header_section_offset + unit_header.header_length, cie_ptr_or_id),
-            .debug_frame =&gt; cie_ptr_or_id,
-        };
-        return .{ .fde = .{
-            .cie_offset = cie_offset,
-            .bytes_len = remaining_bytes,
-        } };
-    }
-};
-
-pub const CommonInformationEntry = struct {
-    version: u8,
-    format: Format,
-
-    /// In version 4, CIEs can specify the address size used in the CIE and associated FDEs.
-    /// This value must be used *only* to parse associated FDEs in `FrameDescriptionEntry.parse`.
-    addr_size_bytes: u8,
-
-    /// Always 0 for versions which do not specify this (currently all versions other than 4).
-    segment_selector_size: u8,
-
-    code_alignment_factor: u32,
-    data_alignment_factor: i32,
-    return_address_register: u8,
-
-    fde_pointer_enc: EH.PE,
-    is_signal_frame: bool,
-
-    augmentation_kind: AugmentationKind,
-
-    initial_instructions: []const u8,
-
-    last_row: ?struct {
-        offset: u64,
-        cfa: VirtualMachine.CfaRule,
-        cols: []VirtualMachine.Column,
-    },
-
-    pub const AugmentationKind = enum { none, gcc_eh, lsb_z };
-
-    /// This function expects to read the CIE starting with the version field.
-    /// The returned struct references memory backed by `cie_bytes`.
-    ///
-    /// `length_offset` specifies the offset of this CIE's length field in the
-    /// .eh_frame / .debug_frame section.
-    fn parse(
-        format: Format,
-        cie_bytes: []const u8,
-        section: Section,
-        default_addr_size_bytes: u8,
-    ) !CommonInformationEntry {
-        // We only read the data through this reader.
-        var r: Reader = .fixed(cie_bytes);
-
-        const version = try r.takeByte();
-        switch (section) {
-            .eh_frame =&gt; if (version != 1 and version != 3) return error.UnsupportedDwarfVersion,
-            .debug_frame =&gt; if (version != 4) return error.UnsupportedDwarfVersion,
-        }
-
-        const aug_str = try r.takeSentinel(0);
-        const aug_kind: AugmentationKind = aug: {
-            if (aug_str.len == 0) break :aug .none;
-            if (aug_str[0] == 'z') break :aug .lsb_z;
-            if (std.mem.eql(u8, aug_str, "eh")) break :aug .gcc_eh;
-            // We can't finish parsing the CIE if we don't know what its augmentation means.
-            return bad();
-        };
-
-        switch (aug_kind) {
-            .none =&gt; {}, // no extra data
-            .lsb_z =&gt; {}, // no extra data yet, but there is a bit later
-            .gcc_eh =&gt; try r.discardAll(default_addr_size_bytes), // unsupported data
-        }
-
-        const addr_size_bytes = if (version == 4) try r.takeByte() else default_addr_size_bytes;
-        const segment_selector_size: u8 = if (version == 4) try r.takeByte() else 0;
-        const code_alignment_factor = try r.takeLeb128(u32);
-        const data_alignment_factor = try r.takeLeb128(i32);
-        const return_address_register = if (version == 1) try r.takeByte() else try r.takeLeb128(u8);
-
-        // This is where LSB's augmentation might add some data.
-        const fde_pointer_enc: EH.PE, const is_signal_frame: bool = aug: {
-            const default_fde_pointer_enc: EH.PE = .{ .type = .absptr, .rel = .abs };
-            if (aug_kind != .lsb_z) break :aug .{ default_fde_pointer_enc, false };
-            const aug_data_len = try r.takeLeb128(u32);
-            var aug_data: Reader = .fixed(try r.take(aug_data_len));
-            var fde_pointer_enc: EH.PE = default_fde_pointer_enc;
-            var is_signal_frame = false;
-            for (aug_str[1..]) |byte| switch (byte) {
-                'L' =&gt; _ = try aug_data.takeByte(), // we ignore the LSDA pointer
-                'P' =&gt; {
-                    const enc: EH.PE = @bitCast(try aug_data.takeByte());
-                    const endian: Endian = .little; // irrelevant because we're discarding the value anyway
-                    _ = try readEhPointerAbs(&amp;aug_data, enc.type, addr_size_bytes, endian); // we ignore the personality routine; endianness is irrelevant since we're discarding
-                },
-                'R' =&gt; fde_pointer_enc = @bitCast(try aug_data.takeByte()),
-                'S' =&gt; is_signal_frame = true,
-                'B', 'G' =&gt; {},
-                else =&gt; return bad(),
-            };
-            break :aug .{ fde_pointer_enc, is_signal_frame };
-        };
-
-        return .{
-            .format = format,
-            .version = version,
-            .addr_size_bytes = addr_size_bytes,
-            .segment_selector_size = segment_selector_size,
-            .code_alignment_factor = code_alignment_factor,
-            .data_alignment_factor = data_alignment_factor,
-            .return_address_register = return_address_register,
-            .fde_pointer_enc = fde_pointer_enc,
-            .is_signal_frame = is_signal_frame,
-            .augmentation_kind = aug_kind,
-            .initial_instructions = r.buffered(),
-            .last_row = null,
-        };
-    }
-};
-
-pub const FrameDescriptionEntry = struct {
-    pc_begin: u64,
-    pc_range: u64,
-    instructions: []const u8,
-
-    /// This function expects to read the FDE starting at the PC Begin field.
-    /// The returned struct references memory backed by `fde_bytes`.
-    fn parse(
-        /// The virtual address of the FDE we're parsing, *excluding* its entry header (i.e. the
-        /// address is after the header). If `fde_bytes` is backed by the memory of a loaded
-        /// module's `.eh_frame` section, this will equal `fde_bytes.ptr`.
-        fde_vaddr: u64,
-        fde_bytes: []const u8,
-        cie: *const CommonInformationEntry,
-        endian: Endian,
-    ) !FrameDescriptionEntry {
-        if (cie.segment_selector_size != 0) return error.UnsupportedAddrSize;
-
-        var r: Reader = .fixed(fde_bytes);
-
-        const pc_begin = try readEhPointer(&amp;r, cie.fde_pointer_enc, cie.addr_size_bytes, .{
-            .pc_rel_base = fde_vaddr,
-        }, endian);
-
-        // I swear I'm not kidding when I say that PC Range is encoded with `cie.fde_pointer_enc`, but ignoring `rel`.
-        const pc_range = switch (try readEhPointerAbs(&amp;r, cie.fde_pointer_enc.type, cie.addr_size_bytes, endian)) {
-            .unsigned =&gt; |x| x,
-            .signed =&gt; |x| cast(u64, x) orelse return bad(),
-        };
-
-        switch (cie.augmentation_kind) {
-            .none, .gcc_eh =&gt; {},
-            .lsb_z =&gt; {
-                // There is augmentation data, but it's irrelevant to us -- it
-                // only contains the LSDA pointer, which we don't care about.
-                const aug_data_len = try r.takeLeb128(usize);
-                _ = try r.discardAll(aug_data_len);
-            },
-        }
-
-        return .{
-            .pc_begin = pc_begin,
-            .pc_range = pc_range,
-            .instructions = r.buffered(),
-        };
-    }
-};
-
-/// Builds the CIE list and FDE lookup table if they are not already built. It is required to call
-/// this function at least once before calling `lookupPc` or `getFde`. If only `getFde` is needed,
-/// then `need_lookup` can be set to `false` to make this function more efficient.
-pub fn prepare(
-    unwind: *Unwind,
-    gpa: Allocator,
-    addr_size_bytes: u8,
-    endian: Endian,
-    need_lookup: bool,
-    /// The `__eh_frame` section in Mach-O binaries deviates from the standard `.eh_frame` section
-    /// in one way which this function needs to be aware of.
-    is_macho: bool,
-) !void {
-    if (unwind.cie_list.len &gt; 0 and (!need_lookup or unwind.lookup != null)) return;
-    unwind.cie_list.clearRetainingCapacity();
-
-    if (is_macho) assert(unwind.lookup == null or unwind.lookup.? != .eh_frame_hdr);
-
-    const section = unwind.frame_section;
-
-    var r: Reader = .fixed(section.bytes);
-    var fde_list: std.ArrayList(SortedFdeEntry) = .empty;
-    defer fde_list.deinit(gpa);
-
-    const saw_terminator = while (r.seek &lt; r.buffer.len) {
-        const entry_offset = r.seek;
-        switch (try EntryHeader.read(&amp;r, entry_offset, section.id, endian)) {
-            .cie =&gt; |cie_info| {
-                // We will pre-populate a list of CIEs for efficiency: this avoids work re-parsing
-                // them every time we look up an FDE. It also lets us cache the result of evaluating
-                // the CIE's initial CFI instructions, which is useful because in the vast majority
-                // of cases those instructions will be needed to reach the PC we are unwinding to.
-                const bytes_len = cast(usize, cie_info.bytes_len) orelse return error.EndOfStream;
-                const idx = unwind.cie_list.len;
-                try unwind.cie_list.append(gpa, .{
-                    .offset = entry_offset,
-                    .cie = try .parse(cie_info.format, try r.take(bytes_len), section.id, addr_size_bytes),
-                });
-                errdefer _ = unwind.cie_list.pop().?;
-                try VirtualMachine.populateCieLastRow(gpa, &amp;unwind.cie_list.items(.cie)[idx], addr_size_bytes, endian);
-                continue;
-            },
-            .fde =&gt; |fde_info| {
-                const bytes_len = cast(usize, fde_info.bytes_len) orelse return error.EndOfStream;
-                if (!need_lookup) {
-                    try r.discardAll(bytes_len);
-                    continue;
-                }
-                const cie = unwind.findCie(fde_info.cie_offset) orelse return error.InvalidDebugInfo;
-                const fde: FrameDescriptionEntry = try .parse(section.vaddr + r.seek, try r.take(bytes_len), cie, endian);
-                try fde_list.append(gpa, .{
-                    .pc_begin = fde.pc_begin,
-                    .fde_offset = entry_offset,
-                });
-            },
-            .terminator =&gt; break true,
-        }
-    } else false;
-    const expect_terminator = switch (section.id) {
-        .eh_frame =&gt; !is_macho, // `.eh_frame` indicates the end of the CIE/FDE list with a sentinel entry, though macOS omits this
-        .debug_frame =&gt; false, // `.debug_frame` uses the section bounds and does not specify a sentinel entry
-    };
-    if (saw_terminator != expect_terminator) return bad();
-
-    if (need_lookup) {
-        std.mem.sortUnstable(SortedFdeEntry, fde_list.items, {}, struct {
-            fn lessThan(ctx: void, a: SortedFdeEntry, b: SortedFdeEntry) bool {
-                ctx;
-                return a.pc_begin &lt; b.pc_begin;
-            }
-        }.lessThan);
-
-        // This temporary is necessary to avoid an RLS footgun where `lookup` ends up non-null `undefined` on OOM.
-        const final_fdes = try fde_list.toOwnedSlice(gpa);
-        unwind.lookup = .{ .sorted_fdes = final_fdes };
-    }
-}
-
-fn findCie(unwind: *const Unwind, offset: u64) ?*const CommonInformationEntry {
-    const offsets = unwind.cie_list.items(.offset);
-    if (offsets.len == 0) return null;
-    var start: usize = 0;
-    var len: usize = offsets.len;
-    while (len &gt; 1) {
-        const mid = len / 2;
-        if (offset &lt; offsets[start + mid]) {
-            len = mid;
-        } else {
-            start += mid;
-            len -= mid;
-        }
-    }
-    if (offsets[start] != offset) return null;
-    return &amp;unwind.cie_list.items(.cie)[start];
-}
-
-/// Given a program counter value, returns the offset of the corresponding FDE, or `null` if no
-/// matching FDE was found. The returned offset can be passed to `getFde` to load the data
-/// associated with the FDE.
-///
-/// Before calling this function, `prepare` must return successfully at least once, to ensure that
-/// `unwind.lookup` is populated.
-///
-/// The return value may be a false positive. After loading the FDE with `loadFde`, the caller must
-/// validate that `pc` is indeed in its range -- if it is not, then no FDE matches `pc`.
-pub fn lookupPc(unwind: *const Unwind, pc: u64, addr_size_bytes: u8, endian: Endian) !?u64 {
-    const sorted_fdes: []const SortedFdeEntry = switch (unwind.lookup.?) {
-        .eh_frame_hdr =&gt; |eh_frame_hdr| {
-            const fde_vaddr = try eh_frame_hdr.table.findEntry(
-                eh_frame_hdr.vaddr,
-                pc,
-                addr_size_bytes,
-                endian,
-            ) orelse return null;
-            return std.math.sub(u64, fde_vaddr, unwind.frame_section.vaddr) catch bad(); // convert vaddr to offset
-        },
-        .sorted_fdes =&gt; |sorted_fdes| sorted_fdes,
-    };
-    if (sorted_fdes.len == 0) return null;
-    var start: usize = 0;
-    var len: usize = sorted_fdes.len;
-    while (len &gt; 1) {
-        const half = len / 2;
-        if (pc &lt; sorted_fdes[start + half].pc_begin) {
-            len = half;
-        } else {
-            start += half;
-            len -= half;
-        }
-    }
-    // If any FDE matches, it'll be the one at `start` (maybe false positive).
-    return sorted_fdes[start].fde_offset;
-}
-
-/// Get the FDE at a given offset, as well as its associated CIE. This offset typically comes from
-/// `lookupPc`. The CFI instructions within can be evaluated with `VirtualMachine`.
-pub fn getFde(unwind: *const Unwind, fde_offset: u64, endian: Endian) !struct { *const CommonInformationEntry, FrameDescriptionEntry } {
-    const section = unwind.frame_section;
-
-    if (fde_offset &gt; section.bytes.len) return error.EndOfStream;
-    var fde_reader: Reader = .fixed(section.bytes[@intCast(fde_offset)..]);
-    const fde_info = switch (try EntryHeader.read(&amp;fde_reader, fde_offset, section.id, endian)) {
-        .fde =&gt; |info| info,
-        .cie, .terminator =&gt; return bad(), // This is meant to be an FDE
-    };
-
-    const cie = unwind.findCie(fde_info.cie_offset) orelse return error.InvalidDebugInfo;
-    const fde: FrameDescriptionEntry = try .parse(
-        section.vaddr + fde_offset + fde_reader.seek,
-        try fde_reader.take(cast(usize, fde_info.bytes_len) orelse return error.EndOfStream),
-        cie,
-        endian,
-    );
-
-    return .{ cie, fde };
-}
-
-const EhPointerContext = struct {
-    /// The address of the pointer field itself
-    pc_rel_base: u64,
-    // These relative addressing modes are only used in specific cases, and
-    // might not be available / required in all parsing contexts
-    data_rel_base: ?u64 = null,
-    text_rel_base: ?u64 = null,
-    function_rel_base: ?u64 = null,
-};
-/// Returns `error.InvalidDebugInfo` if the encoding is `EH.PE.omit`.
-fn readEhPointerAbs(r: *Reader, enc_ty: EH.PE.Type, addr_size_bytes: u8, endian: Endian) !union(enum) {
-    signed: i64,
-    unsigned: u64,
-} {
-    return switch (enc_ty) {
-        .absptr =&gt; .{
-            .unsigned = switch (addr_size_bytes) {
-                2 =&gt; try r.takeInt(u16, endian),
-                4 =&gt; try r.takeInt(u32, endian),
-                8 =&gt; try r.takeInt(u64, endian),
-                else =&gt; return error.UnsupportedAddrSize,
-            },
-        },
-        .uleb128 =&gt; .{ .unsigned = try r.takeLeb128(u64) },
-        .udata2 =&gt; .{ .unsigned = try r.takeInt(u16, endian) },
-        .udata4 =&gt; .{ .unsigned = try r.takeInt(u32, endian) },
-        .udata8 =&gt; .{ .unsigned = try r.takeInt(u64, endian) },
-        .sleb128 =&gt; .{ .signed = try r.takeLeb128(i64) },
-        .sdata2 =&gt; .{ .signed = try r.takeInt(i16, endian) },
-        .sdata4 =&gt; .{ .signed = try r.takeInt(i32, endian) },
-        .sdata8 =&gt; .{ .signed = try r.takeInt(i64, endian) },
-        else =&gt; return bad(),
-    };
-}
-/// Returns `error.InvalidDebugInfo` if the encoding is `EH.PE.omit`.
-fn readEhPointer(r: *Reader, enc: EH.PE, addr_size_bytes: u8, ctx: EhPointerContext, endian: Endian) !u64 {
-    const offset = try readEhPointerAbs(r, enc.type, addr_size_bytes, endian);
-    if (enc.indirect) return bad(); // GCC extension; not supported
-    const base: u64 = switch (enc.rel) {
-        .abs, .aligned =&gt; 0,
-        .pcrel =&gt; ctx.pc_rel_base,
-        .textrel =&gt; ctx.text_rel_base orelse return bad(),
-        .datarel =&gt; ctx.data_rel_base orelse return bad(),
-        .funcrel =&gt; ctx.function_rel_base orelse return bad(),
-        _ =&gt; return bad(),
-    };
-    return switch (offset) {
-        .signed =&gt; |s| if (s &gt;= 0)
-            try std.math.add(u64, base, @intCast(s))
-        else
-            try std.math.sub(u64, base, @intCast(-s)),
-        // absptr can actually contain signed values in some cases (aarch64 MachO)
-        .unsigned =&gt; |u| u +% base,
-    };
-}
-
-/// Like `Reader.fixed`, but when the length of the data is unknown and we just want to allow
-/// reading indefinitely.
-fn maxSlice(ptr: [*]const u8) []const u8 {
-    const len = std.math.maxInt(usize) - @intFromPtr(ptr);
-    return ptr[0..len];
-}
-
-const Allocator = std.mem.Allocator;
-const assert = std.debug.assert;
-const bad = Dwarf.bad;
-const cast = std.math.cast;
-const DW = std.dwarf;
-const Dwarf = std.debug.Dwarf;
-const EH = DW.EH;
-const Endian = std.builtin.Endian;
-const Format = DW.Format;
-const maxInt = std.math.maxInt;
-const missing = Dwarf.missing;
-const Reader = std.Io.Reader;
-const std = @import("std");
-const Unwind = @This();</pre>
+    <pre><a id="L1"></a>//! Contains state relevant to stack unwinding through the DWARF `.debug_frame` section, or the
+<a id="L2"></a>//! `.eh_frame` section which is an extension of the former specified by Linux Standard Base Core.
+<a id="L3"></a>//! Like `Dwarf`, no assumptions are made about the host's relationship to the target of the unwind
+<a id="L4"></a>//! information -- unwind data for any target can be read by any host.
+<a id="L5"></a>//!
+<a id="L6"></a>//! `Unwind` specifically deals with loading the data from CIEs and FDEs in the section, and with
+<a id="L7"></a>//! performing fast lookups of a program counter's corresponding FDE. The CFI instructions in the
+<a id="L8"></a>//! CIEs and FDEs can be interpreted by `VirtualMachine`.
+<a id="L9"></a>//!
+<a id="L10"></a>//! The typical usage of `Unwind` is as follows:
+<a id="L11"></a>//!
+<a id="L12"></a>//! * Initialize with `initEhFrameHdr` or `initSection`, depending on the available data
+<a id="L13"></a>//! * Call `prepare` to scan CIEs and, if necessary, construct a search table
+<a id="L14"></a>//! * Call `lookupPc` to find the section offset of the FDE corresponding to a PC
+<a id="L15"></a>//! * Call `getFde` to load the corresponding FDE and CIE
+<a id="L16"></a>//! * Check that the PC does indeed fall in that range (`lookupPc` may return a false positive)
+<a id="L17"></a>//! * Interpret the embedded CFI instructions using `VirtualMachine`
+<a id="L18"></a>//!
+<a id="L19"></a>//! In some cases, such as when using the "compact unwind" data in Mach-O binaries, the FDE offsets
+<a id="L20"></a>//! may already be known. In that case, no call to `lookupPc` is necessary, which means the call to
+<a id="L21"></a>//! `prepare` can be optimized to only scan CIEs.
+<a id="L22"></a>
+<a id="L23"></a>pub const VirtualMachine = @import("Unwind/VirtualMachine.zig");
+<a id="L24"></a>
+<a id="L25"></a>frame_section: struct {
+<a id="L26"></a>    id: Section,
+<a id="L27"></a>    /// The virtual address of the start of the section. "Virtual address" refers to the address in
+<a id="L28"></a>    /// the binary (e.g. `sh_addr` in an ELF file); the equivalent runtime address may be relocated
+<a id="L29"></a>    /// in position-independent binaries.
+<a id="L30"></a>    vaddr: u64,
+<a id="L31"></a>    /// The full contents of the section. May have imprecise bounds depending on `section`. This
+<a id="L32"></a>    /// memory is externally managed.
+<a id="L33"></a>    ///
+<a id="L34"></a>    /// For `.debug_frame`, the slice length is exactly equal to the section length. This is needed
+<a id="L35"></a>    /// to know the number of CIEs and FDEs.
+<a id="L36"></a>    ///
+<a id="L37"></a>    /// For `.eh_frame`, the slice length may exceed the section length, i.e. the slice may refer to
+<a id="L38"></a>    /// more bytes than are in the second. This restriction exists because `.eh_frame_hdr` only
+<a id="L39"></a>    /// includes the address of the loaded `.eh_frame` data, not its length. It is not a problem
+<a id="L40"></a>    /// because unlike `.debug_frame`, the end of the CIE/FDE list is signaled through a sentinel
+<a id="L41"></a>    /// value. If this slice does have bounds, they will still be checked, preventing crashes when
+<a id="L42"></a>    /// reading potentially-invalid `.eh_frame` data from files.
+<a id="L43"></a>    bytes: []const u8,
+<a id="L44"></a>},
+<a id="L45"></a>
+<a id="L46"></a>/// A structure allowing fast lookups of the FDE corresponding to a particular PC. We use a binary
+<a id="L47"></a>/// search table for the lookup; essentially, a list of all FDEs ordered by PC range. `null` means
+<a id="L48"></a>/// the lookup data is not yet populated, so `prepare` must be called before `lookupPc`.
+<a id="L49"></a>lookup: ?union(enum) {
+<a id="L50"></a>    /// The `.eh_frame_hdr` section contains a pre-computed search table which we can use.
+<a id="L51"></a>    eh_frame_hdr: struct {
+<a id="L52"></a>        /// Virtual address of the `.eh_frame_hdr` section.
+<a id="L53"></a>        vaddr: u64,
+<a id="L54"></a>        table: EhFrameHeader.SearchTable,
+<a id="L55"></a>    },
+<a id="L56"></a>    /// There is no pre-computed search table, so we have built one ourselves.
+<a id="L57"></a>    /// Allocated into `gpa` and freed by `deinit`.
+<a id="L58"></a>    sorted_fdes: []SortedFdeEntry,
+<a id="L59"></a>},
+<a id="L60"></a>
+<a id="L61"></a>/// Initially empty; populated by `prepare`.
+<a id="L62"></a>cie_list: std.MultiArrayList(struct {
+<a id="L63"></a>    offset: u64,
+<a id="L64"></a>    cie: CommonInformationEntry,
+<a id="L65"></a>}),
+<a id="L66"></a>
+<a id="L67"></a>const SortedFdeEntry = struct {
+<a id="L68"></a>    /// This FDE's value of `pc_begin`.
+<a id="L69"></a>    pc_begin: u64,
+<a id="L70"></a>    /// Offset into the section of the corresponding FDE, including the entry header.
+<a id="L71"></a>    fde_offset: u64,
+<a id="L72"></a>};
+<a id="L73"></a>
+<a id="L74"></a>pub const Section = enum { debug_frame, eh_frame };
+<a id="L75"></a>
+<a id="L76"></a>/// Initialize with unwind information from a header loaded from an `.eh_frame_hdr` section, and a
+<a id="L77"></a>/// pointer to the contents of the `.eh_frame` section.
+<a id="L78"></a>///
+<a id="L79"></a>/// `.eh_frame_hdr` may embed a binary search table of FDEs. If it does, we will use that table for
+<a id="L80"></a>/// PC lookups rather than spending time constructing our own search table.
+<a id="L81"></a>pub fn initEhFrameHdr(header: EhFrameHeader, section_vaddr: u64, section_bytes_ptr: [*]const u8) Unwind {
+<a id="L82"></a>    return .{
+<a id="L83"></a>        .frame_section = .{
+<a id="L84"></a>            .id = .eh_frame,
+<a id="L85"></a>            .bytes = maxSlice(section_bytes_ptr),
+<a id="L86"></a>            .vaddr = header.eh_frame_vaddr,
+<a id="L87"></a>        },
+<a id="L88"></a>        .lookup = if (header.search_table) |table| .{ .eh_frame_hdr = .{
+<a id="L89"></a>            .vaddr = section_vaddr,
+<a id="L90"></a>            .table = table,
+<a id="L91"></a>        } } else null,
+<a id="L92"></a>        .cie_list = .empty,
+<a id="L93"></a>    };
+<a id="L94"></a>}
+<a id="L95"></a>
+<a id="L96"></a>/// Initialize with unwind information from the contents of a `.debug_frame` or `.eh_frame` section.
+<a id="L97"></a>///
+<a id="L98"></a>/// If the `.eh_frame_hdr` section is available, consider instead using `initEhFrameHdr`, which
+<a id="L99"></a>/// allows the implementation to use a search table embedded in that section if it is available.
+<a id="L100"></a>pub fn initSection(section: Section, section_vaddr: u64, section_bytes: []const u8) Unwind {
+<a id="L101"></a>    return .{
+<a id="L102"></a>        .frame_section = .{
+<a id="L103"></a>            .id = section,
+<a id="L104"></a>            .bytes = section_bytes,
+<a id="L105"></a>            .vaddr = section_vaddr,
+<a id="L106"></a>        },
+<a id="L107"></a>        .lookup = null,
+<a id="L108"></a>        .cie_list = .empty,
+<a id="L109"></a>    };
+<a id="L110"></a>}
+<a id="L111"></a>
+<a id="L112"></a>pub fn deinit(unwind: *Unwind, gpa: Allocator) void {
+<a id="L113"></a>    if (unwind.lookup) |lookup| switch (lookup) {
+<a id="L114"></a>        .eh_frame_hdr =&gt; {},
+<a id="L115"></a>        .sorted_fdes =&gt; |fdes| gpa.free(fdes),
+<a id="L116"></a>    };
+<a id="L117"></a>    for (unwind.cie_list.items(.cie)) |*cie| {
+<a id="L118"></a>        if (cie.last_row) |*lr| {
+<a id="L119"></a>            gpa.free(lr.cols);
+<a id="L120"></a>        }
+<a id="L121"></a>    }
+<a id="L122"></a>    unwind.cie_list.deinit(gpa);
+<a id="L123"></a>}
+<a id="L124"></a>
+<a id="L125"></a>/// Decoded version of the `.eh_frame_hdr` section.
+<a id="L126"></a>pub const EhFrameHeader = struct {
+<a id="L127"></a>    /// The virtual address (i.e. as given in the binary, before relocations) of the `.eh_frame`
+<a id="L128"></a>    /// section. This value is important when using `.eh_frame_hdr` to find debug information for
+<a id="L129"></a>    /// the current binary, because it allows locating where the `.eh_frame` section is loaded in
+<a id="L130"></a>    /// memory (by adding it to the ELF module's base address).
+<a id="L131"></a>    eh_frame_vaddr: u64,
+<a id="L132"></a>    search_table: ?SearchTable,
+<a id="L133"></a>
+<a id="L134"></a>    pub const SearchTable = struct {
+<a id="L135"></a>        /// The byte offset of the search table into the `.eh_frame_hdr` section.
+<a id="L136"></a>        offset: u8,
+<a id="L137"></a>        encoding: EH.PE,
+<a id="L138"></a>        fde_count: usize,
+<a id="L139"></a>        /// The actual table entries are viewed as a plain byte slice because `encoding` causes the
+<a id="L140"></a>        /// size of entries in the table to vary.
+<a id="L141"></a>        entries: []const u8,
+<a id="L142"></a>
+<a id="L143"></a>        /// Returns the vaddr of the FDE for `pc`, or `null` if no matching FDE was found.
+<a id="L144"></a>        fn findEntry(
+<a id="L145"></a>            table: *const SearchTable,
+<a id="L146"></a>            eh_frame_hdr_vaddr: u64,
+<a id="L147"></a>            pc: u64,
+<a id="L148"></a>            addr_size_bytes: u8,
+<a id="L149"></a>            endian: Endian,
+<a id="L150"></a>        ) !?u64 {
+<a id="L151"></a>            const table_vaddr = eh_frame_hdr_vaddr + table.offset;
+<a id="L152"></a>            const entry_size = try entrySize(table.encoding, addr_size_bytes);
+<a id="L153"></a>            var left: usize = 0;
+<a id="L154"></a>            var len: usize = table.fde_count;
+<a id="L155"></a>            while (len &gt; 1) {
+<a id="L156"></a>                const mid = left + len / 2;
+<a id="L157"></a>                var entry_reader: Reader = .fixed(table.entries[mid * entry_size ..][0..entry_size]);
+<a id="L158"></a>                const pc_begin = try readEhPointer(&amp;entry_reader, table.encoding, addr_size_bytes, .{
+<a id="L159"></a>                    .pc_rel_base = table_vaddr + left * entry_size,
+<a id="L160"></a>                    .data_rel_base = eh_frame_hdr_vaddr,
+<a id="L161"></a>                }, endian);
+<a id="L162"></a>                if (pc &lt; pc_begin) {
+<a id="L163"></a>                    len /= 2;
+<a id="L164"></a>                } else {
+<a id="L165"></a>                    left = mid;
+<a id="L166"></a>                    len -= len / 2;
+<a id="L167"></a>                }
+<a id="L168"></a>            }
+<a id="L169"></a>            if (len == 0) return null;
+<a id="L170"></a>            var entry_reader: Reader = .fixed(table.entries[left * entry_size ..][0..entry_size]);
+<a id="L171"></a>            // Skip past `pc_begin`; we're now interested in the fde offset
+<a id="L172"></a>            _ = try readEhPointerAbs(&amp;entry_reader, table.encoding.type, addr_size_bytes, endian);
+<a id="L173"></a>            const fde_ptr = try readEhPointer(&amp;entry_reader, table.encoding, addr_size_bytes, .{
+<a id="L174"></a>                .pc_rel_base = table_vaddr + left * entry_size,
+<a id="L175"></a>                .data_rel_base = eh_frame_hdr_vaddr,
+<a id="L176"></a>            }, endian);
+<a id="L177"></a>            return fde_ptr;
+<a id="L178"></a>        }
+<a id="L179"></a>
+<a id="L180"></a>        fn entrySize(table_enc: EH.PE, addr_size_bytes: u8) !u8 {
+<a id="L181"></a>            return switch (table_enc.type) {
+<a id="L182"></a>                .absptr =&gt; 2 * addr_size_bytes,
+<a id="L183"></a>                .udata2, .sdata2 =&gt; 4,
+<a id="L184"></a>                .udata4, .sdata4 =&gt; 8,
+<a id="L185"></a>                .udata8, .sdata8 =&gt; 16,
+<a id="L186"></a>                .uleb128, .sleb128 =&gt; return bad(), // this is a binary search table; all entries must be the same size
+<a id="L187"></a>                _ =&gt; return bad(),
+<a id="L188"></a>            };
+<a id="L189"></a>        }
+<a id="L190"></a>    };
+<a id="L191"></a>
+<a id="L192"></a>    pub fn parse(
+<a id="L193"></a>        eh_frame_hdr_vaddr: u64,
+<a id="L194"></a>        eh_frame_hdr_bytes: []const u8,
+<a id="L195"></a>        addr_size_bytes: u8,
+<a id="L196"></a>        endian: Endian,
+<a id="L197"></a>    ) !EhFrameHeader {
+<a id="L198"></a>        var r: Reader = .fixed(eh_frame_hdr_bytes);
+<a id="L199"></a>
+<a id="L200"></a>        const version = try r.takeByte();
+<a id="L201"></a>        if (version != 1) return bad();
+<a id="L202"></a>
+<a id="L203"></a>        const eh_frame_ptr_enc: EH.PE = @bitCast(try r.takeByte());
+<a id="L204"></a>        const fde_count_enc: EH.PE = @bitCast(try r.takeByte());
+<a id="L205"></a>        const table_enc: EH.PE = @bitCast(try r.takeByte());
+<a id="L206"></a>
+<a id="L207"></a>        const eh_frame_ptr = try readEhPointer(&amp;r, eh_frame_ptr_enc, addr_size_bytes, .{
+<a id="L208"></a>            .pc_rel_base = eh_frame_hdr_vaddr + r.seek,
+<a id="L209"></a>        }, endian);
+<a id="L210"></a>
+<a id="L211"></a>        const table: ?SearchTable = table: {
+<a id="L212"></a>            if (fde_count_enc == EH.PE.omit) break :table null;
+<a id="L213"></a>            if (table_enc == EH.PE.omit) break :table null;
+<a id="L214"></a>            const fde_count = try readEhPointer(&amp;r, fde_count_enc, addr_size_bytes, .{
+<a id="L215"></a>                .pc_rel_base = eh_frame_hdr_vaddr + r.seek,
+<a id="L216"></a>            }, endian);
+<a id="L217"></a>            const entry_size = try SearchTable.entrySize(table_enc, addr_size_bytes);
+<a id="L218"></a>            const bytes_offset = r.seek;
+<a id="L219"></a>            const bytes_len = cast(usize, fde_count * entry_size) orelse return error.EndOfStream;
+<a id="L220"></a>            const bytes = try r.take(bytes_len);
+<a id="L221"></a>            break :table .{
+<a id="L222"></a>                .encoding = table_enc,
+<a id="L223"></a>                .fde_count = @intCast(fde_count),
+<a id="L224"></a>                .entries = bytes,
+<a id="L225"></a>                .offset = @intCast(bytes_offset),
+<a id="L226"></a>            };
+<a id="L227"></a>        };
+<a id="L228"></a>
+<a id="L229"></a>        return .{
+<a id="L230"></a>            .eh_frame_vaddr = eh_frame_ptr,
+<a id="L231"></a>            .search_table = table,
+<a id="L232"></a>        };
+<a id="L233"></a>    }
+<a id="L234"></a>};
+<a id="L235"></a>
+<a id="L236"></a>/// The shared header of an FDE/CIE, containing a length in bytes (DWARF's "initial length field")
+<a id="L237"></a>/// and a value which differentiates CIEs from FDEs and maps FDEs to their corresponding CIEs. The
+<a id="L238"></a>/// `.eh_frame` format also includes a third variation, here called `.terminator`, which acts as a
+<a id="L239"></a>/// sentinel for the whole section.
+<a id="L240"></a>///
+<a id="L241"></a>/// `CommonInformationEntry.parse` and `FrameDescriptionEntry.parse` expect the `EntryHeader` to
+<a id="L242"></a>/// have been parsed first: they accept data stored in the `EntryHeader`, and only read the bytes
+<a id="L243"></a>/// following this header.
+<a id="L244"></a>const EntryHeader = union(enum) {
+<a id="L245"></a>    cie: struct {
+<a id="L246"></a>        format: Format,
+<a id="L247"></a>        /// Remaining bytes in the CIE. These are parseable by `CommonInformationEntry.parse`.
+<a id="L248"></a>        bytes_len: u64,
+<a id="L249"></a>    },
+<a id="L250"></a>    fde: struct {
+<a id="L251"></a>        /// Offset into the section of the corresponding CIE, *including* its entry header.
+<a id="L252"></a>        cie_offset: u64,
+<a id="L253"></a>        /// Remaining bytes in the FDE. These are parseable by `FrameDescriptionEntry.parse`.
+<a id="L254"></a>        bytes_len: u64,
+<a id="L255"></a>    },
+<a id="L256"></a>    /// The `.eh_frame` format includes terminators which indicate that the last CIE/FDE has been
+<a id="L257"></a>    /// reached. However, `.debug_frame` does not include such a terminator, so the caller must
+<a id="L258"></a>    /// keep track of how many section bytes remain when parsing all entries in `.debug_frame`.
+<a id="L259"></a>    terminator,
+<a id="L260"></a>
+<a id="L261"></a>    fn read(r: *Reader, header_section_offset: u64, section: Section, endian: Endian) !EntryHeader {
+<a id="L262"></a>        const unit_header = try Dwarf.readUnitHeader(r, endian);
+<a id="L263"></a>        if (unit_header.unit_length == 0) return .terminator;
+<a id="L264"></a>
+<a id="L265"></a>        // Next is a value which will disambiguate CIEs and FDEs. Annoyingly, LSB Core makes this
+<a id="L266"></a>        // value always 4-byte, whereas DWARF makes it depend on the `dwarf.Format`.
+<a id="L267"></a>        const cie_ptr_or_id_size: u8 = switch (section) {
+<a id="L268"></a>            .eh_frame =&gt; 4,
+<a id="L269"></a>            .debug_frame =&gt; switch (unit_header.format) {
+<a id="L270"></a>                .@"32" =&gt; 4,
+<a id="L271"></a>                .@"64" =&gt; 8,
+<a id="L272"></a>            },
+<a id="L273"></a>        };
+<a id="L274"></a>        const cie_ptr_or_id = switch (cie_ptr_or_id_size) {
+<a id="L275"></a>            4 =&gt; try r.takeInt(u32, endian),
+<a id="L276"></a>            8 =&gt; try r.takeInt(u64, endian),
+<a id="L277"></a>            else =&gt; unreachable,
+<a id="L278"></a>        };
+<a id="L279"></a>        const remaining_bytes = unit_header.unit_length - cie_ptr_or_id_size;
+<a id="L280"></a>
+<a id="L281"></a>        // If this entry is a CIE, then `cie_ptr_or_id` will have this value, which is different
+<a id="L282"></a>        // between the DWARF `.debug_frame` section and the LSB Core `.eh_frame` section.
+<a id="L283"></a>        const cie_id: u64 = switch (section) {
+<a id="L284"></a>            .eh_frame =&gt; 0,
+<a id="L285"></a>            .debug_frame =&gt; switch (unit_header.format) {
+<a id="L286"></a>                .@"32" =&gt; maxInt(u32),
+<a id="L287"></a>                .@"64" =&gt; maxInt(u64),
+<a id="L288"></a>            },
+<a id="L289"></a>        };
+<a id="L290"></a>        if (cie_ptr_or_id == cie_id) {
+<a id="L291"></a>            return .{ .cie = .{
+<a id="L292"></a>                .format = unit_header.format,
+<a id="L293"></a>                .bytes_len = remaining_bytes,
+<a id="L294"></a>            } };
+<a id="L295"></a>        }
+<a id="L296"></a>
+<a id="L297"></a>        // This is an FDE -- `cie_ptr_or_id` points to the associated CIE. Unfortunately, the format
+<a id="L298"></a>        // of that pointer again differs between `.debug_frame` and `.eh_frame`.
+<a id="L299"></a>        const cie_offset = switch (section) {
+<a id="L300"></a>            .eh_frame =&gt; try std.math.sub(u64, header_section_offset + unit_header.header_length, cie_ptr_or_id),
+<a id="L301"></a>            .debug_frame =&gt; cie_ptr_or_id,
+<a id="L302"></a>        };
+<a id="L303"></a>        return .{ .fde = .{
+<a id="L304"></a>            .cie_offset = cie_offset,
+<a id="L305"></a>            .bytes_len = remaining_bytes,
+<a id="L306"></a>        } };
+<a id="L307"></a>    }
+<a id="L308"></a>};
+<a id="L309"></a>
+<a id="L310"></a>pub const CommonInformationEntry = struct {
+<a id="L311"></a>    version: u8,
+<a id="L312"></a>    format: Format,
+<a id="L313"></a>
+<a id="L314"></a>    /// In version 4, CIEs can specify the address size used in the CIE and associated FDEs.
+<a id="L315"></a>    /// This value must be used *only* to parse associated FDEs in `FrameDescriptionEntry.parse`.
+<a id="L316"></a>    addr_size_bytes: u8,
+<a id="L317"></a>
+<a id="L318"></a>    /// Always 0 for versions which do not specify this (currently all versions other than 4).
+<a id="L319"></a>    segment_selector_size: u8,
+<a id="L320"></a>
+<a id="L321"></a>    code_alignment_factor: u32,
+<a id="L322"></a>    data_alignment_factor: i32,
+<a id="L323"></a>    return_address_register: u8,
+<a id="L324"></a>
+<a id="L325"></a>    fde_pointer_enc: EH.PE,
+<a id="L326"></a>    is_signal_frame: bool,
+<a id="L327"></a>
+<a id="L328"></a>    augmentation_kind: AugmentationKind,
+<a id="L329"></a>
+<a id="L330"></a>    initial_instructions: []const u8,
+<a id="L331"></a>
+<a id="L332"></a>    last_row: ?struct {
+<a id="L333"></a>        offset: u64,
+<a id="L334"></a>        cfa: VirtualMachine.CfaRule,
+<a id="L335"></a>        cols: []VirtualMachine.Column,
+<a id="L336"></a>    },
+<a id="L337"></a>
+<a id="L338"></a>    pub const AugmentationKind = enum { none, gcc_eh, lsb_z };
+<a id="L339"></a>
+<a id="L340"></a>    /// This function expects to read the CIE starting with the version field.
+<a id="L341"></a>    /// The returned struct references memory backed by `cie_bytes`.
+<a id="L342"></a>    ///
+<a id="L343"></a>    /// `length_offset` specifies the offset of this CIE's length field in the
+<a id="L344"></a>    /// .eh_frame / .debug_frame section.
+<a id="L345"></a>    fn parse(
+<a id="L346"></a>        format: Format,
+<a id="L347"></a>        cie_bytes: []const u8,
+<a id="L348"></a>        section: Section,
+<a id="L349"></a>        default_addr_size_bytes: u8,
+<a id="L350"></a>    ) !CommonInformationEntry {
+<a id="L351"></a>        // We only read the data through this reader.
+<a id="L352"></a>        var r: Reader = .fixed(cie_bytes);
+<a id="L353"></a>
+<a id="L354"></a>        const version = try r.takeByte();
+<a id="L355"></a>        switch (section) {
+<a id="L356"></a>            .eh_frame =&gt; if (version != 1 and version != 3) return error.UnsupportedDwarfVersion,
+<a id="L357"></a>            .debug_frame =&gt; if (version != 4) return error.UnsupportedDwarfVersion,
+<a id="L358"></a>        }
+<a id="L359"></a>
+<a id="L360"></a>        const aug_str = try r.takeSentinel(0);
+<a id="L361"></a>        const aug_kind: AugmentationKind = aug: {
+<a id="L362"></a>            if (aug_str.len == 0) break :aug .none;
+<a id="L363"></a>            if (aug_str[0] == 'z') break :aug .lsb_z;
+<a id="L364"></a>            if (std.mem.eql(u8, aug_str, "eh")) break :aug .gcc_eh;
+<a id="L365"></a>            // We can't finish parsing the CIE if we don't know what its augmentation means.
+<a id="L366"></a>            return bad();
+<a id="L367"></a>        };
+<a id="L368"></a>
+<a id="L369"></a>        switch (aug_kind) {
+<a id="L370"></a>            .none =&gt; {}, // no extra data
+<a id="L371"></a>            .lsb_z =&gt; {}, // no extra data yet, but there is a bit later
+<a id="L372"></a>            .gcc_eh =&gt; try r.discardAll(default_addr_size_bytes), // unsupported data
+<a id="L373"></a>        }
+<a id="L374"></a>
+<a id="L375"></a>        const addr_size_bytes = if (version == 4) try r.takeByte() else default_addr_size_bytes;
+<a id="L376"></a>        const segment_selector_size: u8 = if (version == 4) try r.takeByte() else 0;
+<a id="L377"></a>        const code_alignment_factor = try r.takeLeb128(u32);
+<a id="L378"></a>        const data_alignment_factor = try r.takeLeb128(i32);
+<a id="L379"></a>        const return_address_register = if (version == 1) try r.takeByte() else try r.takeLeb128(u8);
+<a id="L380"></a>
+<a id="L381"></a>        // This is where LSB's augmentation might add some data.
+<a id="L382"></a>        const fde_pointer_enc: EH.PE, const is_signal_frame: bool = aug: {
+<a id="L383"></a>            const default_fde_pointer_enc: EH.PE = .{ .type = .absptr, .rel = .abs };
+<a id="L384"></a>            if (aug_kind != .lsb_z) break :aug .{ default_fde_pointer_enc, false };
+<a id="L385"></a>            const aug_data_len = try r.takeLeb128(u32);
+<a id="L386"></a>            var aug_data: Reader = .fixed(try r.take(aug_data_len));
+<a id="L387"></a>            var fde_pointer_enc: EH.PE = default_fde_pointer_enc;
+<a id="L388"></a>            var is_signal_frame = false;
+<a id="L389"></a>            for (aug_str[1..]) |byte| switch (byte) {
+<a id="L390"></a>                'L' =&gt; _ = try aug_data.takeByte(), // we ignore the LSDA pointer
+<a id="L391"></a>                'P' =&gt; {
+<a id="L392"></a>                    const enc: EH.PE = @bitCast(try aug_data.takeByte());
+<a id="L393"></a>                    const endian: Endian = .little; // irrelevant because we're discarding the value anyway
+<a id="L394"></a>                    _ = try readEhPointerAbs(&amp;aug_data, enc.type, addr_size_bytes, endian); // we ignore the personality routine; endianness is irrelevant since we're discarding
+<a id="L395"></a>                },
+<a id="L396"></a>                'R' =&gt; fde_pointer_enc = @bitCast(try aug_data.takeByte()),
+<a id="L397"></a>                'S' =&gt; is_signal_frame = true,
+<a id="L398"></a>                'B', 'G' =&gt; {},
+<a id="L399"></a>                else =&gt; return bad(),
+<a id="L400"></a>            };
+<a id="L401"></a>            break :aug .{ fde_pointer_enc, is_signal_frame };
+<a id="L402"></a>        };
+<a id="L403"></a>
+<a id="L404"></a>        return .{
+<a id="L405"></a>            .format = format,
+<a id="L406"></a>            .version = version,
+<a id="L407"></a>            .addr_size_bytes = addr_size_bytes,
+<a id="L408"></a>            .segment_selector_size = segment_selector_size,
+<a id="L409"></a>            .code_alignment_factor = code_alignment_factor,
+<a id="L410"></a>            .data_alignment_factor = data_alignment_factor,
+<a id="L411"></a>            .return_address_register = return_address_register,
+<a id="L412"></a>            .fde_pointer_enc = fde_pointer_enc,
+<a id="L413"></a>            .is_signal_frame = is_signal_frame,
+<a id="L414"></a>            .augmentation_kind = aug_kind,
+<a id="L415"></a>            .initial_instructions = r.buffered(),
+<a id="L416"></a>            .last_row = null,
+<a id="L417"></a>        };
+<a id="L418"></a>    }
+<a id="L419"></a>};
+<a id="L420"></a>
+<a id="L421"></a>pub const FrameDescriptionEntry = struct {
+<a id="L422"></a>    pc_begin: u64,
+<a id="L423"></a>    pc_range: u64,
+<a id="L424"></a>    instructions: []const u8,
+<a id="L425"></a>
+<a id="L426"></a>    /// This function expects to read the FDE starting at the PC Begin field.
+<a id="L427"></a>    /// The returned struct references memory backed by `fde_bytes`.
+<a id="L428"></a>    fn parse(
+<a id="L429"></a>        /// The virtual address of the FDE we're parsing, *excluding* its entry header (i.e. the
+<a id="L430"></a>        /// address is after the header). If `fde_bytes` is backed by the memory of a loaded
+<a id="L431"></a>        /// module's `.eh_frame` section, this will equal `fde_bytes.ptr`.
+<a id="L432"></a>        fde_vaddr: u64,
+<a id="L433"></a>        fde_bytes: []const u8,
+<a id="L434"></a>        cie: *const CommonInformationEntry,
+<a id="L435"></a>        endian: Endian,
+<a id="L436"></a>    ) !FrameDescriptionEntry {
+<a id="L437"></a>        if (cie.segment_selector_size != 0) return error.UnsupportedAddrSize;
+<a id="L438"></a>
+<a id="L439"></a>        var r: Reader = .fixed(fde_bytes);
+<a id="L440"></a>
+<a id="L441"></a>        const pc_begin = try readEhPointer(&amp;r, cie.fde_pointer_enc, cie.addr_size_bytes, .{
+<a id="L442"></a>            .pc_rel_base = fde_vaddr,
+<a id="L443"></a>        }, endian);
+<a id="L444"></a>
+<a id="L445"></a>        // I swear I'm not kidding when I say that PC Range is encoded with `cie.fde_pointer_enc`, but ignoring `rel`.
+<a id="L446"></a>        const pc_range = switch (try readEhPointerAbs(&amp;r, cie.fde_pointer_enc.type, cie.addr_size_bytes, endian)) {
+<a id="L447"></a>            .unsigned =&gt; |x| x,
+<a id="L448"></a>            .signed =&gt; |x| cast(u64, x) orelse return bad(),
+<a id="L449"></a>        };
+<a id="L450"></a>
+<a id="L451"></a>        switch (cie.augmentation_kind) {
+<a id="L452"></a>            .none, .gcc_eh =&gt; {},
+<a id="L453"></a>            .lsb_z =&gt; {
+<a id="L454"></a>                // There is augmentation data, but it's irrelevant to us -- it
+<a id="L455"></a>                // only contains the LSDA pointer, which we don't care about.
+<a id="L456"></a>                const aug_data_len = try r.takeLeb128(usize);
+<a id="L457"></a>                _ = try r.discardAll(aug_data_len);
+<a id="L458"></a>            },
+<a id="L459"></a>        }
+<a id="L460"></a>
+<a id="L461"></a>        return .{
+<a id="L462"></a>            .pc_begin = pc_begin,
+<a id="L463"></a>            .pc_range = pc_range,
+<a id="L464"></a>            .instructions = r.buffered(),
+<a id="L465"></a>        };
+<a id="L466"></a>    }
+<a id="L467"></a>};
+<a id="L468"></a>
+<a id="L469"></a>/// Builds the CIE list and FDE lookup table if they are not already built. It is required to call
+<a id="L470"></a>/// this function at least once before calling `lookupPc` or `getFde`. If only `getFde` is needed,
+<a id="L471"></a>/// then `need_lookup` can be set to `false` to make this function more efficient.
+<a id="L472"></a>pub fn prepare(
+<a id="L473"></a>    unwind: *Unwind,
+<a id="L474"></a>    gpa: Allocator,
+<a id="L475"></a>    addr_size_bytes: u8,
+<a id="L476"></a>    endian: Endian,
+<a id="L477"></a>    need_lookup: bool,
+<a id="L478"></a>    /// The `__eh_frame` section in Mach-O binaries deviates from the standard `.eh_frame` section
+<a id="L479"></a>    /// in one way which this function needs to be aware of.
+<a id="L480"></a>    is_macho: bool,
+<a id="L481"></a>) !void {
+<a id="L482"></a>    if (unwind.cie_list.len &gt; 0 and (!need_lookup or unwind.lookup != null)) return;
+<a id="L483"></a>    unwind.cie_list.clearRetainingCapacity();
+<a id="L484"></a>
+<a id="L485"></a>    if (is_macho) assert(unwind.lookup == null or unwind.lookup.? != .eh_frame_hdr);
+<a id="L486"></a>
+<a id="L487"></a>    const section = unwind.frame_section;
+<a id="L488"></a>
+<a id="L489"></a>    var r: Reader = .fixed(section.bytes);
+<a id="L490"></a>    var fde_list: std.ArrayList(SortedFdeEntry) = .empty;
+<a id="L491"></a>    defer fde_list.deinit(gpa);
+<a id="L492"></a>
+<a id="L493"></a>    const saw_terminator = while (r.seek &lt; r.buffer.len) {
+<a id="L494"></a>        const entry_offset = r.seek;
+<a id="L495"></a>        switch (try EntryHeader.read(&amp;r, entry_offset, section.id, endian)) {
+<a id="L496"></a>            .cie =&gt; |cie_info| {
+<a id="L497"></a>                // We will pre-populate a list of CIEs for efficiency: this avoids work re-parsing
+<a id="L498"></a>                // them every time we look up an FDE. It also lets us cache the result of evaluating
+<a id="L499"></a>                // the CIE's initial CFI instructions, which is useful because in the vast majority
+<a id="L500"></a>                // of cases those instructions will be needed to reach the PC we are unwinding to.
+<a id="L501"></a>                const bytes_len = cast(usize, cie_info.bytes_len) orelse return error.EndOfStream;
+<a id="L502"></a>                const idx = unwind.cie_list.len;
+<a id="L503"></a>                try unwind.cie_list.append(gpa, .{
+<a id="L504"></a>                    .offset = entry_offset,
+<a id="L505"></a>                    .cie = try .parse(cie_info.format, try r.take(bytes_len), section.id, addr_size_bytes),
+<a id="L506"></a>                });
+<a id="L507"></a>                errdefer _ = unwind.cie_list.pop().?;
+<a id="L508"></a>                try VirtualMachine.populateCieLastRow(gpa, &amp;unwind.cie_list.items(.cie)[idx], addr_size_bytes, endian);
+<a id="L509"></a>                continue;
+<a id="L510"></a>            },
+<a id="L511"></a>            .fde =&gt; |fde_info| {
+<a id="L512"></a>                const bytes_len = cast(usize, fde_info.bytes_len) orelse return error.EndOfStream;
+<a id="L513"></a>                if (!need_lookup) {
+<a id="L514"></a>                    try r.discardAll(bytes_len);
+<a id="L515"></a>                    continue;
+<a id="L516"></a>                }
+<a id="L517"></a>                const cie = unwind.findCie(fde_info.cie_offset) orelse return error.InvalidDebugInfo;
+<a id="L518"></a>                const fde: FrameDescriptionEntry = try .parse(section.vaddr + r.seek, try r.take(bytes_len), cie, endian);
+<a id="L519"></a>                try fde_list.append(gpa, .{
+<a id="L520"></a>                    .pc_begin = fde.pc_begin,
+<a id="L521"></a>                    .fde_offset = entry_offset,
+<a id="L522"></a>                });
+<a id="L523"></a>            },
+<a id="L524"></a>            .terminator =&gt; break true,
+<a id="L525"></a>        }
+<a id="L526"></a>    } else false;
+<a id="L527"></a>    const expect_terminator = switch (section.id) {
+<a id="L528"></a>        .eh_frame =&gt; !is_macho, // `.eh_frame` indicates the end of the CIE/FDE list with a sentinel entry, though macOS omits this
+<a id="L529"></a>        .debug_frame =&gt; false, // `.debug_frame` uses the section bounds and does not specify a sentinel entry
+<a id="L530"></a>    };
+<a id="L531"></a>    if (saw_terminator != expect_terminator) return bad();
+<a id="L532"></a>
+<a id="L533"></a>    if (need_lookup) {
+<a id="L534"></a>        std.mem.sortUnstable(SortedFdeEntry, fde_list.items, {}, struct {
+<a id="L535"></a>            fn lessThan(ctx: void, a: SortedFdeEntry, b: SortedFdeEntry) bool {
+<a id="L536"></a>                ctx;
+<a id="L537"></a>                return a.pc_begin &lt; b.pc_begin;
+<a id="L538"></a>            }
+<a id="L539"></a>        }.lessThan);
+<a id="L540"></a>
+<a id="L541"></a>        // This temporary is necessary to avoid an RLS footgun where `lookup` ends up non-null `undefined` on OOM.
+<a id="L542"></a>        const final_fdes = try fde_list.toOwnedSlice(gpa);
+<a id="L543"></a>        unwind.lookup = .{ .sorted_fdes = final_fdes };
+<a id="L544"></a>    }
+<a id="L545"></a>}
+<a id="L546"></a>
+<a id="L547"></a>fn findCie(unwind: *const Unwind, offset: u64) ?*const CommonInformationEntry {
+<a id="L548"></a>    const offsets = unwind.cie_list.items(.offset);
+<a id="L549"></a>    if (offsets.len == 0) return null;
+<a id="L550"></a>    var start: usize = 0;
+<a id="L551"></a>    var len: usize = offsets.len;
+<a id="L552"></a>    while (len &gt; 1) {
+<a id="L553"></a>        const mid = len / 2;
+<a id="L554"></a>        if (offset &lt; offsets[start + mid]) {
+<a id="L555"></a>            len = mid;
+<a id="L556"></a>        } else {
+<a id="L557"></a>            start += mid;
+<a id="L558"></a>            len -= mid;
+<a id="L559"></a>        }
+<a id="L560"></a>    }
+<a id="L561"></a>    if (offsets[start] != offset) return null;
+<a id="L562"></a>    return &amp;unwind.cie_list.items(.cie)[start];
+<a id="L563"></a>}
+<a id="L564"></a>
+<a id="L565"></a>/// Given a program counter value, returns the offset of the corresponding FDE, or `null` if no
+<a id="L566"></a>/// matching FDE was found. The returned offset can be passed to `getFde` to load the data
+<a id="L567"></a>/// associated with the FDE.
+<a id="L568"></a>///
+<a id="L569"></a>/// Before calling this function, `prepare` must return successfully at least once, to ensure that
+<a id="L570"></a>/// `unwind.lookup` is populated.
+<a id="L571"></a>///
+<a id="L572"></a>/// The return value may be a false positive. After loading the FDE with `loadFde`, the caller must
+<a id="L573"></a>/// validate that `pc` is indeed in its range -- if it is not, then no FDE matches `pc`.
+<a id="L574"></a>pub fn lookupPc(unwind: *const Unwind, pc: u64, addr_size_bytes: u8, endian: Endian) !?u64 {
+<a id="L575"></a>    const sorted_fdes: []const SortedFdeEntry = switch (unwind.lookup.?) {
+<a id="L576"></a>        .eh_frame_hdr =&gt; |eh_frame_hdr| {
+<a id="L577"></a>            const fde_vaddr = try eh_frame_hdr.table.findEntry(
+<a id="L578"></a>                eh_frame_hdr.vaddr,
+<a id="L579"></a>                pc,
+<a id="L580"></a>                addr_size_bytes,
+<a id="L581"></a>                endian,
+<a id="L582"></a>            ) orelse return null;
+<a id="L583"></a>            return std.math.sub(u64, fde_vaddr, unwind.frame_section.vaddr) catch bad(); // convert vaddr to offset
+<a id="L584"></a>        },
+<a id="L585"></a>        .sorted_fdes =&gt; |sorted_fdes| sorted_fdes,
+<a id="L586"></a>    };
+<a id="L587"></a>    if (sorted_fdes.len == 0) return null;
+<a id="L588"></a>    var start: usize = 0;
+<a id="L589"></a>    var len: usize = sorted_fdes.len;
+<a id="L590"></a>    while (len &gt; 1) {
+<a id="L591"></a>        const half = len / 2;
+<a id="L592"></a>        if (pc &lt; sorted_fdes[start + half].pc_begin) {
+<a id="L593"></a>            len = half;
+<a id="L594"></a>        } else {
+<a id="L595"></a>            start += half;
+<a id="L596"></a>            len -= half;
+<a id="L597"></a>        }
+<a id="L598"></a>    }
+<a id="L599"></a>    // If any FDE matches, it'll be the one at `start` (maybe false positive).
+<a id="L600"></a>    return sorted_fdes[start].fde_offset;
+<a id="L601"></a>}
+<a id="L602"></a>
+<a id="L603"></a>/// Get the FDE at a given offset, as well as its associated CIE. This offset typically comes from
+<a id="L604"></a>/// `lookupPc`. The CFI instructions within can be evaluated with `VirtualMachine`.
+<a id="L605"></a>pub fn getFde(unwind: *const Unwind, fde_offset: u64, endian: Endian) !struct { *const CommonInformationEntry, FrameDescriptionEntry } {
+<a id="L606"></a>    const section = unwind.frame_section;
+<a id="L607"></a>
+<a id="L608"></a>    if (fde_offset &gt; section.bytes.len) return error.EndOfStream;
+<a id="L609"></a>    var fde_reader: Reader = .fixed(section.bytes[@intCast(fde_offset)..]);
+<a id="L610"></a>    const fde_info = switch (try EntryHeader.read(&amp;fde_reader, fde_offset, section.id, endian)) {
+<a id="L611"></a>        .fde =&gt; |info| info,
+<a id="L612"></a>        .cie, .terminator =&gt; return bad(), // This is meant to be an FDE
+<a id="L613"></a>    };
+<a id="L614"></a>
+<a id="L615"></a>    const cie = unwind.findCie(fde_info.cie_offset) orelse return error.InvalidDebugInfo;
+<a id="L616"></a>    const fde: FrameDescriptionEntry = try .parse(
+<a id="L617"></a>        section.vaddr + fde_offset + fde_reader.seek,
+<a id="L618"></a>        try fde_reader.take(cast(usize, fde_info.bytes_len) orelse return error.EndOfStream),
+<a id="L619"></a>        cie,
+<a id="L620"></a>        endian,
+<a id="L621"></a>    );
+<a id="L622"></a>
+<a id="L623"></a>    return .{ cie, fde };
+<a id="L624"></a>}
+<a id="L625"></a>
+<a id="L626"></a>const EhPointerContext = struct {
+<a id="L627"></a>    /// The address of the pointer field itself
+<a id="L628"></a>    pc_rel_base: u64,
+<a id="L629"></a>    // These relative addressing modes are only used in specific cases, and
+<a id="L630"></a>    // might not be available / required in all parsing contexts
+<a id="L631"></a>    data_rel_base: ?u64 = null,
+<a id="L632"></a>    text_rel_base: ?u64 = null,
+<a id="L633"></a>    function_rel_base: ?u64 = null,
+<a id="L634"></a>};
+<a id="L635"></a>/// Returns `error.InvalidDebugInfo` if the encoding is `EH.PE.omit`.
+<a id="L636"></a>fn readEhPointerAbs(r: *Reader, enc_ty: EH.PE.Type, addr_size_bytes: u8, endian: Endian) !union(enum) {
+<a id="L637"></a>    signed: i64,
+<a id="L638"></a>    unsigned: u64,
+<a id="L639"></a>} {
+<a id="L640"></a>    return switch (enc_ty) {
+<a id="L641"></a>        .absptr =&gt; .{
+<a id="L642"></a>            .unsigned = switch (addr_size_bytes) {
+<a id="L643"></a>                2 =&gt; try r.takeInt(u16, endian),
+<a id="L644"></a>                4 =&gt; try r.takeInt(u32, endian),
+<a id="L645"></a>                8 =&gt; try r.takeInt(u64, endian),
+<a id="L646"></a>                else =&gt; return error.UnsupportedAddrSize,
+<a id="L647"></a>            },
+<a id="L648"></a>        },
+<a id="L649"></a>        .uleb128 =&gt; .{ .unsigned = try r.takeLeb128(u64) },
+<a id="L650"></a>        .udata2 =&gt; .{ .unsigned = try r.takeInt(u16, endian) },
+<a id="L651"></a>        .udata4 =&gt; .{ .unsigned = try r.takeInt(u32, endian) },
+<a id="L652"></a>        .udata8 =&gt; .{ .unsigned = try r.takeInt(u64, endian) },
+<a id="L653"></a>        .sleb128 =&gt; .{ .signed = try r.takeLeb128(i64) },
+<a id="L654"></a>        .sdata2 =&gt; .{ .signed = try r.takeInt(i16, endian) },
+<a id="L655"></a>        .sdata4 =&gt; .{ .signed = try r.takeInt(i32, endian) },
+<a id="L656"></a>        .sdata8 =&gt; .{ .signed = try r.takeInt(i64, endian) },
+<a id="L657"></a>        else =&gt; return bad(),
+<a id="L658"></a>    };
+<a id="L659"></a>}
+<a id="L660"></a>/// Returns `error.InvalidDebugInfo` if the encoding is `EH.PE.omit`.
+<a id="L661"></a>fn readEhPointer(r: *Reader, enc: EH.PE, addr_size_bytes: u8, ctx: EhPointerContext, endian: Endian) !u64 {
+<a id="L662"></a>    const offset = try readEhPointerAbs(r, enc.type, addr_size_bytes, endian);
+<a id="L663"></a>    if (enc.indirect) return bad(); // GCC extension; not supported
+<a id="L664"></a>    const base: u64 = switch (enc.rel) {
+<a id="L665"></a>        .abs, .aligned =&gt; 0,
+<a id="L666"></a>        .pcrel =&gt; ctx.pc_rel_base,
+<a id="L667"></a>        .textrel =&gt; ctx.text_rel_base orelse return bad(),
+<a id="L668"></a>        .datarel =&gt; ctx.data_rel_base orelse return bad(),
+<a id="L669"></a>        .funcrel =&gt; ctx.function_rel_base orelse return bad(),
+<a id="L670"></a>        _ =&gt; return bad(),
+<a id="L671"></a>    };
+<a id="L672"></a>    return switch (offset) {
+<a id="L673"></a>        .signed =&gt; |s| if (s &gt;= 0)
+<a id="L674"></a>            try std.math.add(u64, base, @intCast(s))
+<a id="L675"></a>        else
+<a id="L676"></a>            try std.math.sub(u64, base, @intCast(-s)),
+<a id="L677"></a>        // absptr can actually contain signed values in some cases (aarch64 MachO)
+<a id="L678"></a>        .unsigned =&gt; |u| u +% base,
+<a id="L679"></a>    };
+<a id="L680"></a>}
+<a id="L681"></a>
+<a id="L682"></a>/// Like `Reader.fixed`, but when the length of the data is unknown and we just want to allow
+<a id="L683"></a>/// reading indefinitely.
+<a id="L684"></a>fn maxSlice(ptr: [*]const u8) []const u8 {
+<a id="L685"></a>    const len = std.math.maxInt(usize) - @intFromPtr(ptr);
+<a id="L686"></a>    return ptr[0..len];
+<a id="L687"></a>}
+<a id="L688"></a>
+<a id="L689"></a>const Allocator = std.mem.Allocator;
+<a id="L690"></a>const assert = std.debug.assert;
+<a id="L691"></a>const bad = Dwarf.bad;
+<a id="L692"></a>const cast = std.math.cast;
+<a id="L693"></a>const DW = std.dwarf;
+<a id="L694"></a>const Dwarf = std.debug.Dwarf;
+<a id="L695"></a>const EH = DW.EH;
+<a id="L696"></a>const Endian = std.builtin.Endian;
+<a id="L697"></a>const Format = DW.Format;
+<a id="L698"></a>const maxInt = std.math.maxInt;
+<a id="L699"></a>const missing = Dwarf.missing;
+<a id="L700"></a>const Reader = std.Io.Reader;
+<a id="L701"></a>const std = @import("std");
+<a id="L702"></a>const Unwind = @This();
+</pre>
 </body>
 </html>

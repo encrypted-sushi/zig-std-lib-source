@@ -2,1501 +2,1504 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Source: zig-0.16.0-std/Io/net.zig</title>
+    <title>Source: Io/net.zig</title>
     <style>
         body { background: #1e1e1e; color: #d4d4d4; font-family: monospace; padding: 20px; }
         pre { white-space: pre-wrap; word-wrap: break-word; }
         .header { border-bottom: 1px solid #444; padding-bottom: 10px; margin-bottom: 20px; }
         a { color: #569cd6; }
+        a[id] { color: inherit; text-decoration: none; }
+        :target { background: #3a3a00; }
     </style>
 </head>
 <body>
     <div class="header">
-        <a href="/">Index</a> | <strong>File: zig-0.16.0-std/Io/net.zig</strong>
+        <a href="/">Index</a> | <strong>File: Io/net.zig</strong>
     </div>
-    <pre>const builtin = @import("builtin");
-const native_os = builtin.os.tag;
-const std = @import("../std.zig");
-const Io = std.Io;
-const assert = std.debug.assert;
-
-pub const HostName = @import("net/HostName.zig");
-
-/// Source of truth: Internet Assigned Numbers Authority (IANA)
-pub const Protocol = enum(u32) {
-    hopopts = 0,
-    icmp = 1,
-    igmp = 2,
-    ipip = 4,
-    tcp = 6,
-    egp = 8,
-    pup = 12,
-    udp = 17,
-    idp = 22,
-    tp = 29,
-    dccp = 33,
-    ipv6 = 41,
-    routing = 43,
-    fragment = 44,
-    rsvp = 46,
-    gre = 47,
-    esp = 50,
-    ah = 51,
-    icmpv6 = 58,
-    none = 59,
-    dstopts = 60,
-    mtp = 92,
-    beetph = 94,
-    encap = 98,
-    pim = 103,
-    comp = 108,
-    sctp = 132,
-    mh = 135,
-    udplite = 136,
-    mpls = 137,
-    ethernet = 143,
-    raw = 255,
-    mptcp = 262,
-    _,
-};
-
-/// Windows 10 added support for unix sockets in build 17063, redstone 4 is the
-/// first release to support them.
-pub const has_unix_sockets = switch (native_os) {
-    .windows =&gt; builtin.os.version_range.windows.isAtLeast(.win10_rs4) orelse false,
-    .wasi =&gt; false,
-    else =&gt; true,
-};
-
-pub const default_kernel_backlog = 128;
-
-pub const IpAddress = union(enum) {
-    ip4: Ip4Address,
-    ip6: Ip6Address,
-
-    pub const Family = @typeInfo(IpAddress).@"union".tag_type.?;
-
-    pub const ParseLiteralError = error{ InvalidAddress, InvalidPort };
-
-    /// Parse an IP address which may include a port.
-    ///
-    /// For IPv4, this is written `address:port`.
-    ///
-    /// For IPv6, RFC 3986 defines this as an "IP literal", and the port is
-    /// differentiated from the address by surrounding the address part in
-    /// brackets "[addr]:port". Even if the port is not given, the brackets are
-    /// mandatory.
-    pub fn parseLiteral(text: []const u8) ParseLiteralError!IpAddress {
-        if (text.len == 0) return error.InvalidAddress;
-        if (text[0] == '[') {
-            const addr_end = std.mem.findScalar(u8, text, ']') orelse
-                return error.InvalidAddress;
-            const addr_text = text[1..addr_end];
-            const port: u16 = p: {
-                if (addr_end == text.len - 1) break :p 0;
-                if (text[addr_end + 1] != ':') return error.InvalidAddress;
-                break :p std.fmt.parseInt(u16, text[addr_end + 2 ..], 10) catch return error.InvalidPort;
-            };
-            return parseIp6(addr_text, port) catch error.InvalidAddress;
-        }
-        if (std.mem.findScalar(u8, text, ':')) |i| {
-            const addr = Ip4Address.parse(text[0..i], 0) catch return error.InvalidAddress;
-            return .{ .ip4 = .{
-                .bytes = addr.bytes,
-                .port = std.fmt.parseInt(u16, text[i + 1 ..], 10) catch return error.InvalidPort,
-            } };
-        }
-        return parseIp4(text, 0) catch error.InvalidAddress;
-    }
-
-    /// Parse the given IP address string into an `IpAddress` value.
-    ///
-    /// This is a pure function but it cannot handle IPv6 addresses that have
-    /// scope ids ("%foo" at the end). To also handle those, `resolve` must be
-    /// called instead.
-    pub fn parse(text: []const u8, port: u16) !IpAddress {
-        if (parseIp4(text, port)) |ip4| return ip4 else |err| switch (err) {
-            error.Overflow,
-            error.InvalidEnd,
-            error.InvalidCharacter,
-            error.Incomplete,
-            error.NonCanonical,
-            =&gt; {},
-        }
-
-        return parseIp6(text, port);
-    }
-
-    pub fn parseIp4(text: []const u8, port: u16) Ip4Address.ParseError!IpAddress {
-        return .{ .ip4 = try Ip4Address.parse(text, port) };
-    }
-
-    /// This is a pure function but it cannot handle IPv6 addresses that have
-    /// scope ids ("%foo" at the end). To also handle those, `resolveIp6` must be
-    /// called instead.
-    pub fn parseIp6(text: []const u8, port: u16) Ip6Address.ParseError!IpAddress {
-        return .{ .ip6 = try Ip6Address.parse(text, port) };
-    }
-
-    /// This function requires an `Io` parameter because it must query the operating
-    /// system to convert interface name to index. For example, in
-    /// "fe80::e0e:76ff:fed4:cf22%eno1", "eno1" must be resolved to an index by
-    /// creating a socket and then using an `ioctl` syscall.
-    ///
-    /// For a pure function that cannot handle scopes, see `parse`.
-    pub fn resolve(io: Io, text: []const u8, port: u16) !IpAddress {
-        if (parseIp4(text, port)) |ip4| return ip4 else |err| switch (err) {
-            error.Overflow,
-            error.InvalidEnd,
-            error.InvalidCharacter,
-            error.Incomplete,
-            error.NonCanonical,
-            =&gt; {},
-        }
-
-        return resolveIp6(io, text, port);
-    }
-
-    pub fn resolveIp6(io: Io, text: []const u8, port: u16) Ip6Address.ResolveError!IpAddress {
-        return .{ .ip6 = try Ip6Address.resolve(io, text, port) };
-    }
-
-    /// Returns the port in native endian.
-    pub fn getPort(a: IpAddress) u16 {
-        return switch (a) {
-            inline .ip4, .ip6 =&gt; |x| x.port,
-        };
-    }
-
-    /// `port` is native-endian.
-    pub fn setPort(a: *IpAddress, port: u16) void {
-        switch (a.*) {
-            .ip4 =&gt; a.ip4.port = port,
-            .ip6 =&gt; a.ip6.port = port,
-        }
-    }
-
-    /// Converts from an IPv4-mapped IPv6 address, or returns the IPv6 address directly.
-    pub fn fromIp6(ip6: Ip6Address) IpAddress {
-        return if (Ip4Address.fromIp6(ip6)) |ip4| .{ .ip4 = ip4 } else .{ .ip6 = ip6 };
-    }
-
-    /// Includes the optional scope ("%foo" at the end) in IPv6 addresses.
-    ///
-    /// See `format` for an alternative that omits scopes and does
-    /// not require an `Io` parameter.
-    pub fn formatResolved(a: IpAddress, io: Io, w: *Io.Writer) Ip6Address.FormatError!void {
-        switch (a) {
-            .ip4 =&gt; |x| return x.format(w),
-            .ip6 =&gt; |x| return x.formatResolved(io, w),
-        }
-    }
-
-    /// See `formatResolved` for an alternative that additionally prints the optional
-    /// scope at the end of IPv6 addresses and requires an `Io` parameter.
-    pub fn format(a: IpAddress, w: *Io.Writer) Io.Writer.Error!void {
-        switch (a) {
-            inline .ip4, .ip6 =&gt; |x| return x.format(w),
-        }
-    }
-
-    pub fn eql(a: *const IpAddress, b: *const IpAddress) bool {
-        return switch (a.*) {
-            .ip4 =&gt; |a_ip4| switch (b.*) {
-                .ip4 =&gt; |b_ip4| a_ip4.eql(b_ip4),
-                else =&gt; false,
-            },
-            .ip6 =&gt; |a_ip6| switch (b.*) {
-                .ip6 =&gt; |b_ip6| a_ip6.eql(b_ip6),
-                else =&gt; false,
-            },
-        };
-    }
-
-    pub const ListenError = error{
-        /// The address is already taken. Can occur when bound port is 0 but
-        /// all ephemeral ports are already in use.
-        AddressInUse,
-        /// A nonexistent interface was requested or the requested address was not local.
-        AddressUnavailable,
-        /// The local network interface used to reach the destination is offline.
-        NetworkDown,
-        /// Insufficient memory or other resource internal to the operating system.
-        SystemResources,
-        /// Per-process limit on the number of open file descriptors has been reached.
-        ProcessFdQuotaExceeded,
-        /// System-wide limit on the total number of open files has been reached.
-        SystemFdQuotaExceeded,
-        /// The requested address family (IPv4 or IPv6) is not supported by the operating system.
-        AddressFamilyUnsupported,
-        ProtocolUnsupportedBySystem,
-        ProtocolUnsupportedByAddressFamily,
-        SocketModeUnsupported,
-        /// One of the `ListenOptions` is not supported by the Io
-        /// implementation.
-        OptionUnsupported,
-    } || Io.UnexpectedError || Io.Cancelable;
-
-    pub const ListenOptions = struct {
-        /// How many connections the kernel will accept on the application's behalf.
-        /// If more than this many connections pool in the kernel, clients will start
-        /// seeing "Connection refused".
-        kernel_backlog: u31 = default_kernel_backlog,
-        /// Sets SO_REUSEADDR and SO_REUSEPORT on POSIX.
-        /// Sets SO_REUSEADDR on Windows, which is roughly equivalent.
-        reuse_address: bool = false,
-        /// Only connection-oriented modes may be used here, which includes:
-        /// * `Socket.Mode.stream`
-        /// * `Socket.Mode.seqpacket`
-        mode: Socket.Mode = .stream,
-        /// Only connection-oriented protocols may be used here, which includes:
-        /// * `Protocol.tcp`
-        /// * `Protocol.tp`
-        /// * `Protocol.dccp`
-        /// * `Protocol.sctp`
-        protocol: Protocol = .tcp,
-    };
-
-    /// Waits for a TCP connection. When using this API, `bind` does not need
-    /// to be called. The returned `Server` has an open `stream`.
-    pub fn listen(address: *const IpAddress, io: Io, options: ListenOptions) ListenError!Server {
-        return .{
-            .socket = try io.vtable.netListenIp(io.userdata, address, options),
-            .options = if (Server.AcceptOptions != void) .{
-                .mode = options.mode,
-                .protocol = options.protocol,
-            },
-        };
-    }
-
-    pub const BindError = error{
-        /// The address is already taken. Can occur when bound port is 0 but
-        /// all ephemeral ports are already in use.
-        AddressInUse,
-        /// A nonexistent interface was requested or the requested address was not local.
-        AddressUnavailable,
-        /// The address is not valid for the address family of socket.
-        AddressFamilyUnsupported,
-        /// Insufficient memory or other resource internal to the operating system.
-        SystemResources,
-        /// The local network interface used to reach the destination is offline.
-        NetworkDown,
-        ProtocolUnsupportedBySystem,
-        ProtocolUnsupportedByAddressFamily,
-        /// Per-process limit on the number of open file descriptors has been reached.
-        ProcessFdQuotaExceeded,
-        /// System-wide limit on the total number of open files has been reached.
-        SystemFdQuotaExceeded,
-        SocketModeUnsupported,
-        /// One of the `BindOptions` is not supported by the Io
-        /// implementation.
-        OptionUnsupported,
-    } || Io.UnexpectedError || Io.Cancelable;
-
-    pub const BindOptions = struct {
-        /// The socket is restricted to sending and receiving IPv6 packets only.
-        /// In this case, an IPv4 and an IPv6 application can bind to a single port
-        /// at the same time.
-        ip6_only: bool = false,
-        /// Allow the socket to send datagrams to broadcast addresses.
-        /// When not enabled any attempt to send datagrams to a broadcast address
-        /// will fail with `error.AccessDenied`
-        allow_broadcast: bool = false,
-        mode: Socket.Mode,
-        protocol: ?Protocol = null,
-    };
-
-    /// Associates an address with a `Socket` which can be used to receive UDP
-    /// packets and other kinds of non-streaming messages. See `listen` for a
-    /// streaming alternative.
-    ///
-    /// One bound `Socket` can be used to receive messages from multiple
-    /// different addresses.
-    pub fn bind(address: *const IpAddress, io: Io, options: BindOptions) BindError!Socket {
-        return io.vtable.netBindIp(io.userdata, address, options);
-    }
-
-    pub const ConnectError = error{
-        AddressUnavailable,
-        AddressFamilyUnsupported,
-        /// Insufficient memory or other resource internal to the operating system.
-        SystemResources,
-        ConnectionPending,
-        ConnectionRefused,
-        ConnectionResetByPeer,
-        HostUnreachable,
-        NetworkUnreachable,
-        Timeout,
-        /// One of the `ConnectOptions` is not supported by the Io
-        /// implementation.
-        OptionUnsupported,
-        /// Per-process limit on the number of open file descriptors has been reached.
-        ProcessFdQuotaExceeded,
-        /// System-wide limit on the total number of open files has been reached.
-        SystemFdQuotaExceeded,
-        ProtocolUnsupportedBySystem,
-        ProtocolUnsupportedByAddressFamily,
-        SocketModeUnsupported,
-        /// The user tried to connect to a broadcast address without having the socket broadcast flag enabled or
-        /// the connection request failed because of a local firewall rule.
-        AccessDenied,
-        /// Non-blocking was requested and the operation cannot return immediately.
-        WouldBlock,
-        NetworkDown,
-    } || Io.Timeout.Error || Io.UnexpectedError || Io.Cancelable;
-
-    pub const ConnectOptions = struct {
-        mode: Socket.Mode,
-        protocol: ?Protocol = null,
-        timeout: Io.Timeout = .none,
-    };
-
-    /// Initiates a connection-oriented network stream.
-    pub fn connect(address: *const IpAddress, io: Io, options: ConnectOptions) ConnectError!Stream {
-        return .{ .socket = try io.vtable.netConnectIp(io.userdata, address, options) };
-    }
-};
-
-/// An IPv4 address in binary memory layout.
-pub const Ip4Address = struct {
-    bytes: [4]u8,
-    port: u16,
-
-    pub fn loopback(port: u16) Ip4Address {
-        return .{
-            .bytes = .{ 127, 0, 0, 1 },
-            .port = port,
-        };
-    }
-
-    pub fn unspecified(port: u16) Ip4Address {
-        return .{
-            .bytes = .{ 0, 0, 0, 0 },
-            .port = port,
-        };
-    }
-
-    /// Converts from an IPv4-mapped IPv6 address, or returns `null`.
-    pub fn fromIp6(ip6: Ip6Address) ?Ip4Address {
-        return if (std.mem.eql(u8, ip6.bytes[0..12], &amp;.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff })) .{
-            .bytes = ip6.bytes[12..].*,
-            .port = ip6.port,
-        } else null;
-    }
-
-    /// Given an `IpAddress`, converts it to an `Ip4Address` directly, or from
-    /// an IPv4-mapped IPv6 address, or returns `null`.
-    pub fn fromAny(addr: IpAddress) ?Ip6Address {
-        return switch (addr) {
-            .ip4 =&gt; |ip4| ip4,
-            .ip6 =&gt; |ip6| fromIp6(ip6),
-        };
-    }
-
-    pub const ParseError = error{
-        Overflow,
-        InvalidEnd,
-        InvalidCharacter,
-        Incomplete,
-        NonCanonical,
-    };
-
-    pub fn parse(buffer: []const u8, port: u16) ParseError!Ip4Address {
-        var bytes: [4]u8 = @splat(0);
-        var index: u8 = 0;
-        var saw_any_digits = false;
-        var has_zero_prefix = false;
-        for (buffer) |c| switch (c) {
-            '.' =&gt; {
-                if (!saw_any_digits) return error.InvalidCharacter;
-                if (index == 3) return error.InvalidEnd;
-                index += 1;
-                saw_any_digits = false;
-                has_zero_prefix = false;
-            },
-            '0'...'9' =&gt; {
-                if (c == '0' and !saw_any_digits) {
-                    has_zero_prefix = true;
-                } else if (has_zero_prefix) {
-                    return error.NonCanonical;
-                }
-                saw_any_digits = true;
-                bytes[index] = try std.math.mul(u8, bytes[index], 10);
-                bytes[index] = try std.math.add(u8, bytes[index], c - '0');
-            },
-            else =&gt; return error.InvalidCharacter,
-        };
-        if (index == 3 and saw_any_digits) return .{
-            .bytes = bytes,
-            .port = port,
-        };
-        return error.Incomplete;
-    }
-
-    pub fn format(a: Ip4Address, w: *Io.Writer) Io.Writer.Error!void {
-        const bytes = &amp;a.bytes;
-        try w.print("{d}.{d}.{d}.{d}:{d}", .{ bytes[0], bytes[1], bytes[2], bytes[3], a.port });
-    }
-
-    pub fn eql(a: Ip4Address, b: Ip4Address) bool {
-        const a_int: u32 = @bitCast(a.bytes);
-        const b_int: u32 = @bitCast(b.bytes);
-        return a.port == b.port and a_int == b_int;
-    }
-};
-
-/// An IPv6 address in binary memory layout.
-pub const Ip6Address = struct {
-    /// Native endian
-    port: u16,
-    /// Big endian
-    bytes: [16]u8,
-    flow: u32 = 0,
-    interface: Interface = .none,
-
-    pub const Policy = struct {
-        addr: [16]u8,
-        len: u8,
-        mask: u8,
-        prec: u8,
-        label: u8,
-    };
-
-    pub fn loopback(port: u16) Ip6Address {
-        return .{
-            .bytes = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 },
-            .port = port,
-        };
-    }
-
-    pub fn unspecified(port: u16) Ip6Address {
-        return .{
-            .bytes = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
-            .port = port,
-        };
-    }
-
-    /// Constructs an IPv4-mapped IPv6 address.
-    pub fn fromIp4(ip4: Ip4Address) Ip6Address {
-        return .{
-            .bytes = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff } ++ ip4.bytes,
-            .port = ip4.port,
-        };
-    }
-
-    /// Given an `IpAddress`, converts it to an `Ip6Address` directly, or via
-    /// constructing an IPv4-mapped IPv6 address.
-    pub fn fromAny(addr: IpAddress) Ip6Address {
-        return switch (addr) {
-            .ip4 =&gt; |ip4| fromIp4(ip4),
-            .ip6 =&gt; |ip6| ip6,
-        };
-    }
-
-    /// An IPv6 address but with `Interface` as a name rather than index.
-    pub const Unresolved = struct {
-        /// Big endian
-        bytes: [16]u8,
-        /// Has not been checked to be a valid native interface name.
-        /// Externally managed memory.
-        interface_name: ?[]const u8,
-
-        pub const Parsed = union(enum) {
-            success: Unresolved,
-            invalid_byte: usize,
-            incomplete,
-            junk_after_end: usize,
-            interface_name_oversized: usize,
-            invalid_ip4_mapping: usize,
-            overflow: usize,
-        };
-
-        pub fn parse(text: []const u8) Parsed {
-            if (text.len &lt; 2) return .incomplete;
-            const ip4_prefix = "::ffff:";
-            if (std.ascii.startsWithIgnoreCase(text, ip4_prefix)) {
-                const parsed = Ip4Address.parse(text[ip4_prefix.len..], 0) catch
-                    return .{ .invalid_ip4_mapping = ip4_prefix.len };
-                const b = parsed.bytes;
-                return .{ .success = .{
-                    .bytes = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, b[0], b[1], b[2], b[3] },
-                    .interface_name = null,
-                } };
-            }
-            // Has to be u16 elements to handle 3-digit hex numbers from compression.
-            var parts: [8]u16 = @splat(0);
-            var parts_i: u8 = 0;
-            var text_i: u8 = 0;
-            var digit_i: u8 = 0;
-            var compress_start: ?u8 = null;
-            var interface_name_text: ?[]const u8 = null;
-            const State = union(enum) { digit, end };
-            state: switch (State.digit) {
-                .digit =&gt; c: switch (text[text_i]) {
-                    'a'...'f' =&gt; |c| {
-                        const digit = c - 'a' + 10;
-                        parts[parts_i] = (std.math.mul(u16, parts[parts_i], 16) catch return .{
-                            .overflow = text_i,
-                        }) + digit;
-                        if (digit_i == 4) return .{ .invalid_byte = text_i };
-                        digit_i += 1;
-                        text_i += 1;
-                        if (text.len - text_i == 0) {
-                            parts_i += 1;
-                            continue :state .end;
-                        }
-                        continue :c text[text_i];
-                    },
-                    'A'...'F' =&gt; |c| continue :c c - 'A' + 'a',
-                    '0'...'9' =&gt; |c| {
-                        const digit = c - '0';
-                        parts[parts_i] = (std.math.mul(u16, parts[parts_i], 16) catch return .{
-                            .overflow = text_i,
-                        }) + digit;
-                        if (digit_i == 4) return .{ .invalid_byte = text_i };
-                        digit_i += 1;
-                        text_i += 1;
-                        if (text.len - text_i == 0) {
-                            parts_i += 1;
-                            continue :state .end;
-                        }
-                        continue :c text[text_i];
-                    },
-                    ':' =&gt; {
-                        if (digit_i == 0) {
-                            if (compress_start != null) return .{ .invalid_byte = text_i };
-                            if (text_i == 0) {
-                                text_i += 1;
-                                if (text[text_i] != ':') return .{ .invalid_byte = text_i };
-                                assert(parts_i == 0);
-                            }
-                            compress_start = parts_i;
-                            text_i += 1;
-                            if (text.len - text_i == 0) continue :state .end;
-                            continue :c text[text_i];
-                        } else {
-                            parts_i += 1;
-                            if (parts.len - parts_i == 0) continue :state .end;
-                            digit_i = 0;
-                            text_i += 1;
-                            if (text.len - text_i == 0) return .incomplete;
-                            continue :c text[text_i];
-                        }
-                    },
-                    '%' =&gt; {
-                        if (digit_i == 0) return .{ .invalid_byte = text_i };
-                        parts_i += 1;
-                        text_i += 1;
-                        const name = text[text_i..];
-                        if (name.len == 0) return .incomplete;
-                        interface_name_text = name;
-                        text_i = @intCast(text.len);
-                        continue :state .end;
-                    },
-                    else =&gt; return .{ .invalid_byte = text_i },
-                },
-                .end =&gt; {
-                    if (text.len - text_i != 0) return .{ .junk_after_end = text_i };
-                    const remaining = parts.len - parts_i;
-                    if (compress_start) |s| {
-                        const src = parts[s..parts_i];
-                        @memmove(parts[parts.len - src.len ..], src);
-                        @memset(parts[s..][0..remaining], 0);
-                    } else {
-                        if (remaining != 0) return .incomplete;
-                    }
-
-                    // Workaround that can be removed when this proposal is
-                    // implemented https://github.com/ziglang/zig/issues/19755
-                    if ((comptime @import("builtin").cpu.arch.endian()) != .big) {
-                        for (&amp;parts) |*part| part.* = @byteSwap(part.*);
-                    }
-
-                    return .{ .success = .{
-                        .bytes = @bitCast(parts),
-                        .interface_name = interface_name_text,
-                    } };
-                },
-            }
-        }
-
-        pub fn format(u: *const Unresolved, w: *Io.Writer) Io.Writer.Error!void {
-            const bytes = &amp;u.bytes;
-            if (std.mem.eql(u8, bytes[0..12], &amp;[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff })) {
-                try w.print("::ffff:{d}.{d}.{d}.{d}", .{ bytes[12], bytes[13], bytes[14], bytes[15] });
-            } else {
-                const parts: [8]u16 = .{
-                    std.mem.readInt(u16, bytes[0..2], .big),
-                    std.mem.readInt(u16, bytes[2..4], .big),
-                    std.mem.readInt(u16, bytes[4..6], .big),
-                    std.mem.readInt(u16, bytes[6..8], .big),
-                    std.mem.readInt(u16, bytes[8..10], .big),
-                    std.mem.readInt(u16, bytes[10..12], .big),
-                    std.mem.readInt(u16, bytes[12..14], .big),
-                    std.mem.readInt(u16, bytes[14..16], .big),
-                };
-
-                // Find the longest zero run
-                var longest_start: usize = 8;
-                var longest_len: usize = 0;
-                var current_start: usize = 0;
-                var current_len: usize = 0;
-
-                for (parts, 0..) |part, i| {
-                    if (part == 0) {
-                        if (current_len == 0) {
-                            current_start = i;
-                        }
-                        current_len += 1;
-                        if (current_len &gt; longest_len) {
-                            longest_start = current_start;
-                            longest_len = current_len;
-                        }
-                    } else {
-                        current_len = 0;
-                    }
-                }
-
-                // Only compress if the longest zero run is 2 or more
-                if (longest_len &lt; 2) {
-                    longest_start = 8;
-                    longest_len = 0;
-                }
-
-                var i: usize = 0;
-                while (parts.len - i != 0) : (i += 1) {
-                    if (i == longest_start) {
-                        // Emit "::" for the longest zero run
-                        try w.writeAll(if (i == 0) "::" else ":");
-                        i += longest_len - 1; // Skip the compressed range
-                        continue;
-                    }
-                    try w.print("{x}", .{parts[i]});
-                    if (i != parts.len - 1) {
-                        try w.writeAll(":");
-                    }
-                }
-            }
-            if (u.interface_name) |n| try w.print("%{s}", .{n});
-        }
-    };
-
-    pub const ParseError = error{
-        /// If this is returned, more detailed diagnostics can be obtained by
-        /// calling `Ip6Address.Parsed.init`.
-        ParseFailed,
-        /// If this is returned, the IPv6 address had a scope id on it ("%foo"
-        /// at the end) which requires calling `resolve`.
-        UnresolvedScope,
-    };
-
-    /// This is a pure function but it cannot handle IPv6 addresses that have
-    /// scope ids ("%foo" at the end). To also handle those, `resolve` must be
-    /// called instead, or the lower level `Unresolved` API may be used.
-    pub fn parse(buffer: []const u8, port: u16) ParseError!Ip6Address {
-        switch (Unresolved.parse(buffer)) {
-            .success =&gt; |p| return .{
-                .bytes = p.bytes,
-                .port = port,
-                .interface = if (p.interface_name != null) return error.UnresolvedScope else .none,
-            },
-            else =&gt; return error.ParseFailed,
-        }
-        return .{ .ip6 = try Ip6Address.parse(buffer, port) };
-    }
-
-    pub const ResolveError = error{
-        /// If this is returned, more detailed diagnostics can be obtained by
-        /// calling the `Parsed.init` function.
-        ParseFailed,
-        /// The interface name is longer than the host operating system supports.
-        NameTooLong,
-    } || Interface.Name.ResolveError;
-
-    /// This function requires an `Io` parameter because it must query the operating
-    /// system to convert interface name to index. For example, in
-    /// "fe80::e0e:76ff:fed4:cf22%eno1", "eno1" must be resolved to an index by
-    /// creating a socket and then using an `ioctl` syscall.
-    pub fn resolve(io: Io, buffer: []const u8, port: u16) ResolveError!Ip6Address {
-        return switch (Unresolved.parse(buffer)) {
-            .success =&gt; |p| return .{
-                .bytes = p.bytes,
-                .port = port,
-                .interface = i: {
-                    const text = p.interface_name orelse break :i .none;
-                    const name: Interface.Name = try .fromSlice(text);
-                    break :i try name.resolve(io);
-                },
-            },
-            else =&gt; return error.ParseFailed,
-        };
-    }
-
-    pub const FormatError = Io.Writer.Error || Interface.NameError;
-
-    /// Includes the optional scope ("%foo" at the end).
-    ///
-    /// See `format` for an alternative that omits scopes and does
-    /// not require an `Io` parameter.
-    pub fn formatResolved(a: *const Ip6Address, io: Io, w: *Io.Writer) FormatError!void {
-        const interface_name = if (a.interface.isNone()) null else try a.interface.name(io);
-        const u: Unresolved = .{
-            .bytes = a.bytes,
-            .interface_name = if (interface_name) |name| name.toSlice() else null,
-        };
-        try w.print("[{f}]:{d}", .{ u, a.port });
-    }
-
-    /// See `formatResolved` for an alternative that additionally prints the optional
-    /// scope at the end of addresses and requires an `Io` parameter.
-    pub fn format(a: *const Ip6Address, w: *Io.Writer) Io.Writer.Error!void {
-        const u: Unresolved = .{ .bytes = a.bytes, .interface_name = null };
-        try w.print("[{f}]:{d}", .{ u, a.port });
-    }
-
-    pub fn eql(a: Ip6Address, b: Ip6Address) bool {
-        return a.port == b.port and std.mem.eql(u8, &amp;a.bytes, &amp;b.bytes);
-    }
-
-    pub fn isMultiCast(a: Ip6Address) bool {
-        return a.bytes[0] == 0xff;
-    }
-
-    pub fn isLinkLocal(a: Ip6Address) bool {
-        const b = &amp;a.bytes;
-        return b[0] == 0xfe and (b[1] &amp; 0xc0) == 0x80;
-    }
-
-    pub fn isLoopBack(a: Ip6Address) bool {
-        const b = &amp;a.bytes;
-        return b[0] == 0 and b[1] == 0 and
-            b[2] == 0 and
-            b[12] == 0 and b[13] == 0 and
-            b[14] == 0 and b[15] == 1;
-    }
-
-    pub fn isSiteLocal(a: Ip6Address) bool {
-        const b = &amp;a.bytes;
-        return b[0] == 0xfe and (b[1] &amp; 0xc0) == 0xc0;
-    }
-
-    pub fn policy(a: Ip6Address) *const Policy {
-        const b = &amp;a.bytes;
-        for (&amp;defined_policies) |*p| {
-            if (!std.mem.eql(u8, b[0..p.len], p.addr[0..p.len])) continue;
-            if ((b[p.len] &amp; p.mask) != p.addr[p.len]) continue;
-            return p;
-        }
-        unreachable;
-    }
-
-    pub fn scope(a: Ip6Address) u8 {
-        if (isMultiCast(a)) return a.bytes[1] &amp; 15;
-        if (isLinkLocal(a)) return 2;
-        if (isLoopBack(a)) return 2;
-        if (isSiteLocal(a)) return 5;
-        return 14;
-    }
-
-    const defined_policies = [_]Policy{
-        .{
-            .addr = "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01".*,
-            .len = 15,
-            .mask = 0xff,
-            .prec = 50,
-            .label = 0,
-        },
-        .{
-            .addr = "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff\x00\x00\x00\x00".*,
-            .len = 11,
-            .mask = 0xff,
-            .prec = 35,
-            .label = 4,
-        },
-        .{
-            .addr = "\x20\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00".*,
-            .len = 1,
-            .mask = 0xff,
-            .prec = 30,
-            .label = 2,
-        },
-        .{
-            .addr = "\x20\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00".*,
-            .len = 3,
-            .mask = 0xff,
-            .prec = 5,
-            .label = 5,
-        },
-        .{
-            .addr = "\xfc\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00".*,
-            .len = 0,
-            .mask = 0xfe,
-            .prec = 3,
-            .label = 13,
-        },
-        //  These are deprecated and/or returned to the address
-        //  pool, so despite the RFC, treating them as special
-        //  is probably wrong.
-        // { "", 11, 0xff, 1, 3 },
-        // { "\xfe\xc0", 1, 0xc0, 1, 11 },
-        // { "\x3f\xfe", 1, 0xff, 1, 12 },
-        // Last rule must match all addresses to stop loop.
-        .{
-            .addr = "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00".*,
-            .len = 0,
-            .mask = 0,
-            .prec = 40,
-            .label = 1,
-        },
-    };
-};
-
-pub const UnixAddress = struct {
-    path: []const u8,
-
-    pub const max_len = switch (native_os) {
-        .windows =&gt; std.os.windows.PATH_MAX_WIDE,
-        else =&gt; 108,
-    };
-
-    pub const InitError = error{NameTooLong};
-
-    pub fn init(p: []const u8) InitError!UnixAddress {
-        if (p.len &gt; max_len) return error.NameTooLong;
-        return .{ .path = p };
-    }
-
-    pub fn isAbstract(ua: *const UnixAddress) bool {
-        return ua.path.len == 0 or ua.path[0] == 0;
-    }
-
-    pub const ListenError = error{
-        AddressFamilyUnsupported,
-        AddressInUse,
-        NetworkDown,
-        SystemResources,
-        SymLinkLoop,
-        FileNotFound,
-        NotDir,
-        ReadOnlyFileSystem,
-        ProcessFdQuotaExceeded,
-        SystemFdQuotaExceeded,
-        AccessDenied,
-        PermissionDenied,
-        AddressUnavailable,
-    } || Io.Cancelable || Io.UnexpectedError;
-
-    pub const ListenOptions = struct {
-        /// How many connections the kernel will accept on the application's behalf.
-        /// If more than this many connections pool in the kernel, clients will start
-        /// seeing "Connection refused".
-        kernel_backlog: u31 = default_kernel_backlog,
-    };
-
-    pub fn listen(ua: *const UnixAddress, io: Io, options: ListenOptions) ListenError!Server {
-        assert(ua.path.len &lt;= max_len);
-        return .{
-            .socket = .{
-                .handle = try io.vtable.netListenUnix(io.userdata, ua, options),
-                .address = .{ .ip4 = .loopback(0) },
-            },
-            .options = if (Server.AcceptOptions != void) .{ .mode = .stream, .protocol = null },
-        };
-    }
-
-    pub const ConnectError = error{
-        SystemResources,
-        ProcessFdQuotaExceeded,
-        SystemFdQuotaExceeded,
-        AddressFamilyUnsupported,
-        ProtocolUnsupportedBySystem,
-        SocketModeUnsupported,
-        AccessDenied,
-        PermissionDenied,
-        SymLinkLoop,
-        FileNotFound,
-        NotDir,
-        ReadOnlyFileSystem,
-        WouldBlock,
-        NetworkDown,
-    } || Io.Cancelable || Io.UnexpectedError;
-
-    pub fn connect(ua: *const UnixAddress, io: Io) ConnectError!Stream {
-        assert(ua.path.len &lt;= max_len);
-        return .{ .socket = .{
-            .handle = try io.vtable.netConnectUnix(io.userdata, ua),
-            .address = .{ .ip4 = .loopback(0) },
-        } };
-    }
-};
-
-pub const ReceiveFlags = packed struct(u8) {
-    oob: bool = false,
-    peek: bool = false,
-    trunc: bool = false,
-    _: u5 = 0,
-};
-
-pub const IncomingMessage = struct {
-    /// Populated by receive functions.
-    from: IpAddress,
-    /// Populated by receive functions, points into the caller-supplied buffer.
-    data: []u8,
-    /// Supplied by caller before calling receive functions; mutated by receive
-    /// functions.
-    control: []u8,
-    /// Populated by receive functions.
-    flags: Flags,
-
-    /// Useful for initializing before calling `receiveManyTimeout`.
-    pub const init: IncomingMessage = .{
-        .from = undefined,
-        .data = undefined,
-        .control = &amp;.{},
-        .flags = undefined,
-    };
-
-    pub const Flags = packed struct(u8) {
-        /// indicates end-of-record; the data returned completed a record
-        /// (generally used with sockets of type SOCK_SEQPACKET).
-        eor: bool,
-        /// indicates that the trailing portion of a datagram was discarded
-        /// because the datagram was larger than the buffer supplied.
-        trunc: bool,
-        /// indicates that some control data was discarded due to lack of
-        /// space in the buffer for ancil‐ lary data.
-        ctrunc: bool,
-        /// indicates expedited or out-of-band data was received.
-        oob: bool,
-        /// indicates that no data was received but an extended error from the
-        /// socket error queue.
-        errqueue: bool,
-        _: u3 = 0,
-    };
-};
-
-pub const OutgoingMessage = struct {
-    address: *const IpAddress,
-    data_ptr: [*]const u8,
-    /// Initialized with how many bytes of `data_ptr` to send. After sending
-    /// succeeds, replaced with how many bytes were actually sent.
-    data_len: usize,
-    control: []const u8 = &amp;.{},
-};
-
-pub const SendFlags = packed struct(u8) {
-    confirm: bool = false,
-    dont_route: bool = false,
-    eor: bool = false,
-    oob: bool = false,
-    fastopen: bool = false,
-    _: u3 = 0,
-};
-
-pub const ShutdownHow = enum { recv, send, both };
-
-pub const ShutdownError = error{
-    ConnectionAborted,
-    ConnectionResetByPeer,
-    NetworkDown,
-    SocketUnconnected,
-    SystemResources,
-} || Io.UnexpectedError || Io.Cancelable;
-
-pub const Interface = struct {
-    /// Value 0 indicates `none`.
-    index: u32,
-
-    pub const none: Interface = .{ .index = 0 };
-
-    pub const Name = struct {
-        bytes: [max_len:0]u8,
-
-        pub const max_len = if (@TypeOf(std.posix.IFNAMESIZE) == void) 0 else std.posix.IFNAMESIZE - 1;
-
-        pub fn toSlice(n: *const Name) []const u8 {
-            return std.mem.sliceTo(&amp;n.bytes, 0);
-        }
-
-        pub fn fromSlice(bytes: []const u8) error{NameTooLong}!Name {
-            if (bytes.len &gt; max_len) return error.NameTooLong;
-            return .fromSliceUnchecked(bytes);
-        }
-
-        /// Asserts bytes.len fits in `max_len`.
-        pub fn fromSliceUnchecked(bytes: []const u8) Name {
-            assert(bytes.len &lt;= max_len);
-            var result: Name = undefined;
-            @memcpy(result.bytes[0..bytes.len], bytes);
-            result.bytes[bytes.len] = 0;
-            return result;
-        }
-
-        pub const ResolveError = error{
-            InterfaceNotFound,
-            AccessDenied,
-            SystemResources,
-        } || Io.UnexpectedError || Io.Cancelable;
-
-        /// Corresponds to "if_nametoindex" in libc.
-        pub fn resolve(n: *const Name, io: Io) ResolveError!Interface {
-            return io.vtable.netInterfaceNameResolve(io.userdata, n);
-        }
-    };
-
-    pub const NameError = error{
-        /// Out of range `index`.
-        InterfaceNotFound,
-        /// Interface name longer than `Name.max_len`.
-        NameTooLong,
-    } || Io.UnexpectedError || Io.Cancelable;
-
-    /// Asserts not `none`.
-    ///
-    /// Corresponds to "if_indextoname" in libc.
-    pub fn name(i: Interface, io: Io) NameError!Name {
-        assert(i.index != 0);
-        return io.vtable.netInterfaceName(io.userdata, i);
-    }
-
-    pub fn isNone(i: Interface) bool {
-        return i.index == 0;
-    }
-};
-
-/// An open port with unspecified protocol.
-pub const Socket = struct {
-    handle: Handle,
-    /// Contains the resolved ephemeral port number if requested.
-    address: IpAddress,
-
-    pub const Mode = enum {
-        /// Provides sequenced, reliable, two-way, connection-based byte
-        /// streams. An out-of-band data transmission mechanism may be
-        /// supported.
-        stream,
-        /// Supports datagrams (connectionless, unreliable messages of a fixed
-        /// maximum length).
-        dgram,
-        /// Provides  a  sequenced,  reliable,  two-way connection-based data
-        /// transmission path for datagrams of fixed maximum length; a consumer
-        /// is required to read an entire packet with each input system call.
-        seqpacket,
-        /// Provides raw network protocol access.
-        raw,
-        /// Provides a reliable datagram layer that does not guarantee ordering.
-        rdm,
-    };
-
-    /// Underlying platform-defined type which may or may not be
-    /// interchangeable with a file system file descriptor.
-    pub const Handle = std.posix.fd_t;
-
-    /// Leaves `address` in a valid state.
-    pub fn close(s: *const Socket, io: Io) void {
-        io.vtable.netClose(io.userdata, (&amp;s.handle)[0..1]);
-    }
-
-    pub fn closeMany(io: Io, sockets: []const Socket) void {
-        io.vtable.netClose(io.userdata, sockets);
-    }
-
-    pub const SendError = error{
-        /// The socket type requires that message be sent atomically, and the
-        /// size of the message to be sent made this impossible. The message
-        /// was not transmitted, or was partially transmitted.
-        MessageOversize,
-        /// The output queue for a network interface was full. This generally indicates that the
-        /// interface has stopped sending, but may be caused by transient congestion. (Normally,
-        /// this does not occur in Linux. Packets are just silently dropped when a device queue
-        /// overflows.)
-        ///
-        /// This is also caused when there is not enough kernel memory available.
-        SystemResources,
-        /// No route to network.
-        NetworkUnreachable,
-        /// Network reached but no route to host.
-        HostUnreachable,
-        /// The local network interface used to reach the destination is offline.
-        NetworkDown,
-        /// The destination address is not listening. Can still occur for
-        /// connectionless messages.
-        ConnectionRefused,
-        /// Operating system or protocol does not support the address family.
-        AddressFamilyUnsupported,
-        /// Another TCP Fast Open is already in progress.
-        FastOpenAlreadyInProgress,
-        /// Network session was unexpectedly closed by recipient.
-        ConnectionResetByPeer,
-        /// Local end has been shut down on a connection-oriented socket, or
-        /// the socket was never connected.
-        SocketUnconnected,
-        /// An attempt was made to send to a network/broadcast address as
-        /// though it was a unicast address.
-        AccessDenied,
-    } || Io.UnexpectedError || Io.Cancelable;
-
-    /// Transfers `data` to `dest`, connectionless, in one packet.
-    pub fn send(s: *const Socket, io: Io, dest: *const IpAddress, data: []const u8) SendError!void {
-        var message: OutgoingMessage = .{ .address = dest, .data_ptr = data.ptr, .data_len = data.len };
-        const err, const n = io.vtable.netSend(io.userdata, s.handle, (&amp;message)[0..1], .{});
-        if (n != 1) return err.?;
-        if (message.data_len != data.len) return error.MessageOversize;
-    }
-
-    pub fn sendMany(s: *const Socket, io: Io, messages: []OutgoingMessage, flags: SendFlags) SendError!void {
-        const err, const n = io.vtable.netSend(io.userdata, s.handle, messages, flags);
-        if (n != messages.len) return err.?;
-    }
-
-    pub const ReceiveError = Io.Operation.NetReceive.Error || Io.Cancelable;
-
-    /// Waits for data. Connectionless.
-    ///
-    /// See also:
-    /// * `receiveTimeout`
-    pub fn receive(s: *const Socket, io: Io, buffer: []u8) ReceiveError!IncomingMessage {
-        var message: IncomingMessage = .init;
-        const maybe_err, const count = (try io.operate(.{ .net_receive = .{
-            .socket_handle = s.handle,
-            .message_buffer = (&amp;message)[0..1],
-            .data_buffer = buffer,
-            .flags = .{},
-        } })).net_receive;
-        if (maybe_err) |err| return err;
-        assert(1 == count);
-        return message;
-    }
-
-    pub const ReceiveTimeoutError = ReceiveError || Io.Timeout.Error || Io.ConcurrentError;
-
-    /// Waits for data. Connectionless.
-    ///
-    /// Returns `error.Timeout` if no message arrives early enough.
-    ///
-    /// See also:
-    /// * `receive`
-    /// * `receiveManyTimeout`
-    pub fn receiveTimeout(
-        s: *const Socket,
-        io: Io,
-        buffer: []u8,
-        timeout: Io.Timeout,
-    ) ReceiveTimeoutError!IncomingMessage {
-        var message: IncomingMessage = .init;
-        const maybe_err, const count = (try io.operateTimeout(.{ .net_receive = .{
-            .socket_handle = s.handle,
-            .message_buffer = (&amp;message)[0..1],
-            .data_buffer = buffer,
-            .flags = .{},
-        } }, timeout)).net_receive;
-        if (maybe_err) |err| return err;
-        assert(1 == count);
-        return message;
-    }
-
-    /// Waits until at least one message is delivered, possibly returning more
-    /// than one message. Connectionless.
-    ///
-    /// Returns number of messages received, or `error.Timeout` if no message
-    /// arrives early enough.
-    ///
-    /// See also:
-    /// * `receive`
-    /// * `receiveTimeout`
-    pub fn receiveManyTimeout(
-        s: *const Socket,
-        io: Io,
-        /// Function assumes each element has initialized `control` field.
-        /// Initializing with `IncomingMessage.init` may be helpful.
-        message_buffer: []IncomingMessage,
-        data_buffer: []u8,
-        flags: ReceiveFlags,
-        timeout: Io.Timeout,
-    ) struct { ?ReceiveTimeoutError, usize } {
-        const result = io.operateTimeout(.{ .net_receive = .{
-            .socket_handle = s.handle,
-            .message_buffer = message_buffer,
-            .data_buffer = data_buffer,
-            .flags = flags,
-        } }, timeout) catch |err| return .{ err, 0 };
-        return result.net_receive;
-    }
-
-    pub const CreatePairError = error{
-        OperationUnsupported,
-        AccessDenied,
-        AddressFamilyUnsupported,
-        ProtocolUnsupportedBySystem,
-        /// The per-process limit on the number of open file descriptors has been reached.
-        ProcessFdQuotaExceeded,
-        /// The system-wide limit on the total number of open files has been reached.
-        SystemFdQuotaExceeded,
-        /// Insufficient memory is available. The socket cannot be created
-        /// until sufficient resources are freed.
-        SystemResources,
-        ProtocolUnsupportedByAddressFamily,
-        SocketModeUnsupported,
-    } || Io.UnexpectedError || Io.Cancelable;
-
-    pub const CreatePairOptions = struct {
-        family: IpAddress.Family = .ip4,
-        mode: Mode = .stream,
-        protocol: ?Protocol = null,
-    };
-
-    /// Create a set of two sockets that are connected to each other.
-    ///
-    /// Also known as "socketpair".
-    pub fn createPair(io: Io, options: CreatePairOptions) CreatePairError![2]Socket {
-        return io.vtable.netSocketCreatePair(io.userdata, options);
-    }
-};
-
-/// An open socket connection with a network protocol that guarantees
-/// sequencing, delivery, and prevents repetition. Typically TCP or UNIX domain
-/// socket.
-pub const Stream = struct {
-    socket: Socket,
-
-    const max_iovecs_len = 8;
-
-    pub fn close(s: *const Stream, io: Io) void {
-        io.vtable.netClose(io.userdata, (&amp;s.socket.handle)[0..1]);
-    }
-
-    pub fn shutdown(s: *const Stream, io: Io, how: ShutdownHow) ShutdownError!void {
-        return io.vtable.netShutdown(io.userdata, s.socket.handle, how);
-    }
-
-    pub const Reader = struct {
-        io: Io,
-        interface: Io.Reader,
-        stream: Stream,
-        err: ?Error,
-
-        pub const Error = error{
-            SystemResources,
-            ConnectionResetByPeer,
-            Timeout,
-            SocketUnconnected,
-            /// The file descriptor does not hold the required rights to read
-            /// from it.
-            AccessDenied,
-            NetworkDown,
-        } || Io.Cancelable || Io.UnexpectedError;
-
-        pub fn init(stream: Stream, io: Io, buffer: []u8) Reader {
-            return .{
-                .io = io,
-                .interface = .{
-                    .vtable = &amp;.{
-                        .stream = streamImpl,
-                        .readVec = readVec,
-                    },
-                    .buffer = buffer,
-                    .seek = 0,
-                    .end = 0,
-                },
-                .stream = stream,
-                .err = null,
-            };
-        }
-
-        fn streamImpl(io_r: *Io.Reader, io_w: *Io.Writer, limit: Io.Limit) Io.Reader.StreamError!usize {
-            const dest = limit.slice(try io_w.writableSliceGreedy(1));
-            var data: [1][]u8 = .{dest};
-            const n = try readVec(io_r, &amp;data);
-            io_w.advance(n);
-            return n;
-        }
-
-        fn readVec(io_r: *Io.Reader, data: [][]u8) Io.Reader.Error!usize {
-            const r: *Reader = @alignCast(@fieldParentPtr("interface", io_r));
-            const io = r.io;
-            var iovecs_buffer: [max_iovecs_len][]u8 = undefined;
-            const dest_n, const data_size = try io_r.writableVector(&amp;iovecs_buffer, data);
-            const dest = iovecs_buffer[0..dest_n];
-            assert(dest[0].len &gt; 0);
-            const n = io.vtable.netRead(io.userdata, r.stream.socket.handle, dest) catch |err| {
-                r.err = err;
-                return error.ReadFailed;
-            };
-            if (n == 0) {
-                return error.EndOfStream;
-            }
-            if (n &gt; data_size) {
-                r.interface.end += n - data_size;
-                return data_size;
-            }
-            return n;
-        }
-    };
-
-    pub const Writer = struct {
-        io: Io,
-        interface: Io.Writer,
-        stream: Stream,
-        err: ?Error = null,
-        write_file_err: ?WriteFileError = null,
-
-        pub const Error = error{
-            /// Another TCP Fast Open is already in progress.
-            FastOpenAlreadyInProgress,
-            /// Network session was unexpectedly closed by recipient.
-            ConnectionResetByPeer,
-            /// The output queue for a network interface was full. This generally indicates that the
-            /// interface has stopped sending, but may be caused by transient congestion. (Normally,
-            /// this does not occur in Linux. Packets are just silently dropped when a device queue
-            /// overflows.)
-            ///
-            /// This is also caused when there is not enough kernel memory available.
-            SystemResources,
-            /// No route to network.
-            NetworkUnreachable,
-            /// Network reached but no route to host.
-            HostUnreachable,
-            /// The local network interface used to reach the destination is down.
-            NetworkDown,
-            /// The destination address is not listening.
-            ConnectionRefused,
-            /// The passed address didn't have the correct address family in its sa_family field.
-            AddressFamilyUnsupported,
-            /// Local end has been shut down on a connection-oriented socket, or
-            /// the socket was never connected.
-            SocketUnconnected,
-            SocketNotBound,
-        } || Io.UnexpectedError || Io.Cancelable;
-
-        pub const WriteFileError = error{
-            NetworkDown,
-        } || Io.Cancelable || Io.UnexpectedError;
-
-        pub fn init(stream: Stream, io: Io, buffer: []u8) Writer {
-            return .{
-                .io = io,
-                .stream = stream,
-                .interface = .{
-                    .vtable = &amp;.{
-                        .drain = drain,
-                        .sendFile = sendFile,
-                    },
-                    .buffer = buffer,
-                },
-            };
-        }
-
-        fn drain(io_w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
-            const w: *Writer = @alignCast(@fieldParentPtr("interface", io_w));
-            const io = w.io;
-            const buffered = io_w.buffered();
-            const handle = w.stream.socket.handle;
-            const n = io.vtable.netWrite(io.userdata, handle, buffered, data, splat) catch |err| {
-                w.err = err;
-                return error.WriteFailed;
-            };
-            return io_w.consume(n);
-        }
-
-        fn sendFile(io_w: *Io.Writer, file_reader: *Io.File.Reader, limit: Io.Limit) Io.Writer.FileError!usize {
-            _ = io_w;
-            _ = file_reader;
-            _ = limit;
-            return error.Unimplemented; // TODO
-        }
-    };
-
-    pub fn reader(stream: Stream, io: Io, buffer: []u8) Reader {
-        return .init(stream, io, buffer);
-    }
-
-    pub fn writer(stream: Stream, io: Io, buffer: []u8) Writer {
-        return .init(stream, io, buffer);
-    }
-};
-
-pub const Server = struct {
-    socket: Socket,
-    options: AcceptOptions,
-
-    pub fn deinit(s: *Server, io: Io) void {
-        s.socket.close(io);
-        s.* = undefined;
-    }
-
-    pub const AcceptError = error{
-        /// The per-process limit on the number of open file descriptors has been reached.
-        ProcessFdQuotaExceeded,
-        /// The system-wide limit on the total number of open files has been reached.
-        SystemFdQuotaExceeded,
-        /// Not enough free memory. This often means that the memory allocation is limited
-        /// by the socket buffer limits, not by the system memory.
-        SystemResources,
-        /// Either `listen` was never called, or `shutdown` was called (possibly while
-        /// this call was blocking). This allows `shutdown` to be used as a concurrent
-        /// cancellation mechanism.
-        SocketNotListening,
-        /// The network subsystem has failed.
-        NetworkDown,
-        /// No connection is already queued and ready to be accepted, and
-        /// the socket is configured as non-blocking.
-        WouldBlock,
-        /// An incoming connection was indicated, but was subsequently terminated by the
-        /// remote peer prior to accepting the call.
-        ConnectionAborted,
-        /// Firewall rules forbid connection.
-        BlockedByFirewall,
-        ProtocolFailure,
-    } || Io.UnexpectedError || Io.Cancelable;
-
-    pub const AcceptOptions = switch (native_os) {
-        .windows =&gt; struct { mode: Socket.Mode, protocol: ?Protocol },
-        else =&gt; void,
-    };
-
-    /// Blocks until a client connects to the server.
-    pub fn accept(s: *Server, io: Io) AcceptError!Stream {
-        return .{ .socket = try io.vtable.netAccept(io.userdata, s.socket.handle, s.options) };
-    }
-};
-
-test "parsing IPv6 addresses" {
-    try testIp6Parse("fe80::e0e:76ff:fed4:cf22%eno1");
-    try testIp6Parse("2001:db8::1");
-    try testIp6ParseTransform("2001:db8::1", "2001:0db8:0000:0000:0000:0000:0000:0001");
-    try testIp6Parse("::1");
-    try testIp6Parse("::");
-    try testIp6Parse("fe80::1");
-    try testIp6Parse("fe80::abcd:ef12%3");
-    try testIp6Parse("ff02::");
-    try testIp6Parse("ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff");
-}
-test "IpAddress.setPort works" {
-    var addr: IpAddress = .{ .ip4 = undefined };
-    addr.setPort(0);
-    try std.testing.expectEqual(0, addr.getPort());
-}
-
-fn testIp6Parse(input: []const u8) !void {
-    return testIp6ParseTransform(input, input);
-}
-
-fn testIp6ParseTransform(expected: []const u8, input: []const u8) !void {
-    const ua = switch (Ip6Address.Unresolved.parse(input)) {
-        .success =&gt; |p| p,
-        else =&gt; |x| {
-            std.debug.print("failed to parse \"{s}\": {any}\n", .{ input, x });
-            return error.TestFailed;
-        },
-    };
-    var buffer: [100]u8 = undefined;
-    const result = try std.fmt.bufPrint(&amp;buffer, "{f}", .{ua});
-    try std.testing.expectEqualStrings(expected, result);
-}
-
-test {
-    _ = HostName;
-    _ = @import("net/test.zig");
-}</pre>
+    <pre><a id="L1"></a>const builtin = @import("builtin");
+<a id="L2"></a>const native_os = builtin.os.tag;
+<a id="L3"></a>const std = @import("../std.zig");
+<a id="L4"></a>const Io = std.Io;
+<a id="L5"></a>const assert = std.debug.assert;
+<a id="L6"></a>
+<a id="L7"></a>pub const HostName = @import("net/HostName.zig");
+<a id="L8"></a>
+<a id="L9"></a>/// Source of truth: Internet Assigned Numbers Authority (IANA)
+<a id="L10"></a>pub const Protocol = enum(u32) {
+<a id="L11"></a>    hopopts = 0,
+<a id="L12"></a>    icmp = 1,
+<a id="L13"></a>    igmp = 2,
+<a id="L14"></a>    ipip = 4,
+<a id="L15"></a>    tcp = 6,
+<a id="L16"></a>    egp = 8,
+<a id="L17"></a>    pup = 12,
+<a id="L18"></a>    udp = 17,
+<a id="L19"></a>    idp = 22,
+<a id="L20"></a>    tp = 29,
+<a id="L21"></a>    dccp = 33,
+<a id="L22"></a>    ipv6 = 41,
+<a id="L23"></a>    routing = 43,
+<a id="L24"></a>    fragment = 44,
+<a id="L25"></a>    rsvp = 46,
+<a id="L26"></a>    gre = 47,
+<a id="L27"></a>    esp = 50,
+<a id="L28"></a>    ah = 51,
+<a id="L29"></a>    icmpv6 = 58,
+<a id="L30"></a>    none = 59,
+<a id="L31"></a>    dstopts = 60,
+<a id="L32"></a>    mtp = 92,
+<a id="L33"></a>    beetph = 94,
+<a id="L34"></a>    encap = 98,
+<a id="L35"></a>    pim = 103,
+<a id="L36"></a>    comp = 108,
+<a id="L37"></a>    sctp = 132,
+<a id="L38"></a>    mh = 135,
+<a id="L39"></a>    udplite = 136,
+<a id="L40"></a>    mpls = 137,
+<a id="L41"></a>    ethernet = 143,
+<a id="L42"></a>    raw = 255,
+<a id="L43"></a>    mptcp = 262,
+<a id="L44"></a>    _,
+<a id="L45"></a>};
+<a id="L46"></a>
+<a id="L47"></a>/// Windows 10 added support for unix sockets in build 17063, redstone 4 is the
+<a id="L48"></a>/// first release to support them.
+<a id="L49"></a>pub const has_unix_sockets = switch (native_os) {
+<a id="L50"></a>    .windows =&gt; builtin.os.version_range.windows.isAtLeast(.win10_rs4) orelse false,
+<a id="L51"></a>    .wasi =&gt; false,
+<a id="L52"></a>    else =&gt; true,
+<a id="L53"></a>};
+<a id="L54"></a>
+<a id="L55"></a>pub const default_kernel_backlog = 128;
+<a id="L56"></a>
+<a id="L57"></a>pub const IpAddress = union(enum) {
+<a id="L58"></a>    ip4: Ip4Address,
+<a id="L59"></a>    ip6: Ip6Address,
+<a id="L60"></a>
+<a id="L61"></a>    pub const Family = @typeInfo(IpAddress).@"union".tag_type.?;
+<a id="L62"></a>
+<a id="L63"></a>    pub const ParseLiteralError = error{ InvalidAddress, InvalidPort };
+<a id="L64"></a>
+<a id="L65"></a>    /// Parse an IP address which may include a port.
+<a id="L66"></a>    ///
+<a id="L67"></a>    /// For IPv4, this is written `address:port`.
+<a id="L68"></a>    ///
+<a id="L69"></a>    /// For IPv6, RFC 3986 defines this as an "IP literal", and the port is
+<a id="L70"></a>    /// differentiated from the address by surrounding the address part in
+<a id="L71"></a>    /// brackets "[addr]:port". Even if the port is not given, the brackets are
+<a id="L72"></a>    /// mandatory.
+<a id="L73"></a>    pub fn parseLiteral(text: []const u8) ParseLiteralError!IpAddress {
+<a id="L74"></a>        if (text.len == 0) return error.InvalidAddress;
+<a id="L75"></a>        if (text[0] == '[') {
+<a id="L76"></a>            const addr_end = std.mem.findScalar(u8, text, ']') orelse
+<a id="L77"></a>                return error.InvalidAddress;
+<a id="L78"></a>            const addr_text = text[1..addr_end];
+<a id="L79"></a>            const port: u16 = p: {
+<a id="L80"></a>                if (addr_end == text.len - 1) break :p 0;
+<a id="L81"></a>                if (text[addr_end + 1] != ':') return error.InvalidAddress;
+<a id="L82"></a>                break :p std.fmt.parseInt(u16, text[addr_end + 2 ..], 10) catch return error.InvalidPort;
+<a id="L83"></a>            };
+<a id="L84"></a>            return parseIp6(addr_text, port) catch error.InvalidAddress;
+<a id="L85"></a>        }
+<a id="L86"></a>        if (std.mem.findScalar(u8, text, ':')) |i| {
+<a id="L87"></a>            const addr = Ip4Address.parse(text[0..i], 0) catch return error.InvalidAddress;
+<a id="L88"></a>            return .{ .ip4 = .{
+<a id="L89"></a>                .bytes = addr.bytes,
+<a id="L90"></a>                .port = std.fmt.parseInt(u16, text[i + 1 ..], 10) catch return error.InvalidPort,
+<a id="L91"></a>            } };
+<a id="L92"></a>        }
+<a id="L93"></a>        return parseIp4(text, 0) catch error.InvalidAddress;
+<a id="L94"></a>    }
+<a id="L95"></a>
+<a id="L96"></a>    /// Parse the given IP address string into an `IpAddress` value.
+<a id="L97"></a>    ///
+<a id="L98"></a>    /// This is a pure function but it cannot handle IPv6 addresses that have
+<a id="L99"></a>    /// scope ids ("%foo" at the end). To also handle those, `resolve` must be
+<a id="L100"></a>    /// called instead.
+<a id="L101"></a>    pub fn parse(text: []const u8, port: u16) !IpAddress {
+<a id="L102"></a>        if (parseIp4(text, port)) |ip4| return ip4 else |err| switch (err) {
+<a id="L103"></a>            error.Overflow,
+<a id="L104"></a>            error.InvalidEnd,
+<a id="L105"></a>            error.InvalidCharacter,
+<a id="L106"></a>            error.Incomplete,
+<a id="L107"></a>            error.NonCanonical,
+<a id="L108"></a>            =&gt; {},
+<a id="L109"></a>        }
+<a id="L110"></a>
+<a id="L111"></a>        return parseIp6(text, port);
+<a id="L112"></a>    }
+<a id="L113"></a>
+<a id="L114"></a>    pub fn parseIp4(text: []const u8, port: u16) Ip4Address.ParseError!IpAddress {
+<a id="L115"></a>        return .{ .ip4 = try Ip4Address.parse(text, port) };
+<a id="L116"></a>    }
+<a id="L117"></a>
+<a id="L118"></a>    /// This is a pure function but it cannot handle IPv6 addresses that have
+<a id="L119"></a>    /// scope ids ("%foo" at the end). To also handle those, `resolveIp6` must be
+<a id="L120"></a>    /// called instead.
+<a id="L121"></a>    pub fn parseIp6(text: []const u8, port: u16) Ip6Address.ParseError!IpAddress {
+<a id="L122"></a>        return .{ .ip6 = try Ip6Address.parse(text, port) };
+<a id="L123"></a>    }
+<a id="L124"></a>
+<a id="L125"></a>    /// This function requires an `Io` parameter because it must query the operating
+<a id="L126"></a>    /// system to convert interface name to index. For example, in
+<a id="L127"></a>    /// "fe80::e0e:76ff:fed4:cf22%eno1", "eno1" must be resolved to an index by
+<a id="L128"></a>    /// creating a socket and then using an `ioctl` syscall.
+<a id="L129"></a>    ///
+<a id="L130"></a>    /// For a pure function that cannot handle scopes, see `parse`.
+<a id="L131"></a>    pub fn resolve(io: Io, text: []const u8, port: u16) !IpAddress {
+<a id="L132"></a>        if (parseIp4(text, port)) |ip4| return ip4 else |err| switch (err) {
+<a id="L133"></a>            error.Overflow,
+<a id="L134"></a>            error.InvalidEnd,
+<a id="L135"></a>            error.InvalidCharacter,
+<a id="L136"></a>            error.Incomplete,
+<a id="L137"></a>            error.NonCanonical,
+<a id="L138"></a>            =&gt; {},
+<a id="L139"></a>        }
+<a id="L140"></a>
+<a id="L141"></a>        return resolveIp6(io, text, port);
+<a id="L142"></a>    }
+<a id="L143"></a>
+<a id="L144"></a>    pub fn resolveIp6(io: Io, text: []const u8, port: u16) Ip6Address.ResolveError!IpAddress {
+<a id="L145"></a>        return .{ .ip6 = try Ip6Address.resolve(io, text, port) };
+<a id="L146"></a>    }
+<a id="L147"></a>
+<a id="L148"></a>    /// Returns the port in native endian.
+<a id="L149"></a>    pub fn getPort(a: IpAddress) u16 {
+<a id="L150"></a>        return switch (a) {
+<a id="L151"></a>            inline .ip4, .ip6 =&gt; |x| x.port,
+<a id="L152"></a>        };
+<a id="L153"></a>    }
+<a id="L154"></a>
+<a id="L155"></a>    /// `port` is native-endian.
+<a id="L156"></a>    pub fn setPort(a: *IpAddress, port: u16) void {
+<a id="L157"></a>        switch (a.*) {
+<a id="L158"></a>            .ip4 =&gt; a.ip4.port = port,
+<a id="L159"></a>            .ip6 =&gt; a.ip6.port = port,
+<a id="L160"></a>        }
+<a id="L161"></a>    }
+<a id="L162"></a>
+<a id="L163"></a>    /// Converts from an IPv4-mapped IPv6 address, or returns the IPv6 address directly.
+<a id="L164"></a>    pub fn fromIp6(ip6: Ip6Address) IpAddress {
+<a id="L165"></a>        return if (Ip4Address.fromIp6(ip6)) |ip4| .{ .ip4 = ip4 } else .{ .ip6 = ip6 };
+<a id="L166"></a>    }
+<a id="L167"></a>
+<a id="L168"></a>    /// Includes the optional scope ("%foo" at the end) in IPv6 addresses.
+<a id="L169"></a>    ///
+<a id="L170"></a>    /// See `format` for an alternative that omits scopes and does
+<a id="L171"></a>    /// not require an `Io` parameter.
+<a id="L172"></a>    pub fn formatResolved(a: IpAddress, io: Io, w: *Io.Writer) Ip6Address.FormatError!void {
+<a id="L173"></a>        switch (a) {
+<a id="L174"></a>            .ip4 =&gt; |x| return x.format(w),
+<a id="L175"></a>            .ip6 =&gt; |x| return x.formatResolved(io, w),
+<a id="L176"></a>        }
+<a id="L177"></a>    }
+<a id="L178"></a>
+<a id="L179"></a>    /// See `formatResolved` for an alternative that additionally prints the optional
+<a id="L180"></a>    /// scope at the end of IPv6 addresses and requires an `Io` parameter.
+<a id="L181"></a>    pub fn format(a: IpAddress, w: *Io.Writer) Io.Writer.Error!void {
+<a id="L182"></a>        switch (a) {
+<a id="L183"></a>            inline .ip4, .ip6 =&gt; |x| return x.format(w),
+<a id="L184"></a>        }
+<a id="L185"></a>    }
+<a id="L186"></a>
+<a id="L187"></a>    pub fn eql(a: *const IpAddress, b: *const IpAddress) bool {
+<a id="L188"></a>        return switch (a.*) {
+<a id="L189"></a>            .ip4 =&gt; |a_ip4| switch (b.*) {
+<a id="L190"></a>                .ip4 =&gt; |b_ip4| a_ip4.eql(b_ip4),
+<a id="L191"></a>                else =&gt; false,
+<a id="L192"></a>            },
+<a id="L193"></a>            .ip6 =&gt; |a_ip6| switch (b.*) {
+<a id="L194"></a>                .ip6 =&gt; |b_ip6| a_ip6.eql(b_ip6),
+<a id="L195"></a>                else =&gt; false,
+<a id="L196"></a>            },
+<a id="L197"></a>        };
+<a id="L198"></a>    }
+<a id="L199"></a>
+<a id="L200"></a>    pub const ListenError = error{
+<a id="L201"></a>        /// The address is already taken. Can occur when bound port is 0 but
+<a id="L202"></a>        /// all ephemeral ports are already in use.
+<a id="L203"></a>        AddressInUse,
+<a id="L204"></a>        /// A nonexistent interface was requested or the requested address was not local.
+<a id="L205"></a>        AddressUnavailable,
+<a id="L206"></a>        /// The local network interface used to reach the destination is offline.
+<a id="L207"></a>        NetworkDown,
+<a id="L208"></a>        /// Insufficient memory or other resource internal to the operating system.
+<a id="L209"></a>        SystemResources,
+<a id="L210"></a>        /// Per-process limit on the number of open file descriptors has been reached.
+<a id="L211"></a>        ProcessFdQuotaExceeded,
+<a id="L212"></a>        /// System-wide limit on the total number of open files has been reached.
+<a id="L213"></a>        SystemFdQuotaExceeded,
+<a id="L214"></a>        /// The requested address family (IPv4 or IPv6) is not supported by the operating system.
+<a id="L215"></a>        AddressFamilyUnsupported,
+<a id="L216"></a>        ProtocolUnsupportedBySystem,
+<a id="L217"></a>        ProtocolUnsupportedByAddressFamily,
+<a id="L218"></a>        SocketModeUnsupported,
+<a id="L219"></a>        /// One of the `ListenOptions` is not supported by the Io
+<a id="L220"></a>        /// implementation.
+<a id="L221"></a>        OptionUnsupported,
+<a id="L222"></a>    } || Io.UnexpectedError || Io.Cancelable;
+<a id="L223"></a>
+<a id="L224"></a>    pub const ListenOptions = struct {
+<a id="L225"></a>        /// How many connections the kernel will accept on the application's behalf.
+<a id="L226"></a>        /// If more than this many connections pool in the kernel, clients will start
+<a id="L227"></a>        /// seeing "Connection refused".
+<a id="L228"></a>        kernel_backlog: u31 = default_kernel_backlog,
+<a id="L229"></a>        /// Sets SO_REUSEADDR and SO_REUSEPORT on POSIX.
+<a id="L230"></a>        /// Sets SO_REUSEADDR on Windows, which is roughly equivalent.
+<a id="L231"></a>        reuse_address: bool = false,
+<a id="L232"></a>        /// Only connection-oriented modes may be used here, which includes:
+<a id="L233"></a>        /// * `Socket.Mode.stream`
+<a id="L234"></a>        /// * `Socket.Mode.seqpacket`
+<a id="L235"></a>        mode: Socket.Mode = .stream,
+<a id="L236"></a>        /// Only connection-oriented protocols may be used here, which includes:
+<a id="L237"></a>        /// * `Protocol.tcp`
+<a id="L238"></a>        /// * `Protocol.tp`
+<a id="L239"></a>        /// * `Protocol.dccp`
+<a id="L240"></a>        /// * `Protocol.sctp`
+<a id="L241"></a>        protocol: Protocol = .tcp,
+<a id="L242"></a>    };
+<a id="L243"></a>
+<a id="L244"></a>    /// Waits for a TCP connection. When using this API, `bind` does not need
+<a id="L245"></a>    /// to be called. The returned `Server` has an open `stream`.
+<a id="L246"></a>    pub fn listen(address: *const IpAddress, io: Io, options: ListenOptions) ListenError!Server {
+<a id="L247"></a>        return .{
+<a id="L248"></a>            .socket = try io.vtable.netListenIp(io.userdata, address, options),
+<a id="L249"></a>            .options = if (Server.AcceptOptions != void) .{
+<a id="L250"></a>                .mode = options.mode,
+<a id="L251"></a>                .protocol = options.protocol,
+<a id="L252"></a>            },
+<a id="L253"></a>        };
+<a id="L254"></a>    }
+<a id="L255"></a>
+<a id="L256"></a>    pub const BindError = error{
+<a id="L257"></a>        /// The address is already taken. Can occur when bound port is 0 but
+<a id="L258"></a>        /// all ephemeral ports are already in use.
+<a id="L259"></a>        AddressInUse,
+<a id="L260"></a>        /// A nonexistent interface was requested or the requested address was not local.
+<a id="L261"></a>        AddressUnavailable,
+<a id="L262"></a>        /// The address is not valid for the address family of socket.
+<a id="L263"></a>        AddressFamilyUnsupported,
+<a id="L264"></a>        /// Insufficient memory or other resource internal to the operating system.
+<a id="L265"></a>        SystemResources,
+<a id="L266"></a>        /// The local network interface used to reach the destination is offline.
+<a id="L267"></a>        NetworkDown,
+<a id="L268"></a>        ProtocolUnsupportedBySystem,
+<a id="L269"></a>        ProtocolUnsupportedByAddressFamily,
+<a id="L270"></a>        /// Per-process limit on the number of open file descriptors has been reached.
+<a id="L271"></a>        ProcessFdQuotaExceeded,
+<a id="L272"></a>        /// System-wide limit on the total number of open files has been reached.
+<a id="L273"></a>        SystemFdQuotaExceeded,
+<a id="L274"></a>        SocketModeUnsupported,
+<a id="L275"></a>        /// One of the `BindOptions` is not supported by the Io
+<a id="L276"></a>        /// implementation.
+<a id="L277"></a>        OptionUnsupported,
+<a id="L278"></a>    } || Io.UnexpectedError || Io.Cancelable;
+<a id="L279"></a>
+<a id="L280"></a>    pub const BindOptions = struct {
+<a id="L281"></a>        /// The socket is restricted to sending and receiving IPv6 packets only.
+<a id="L282"></a>        /// In this case, an IPv4 and an IPv6 application can bind to a single port
+<a id="L283"></a>        /// at the same time.
+<a id="L284"></a>        ip6_only: bool = false,
+<a id="L285"></a>        /// Allow the socket to send datagrams to broadcast addresses.
+<a id="L286"></a>        /// When not enabled any attempt to send datagrams to a broadcast address
+<a id="L287"></a>        /// will fail with `error.AccessDenied`
+<a id="L288"></a>        allow_broadcast: bool = false,
+<a id="L289"></a>        mode: Socket.Mode,
+<a id="L290"></a>        protocol: ?Protocol = null,
+<a id="L291"></a>    };
+<a id="L292"></a>
+<a id="L293"></a>    /// Associates an address with a `Socket` which can be used to receive UDP
+<a id="L294"></a>    /// packets and other kinds of non-streaming messages. See `listen` for a
+<a id="L295"></a>    /// streaming alternative.
+<a id="L296"></a>    ///
+<a id="L297"></a>    /// One bound `Socket` can be used to receive messages from multiple
+<a id="L298"></a>    /// different addresses.
+<a id="L299"></a>    pub fn bind(address: *const IpAddress, io: Io, options: BindOptions) BindError!Socket {
+<a id="L300"></a>        return io.vtable.netBindIp(io.userdata, address, options);
+<a id="L301"></a>    }
+<a id="L302"></a>
+<a id="L303"></a>    pub const ConnectError = error{
+<a id="L304"></a>        AddressUnavailable,
+<a id="L305"></a>        AddressFamilyUnsupported,
+<a id="L306"></a>        /// Insufficient memory or other resource internal to the operating system.
+<a id="L307"></a>        SystemResources,
+<a id="L308"></a>        ConnectionPending,
+<a id="L309"></a>        ConnectionRefused,
+<a id="L310"></a>        ConnectionResetByPeer,
+<a id="L311"></a>        HostUnreachable,
+<a id="L312"></a>        NetworkUnreachable,
+<a id="L313"></a>        Timeout,
+<a id="L314"></a>        /// One of the `ConnectOptions` is not supported by the Io
+<a id="L315"></a>        /// implementation.
+<a id="L316"></a>        OptionUnsupported,
+<a id="L317"></a>        /// Per-process limit on the number of open file descriptors has been reached.
+<a id="L318"></a>        ProcessFdQuotaExceeded,
+<a id="L319"></a>        /// System-wide limit on the total number of open files has been reached.
+<a id="L320"></a>        SystemFdQuotaExceeded,
+<a id="L321"></a>        ProtocolUnsupportedBySystem,
+<a id="L322"></a>        ProtocolUnsupportedByAddressFamily,
+<a id="L323"></a>        SocketModeUnsupported,
+<a id="L324"></a>        /// The user tried to connect to a broadcast address without having the socket broadcast flag enabled or
+<a id="L325"></a>        /// the connection request failed because of a local firewall rule.
+<a id="L326"></a>        AccessDenied,
+<a id="L327"></a>        /// Non-blocking was requested and the operation cannot return immediately.
+<a id="L328"></a>        WouldBlock,
+<a id="L329"></a>        NetworkDown,
+<a id="L330"></a>    } || Io.Timeout.Error || Io.UnexpectedError || Io.Cancelable;
+<a id="L331"></a>
+<a id="L332"></a>    pub const ConnectOptions = struct {
+<a id="L333"></a>        mode: Socket.Mode,
+<a id="L334"></a>        protocol: ?Protocol = null,
+<a id="L335"></a>        timeout: Io.Timeout = .none,
+<a id="L336"></a>    };
+<a id="L337"></a>
+<a id="L338"></a>    /// Initiates a connection-oriented network stream.
+<a id="L339"></a>    pub fn connect(address: *const IpAddress, io: Io, options: ConnectOptions) ConnectError!Stream {
+<a id="L340"></a>        return .{ .socket = try io.vtable.netConnectIp(io.userdata, address, options) };
+<a id="L341"></a>    }
+<a id="L342"></a>};
+<a id="L343"></a>
+<a id="L344"></a>/// An IPv4 address in binary memory layout.
+<a id="L345"></a>pub const Ip4Address = struct {
+<a id="L346"></a>    bytes: [4]u8,
+<a id="L347"></a>    port: u16,
+<a id="L348"></a>
+<a id="L349"></a>    pub fn loopback(port: u16) Ip4Address {
+<a id="L350"></a>        return .{
+<a id="L351"></a>            .bytes = .{ 127, 0, 0, 1 },
+<a id="L352"></a>            .port = port,
+<a id="L353"></a>        };
+<a id="L354"></a>    }
+<a id="L355"></a>
+<a id="L356"></a>    pub fn unspecified(port: u16) Ip4Address {
+<a id="L357"></a>        return .{
+<a id="L358"></a>            .bytes = .{ 0, 0, 0, 0 },
+<a id="L359"></a>            .port = port,
+<a id="L360"></a>        };
+<a id="L361"></a>    }
+<a id="L362"></a>
+<a id="L363"></a>    /// Converts from an IPv4-mapped IPv6 address, or returns `null`.
+<a id="L364"></a>    pub fn fromIp6(ip6: Ip6Address) ?Ip4Address {
+<a id="L365"></a>        return if (std.mem.eql(u8, ip6.bytes[0..12], &amp;.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff })) .{
+<a id="L366"></a>            .bytes = ip6.bytes[12..].*,
+<a id="L367"></a>            .port = ip6.port,
+<a id="L368"></a>        } else null;
+<a id="L369"></a>    }
+<a id="L370"></a>
+<a id="L371"></a>    /// Given an `IpAddress`, converts it to an `Ip4Address` directly, or from
+<a id="L372"></a>    /// an IPv4-mapped IPv6 address, or returns `null`.
+<a id="L373"></a>    pub fn fromAny(addr: IpAddress) ?Ip6Address {
+<a id="L374"></a>        return switch (addr) {
+<a id="L375"></a>            .ip4 =&gt; |ip4| ip4,
+<a id="L376"></a>            .ip6 =&gt; |ip6| fromIp6(ip6),
+<a id="L377"></a>        };
+<a id="L378"></a>    }
+<a id="L379"></a>
+<a id="L380"></a>    pub const ParseError = error{
+<a id="L381"></a>        Overflow,
+<a id="L382"></a>        InvalidEnd,
+<a id="L383"></a>        InvalidCharacter,
+<a id="L384"></a>        Incomplete,
+<a id="L385"></a>        NonCanonical,
+<a id="L386"></a>    };
+<a id="L387"></a>
+<a id="L388"></a>    pub fn parse(buffer: []const u8, port: u16) ParseError!Ip4Address {
+<a id="L389"></a>        var bytes: [4]u8 = @splat(0);
+<a id="L390"></a>        var index: u8 = 0;
+<a id="L391"></a>        var saw_any_digits = false;
+<a id="L392"></a>        var has_zero_prefix = false;
+<a id="L393"></a>        for (buffer) |c| switch (c) {
+<a id="L394"></a>            '.' =&gt; {
+<a id="L395"></a>                if (!saw_any_digits) return error.InvalidCharacter;
+<a id="L396"></a>                if (index == 3) return error.InvalidEnd;
+<a id="L397"></a>                index += 1;
+<a id="L398"></a>                saw_any_digits = false;
+<a id="L399"></a>                has_zero_prefix = false;
+<a id="L400"></a>            },
+<a id="L401"></a>            '0'...'9' =&gt; {
+<a id="L402"></a>                if (c == '0' and !saw_any_digits) {
+<a id="L403"></a>                    has_zero_prefix = true;
+<a id="L404"></a>                } else if (has_zero_prefix) {
+<a id="L405"></a>                    return error.NonCanonical;
+<a id="L406"></a>                }
+<a id="L407"></a>                saw_any_digits = true;
+<a id="L408"></a>                bytes[index] = try std.math.mul(u8, bytes[index], 10);
+<a id="L409"></a>                bytes[index] = try std.math.add(u8, bytes[index], c - '0');
+<a id="L410"></a>            },
+<a id="L411"></a>            else =&gt; return error.InvalidCharacter,
+<a id="L412"></a>        };
+<a id="L413"></a>        if (index == 3 and saw_any_digits) return .{
+<a id="L414"></a>            .bytes = bytes,
+<a id="L415"></a>            .port = port,
+<a id="L416"></a>        };
+<a id="L417"></a>        return error.Incomplete;
+<a id="L418"></a>    }
+<a id="L419"></a>
+<a id="L420"></a>    pub fn format(a: Ip4Address, w: *Io.Writer) Io.Writer.Error!void {
+<a id="L421"></a>        const bytes = &amp;a.bytes;
+<a id="L422"></a>        try w.print("{d}.{d}.{d}.{d}:{d}", .{ bytes[0], bytes[1], bytes[2], bytes[3], a.port });
+<a id="L423"></a>    }
+<a id="L424"></a>
+<a id="L425"></a>    pub fn eql(a: Ip4Address, b: Ip4Address) bool {
+<a id="L426"></a>        const a_int: u32 = @bitCast(a.bytes);
+<a id="L427"></a>        const b_int: u32 = @bitCast(b.bytes);
+<a id="L428"></a>        return a.port == b.port and a_int == b_int;
+<a id="L429"></a>    }
+<a id="L430"></a>};
+<a id="L431"></a>
+<a id="L432"></a>/// An IPv6 address in binary memory layout.
+<a id="L433"></a>pub const Ip6Address = struct {
+<a id="L434"></a>    /// Native endian
+<a id="L435"></a>    port: u16,
+<a id="L436"></a>    /// Big endian
+<a id="L437"></a>    bytes: [16]u8,
+<a id="L438"></a>    flow: u32 = 0,
+<a id="L439"></a>    interface: Interface = .none,
+<a id="L440"></a>
+<a id="L441"></a>    pub const Policy = struct {
+<a id="L442"></a>        addr: [16]u8,
+<a id="L443"></a>        len: u8,
+<a id="L444"></a>        mask: u8,
+<a id="L445"></a>        prec: u8,
+<a id="L446"></a>        label: u8,
+<a id="L447"></a>    };
+<a id="L448"></a>
+<a id="L449"></a>    pub fn loopback(port: u16) Ip6Address {
+<a id="L450"></a>        return .{
+<a id="L451"></a>            .bytes = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 },
+<a id="L452"></a>            .port = port,
+<a id="L453"></a>        };
+<a id="L454"></a>    }
+<a id="L455"></a>
+<a id="L456"></a>    pub fn unspecified(port: u16) Ip6Address {
+<a id="L457"></a>        return .{
+<a id="L458"></a>            .bytes = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+<a id="L459"></a>            .port = port,
+<a id="L460"></a>        };
+<a id="L461"></a>    }
+<a id="L462"></a>
+<a id="L463"></a>    /// Constructs an IPv4-mapped IPv6 address.
+<a id="L464"></a>    pub fn fromIp4(ip4: Ip4Address) Ip6Address {
+<a id="L465"></a>        return .{
+<a id="L466"></a>            .bytes = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff } ++ ip4.bytes,
+<a id="L467"></a>            .port = ip4.port,
+<a id="L468"></a>        };
+<a id="L469"></a>    }
+<a id="L470"></a>
+<a id="L471"></a>    /// Given an `IpAddress`, converts it to an `Ip6Address` directly, or via
+<a id="L472"></a>    /// constructing an IPv4-mapped IPv6 address.
+<a id="L473"></a>    pub fn fromAny(addr: IpAddress) Ip6Address {
+<a id="L474"></a>        return switch (addr) {
+<a id="L475"></a>            .ip4 =&gt; |ip4| fromIp4(ip4),
+<a id="L476"></a>            .ip6 =&gt; |ip6| ip6,
+<a id="L477"></a>        };
+<a id="L478"></a>    }
+<a id="L479"></a>
+<a id="L480"></a>    /// An IPv6 address but with `Interface` as a name rather than index.
+<a id="L481"></a>    pub const Unresolved = struct {
+<a id="L482"></a>        /// Big endian
+<a id="L483"></a>        bytes: [16]u8,
+<a id="L484"></a>        /// Has not been checked to be a valid native interface name.
+<a id="L485"></a>        /// Externally managed memory.
+<a id="L486"></a>        interface_name: ?[]const u8,
+<a id="L487"></a>
+<a id="L488"></a>        pub const Parsed = union(enum) {
+<a id="L489"></a>            success: Unresolved,
+<a id="L490"></a>            invalid_byte: usize,
+<a id="L491"></a>            incomplete,
+<a id="L492"></a>            junk_after_end: usize,
+<a id="L493"></a>            interface_name_oversized: usize,
+<a id="L494"></a>            invalid_ip4_mapping: usize,
+<a id="L495"></a>            overflow: usize,
+<a id="L496"></a>        };
+<a id="L497"></a>
+<a id="L498"></a>        pub fn parse(text: []const u8) Parsed {
+<a id="L499"></a>            if (text.len &lt; 2) return .incomplete;
+<a id="L500"></a>            const ip4_prefix = "::ffff:";
+<a id="L501"></a>            if (std.ascii.startsWithIgnoreCase(text, ip4_prefix)) {
+<a id="L502"></a>                const parsed = Ip4Address.parse(text[ip4_prefix.len..], 0) catch
+<a id="L503"></a>                    return .{ .invalid_ip4_mapping = ip4_prefix.len };
+<a id="L504"></a>                const b = parsed.bytes;
+<a id="L505"></a>                return .{ .success = .{
+<a id="L506"></a>                    .bytes = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, b[0], b[1], b[2], b[3] },
+<a id="L507"></a>                    .interface_name = null,
+<a id="L508"></a>                } };
+<a id="L509"></a>            }
+<a id="L510"></a>            // Has to be u16 elements to handle 3-digit hex numbers from compression.
+<a id="L511"></a>            var parts: [8]u16 = @splat(0);
+<a id="L512"></a>            var parts_i: u8 = 0;
+<a id="L513"></a>            var text_i: u8 = 0;
+<a id="L514"></a>            var digit_i: u8 = 0;
+<a id="L515"></a>            var compress_start: ?u8 = null;
+<a id="L516"></a>            var interface_name_text: ?[]const u8 = null;
+<a id="L517"></a>            const State = union(enum) { digit, end };
+<a id="L518"></a>            state: switch (State.digit) {
+<a id="L519"></a>                .digit =&gt; c: switch (text[text_i]) {
+<a id="L520"></a>                    'a'...'f' =&gt; |c| {
+<a id="L521"></a>                        const digit = c - 'a' + 10;
+<a id="L522"></a>                        parts[parts_i] = (std.math.mul(u16, parts[parts_i], 16) catch return .{
+<a id="L523"></a>                            .overflow = text_i,
+<a id="L524"></a>                        }) + digit;
+<a id="L525"></a>                        if (digit_i == 4) return .{ .invalid_byte = text_i };
+<a id="L526"></a>                        digit_i += 1;
+<a id="L527"></a>                        text_i += 1;
+<a id="L528"></a>                        if (text.len - text_i == 0) {
+<a id="L529"></a>                            parts_i += 1;
+<a id="L530"></a>                            continue :state .end;
+<a id="L531"></a>                        }
+<a id="L532"></a>                        continue :c text[text_i];
+<a id="L533"></a>                    },
+<a id="L534"></a>                    'A'...'F' =&gt; |c| continue :c c - 'A' + 'a',
+<a id="L535"></a>                    '0'...'9' =&gt; |c| {
+<a id="L536"></a>                        const digit = c - '0';
+<a id="L537"></a>                        parts[parts_i] = (std.math.mul(u16, parts[parts_i], 16) catch return .{
+<a id="L538"></a>                            .overflow = text_i,
+<a id="L539"></a>                        }) + digit;
+<a id="L540"></a>                        if (digit_i == 4) return .{ .invalid_byte = text_i };
+<a id="L541"></a>                        digit_i += 1;
+<a id="L542"></a>                        text_i += 1;
+<a id="L543"></a>                        if (text.len - text_i == 0) {
+<a id="L544"></a>                            parts_i += 1;
+<a id="L545"></a>                            continue :state .end;
+<a id="L546"></a>                        }
+<a id="L547"></a>                        continue :c text[text_i];
+<a id="L548"></a>                    },
+<a id="L549"></a>                    ':' =&gt; {
+<a id="L550"></a>                        if (digit_i == 0) {
+<a id="L551"></a>                            if (compress_start != null) return .{ .invalid_byte = text_i };
+<a id="L552"></a>                            if (text_i == 0) {
+<a id="L553"></a>                                text_i += 1;
+<a id="L554"></a>                                if (text[text_i] != ':') return .{ .invalid_byte = text_i };
+<a id="L555"></a>                                assert(parts_i == 0);
+<a id="L556"></a>                            }
+<a id="L557"></a>                            compress_start = parts_i;
+<a id="L558"></a>                            text_i += 1;
+<a id="L559"></a>                            if (text.len - text_i == 0) continue :state .end;
+<a id="L560"></a>                            continue :c text[text_i];
+<a id="L561"></a>                        } else {
+<a id="L562"></a>                            parts_i += 1;
+<a id="L563"></a>                            if (parts.len - parts_i == 0) continue :state .end;
+<a id="L564"></a>                            digit_i = 0;
+<a id="L565"></a>                            text_i += 1;
+<a id="L566"></a>                            if (text.len - text_i == 0) return .incomplete;
+<a id="L567"></a>                            continue :c text[text_i];
+<a id="L568"></a>                        }
+<a id="L569"></a>                    },
+<a id="L570"></a>                    '%' =&gt; {
+<a id="L571"></a>                        if (digit_i == 0) return .{ .invalid_byte = text_i };
+<a id="L572"></a>                        parts_i += 1;
+<a id="L573"></a>                        text_i += 1;
+<a id="L574"></a>                        const name = text[text_i..];
+<a id="L575"></a>                        if (name.len == 0) return .incomplete;
+<a id="L576"></a>                        interface_name_text = name;
+<a id="L577"></a>                        text_i = @intCast(text.len);
+<a id="L578"></a>                        continue :state .end;
+<a id="L579"></a>                    },
+<a id="L580"></a>                    else =&gt; return .{ .invalid_byte = text_i },
+<a id="L581"></a>                },
+<a id="L582"></a>                .end =&gt; {
+<a id="L583"></a>                    if (text.len - text_i != 0) return .{ .junk_after_end = text_i };
+<a id="L584"></a>                    const remaining = parts.len - parts_i;
+<a id="L585"></a>                    if (compress_start) |s| {
+<a id="L586"></a>                        const src = parts[s..parts_i];
+<a id="L587"></a>                        @memmove(parts[parts.len - src.len ..], src);
+<a id="L588"></a>                        @memset(parts[s..][0..remaining], 0);
+<a id="L589"></a>                    } else {
+<a id="L590"></a>                        if (remaining != 0) return .incomplete;
+<a id="L591"></a>                    }
+<a id="L592"></a>
+<a id="L593"></a>                    // Workaround that can be removed when this proposal is
+<a id="L594"></a>                    // implemented https://github.com/ziglang/zig/issues/19755
+<a id="L595"></a>                    if ((comptime @import("builtin").cpu.arch.endian()) != .big) {
+<a id="L596"></a>                        for (&amp;parts) |*part| part.* = @byteSwap(part.*);
+<a id="L597"></a>                    }
+<a id="L598"></a>
+<a id="L599"></a>                    return .{ .success = .{
+<a id="L600"></a>                        .bytes = @bitCast(parts),
+<a id="L601"></a>                        .interface_name = interface_name_text,
+<a id="L602"></a>                    } };
+<a id="L603"></a>                },
+<a id="L604"></a>            }
+<a id="L605"></a>        }
+<a id="L606"></a>
+<a id="L607"></a>        pub fn format(u: *const Unresolved, w: *Io.Writer) Io.Writer.Error!void {
+<a id="L608"></a>            const bytes = &amp;u.bytes;
+<a id="L609"></a>            if (std.mem.eql(u8, bytes[0..12], &amp;[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff })) {
+<a id="L610"></a>                try w.print("::ffff:{d}.{d}.{d}.{d}", .{ bytes[12], bytes[13], bytes[14], bytes[15] });
+<a id="L611"></a>            } else {
+<a id="L612"></a>                const parts: [8]u16 = .{
+<a id="L613"></a>                    std.mem.readInt(u16, bytes[0..2], .big),
+<a id="L614"></a>                    std.mem.readInt(u16, bytes[2..4], .big),
+<a id="L615"></a>                    std.mem.readInt(u16, bytes[4..6], .big),
+<a id="L616"></a>                    std.mem.readInt(u16, bytes[6..8], .big),
+<a id="L617"></a>                    std.mem.readInt(u16, bytes[8..10], .big),
+<a id="L618"></a>                    std.mem.readInt(u16, bytes[10..12], .big),
+<a id="L619"></a>                    std.mem.readInt(u16, bytes[12..14], .big),
+<a id="L620"></a>                    std.mem.readInt(u16, bytes[14..16], .big),
+<a id="L621"></a>                };
+<a id="L622"></a>
+<a id="L623"></a>                // Find the longest zero run
+<a id="L624"></a>                var longest_start: usize = 8;
+<a id="L625"></a>                var longest_len: usize = 0;
+<a id="L626"></a>                var current_start: usize = 0;
+<a id="L627"></a>                var current_len: usize = 0;
+<a id="L628"></a>
+<a id="L629"></a>                for (parts, 0..) |part, i| {
+<a id="L630"></a>                    if (part == 0) {
+<a id="L631"></a>                        if (current_len == 0) {
+<a id="L632"></a>                            current_start = i;
+<a id="L633"></a>                        }
+<a id="L634"></a>                        current_len += 1;
+<a id="L635"></a>                        if (current_len &gt; longest_len) {
+<a id="L636"></a>                            longest_start = current_start;
+<a id="L637"></a>                            longest_len = current_len;
+<a id="L638"></a>                        }
+<a id="L639"></a>                    } else {
+<a id="L640"></a>                        current_len = 0;
+<a id="L641"></a>                    }
+<a id="L642"></a>                }
+<a id="L643"></a>
+<a id="L644"></a>                // Only compress if the longest zero run is 2 or more
+<a id="L645"></a>                if (longest_len &lt; 2) {
+<a id="L646"></a>                    longest_start = 8;
+<a id="L647"></a>                    longest_len = 0;
+<a id="L648"></a>                }
+<a id="L649"></a>
+<a id="L650"></a>                var i: usize = 0;
+<a id="L651"></a>                while (parts.len - i != 0) : (i += 1) {
+<a id="L652"></a>                    if (i == longest_start) {
+<a id="L653"></a>                        // Emit "::" for the longest zero run
+<a id="L654"></a>                        try w.writeAll(if (i == 0) "::" else ":");
+<a id="L655"></a>                        i += longest_len - 1; // Skip the compressed range
+<a id="L656"></a>                        continue;
+<a id="L657"></a>                    }
+<a id="L658"></a>                    try w.print("{x}", .{parts[i]});
+<a id="L659"></a>                    if (i != parts.len - 1) {
+<a id="L660"></a>                        try w.writeAll(":");
+<a id="L661"></a>                    }
+<a id="L662"></a>                }
+<a id="L663"></a>            }
+<a id="L664"></a>            if (u.interface_name) |n| try w.print("%{s}", .{n});
+<a id="L665"></a>        }
+<a id="L666"></a>    };
+<a id="L667"></a>
+<a id="L668"></a>    pub const ParseError = error{
+<a id="L669"></a>        /// If this is returned, more detailed diagnostics can be obtained by
+<a id="L670"></a>        /// calling `Ip6Address.Parsed.init`.
+<a id="L671"></a>        ParseFailed,
+<a id="L672"></a>        /// If this is returned, the IPv6 address had a scope id on it ("%foo"
+<a id="L673"></a>        /// at the end) which requires calling `resolve`.
+<a id="L674"></a>        UnresolvedScope,
+<a id="L675"></a>    };
+<a id="L676"></a>
+<a id="L677"></a>    /// This is a pure function but it cannot handle IPv6 addresses that have
+<a id="L678"></a>    /// scope ids ("%foo" at the end). To also handle those, `resolve` must be
+<a id="L679"></a>    /// called instead, or the lower level `Unresolved` API may be used.
+<a id="L680"></a>    pub fn parse(buffer: []const u8, port: u16) ParseError!Ip6Address {
+<a id="L681"></a>        switch (Unresolved.parse(buffer)) {
+<a id="L682"></a>            .success =&gt; |p| return .{
+<a id="L683"></a>                .bytes = p.bytes,
+<a id="L684"></a>                .port = port,
+<a id="L685"></a>                .interface = if (p.interface_name != null) return error.UnresolvedScope else .none,
+<a id="L686"></a>            },
+<a id="L687"></a>            else =&gt; return error.ParseFailed,
+<a id="L688"></a>        }
+<a id="L689"></a>        return .{ .ip6 = try Ip6Address.parse(buffer, port) };
+<a id="L690"></a>    }
+<a id="L691"></a>
+<a id="L692"></a>    pub const ResolveError = error{
+<a id="L693"></a>        /// If this is returned, more detailed diagnostics can be obtained by
+<a id="L694"></a>        /// calling the `Parsed.init` function.
+<a id="L695"></a>        ParseFailed,
+<a id="L696"></a>        /// The interface name is longer than the host operating system supports.
+<a id="L697"></a>        NameTooLong,
+<a id="L698"></a>    } || Interface.Name.ResolveError;
+<a id="L699"></a>
+<a id="L700"></a>    /// This function requires an `Io` parameter because it must query the operating
+<a id="L701"></a>    /// system to convert interface name to index. For example, in
+<a id="L702"></a>    /// "fe80::e0e:76ff:fed4:cf22%eno1", "eno1" must be resolved to an index by
+<a id="L703"></a>    /// creating a socket and then using an `ioctl` syscall.
+<a id="L704"></a>    pub fn resolve(io: Io, buffer: []const u8, port: u16) ResolveError!Ip6Address {
+<a id="L705"></a>        return switch (Unresolved.parse(buffer)) {
+<a id="L706"></a>            .success =&gt; |p| return .{
+<a id="L707"></a>                .bytes = p.bytes,
+<a id="L708"></a>                .port = port,
+<a id="L709"></a>                .interface = i: {
+<a id="L710"></a>                    const text = p.interface_name orelse break :i .none;
+<a id="L711"></a>                    const name: Interface.Name = try .fromSlice(text);
+<a id="L712"></a>                    break :i try name.resolve(io);
+<a id="L713"></a>                },
+<a id="L714"></a>            },
+<a id="L715"></a>            else =&gt; return error.ParseFailed,
+<a id="L716"></a>        };
+<a id="L717"></a>    }
+<a id="L718"></a>
+<a id="L719"></a>    pub const FormatError = Io.Writer.Error || Interface.NameError;
+<a id="L720"></a>
+<a id="L721"></a>    /// Includes the optional scope ("%foo" at the end).
+<a id="L722"></a>    ///
+<a id="L723"></a>    /// See `format` for an alternative that omits scopes and does
+<a id="L724"></a>    /// not require an `Io` parameter.
+<a id="L725"></a>    pub fn formatResolved(a: *const Ip6Address, io: Io, w: *Io.Writer) FormatError!void {
+<a id="L726"></a>        const interface_name = if (a.interface.isNone()) null else try a.interface.name(io);
+<a id="L727"></a>        const u: Unresolved = .{
+<a id="L728"></a>            .bytes = a.bytes,
+<a id="L729"></a>            .interface_name = if (interface_name) |name| name.toSlice() else null,
+<a id="L730"></a>        };
+<a id="L731"></a>        try w.print("[{f}]:{d}", .{ u, a.port });
+<a id="L732"></a>    }
+<a id="L733"></a>
+<a id="L734"></a>    /// See `formatResolved` for an alternative that additionally prints the optional
+<a id="L735"></a>    /// scope at the end of addresses and requires an `Io` parameter.
+<a id="L736"></a>    pub fn format(a: *const Ip6Address, w: *Io.Writer) Io.Writer.Error!void {
+<a id="L737"></a>        const u: Unresolved = .{ .bytes = a.bytes, .interface_name = null };
+<a id="L738"></a>        try w.print("[{f}]:{d}", .{ u, a.port });
+<a id="L739"></a>    }
+<a id="L740"></a>
+<a id="L741"></a>    pub fn eql(a: Ip6Address, b: Ip6Address) bool {
+<a id="L742"></a>        return a.port == b.port and std.mem.eql(u8, &amp;a.bytes, &amp;b.bytes);
+<a id="L743"></a>    }
+<a id="L744"></a>
+<a id="L745"></a>    pub fn isMultiCast(a: Ip6Address) bool {
+<a id="L746"></a>        return a.bytes[0] == 0xff;
+<a id="L747"></a>    }
+<a id="L748"></a>
+<a id="L749"></a>    pub fn isLinkLocal(a: Ip6Address) bool {
+<a id="L750"></a>        const b = &amp;a.bytes;
+<a id="L751"></a>        return b[0] == 0xfe and (b[1] &amp; 0xc0) == 0x80;
+<a id="L752"></a>    }
+<a id="L753"></a>
+<a id="L754"></a>    pub fn isLoopBack(a: Ip6Address) bool {
+<a id="L755"></a>        const b = &amp;a.bytes;
+<a id="L756"></a>        return b[0] == 0 and b[1] == 0 and
+<a id="L757"></a>            b[2] == 0 and
+<a id="L758"></a>            b[12] == 0 and b[13] == 0 and
+<a id="L759"></a>            b[14] == 0 and b[15] == 1;
+<a id="L760"></a>    }
+<a id="L761"></a>
+<a id="L762"></a>    pub fn isSiteLocal(a: Ip6Address) bool {
+<a id="L763"></a>        const b = &amp;a.bytes;
+<a id="L764"></a>        return b[0] == 0xfe and (b[1] &amp; 0xc0) == 0xc0;
+<a id="L765"></a>    }
+<a id="L766"></a>
+<a id="L767"></a>    pub fn policy(a: Ip6Address) *const Policy {
+<a id="L768"></a>        const b = &amp;a.bytes;
+<a id="L769"></a>        for (&amp;defined_policies) |*p| {
+<a id="L770"></a>            if (!std.mem.eql(u8, b[0..p.len], p.addr[0..p.len])) continue;
+<a id="L771"></a>            if ((b[p.len] &amp; p.mask) != p.addr[p.len]) continue;
+<a id="L772"></a>            return p;
+<a id="L773"></a>        }
+<a id="L774"></a>        unreachable;
+<a id="L775"></a>    }
+<a id="L776"></a>
+<a id="L777"></a>    pub fn scope(a: Ip6Address) u8 {
+<a id="L778"></a>        if (isMultiCast(a)) return a.bytes[1] &amp; 15;
+<a id="L779"></a>        if (isLinkLocal(a)) return 2;
+<a id="L780"></a>        if (isLoopBack(a)) return 2;
+<a id="L781"></a>        if (isSiteLocal(a)) return 5;
+<a id="L782"></a>        return 14;
+<a id="L783"></a>    }
+<a id="L784"></a>
+<a id="L785"></a>    const defined_policies = [_]Policy{
+<a id="L786"></a>        .{
+<a id="L787"></a>            .addr = "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01".*,
+<a id="L788"></a>            .len = 15,
+<a id="L789"></a>            .mask = 0xff,
+<a id="L790"></a>            .prec = 50,
+<a id="L791"></a>            .label = 0,
+<a id="L792"></a>        },
+<a id="L793"></a>        .{
+<a id="L794"></a>            .addr = "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff\x00\x00\x00\x00".*,
+<a id="L795"></a>            .len = 11,
+<a id="L796"></a>            .mask = 0xff,
+<a id="L797"></a>            .prec = 35,
+<a id="L798"></a>            .label = 4,
+<a id="L799"></a>        },
+<a id="L800"></a>        .{
+<a id="L801"></a>            .addr = "\x20\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00".*,
+<a id="L802"></a>            .len = 1,
+<a id="L803"></a>            .mask = 0xff,
+<a id="L804"></a>            .prec = 30,
+<a id="L805"></a>            .label = 2,
+<a id="L806"></a>        },
+<a id="L807"></a>        .{
+<a id="L808"></a>            .addr = "\x20\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00".*,
+<a id="L809"></a>            .len = 3,
+<a id="L810"></a>            .mask = 0xff,
+<a id="L811"></a>            .prec = 5,
+<a id="L812"></a>            .label = 5,
+<a id="L813"></a>        },
+<a id="L814"></a>        .{
+<a id="L815"></a>            .addr = "\xfc\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00".*,
+<a id="L816"></a>            .len = 0,
+<a id="L817"></a>            .mask = 0xfe,
+<a id="L818"></a>            .prec = 3,
+<a id="L819"></a>            .label = 13,
+<a id="L820"></a>        },
+<a id="L821"></a>        //  These are deprecated and/or returned to the address
+<a id="L822"></a>        //  pool, so despite the RFC, treating them as special
+<a id="L823"></a>        //  is probably wrong.
+<a id="L824"></a>        // { "", 11, 0xff, 1, 3 },
+<a id="L825"></a>        // { "\xfe\xc0", 1, 0xc0, 1, 11 },
+<a id="L826"></a>        // { "\x3f\xfe", 1, 0xff, 1, 12 },
+<a id="L827"></a>        // Last rule must match all addresses to stop loop.
+<a id="L828"></a>        .{
+<a id="L829"></a>            .addr = "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00".*,
+<a id="L830"></a>            .len = 0,
+<a id="L831"></a>            .mask = 0,
+<a id="L832"></a>            .prec = 40,
+<a id="L833"></a>            .label = 1,
+<a id="L834"></a>        },
+<a id="L835"></a>    };
+<a id="L836"></a>};
+<a id="L837"></a>
+<a id="L838"></a>pub const UnixAddress = struct {
+<a id="L839"></a>    path: []const u8,
+<a id="L840"></a>
+<a id="L841"></a>    pub const max_len = switch (native_os) {
+<a id="L842"></a>        .windows =&gt; std.os.windows.PATH_MAX_WIDE,
+<a id="L843"></a>        else =&gt; 108,
+<a id="L844"></a>    };
+<a id="L845"></a>
+<a id="L846"></a>    pub const InitError = error{NameTooLong};
+<a id="L847"></a>
+<a id="L848"></a>    pub fn init(p: []const u8) InitError!UnixAddress {
+<a id="L849"></a>        if (p.len &gt; max_len) return error.NameTooLong;
+<a id="L850"></a>        return .{ .path = p };
+<a id="L851"></a>    }
+<a id="L852"></a>
+<a id="L853"></a>    pub fn isAbstract(ua: *const UnixAddress) bool {
+<a id="L854"></a>        return ua.path.len == 0 or ua.path[0] == 0;
+<a id="L855"></a>    }
+<a id="L856"></a>
+<a id="L857"></a>    pub const ListenError = error{
+<a id="L858"></a>        AddressFamilyUnsupported,
+<a id="L859"></a>        AddressInUse,
+<a id="L860"></a>        NetworkDown,
+<a id="L861"></a>        SystemResources,
+<a id="L862"></a>        SymLinkLoop,
+<a id="L863"></a>        FileNotFound,
+<a id="L864"></a>        NotDir,
+<a id="L865"></a>        ReadOnlyFileSystem,
+<a id="L866"></a>        ProcessFdQuotaExceeded,
+<a id="L867"></a>        SystemFdQuotaExceeded,
+<a id="L868"></a>        AccessDenied,
+<a id="L869"></a>        PermissionDenied,
+<a id="L870"></a>        AddressUnavailable,
+<a id="L871"></a>    } || Io.Cancelable || Io.UnexpectedError;
+<a id="L872"></a>
+<a id="L873"></a>    pub const ListenOptions = struct {
+<a id="L874"></a>        /// How many connections the kernel will accept on the application's behalf.
+<a id="L875"></a>        /// If more than this many connections pool in the kernel, clients will start
+<a id="L876"></a>        /// seeing "Connection refused".
+<a id="L877"></a>        kernel_backlog: u31 = default_kernel_backlog,
+<a id="L878"></a>    };
+<a id="L879"></a>
+<a id="L880"></a>    pub fn listen(ua: *const UnixAddress, io: Io, options: ListenOptions) ListenError!Server {
+<a id="L881"></a>        assert(ua.path.len &lt;= max_len);
+<a id="L882"></a>        return .{
+<a id="L883"></a>            .socket = .{
+<a id="L884"></a>                .handle = try io.vtable.netListenUnix(io.userdata, ua, options),
+<a id="L885"></a>                .address = .{ .ip4 = .loopback(0) },
+<a id="L886"></a>            },
+<a id="L887"></a>            .options = if (Server.AcceptOptions != void) .{ .mode = .stream, .protocol = null },
+<a id="L888"></a>        };
+<a id="L889"></a>    }
+<a id="L890"></a>
+<a id="L891"></a>    pub const ConnectError = error{
+<a id="L892"></a>        SystemResources,
+<a id="L893"></a>        ProcessFdQuotaExceeded,
+<a id="L894"></a>        SystemFdQuotaExceeded,
+<a id="L895"></a>        AddressFamilyUnsupported,
+<a id="L896"></a>        ProtocolUnsupportedBySystem,
+<a id="L897"></a>        SocketModeUnsupported,
+<a id="L898"></a>        AccessDenied,
+<a id="L899"></a>        PermissionDenied,
+<a id="L900"></a>        SymLinkLoop,
+<a id="L901"></a>        FileNotFound,
+<a id="L902"></a>        NotDir,
+<a id="L903"></a>        ReadOnlyFileSystem,
+<a id="L904"></a>        WouldBlock,
+<a id="L905"></a>        NetworkDown,
+<a id="L906"></a>    } || Io.Cancelable || Io.UnexpectedError;
+<a id="L907"></a>
+<a id="L908"></a>    pub fn connect(ua: *const UnixAddress, io: Io) ConnectError!Stream {
+<a id="L909"></a>        assert(ua.path.len &lt;= max_len);
+<a id="L910"></a>        return .{ .socket = .{
+<a id="L911"></a>            .handle = try io.vtable.netConnectUnix(io.userdata, ua),
+<a id="L912"></a>            .address = .{ .ip4 = .loopback(0) },
+<a id="L913"></a>        } };
+<a id="L914"></a>    }
+<a id="L915"></a>};
+<a id="L916"></a>
+<a id="L917"></a>pub const ReceiveFlags = packed struct(u8) {
+<a id="L918"></a>    oob: bool = false,
+<a id="L919"></a>    peek: bool = false,
+<a id="L920"></a>    trunc: bool = false,
+<a id="L921"></a>    _: u5 = 0,
+<a id="L922"></a>};
+<a id="L923"></a>
+<a id="L924"></a>pub const IncomingMessage = struct {
+<a id="L925"></a>    /// Populated by receive functions.
+<a id="L926"></a>    from: IpAddress,
+<a id="L927"></a>    /// Populated by receive functions, points into the caller-supplied buffer.
+<a id="L928"></a>    data: []u8,
+<a id="L929"></a>    /// Supplied by caller before calling receive functions; mutated by receive
+<a id="L930"></a>    /// functions.
+<a id="L931"></a>    control: []u8,
+<a id="L932"></a>    /// Populated by receive functions.
+<a id="L933"></a>    flags: Flags,
+<a id="L934"></a>
+<a id="L935"></a>    /// Useful for initializing before calling `receiveManyTimeout`.
+<a id="L936"></a>    pub const init: IncomingMessage = .{
+<a id="L937"></a>        .from = undefined,
+<a id="L938"></a>        .data = undefined,
+<a id="L939"></a>        .control = &amp;.{},
+<a id="L940"></a>        .flags = undefined,
+<a id="L941"></a>    };
+<a id="L942"></a>
+<a id="L943"></a>    pub const Flags = packed struct(u8) {
+<a id="L944"></a>        /// indicates end-of-record; the data returned completed a record
+<a id="L945"></a>        /// (generally used with sockets of type SOCK_SEQPACKET).
+<a id="L946"></a>        eor: bool,
+<a id="L947"></a>        /// indicates that the trailing portion of a datagram was discarded
+<a id="L948"></a>        /// because the datagram was larger than the buffer supplied.
+<a id="L949"></a>        trunc: bool,
+<a id="L950"></a>        /// indicates that some control data was discarded due to lack of
+<a id="L951"></a>        /// space in the buffer for ancil‐ lary data.
+<a id="L952"></a>        ctrunc: bool,
+<a id="L953"></a>        /// indicates expedited or out-of-band data was received.
+<a id="L954"></a>        oob: bool,
+<a id="L955"></a>        /// indicates that no data was received but an extended error from the
+<a id="L956"></a>        /// socket error queue.
+<a id="L957"></a>        errqueue: bool,
+<a id="L958"></a>        _: u3 = 0,
+<a id="L959"></a>    };
+<a id="L960"></a>};
+<a id="L961"></a>
+<a id="L962"></a>pub const OutgoingMessage = struct {
+<a id="L963"></a>    address: *const IpAddress,
+<a id="L964"></a>    data_ptr: [*]const u8,
+<a id="L965"></a>    /// Initialized with how many bytes of `data_ptr` to send. After sending
+<a id="L966"></a>    /// succeeds, replaced with how many bytes were actually sent.
+<a id="L967"></a>    data_len: usize,
+<a id="L968"></a>    control: []const u8 = &amp;.{},
+<a id="L969"></a>};
+<a id="L970"></a>
+<a id="L971"></a>pub const SendFlags = packed struct(u8) {
+<a id="L972"></a>    confirm: bool = false,
+<a id="L973"></a>    dont_route: bool = false,
+<a id="L974"></a>    eor: bool = false,
+<a id="L975"></a>    oob: bool = false,
+<a id="L976"></a>    fastopen: bool = false,
+<a id="L977"></a>    _: u3 = 0,
+<a id="L978"></a>};
+<a id="L979"></a>
+<a id="L980"></a>pub const ShutdownHow = enum { recv, send, both };
+<a id="L981"></a>
+<a id="L982"></a>pub const ShutdownError = error{
+<a id="L983"></a>    ConnectionAborted,
+<a id="L984"></a>    ConnectionResetByPeer,
+<a id="L985"></a>    NetworkDown,
+<a id="L986"></a>    SocketUnconnected,
+<a id="L987"></a>    SystemResources,
+<a id="L988"></a>} || Io.UnexpectedError || Io.Cancelable;
+<a id="L989"></a>
+<a id="L990"></a>pub const Interface = struct {
+<a id="L991"></a>    /// Value 0 indicates `none`.
+<a id="L992"></a>    index: u32,
+<a id="L993"></a>
+<a id="L994"></a>    pub const none: Interface = .{ .index = 0 };
+<a id="L995"></a>
+<a id="L996"></a>    pub const Name = struct {
+<a id="L997"></a>        bytes: [max_len:0]u8,
+<a id="L998"></a>
+<a id="L999"></a>        pub const max_len = if (@TypeOf(std.posix.IFNAMESIZE) == void) 0 else std.posix.IFNAMESIZE - 1;
+<a id="L1000"></a>
+<a id="L1001"></a>        pub fn toSlice(n: *const Name) []const u8 {
+<a id="L1002"></a>            return std.mem.sliceTo(&amp;n.bytes, 0);
+<a id="L1003"></a>        }
+<a id="L1004"></a>
+<a id="L1005"></a>        pub fn fromSlice(bytes: []const u8) error{NameTooLong}!Name {
+<a id="L1006"></a>            if (bytes.len &gt; max_len) return error.NameTooLong;
+<a id="L1007"></a>            return .fromSliceUnchecked(bytes);
+<a id="L1008"></a>        }
+<a id="L1009"></a>
+<a id="L1010"></a>        /// Asserts bytes.len fits in `max_len`.
+<a id="L1011"></a>        pub fn fromSliceUnchecked(bytes: []const u8) Name {
+<a id="L1012"></a>            assert(bytes.len &lt;= max_len);
+<a id="L1013"></a>            var result: Name = undefined;
+<a id="L1014"></a>            @memcpy(result.bytes[0..bytes.len], bytes);
+<a id="L1015"></a>            result.bytes[bytes.len] = 0;
+<a id="L1016"></a>            return result;
+<a id="L1017"></a>        }
+<a id="L1018"></a>
+<a id="L1019"></a>        pub const ResolveError = error{
+<a id="L1020"></a>            InterfaceNotFound,
+<a id="L1021"></a>            AccessDenied,
+<a id="L1022"></a>            SystemResources,
+<a id="L1023"></a>        } || Io.UnexpectedError || Io.Cancelable;
+<a id="L1024"></a>
+<a id="L1025"></a>        /// Corresponds to "if_nametoindex" in libc.
+<a id="L1026"></a>        pub fn resolve(n: *const Name, io: Io) ResolveError!Interface {
+<a id="L1027"></a>            return io.vtable.netInterfaceNameResolve(io.userdata, n);
+<a id="L1028"></a>        }
+<a id="L1029"></a>    };
+<a id="L1030"></a>
+<a id="L1031"></a>    pub const NameError = error{
+<a id="L1032"></a>        /// Out of range `index`.
+<a id="L1033"></a>        InterfaceNotFound,
+<a id="L1034"></a>        /// Interface name longer than `Name.max_len`.
+<a id="L1035"></a>        NameTooLong,
+<a id="L1036"></a>    } || Io.UnexpectedError || Io.Cancelable;
+<a id="L1037"></a>
+<a id="L1038"></a>    /// Asserts not `none`.
+<a id="L1039"></a>    ///
+<a id="L1040"></a>    /// Corresponds to "if_indextoname" in libc.
+<a id="L1041"></a>    pub fn name(i: Interface, io: Io) NameError!Name {
+<a id="L1042"></a>        assert(i.index != 0);
+<a id="L1043"></a>        return io.vtable.netInterfaceName(io.userdata, i);
+<a id="L1044"></a>    }
+<a id="L1045"></a>
+<a id="L1046"></a>    pub fn isNone(i: Interface) bool {
+<a id="L1047"></a>        return i.index == 0;
+<a id="L1048"></a>    }
+<a id="L1049"></a>};
+<a id="L1050"></a>
+<a id="L1051"></a>/// An open port with unspecified protocol.
+<a id="L1052"></a>pub const Socket = struct {
+<a id="L1053"></a>    handle: Handle,
+<a id="L1054"></a>    /// Contains the resolved ephemeral port number if requested.
+<a id="L1055"></a>    address: IpAddress,
+<a id="L1056"></a>
+<a id="L1057"></a>    pub const Mode = enum {
+<a id="L1058"></a>        /// Provides sequenced, reliable, two-way, connection-based byte
+<a id="L1059"></a>        /// streams. An out-of-band data transmission mechanism may be
+<a id="L1060"></a>        /// supported.
+<a id="L1061"></a>        stream,
+<a id="L1062"></a>        /// Supports datagrams (connectionless, unreliable messages of a fixed
+<a id="L1063"></a>        /// maximum length).
+<a id="L1064"></a>        dgram,
+<a id="L1065"></a>        /// Provides  a  sequenced,  reliable,  two-way connection-based data
+<a id="L1066"></a>        /// transmission path for datagrams of fixed maximum length; a consumer
+<a id="L1067"></a>        /// is required to read an entire packet with each input system call.
+<a id="L1068"></a>        seqpacket,
+<a id="L1069"></a>        /// Provides raw network protocol access.
+<a id="L1070"></a>        raw,
+<a id="L1071"></a>        /// Provides a reliable datagram layer that does not guarantee ordering.
+<a id="L1072"></a>        rdm,
+<a id="L1073"></a>    };
+<a id="L1074"></a>
+<a id="L1075"></a>    /// Underlying platform-defined type which may or may not be
+<a id="L1076"></a>    /// interchangeable with a file system file descriptor.
+<a id="L1077"></a>    pub const Handle = std.posix.fd_t;
+<a id="L1078"></a>
+<a id="L1079"></a>    /// Leaves `address` in a valid state.
+<a id="L1080"></a>    pub fn close(s: *const Socket, io: Io) void {
+<a id="L1081"></a>        io.vtable.netClose(io.userdata, (&amp;s.handle)[0..1]);
+<a id="L1082"></a>    }
+<a id="L1083"></a>
+<a id="L1084"></a>    pub fn closeMany(io: Io, sockets: []const Socket) void {
+<a id="L1085"></a>        io.vtable.netClose(io.userdata, sockets);
+<a id="L1086"></a>    }
+<a id="L1087"></a>
+<a id="L1088"></a>    pub const SendError = error{
+<a id="L1089"></a>        /// The socket type requires that message be sent atomically, and the
+<a id="L1090"></a>        /// size of the message to be sent made this impossible. The message
+<a id="L1091"></a>        /// was not transmitted, or was partially transmitted.
+<a id="L1092"></a>        MessageOversize,
+<a id="L1093"></a>        /// The output queue for a network interface was full. This generally indicates that the
+<a id="L1094"></a>        /// interface has stopped sending, but may be caused by transient congestion. (Normally,
+<a id="L1095"></a>        /// this does not occur in Linux. Packets are just silently dropped when a device queue
+<a id="L1096"></a>        /// overflows.)
+<a id="L1097"></a>        ///
+<a id="L1098"></a>        /// This is also caused when there is not enough kernel memory available.
+<a id="L1099"></a>        SystemResources,
+<a id="L1100"></a>        /// No route to network.
+<a id="L1101"></a>        NetworkUnreachable,
+<a id="L1102"></a>        /// Network reached but no route to host.
+<a id="L1103"></a>        HostUnreachable,
+<a id="L1104"></a>        /// The local network interface used to reach the destination is offline.
+<a id="L1105"></a>        NetworkDown,
+<a id="L1106"></a>        /// The destination address is not listening. Can still occur for
+<a id="L1107"></a>        /// connectionless messages.
+<a id="L1108"></a>        ConnectionRefused,
+<a id="L1109"></a>        /// Operating system or protocol does not support the address family.
+<a id="L1110"></a>        AddressFamilyUnsupported,
+<a id="L1111"></a>        /// Another TCP Fast Open is already in progress.
+<a id="L1112"></a>        FastOpenAlreadyInProgress,
+<a id="L1113"></a>        /// Network session was unexpectedly closed by recipient.
+<a id="L1114"></a>        ConnectionResetByPeer,
+<a id="L1115"></a>        /// Local end has been shut down on a connection-oriented socket, or
+<a id="L1116"></a>        /// the socket was never connected.
+<a id="L1117"></a>        SocketUnconnected,
+<a id="L1118"></a>        /// An attempt was made to send to a network/broadcast address as
+<a id="L1119"></a>        /// though it was a unicast address.
+<a id="L1120"></a>        AccessDenied,
+<a id="L1121"></a>    } || Io.UnexpectedError || Io.Cancelable;
+<a id="L1122"></a>
+<a id="L1123"></a>    /// Transfers `data` to `dest`, connectionless, in one packet.
+<a id="L1124"></a>    pub fn send(s: *const Socket, io: Io, dest: *const IpAddress, data: []const u8) SendError!void {
+<a id="L1125"></a>        var message: OutgoingMessage = .{ .address = dest, .data_ptr = data.ptr, .data_len = data.len };
+<a id="L1126"></a>        const err, const n = io.vtable.netSend(io.userdata, s.handle, (&amp;message)[0..1], .{});
+<a id="L1127"></a>        if (n != 1) return err.?;
+<a id="L1128"></a>        if (message.data_len != data.len) return error.MessageOversize;
+<a id="L1129"></a>    }
+<a id="L1130"></a>
+<a id="L1131"></a>    pub fn sendMany(s: *const Socket, io: Io, messages: []OutgoingMessage, flags: SendFlags) SendError!void {
+<a id="L1132"></a>        const err, const n = io.vtable.netSend(io.userdata, s.handle, messages, flags);
+<a id="L1133"></a>        if (n != messages.len) return err.?;
+<a id="L1134"></a>    }
+<a id="L1135"></a>
+<a id="L1136"></a>    pub const ReceiveError = Io.Operation.NetReceive.Error || Io.Cancelable;
+<a id="L1137"></a>
+<a id="L1138"></a>    /// Waits for data. Connectionless.
+<a id="L1139"></a>    ///
+<a id="L1140"></a>    /// See also:
+<a id="L1141"></a>    /// * `receiveTimeout`
+<a id="L1142"></a>    pub fn receive(s: *const Socket, io: Io, buffer: []u8) ReceiveError!IncomingMessage {
+<a id="L1143"></a>        var message: IncomingMessage = .init;
+<a id="L1144"></a>        const maybe_err, const count = (try io.operate(.{ .net_receive = .{
+<a id="L1145"></a>            .socket_handle = s.handle,
+<a id="L1146"></a>            .message_buffer = (&amp;message)[0..1],
+<a id="L1147"></a>            .data_buffer = buffer,
+<a id="L1148"></a>            .flags = .{},
+<a id="L1149"></a>        } })).net_receive;
+<a id="L1150"></a>        if (maybe_err) |err| return err;
+<a id="L1151"></a>        assert(1 == count);
+<a id="L1152"></a>        return message;
+<a id="L1153"></a>    }
+<a id="L1154"></a>
+<a id="L1155"></a>    pub const ReceiveTimeoutError = ReceiveError || Io.Timeout.Error || Io.ConcurrentError;
+<a id="L1156"></a>
+<a id="L1157"></a>    /// Waits for data. Connectionless.
+<a id="L1158"></a>    ///
+<a id="L1159"></a>    /// Returns `error.Timeout` if no message arrives early enough.
+<a id="L1160"></a>    ///
+<a id="L1161"></a>    /// See also:
+<a id="L1162"></a>    /// * `receive`
+<a id="L1163"></a>    /// * `receiveManyTimeout`
+<a id="L1164"></a>    pub fn receiveTimeout(
+<a id="L1165"></a>        s: *const Socket,
+<a id="L1166"></a>        io: Io,
+<a id="L1167"></a>        buffer: []u8,
+<a id="L1168"></a>        timeout: Io.Timeout,
+<a id="L1169"></a>    ) ReceiveTimeoutError!IncomingMessage {
+<a id="L1170"></a>        var message: IncomingMessage = .init;
+<a id="L1171"></a>        const maybe_err, const count = (try io.operateTimeout(.{ .net_receive = .{
+<a id="L1172"></a>            .socket_handle = s.handle,
+<a id="L1173"></a>            .message_buffer = (&amp;message)[0..1],
+<a id="L1174"></a>            .data_buffer = buffer,
+<a id="L1175"></a>            .flags = .{},
+<a id="L1176"></a>        } }, timeout)).net_receive;
+<a id="L1177"></a>        if (maybe_err) |err| return err;
+<a id="L1178"></a>        assert(1 == count);
+<a id="L1179"></a>        return message;
+<a id="L1180"></a>    }
+<a id="L1181"></a>
+<a id="L1182"></a>    /// Waits until at least one message is delivered, possibly returning more
+<a id="L1183"></a>    /// than one message. Connectionless.
+<a id="L1184"></a>    ///
+<a id="L1185"></a>    /// Returns number of messages received, or `error.Timeout` if no message
+<a id="L1186"></a>    /// arrives early enough.
+<a id="L1187"></a>    ///
+<a id="L1188"></a>    /// See also:
+<a id="L1189"></a>    /// * `receive`
+<a id="L1190"></a>    /// * `receiveTimeout`
+<a id="L1191"></a>    pub fn receiveManyTimeout(
+<a id="L1192"></a>        s: *const Socket,
+<a id="L1193"></a>        io: Io,
+<a id="L1194"></a>        /// Function assumes each element has initialized `control` field.
+<a id="L1195"></a>        /// Initializing with `IncomingMessage.init` may be helpful.
+<a id="L1196"></a>        message_buffer: []IncomingMessage,
+<a id="L1197"></a>        data_buffer: []u8,
+<a id="L1198"></a>        flags: ReceiveFlags,
+<a id="L1199"></a>        timeout: Io.Timeout,
+<a id="L1200"></a>    ) struct { ?ReceiveTimeoutError, usize } {
+<a id="L1201"></a>        const result = io.operateTimeout(.{ .net_receive = .{
+<a id="L1202"></a>            .socket_handle = s.handle,
+<a id="L1203"></a>            .message_buffer = message_buffer,
+<a id="L1204"></a>            .data_buffer = data_buffer,
+<a id="L1205"></a>            .flags = flags,
+<a id="L1206"></a>        } }, timeout) catch |err| return .{ err, 0 };
+<a id="L1207"></a>        return result.net_receive;
+<a id="L1208"></a>    }
+<a id="L1209"></a>
+<a id="L1210"></a>    pub const CreatePairError = error{
+<a id="L1211"></a>        OperationUnsupported,
+<a id="L1212"></a>        AccessDenied,
+<a id="L1213"></a>        AddressFamilyUnsupported,
+<a id="L1214"></a>        ProtocolUnsupportedBySystem,
+<a id="L1215"></a>        /// The per-process limit on the number of open file descriptors has been reached.
+<a id="L1216"></a>        ProcessFdQuotaExceeded,
+<a id="L1217"></a>        /// The system-wide limit on the total number of open files has been reached.
+<a id="L1218"></a>        SystemFdQuotaExceeded,
+<a id="L1219"></a>        /// Insufficient memory is available. The socket cannot be created
+<a id="L1220"></a>        /// until sufficient resources are freed.
+<a id="L1221"></a>        SystemResources,
+<a id="L1222"></a>        ProtocolUnsupportedByAddressFamily,
+<a id="L1223"></a>        SocketModeUnsupported,
+<a id="L1224"></a>    } || Io.UnexpectedError || Io.Cancelable;
+<a id="L1225"></a>
+<a id="L1226"></a>    pub const CreatePairOptions = struct {
+<a id="L1227"></a>        family: IpAddress.Family = .ip4,
+<a id="L1228"></a>        mode: Mode = .stream,
+<a id="L1229"></a>        protocol: ?Protocol = null,
+<a id="L1230"></a>    };
+<a id="L1231"></a>
+<a id="L1232"></a>    /// Create a set of two sockets that are connected to each other.
+<a id="L1233"></a>    ///
+<a id="L1234"></a>    /// Also known as "socketpair".
+<a id="L1235"></a>    pub fn createPair(io: Io, options: CreatePairOptions) CreatePairError![2]Socket {
+<a id="L1236"></a>        return io.vtable.netSocketCreatePair(io.userdata, options);
+<a id="L1237"></a>    }
+<a id="L1238"></a>};
+<a id="L1239"></a>
+<a id="L1240"></a>/// An open socket connection with a network protocol that guarantees
+<a id="L1241"></a>/// sequencing, delivery, and prevents repetition. Typically TCP or UNIX domain
+<a id="L1242"></a>/// socket.
+<a id="L1243"></a>pub const Stream = struct {
+<a id="L1244"></a>    socket: Socket,
+<a id="L1245"></a>
+<a id="L1246"></a>    const max_iovecs_len = 8;
+<a id="L1247"></a>
+<a id="L1248"></a>    pub fn close(s: *const Stream, io: Io) void {
+<a id="L1249"></a>        io.vtable.netClose(io.userdata, (&amp;s.socket.handle)[0..1]);
+<a id="L1250"></a>    }
+<a id="L1251"></a>
+<a id="L1252"></a>    pub fn shutdown(s: *const Stream, io: Io, how: ShutdownHow) ShutdownError!void {
+<a id="L1253"></a>        return io.vtable.netShutdown(io.userdata, s.socket.handle, how);
+<a id="L1254"></a>    }
+<a id="L1255"></a>
+<a id="L1256"></a>    pub const Reader = struct {
+<a id="L1257"></a>        io: Io,
+<a id="L1258"></a>        interface: Io.Reader,
+<a id="L1259"></a>        stream: Stream,
+<a id="L1260"></a>        err: ?Error,
+<a id="L1261"></a>
+<a id="L1262"></a>        pub const Error = error{
+<a id="L1263"></a>            SystemResources,
+<a id="L1264"></a>            ConnectionResetByPeer,
+<a id="L1265"></a>            Timeout,
+<a id="L1266"></a>            SocketUnconnected,
+<a id="L1267"></a>            /// The file descriptor does not hold the required rights to read
+<a id="L1268"></a>            /// from it.
+<a id="L1269"></a>            AccessDenied,
+<a id="L1270"></a>            NetworkDown,
+<a id="L1271"></a>        } || Io.Cancelable || Io.UnexpectedError;
+<a id="L1272"></a>
+<a id="L1273"></a>        pub fn init(stream: Stream, io: Io, buffer: []u8) Reader {
+<a id="L1274"></a>            return .{
+<a id="L1275"></a>                .io = io,
+<a id="L1276"></a>                .interface = .{
+<a id="L1277"></a>                    .vtable = &amp;.{
+<a id="L1278"></a>                        .stream = streamImpl,
+<a id="L1279"></a>                        .readVec = readVec,
+<a id="L1280"></a>                    },
+<a id="L1281"></a>                    .buffer = buffer,
+<a id="L1282"></a>                    .seek = 0,
+<a id="L1283"></a>                    .end = 0,
+<a id="L1284"></a>                },
+<a id="L1285"></a>                .stream = stream,
+<a id="L1286"></a>                .err = null,
+<a id="L1287"></a>            };
+<a id="L1288"></a>        }
+<a id="L1289"></a>
+<a id="L1290"></a>        fn streamImpl(io_r: *Io.Reader, io_w: *Io.Writer, limit: Io.Limit) Io.Reader.StreamError!usize {
+<a id="L1291"></a>            const dest = limit.slice(try io_w.writableSliceGreedy(1));
+<a id="L1292"></a>            var data: [1][]u8 = .{dest};
+<a id="L1293"></a>            const n = try readVec(io_r, &amp;data);
+<a id="L1294"></a>            io_w.advance(n);
+<a id="L1295"></a>            return n;
+<a id="L1296"></a>        }
+<a id="L1297"></a>
+<a id="L1298"></a>        fn readVec(io_r: *Io.Reader, data: [][]u8) Io.Reader.Error!usize {
+<a id="L1299"></a>            const r: *Reader = @alignCast(@fieldParentPtr("interface", io_r));
+<a id="L1300"></a>            const io = r.io;
+<a id="L1301"></a>            var iovecs_buffer: [max_iovecs_len][]u8 = undefined;
+<a id="L1302"></a>            const dest_n, const data_size = try io_r.writableVector(&amp;iovecs_buffer, data);
+<a id="L1303"></a>            const dest = iovecs_buffer[0..dest_n];
+<a id="L1304"></a>            assert(dest[0].len &gt; 0);
+<a id="L1305"></a>            const n = io.vtable.netRead(io.userdata, r.stream.socket.handle, dest) catch |err| {
+<a id="L1306"></a>                r.err = err;
+<a id="L1307"></a>                return error.ReadFailed;
+<a id="L1308"></a>            };
+<a id="L1309"></a>            if (n == 0) {
+<a id="L1310"></a>                return error.EndOfStream;
+<a id="L1311"></a>            }
+<a id="L1312"></a>            if (n &gt; data_size) {
+<a id="L1313"></a>                r.interface.end += n - data_size;
+<a id="L1314"></a>                return data_size;
+<a id="L1315"></a>            }
+<a id="L1316"></a>            return n;
+<a id="L1317"></a>        }
+<a id="L1318"></a>    };
+<a id="L1319"></a>
+<a id="L1320"></a>    pub const Writer = struct {
+<a id="L1321"></a>        io: Io,
+<a id="L1322"></a>        interface: Io.Writer,
+<a id="L1323"></a>        stream: Stream,
+<a id="L1324"></a>        err: ?Error = null,
+<a id="L1325"></a>        write_file_err: ?WriteFileError = null,
+<a id="L1326"></a>
+<a id="L1327"></a>        pub const Error = error{
+<a id="L1328"></a>            /// Another TCP Fast Open is already in progress.
+<a id="L1329"></a>            FastOpenAlreadyInProgress,
+<a id="L1330"></a>            /// Network session was unexpectedly closed by recipient.
+<a id="L1331"></a>            ConnectionResetByPeer,
+<a id="L1332"></a>            /// The output queue for a network interface was full. This generally indicates that the
+<a id="L1333"></a>            /// interface has stopped sending, but may be caused by transient congestion. (Normally,
+<a id="L1334"></a>            /// this does not occur in Linux. Packets are just silently dropped when a device queue
+<a id="L1335"></a>            /// overflows.)
+<a id="L1336"></a>            ///
+<a id="L1337"></a>            /// This is also caused when there is not enough kernel memory available.
+<a id="L1338"></a>            SystemResources,
+<a id="L1339"></a>            /// No route to network.
+<a id="L1340"></a>            NetworkUnreachable,
+<a id="L1341"></a>            /// Network reached but no route to host.
+<a id="L1342"></a>            HostUnreachable,
+<a id="L1343"></a>            /// The local network interface used to reach the destination is down.
+<a id="L1344"></a>            NetworkDown,
+<a id="L1345"></a>            /// The destination address is not listening.
+<a id="L1346"></a>            ConnectionRefused,
+<a id="L1347"></a>            /// The passed address didn't have the correct address family in its sa_family field.
+<a id="L1348"></a>            AddressFamilyUnsupported,
+<a id="L1349"></a>            /// Local end has been shut down on a connection-oriented socket, or
+<a id="L1350"></a>            /// the socket was never connected.
+<a id="L1351"></a>            SocketUnconnected,
+<a id="L1352"></a>            SocketNotBound,
+<a id="L1353"></a>        } || Io.UnexpectedError || Io.Cancelable;
+<a id="L1354"></a>
+<a id="L1355"></a>        pub const WriteFileError = error{
+<a id="L1356"></a>            NetworkDown,
+<a id="L1357"></a>        } || Io.Cancelable || Io.UnexpectedError;
+<a id="L1358"></a>
+<a id="L1359"></a>        pub fn init(stream: Stream, io: Io, buffer: []u8) Writer {
+<a id="L1360"></a>            return .{
+<a id="L1361"></a>                .io = io,
+<a id="L1362"></a>                .stream = stream,
+<a id="L1363"></a>                .interface = .{
+<a id="L1364"></a>                    .vtable = &amp;.{
+<a id="L1365"></a>                        .drain = drain,
+<a id="L1366"></a>                        .sendFile = sendFile,
+<a id="L1367"></a>                    },
+<a id="L1368"></a>                    .buffer = buffer,
+<a id="L1369"></a>                },
+<a id="L1370"></a>            };
+<a id="L1371"></a>        }
+<a id="L1372"></a>
+<a id="L1373"></a>        fn drain(io_w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
+<a id="L1374"></a>            const w: *Writer = @alignCast(@fieldParentPtr("interface", io_w));
+<a id="L1375"></a>            const io = w.io;
+<a id="L1376"></a>            const buffered = io_w.buffered();
+<a id="L1377"></a>            const handle = w.stream.socket.handle;
+<a id="L1378"></a>            const n = io.vtable.netWrite(io.userdata, handle, buffered, data, splat) catch |err| {
+<a id="L1379"></a>                w.err = err;
+<a id="L1380"></a>                return error.WriteFailed;
+<a id="L1381"></a>            };
+<a id="L1382"></a>            return io_w.consume(n);
+<a id="L1383"></a>        }
+<a id="L1384"></a>
+<a id="L1385"></a>        fn sendFile(io_w: *Io.Writer, file_reader: *Io.File.Reader, limit: Io.Limit) Io.Writer.FileError!usize {
+<a id="L1386"></a>            _ = io_w;
+<a id="L1387"></a>            _ = file_reader;
+<a id="L1388"></a>            _ = limit;
+<a id="L1389"></a>            return error.Unimplemented; // TODO
+<a id="L1390"></a>        }
+<a id="L1391"></a>    };
+<a id="L1392"></a>
+<a id="L1393"></a>    pub fn reader(stream: Stream, io: Io, buffer: []u8) Reader {
+<a id="L1394"></a>        return .init(stream, io, buffer);
+<a id="L1395"></a>    }
+<a id="L1396"></a>
+<a id="L1397"></a>    pub fn writer(stream: Stream, io: Io, buffer: []u8) Writer {
+<a id="L1398"></a>        return .init(stream, io, buffer);
+<a id="L1399"></a>    }
+<a id="L1400"></a>};
+<a id="L1401"></a>
+<a id="L1402"></a>pub const Server = struct {
+<a id="L1403"></a>    socket: Socket,
+<a id="L1404"></a>    options: AcceptOptions,
+<a id="L1405"></a>
+<a id="L1406"></a>    pub fn deinit(s: *Server, io: Io) void {
+<a id="L1407"></a>        s.socket.close(io);
+<a id="L1408"></a>        s.* = undefined;
+<a id="L1409"></a>    }
+<a id="L1410"></a>
+<a id="L1411"></a>    pub const AcceptError = error{
+<a id="L1412"></a>        /// The per-process limit on the number of open file descriptors has been reached.
+<a id="L1413"></a>        ProcessFdQuotaExceeded,
+<a id="L1414"></a>        /// The system-wide limit on the total number of open files has been reached.
+<a id="L1415"></a>        SystemFdQuotaExceeded,
+<a id="L1416"></a>        /// Not enough free memory. This often means that the memory allocation is limited
+<a id="L1417"></a>        /// by the socket buffer limits, not by the system memory.
+<a id="L1418"></a>        SystemResources,
+<a id="L1419"></a>        /// Either `listen` was never called, or `shutdown` was called (possibly while
+<a id="L1420"></a>        /// this call was blocking). This allows `shutdown` to be used as a concurrent
+<a id="L1421"></a>        /// cancellation mechanism.
+<a id="L1422"></a>        SocketNotListening,
+<a id="L1423"></a>        /// The network subsystem has failed.
+<a id="L1424"></a>        NetworkDown,
+<a id="L1425"></a>        /// No connection is already queued and ready to be accepted, and
+<a id="L1426"></a>        /// the socket is configured as non-blocking.
+<a id="L1427"></a>        WouldBlock,
+<a id="L1428"></a>        /// An incoming connection was indicated, but was subsequently terminated by the
+<a id="L1429"></a>        /// remote peer prior to accepting the call.
+<a id="L1430"></a>        ConnectionAborted,
+<a id="L1431"></a>        /// Firewall rules forbid connection.
+<a id="L1432"></a>        BlockedByFirewall,
+<a id="L1433"></a>        ProtocolFailure,
+<a id="L1434"></a>    } || Io.UnexpectedError || Io.Cancelable;
+<a id="L1435"></a>
+<a id="L1436"></a>    pub const AcceptOptions = switch (native_os) {
+<a id="L1437"></a>        .windows =&gt; struct { mode: Socket.Mode, protocol: ?Protocol },
+<a id="L1438"></a>        else =&gt; void,
+<a id="L1439"></a>    };
+<a id="L1440"></a>
+<a id="L1441"></a>    /// Blocks until a client connects to the server.
+<a id="L1442"></a>    pub fn accept(s: *Server, io: Io) AcceptError!Stream {
+<a id="L1443"></a>        return .{ .socket = try io.vtable.netAccept(io.userdata, s.socket.handle, s.options) };
+<a id="L1444"></a>    }
+<a id="L1445"></a>};
+<a id="L1446"></a>
+<a id="L1447"></a>test "parsing IPv6 addresses" {
+<a id="L1448"></a>    try testIp6Parse("fe80::e0e:76ff:fed4:cf22%eno1");
+<a id="L1449"></a>    try testIp6Parse("2001:db8::1");
+<a id="L1450"></a>    try testIp6ParseTransform("2001:db8::1", "2001:0db8:0000:0000:0000:0000:0000:0001");
+<a id="L1451"></a>    try testIp6Parse("::1");
+<a id="L1452"></a>    try testIp6Parse("::");
+<a id="L1453"></a>    try testIp6Parse("fe80::1");
+<a id="L1454"></a>    try testIp6Parse("fe80::abcd:ef12%3");
+<a id="L1455"></a>    try testIp6Parse("ff02::");
+<a id="L1456"></a>    try testIp6Parse("ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff");
+<a id="L1457"></a>}
+<a id="L1458"></a>test "IpAddress.setPort works" {
+<a id="L1459"></a>    var addr: IpAddress = .{ .ip4 = undefined };
+<a id="L1460"></a>    addr.setPort(0);
+<a id="L1461"></a>    try std.testing.expectEqual(0, addr.getPort());
+<a id="L1462"></a>}
+<a id="L1463"></a>
+<a id="L1464"></a>fn testIp6Parse(input: []const u8) !void {
+<a id="L1465"></a>    return testIp6ParseTransform(input, input);
+<a id="L1466"></a>}
+<a id="L1467"></a>
+<a id="L1468"></a>fn testIp6ParseTransform(expected: []const u8, input: []const u8) !void {
+<a id="L1469"></a>    const ua = switch (Ip6Address.Unresolved.parse(input)) {
+<a id="L1470"></a>        .success =&gt; |p| p,
+<a id="L1471"></a>        else =&gt; |x| {
+<a id="L1472"></a>            std.debug.print("failed to parse \"{s}\": {any}\n", .{ input, x });
+<a id="L1473"></a>            return error.TestFailed;
+<a id="L1474"></a>        },
+<a id="L1475"></a>    };
+<a id="L1476"></a>    var buffer: [100]u8 = undefined;
+<a id="L1477"></a>    const result = try std.fmt.bufPrint(&amp;buffer, "{f}", .{ua});
+<a id="L1478"></a>    try std.testing.expectEqualStrings(expected, result);
+<a id="L1479"></a>}
+<a id="L1480"></a>
+<a id="L1481"></a>test {
+<a id="L1482"></a>    _ = HostName;
+<a id="L1483"></a>    _ = @import("net/test.zig");
+<a id="L1484"></a>}
+</pre>
 </body>
 </html>

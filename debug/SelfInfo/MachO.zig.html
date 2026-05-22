@@ -2,692 +2,695 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Source: zig-0.16.0-std/debug/SelfInfo/MachO.zig</title>
+    <title>Source: debug/SelfInfo/MachO.zig</title>
     <style>
         body { background: #1e1e1e; color: #d4d4d4; font-family: monospace; padding: 20px; }
         pre { white-space: pre-wrap; word-wrap: break-word; }
         .header { border-bottom: 1px solid #444; padding-bottom: 10px; margin-bottom: 20px; }
         a { color: #569cd6; }
+        a[id] { color: inherit; text-decoration: none; }
+        :target { background: #3a3a00; }
     </style>
 </head>
 <body>
     <div class="header">
-        <a href="/">Index</a> | <strong>File: zig-0.16.0-std/debug/SelfInfo/MachO.zig</strong>
+        <a href="/">Index</a> | <strong>File: debug/SelfInfo/MachO.zig</strong>
     </div>
-    <pre>mutex: Io.Mutex,
-/// Accessed through `Module.Adapter`.
-modules: std.ArrayHashMapUnmanaged(Module, void, Module.Context, false),
-
-pub const init: SelfInfo = .{
-    .mutex = .init,
-    .modules = .empty,
-};
-pub fn deinit(si: *SelfInfo, io: Io) void {
-    _ = io;
-    const gpa = std.debug.getDebugInfoAllocator();
-    for (si.modules.keys()) |*module| {
-        unwind: {
-            const u = &amp;(module.unwind orelse break :unwind catch break :unwind);
-            if (u.dwarf) |*dwarf| dwarf.deinit(gpa);
-        }
-        file: {
-            const f = &amp;(module.file orelse break :file catch break :file);
-            f.deinit(gpa);
-        }
-    }
-    si.modules.deinit(gpa);
-}
-
-pub fn getSymbols(
-    si: *SelfInfo,
-    io: Io,
-    symbol_allocator: Allocator,
-    text_arena: Allocator,
-    address: usize,
-    resolve_inline_callers: bool,
-    symbols: *std.ArrayList(std.debug.Symbol),
-) Error!void {
-    _ = resolve_inline_callers;
-    const gpa = std.debug.getDebugInfoAllocator();
-
-    const module = try si.findModule(gpa, io, address);
-    defer si.mutex.unlock(io);
-
-    const file = try module.getFile(gpa, io);
-
-    // This is not necessarily the same as the vmaddr_slide that dyld would report. This is
-    // because the segments in the file on disk might differ from the ones in memory. Normally
-    // we wouldn't necessarily expect that to work, but /usr/lib/dyld is incredibly annoying:
-    // it exists on disk (necessarily, because the kernel needs to load it!), but is also in
-    // the dyld cache (dyld actually restart itself from cache after loading it), and the two
-    // versions have (very) different segment base addresses. It's sort of like a large slide
-    // has been applied to all addresses in memory. For an optimal experience, we consider the
-    // on-disk vmaddr instead of the in-memory one.
-    const vaddr_offset = module.text_base - file.text_vmaddr;
-
-    const vaddr = address - vaddr_offset;
-
-    const ofile_dwarf, const ofile_vaddr = file.getDwarfForAddress(gpa, io, vaddr) catch {
-        // Return at least the symbol name if available.
-        return symbols.append(symbol_allocator, .{
-            .name = try file.lookupSymbolName(vaddr),
-            .compile_unit_name = null,
-            .source_location = null,
-        });
-    };
-
-    const compile_unit = ofile_dwarf.findCompileUnit(native_endian, ofile_vaddr) catch {
-        // Return at least the symbol name if available.
-        return symbols.append(symbol_allocator, .{
-            .name = try file.lookupSymbolName(vaddr),
-            .compile_unit_name = null,
-            .source_location = null,
-        });
-    };
-
-    try symbols.append(symbol_allocator, .{
-        .name = ofile_dwarf.getSymbolName(ofile_vaddr) orelse
-            try file.lookupSymbolName(vaddr),
-        .compile_unit_name = compile_unit.die.getAttrString(
-            ofile_dwarf,
-            native_endian,
-            std.dwarf.AT.name,
-            ofile_dwarf.section(.debug_str),
-            compile_unit,
-        ) catch |err| switch (err) {
-            error.MissingDebugInfo, error.InvalidDebugInfo =&gt; null,
-        },
-        .source_location = ofile_dwarf.getLineNumberInfo(
-            gpa,
-            text_arena,
-            native_endian,
-            compile_unit,
-            ofile_vaddr,
-        ) catch null,
-    });
-}
-pub fn getModuleName(si: *SelfInfo, io: Io, address: usize) Error![]const u8 {
-    _ = si;
-    _ = io;
-    // This function is marked as deprecated; however, it is significantly more
-    // performant than `dladdr` (since the latter also does a very slow symbol
-    // lookup), so let's use it since it's still available.
-    return std.mem.span(std.c.dyld_image_path_containing_address(
-        @ptrFromInt(address),
-    ) orelse return error.MissingDebugInfo);
-}
-pub fn getModuleSlide(si: *SelfInfo, io: Io, address: usize) Error!usize {
-    const gpa = std.debug.getDebugInfoAllocator();
-    const module = try si.findModule(gpa, io, address);
-    defer si.mutex.unlock(io);
-    const header: *std.macho.mach_header_64 = @ptrFromInt(module.text_base);
-    const raw_macho: [*]u8 = @ptrCast(header);
-    var it = macho.LoadCommandIterator.init(header, raw_macho[@sizeOf(macho.mach_header_64)..][0..header.sizeofcmds]) catch unreachable;
-    const text_vmaddr = while (it.next() catch unreachable) |load_cmd| {
-        if (load_cmd.hdr.cmd != .SEGMENT_64) continue;
-        const segment_cmd = load_cmd.cast(macho.segment_command_64).?;
-        if (!mem.eql(u8, segment_cmd.segName(), "__TEXT")) continue;
-        break segment_cmd.vmaddr;
-    } else unreachable;
-    return module.text_base - text_vmaddr;
-}
-
-pub const can_unwind: bool = true;
-pub const UnwindContext = std.debug.Dwarf.SelfUnwinder;
-/// Unwind a frame using MachO compact unwind info (from `__unwind_info`).
-/// If the compact encoding can't encode a way to unwind a frame, it will
-/// defer unwinding to DWARF, in which case `__eh_frame` will be used if available.
-pub fn unwindFrame(si: *SelfInfo, io: Io, context: *UnwindContext) Error!usize {
-    return unwindFrameInner(si, io, context) catch |err| switch (err) {
-        error.InvalidDebugInfo,
-        error.MissingDebugInfo,
-        error.UnsupportedDebugInfo,
-        error.ReadFailed,
-        error.OutOfMemory,
-        error.Unexpected,
-        error.Canceled,
-        =&gt; |e| return e,
-
-        error.UnsupportedRegister,
-        error.UnsupportedAddrSize,
-        error.UnimplementedUserOpcode,
-        =&gt; return error.UnsupportedDebugInfo,
-
-        error.Overflow,
-        error.EndOfStream,
-        error.StreamTooLong,
-        error.InvalidOpcode,
-        error.InvalidOperation,
-        error.InvalidOperand,
-        error.InvalidRegister,
-        error.IncompatibleRegisterSize,
-        =&gt; return error.InvalidDebugInfo,
-    };
-}
-fn unwindFrameInner(si: *SelfInfo, io: Io, context: *UnwindContext) !usize {
-    const gpa = std.debug.getDebugInfoAllocator();
-    const module = try si.findModule(gpa, io, context.pc);
-    defer si.mutex.unlock(io);
-
-    const unwind: *Module.Unwind = try module.getUnwindInfo(gpa);
-
-    const ip_reg_num = comptime Dwarf.ipRegNum(builtin.target.cpu.arch).?;
-    const fp_reg_num = comptime Dwarf.fpRegNum(builtin.target.cpu.arch);
-    const sp_reg_num = comptime Dwarf.spRegNum(builtin.target.cpu.arch);
-
-    const unwind_info = unwind.unwind_info orelse return error.MissingDebugInfo;
-    if (unwind_info.len &lt; @sizeOf(macho.unwind_info_section_header)) return error.InvalidDebugInfo;
-    const header: *align(1) const macho.unwind_info_section_header = @ptrCast(unwind_info);
-
-    const index_byte_count = header.indexCount * @sizeOf(macho.unwind_info_section_header_index_entry);
-    if (unwind_info.len &lt; header.indexSectionOffset + index_byte_count) return error.InvalidDebugInfo;
-    const indices: []align(1) const macho.unwind_info_section_header_index_entry = @ptrCast(unwind_info[header.indexSectionOffset..][0..index_byte_count]);
-    if (indices.len == 0) return error.MissingDebugInfo;
-
-    // offset of the PC into the `__TEXT` segment
-    const pc_text_offset = context.pc - module.text_base;
-
-    const start_offset: u32, const first_level_offset: u32 = index: {
-        var left: usize = 0;
-        var len: usize = indices.len;
-        while (len &gt; 1) {
-            const mid = left + len / 2;
-            if (pc_text_offset &lt; indices[mid].functionOffset) {
-                len /= 2;
-            } else {
-                left = mid;
-                len -= len / 2;
-            }
-        }
-        break :index .{ indices[left].secondLevelPagesSectionOffset, indices[left].functionOffset };
-    };
-    // An offset of 0 is a sentinel indicating a range does not have unwind info.
-    if (start_offset == 0) return error.MissingDebugInfo;
-
-    const common_encodings_byte_count = header.commonEncodingsArrayCount * @sizeOf(macho.compact_unwind_encoding_t);
-    if (unwind_info.len &lt; header.commonEncodingsArraySectionOffset + common_encodings_byte_count) return error.InvalidDebugInfo;
-    const common_encodings: []align(1) const macho.compact_unwind_encoding_t = @ptrCast(
-        unwind_info[header.commonEncodingsArraySectionOffset..][0..common_encodings_byte_count],
-    );
-
-    if (unwind_info.len &lt; start_offset + @sizeOf(macho.UNWIND_SECOND_LEVEL)) return error.InvalidDebugInfo;
-    const kind: *align(1) const macho.UNWIND_SECOND_LEVEL = @ptrCast(unwind_info[start_offset..]);
-
-    const entry: struct {
-        function_offset: usize,
-        raw_encoding: u32,
-    } = switch (kind.*) {
-        .REGULAR =&gt; entry: {
-            if (unwind_info.len &lt; start_offset + @sizeOf(macho.unwind_info_regular_second_level_page_header)) return error.InvalidDebugInfo;
-            const page_header: *align(1) const macho.unwind_info_regular_second_level_page_header = @ptrCast(unwind_info[start_offset..]);
-
-            const entries_byte_count = page_header.entryCount * @sizeOf(macho.unwind_info_regular_second_level_entry);
-            if (unwind_info.len &lt; start_offset + entries_byte_count) return error.InvalidDebugInfo;
-            const entries: []align(1) const macho.unwind_info_regular_second_level_entry = @ptrCast(
-                unwind_info[start_offset + page_header.entryPageOffset ..][0..entries_byte_count],
-            );
-            if (entries.len == 0) return error.InvalidDebugInfo;
-
-            var left: usize = 0;
-            var len: usize = entries.len;
-            while (len &gt; 1) {
-                const mid = left + len / 2;
-                if (pc_text_offset &lt; entries[mid].functionOffset) {
-                    len /= 2;
-                } else {
-                    left = mid;
-                    len -= len / 2;
-                }
-            }
-            break :entry .{
-                .function_offset = entries[left].functionOffset,
-                .raw_encoding = entries[left].encoding,
-            };
-        },
-        .COMPRESSED =&gt; entry: {
-            if (unwind_info.len &lt; start_offset + @sizeOf(macho.unwind_info_compressed_second_level_page_header)) return error.InvalidDebugInfo;
-            const page_header: *align(1) const macho.unwind_info_compressed_second_level_page_header = @ptrCast(unwind_info[start_offset..]);
-
-            const entries_byte_count = page_header.entryCount * @sizeOf(macho.UnwindInfoCompressedEntry);
-            if (unwind_info.len &lt; start_offset + entries_byte_count) return error.InvalidDebugInfo;
-            const entries: []align(1) const macho.UnwindInfoCompressedEntry = @ptrCast(
-                unwind_info[start_offset + page_header.entryPageOffset ..][0..entries_byte_count],
-            );
-            if (entries.len == 0) return error.InvalidDebugInfo;
-
-            var left: usize = 0;
-            var len: usize = entries.len;
-            while (len &gt; 1) {
-                const mid = left + len / 2;
-                if (pc_text_offset &lt; first_level_offset + entries[mid].funcOffset) {
-                    len /= 2;
-                } else {
-                    left = mid;
-                    len -= len / 2;
-                }
-            }
-            const entry = entries[left];
-
-            const function_offset = first_level_offset + entry.funcOffset;
-            if (entry.encodingIndex &lt; common_encodings.len) {
-                break :entry .{
-                    .function_offset = function_offset,
-                    .raw_encoding = common_encodings[entry.encodingIndex],
-                };
-            }
-
-            const local_index = entry.encodingIndex - common_encodings.len;
-            const local_encodings_byte_count = page_header.encodingsCount * @sizeOf(macho.compact_unwind_encoding_t);
-            if (unwind_info.len &lt; start_offset + page_header.encodingsPageOffset + local_encodings_byte_count) return error.InvalidDebugInfo;
-            const local_encodings: []align(1) const macho.compact_unwind_encoding_t = @ptrCast(
-                unwind_info[start_offset + page_header.encodingsPageOffset ..][0..local_encodings_byte_count],
-            );
-            if (local_index &gt;= local_encodings.len) return error.InvalidDebugInfo;
-            break :entry .{
-                .function_offset = function_offset,
-                .raw_encoding = local_encodings[local_index],
-            };
-        },
-        else =&gt; return error.InvalidDebugInfo,
-    };
-
-    if (entry.raw_encoding == 0) return error.MissingDebugInfo;
-
-    const encoding: macho.CompactUnwindEncoding = @bitCast(entry.raw_encoding);
-    const new_ip = switch (builtin.cpu.arch) {
-        .x86_64 =&gt; switch (encoding.mode.x86_64) {
-            .OLD =&gt; return error.UnsupportedDebugInfo,
-            .RBP_FRAME =&gt; ip: {
-                const frame = encoding.value.x86_64.frame;
-
-                const fp = (try dwarfRegNative(&amp;context.cpu_state, fp_reg_num)).*;
-                const new_sp = fp + 2 * @sizeOf(usize);
-
-                const ip_ptr = fp + @sizeOf(usize);
-                const new_ip = @as(*const usize, @ptrFromInt(ip_ptr)).*;
-                const new_fp = @as(*const usize, @ptrFromInt(fp)).*;
-
-                (try dwarfRegNative(&amp;context.cpu_state, fp_reg_num)).* = new_fp;
-                (try dwarfRegNative(&amp;context.cpu_state, sp_reg_num)).* = new_sp;
-                (try dwarfRegNative(&amp;context.cpu_state, ip_reg_num)).* = new_ip;
-
-                const regs: [5]u3 = .{
-                    frame.reg0,
-                    frame.reg1,
-                    frame.reg2,
-                    frame.reg3,
-                    frame.reg4,
-                };
-                for (regs, 0..) |reg, i| {
-                    if (reg == 0) continue;
-                    const addr = fp - frame.frame_offset * @sizeOf(usize) + i * @sizeOf(usize);
-                    const reg_number = try Dwarf.compactUnwindToDwarfRegNumber(reg);
-                    (try dwarfRegNative(&amp;context.cpu_state, reg_number)).* = @as(*const usize, @ptrFromInt(addr)).*;
-                }
-
-                break :ip new_ip;
-            },
-            .STACK_IMMD,
-            .STACK_IND,
-            =&gt; ip: {
-                const frameless = encoding.value.x86_64.frameless;
-
-                const sp = (try dwarfRegNative(&amp;context.cpu_state, sp_reg_num)).*;
-                const stack_size: usize = stack_size: {
-                    if (encoding.mode.x86_64 == .STACK_IMMD) {
-                        break :stack_size @as(usize, frameless.stack.direct.stack_size) * @sizeOf(usize);
-                    }
-                    // In .STACK_IND, the stack size is inferred from the subq instruction at the beginning of the function.
-                    const sub_offset_addr =
-                        module.text_base +
-                        entry.function_offset +
-                        frameless.stack.indirect.sub_offset;
-                    // `sub_offset_addr` points to the offset of the literal within the instruction
-                    const sub_operand = @as(*align(1) const u32, @ptrFromInt(sub_offset_addr)).*;
-                    break :stack_size sub_operand + @sizeOf(usize) * @as(usize, frameless.stack.indirect.stack_adjust);
-                };
-
-                // Decode the Lehmer-coded sequence of registers.
-                // For a description of the encoding see lib/libc/include/any-macos.13-any/mach-o/compact_unwind_encoding.h
-
-                // Decode the variable-based permutation number into its digits. Each digit represents
-                // an index into the list of register numbers that weren't yet used in the sequence at
-                // the time the digit was added.
-                const reg_count = frameless.stack_reg_count;
-                const ip_ptr = ip_ptr: {
-                    var digits: [6]u3 = undefined;
-                    var accumulator: usize = frameless.stack_reg_permutation;
-                    var base: usize = 2;
-                    for (0..reg_count) |i| {
-                        const div = accumulator / base;
-                        digits[digits.len - 1 - i] = @intCast(accumulator - base * div);
-                        accumulator = div;
-                        base += 1;
-                    }
-
-                    var registers: [6]u3 = undefined;
-                    var used_indices: [6]bool = @splat(false);
-                    for (digits[digits.len - reg_count ..], 0..) |target_unused_index, i| {
-                        var unused_count: u8 = 0;
-                        const unused_index = for (used_indices, 0..) |used, index| {
-                            if (!used) {
-                                if (target_unused_index == unused_count) break index;
-                                unused_count += 1;
-                            }
-                        } else unreachable;
-                        registers[i] = @intCast(unused_index + 1);
-                        used_indices[unused_index] = true;
-                    }
-
-                    var reg_addr = sp + stack_size - @sizeOf(usize) * @as(usize, reg_count + 1);
-                    for (0..reg_count) |i| {
-                        const reg_number = try Dwarf.compactUnwindToDwarfRegNumber(registers[i]);
-                        (try dwarfRegNative(&amp;context.cpu_state, reg_number)).* = @as(*const usize, @ptrFromInt(reg_addr)).*;
-                        reg_addr += @sizeOf(usize);
-                    }
-
-                    break :ip_ptr reg_addr;
-                };
-
-                const new_ip = @as(*const usize, @ptrFromInt(ip_ptr)).*;
-                const new_sp = ip_ptr + @sizeOf(usize);
-
-                (try dwarfRegNative(&amp;context.cpu_state, sp_reg_num)).* = new_sp;
-                (try dwarfRegNative(&amp;context.cpu_state, ip_reg_num)).* = new_ip;
-
-                break :ip new_ip;
-            },
-            .DWARF =&gt; {
-                const dwarf = &amp;(unwind.dwarf orelse return error.MissingDebugInfo);
-                const rules = try context.computeRules(gpa, dwarf, unwind.vmaddr_slide, encoding.value.x86_64.dwarf);
-                return context.next(gpa, &amp;rules);
-            },
-        },
-        .aarch64 =&gt; switch (encoding.mode.arm64) {
-            .OLD =&gt; return error.UnsupportedDebugInfo,
-            .FRAMELESS =&gt; ip: {
-                const sp = (try dwarfRegNative(&amp;context.cpu_state, sp_reg_num)).*;
-                const new_sp = sp + encoding.value.arm64.frameless.stack_size * 16;
-                const new_ip = (try dwarfRegNative(&amp;context.cpu_state, 30)).*;
-                (try dwarfRegNative(&amp;context.cpu_state, sp_reg_num)).* = new_sp;
-                break :ip new_ip;
-            },
-            .DWARF =&gt; {
-                const dwarf = &amp;(unwind.dwarf orelse return error.MissingDebugInfo);
-                const rules = try context.computeRules(gpa, dwarf, unwind.vmaddr_slide, encoding.value.arm64.dwarf);
-                return context.next(gpa, &amp;rules);
-            },
-            .FRAME =&gt; ip: {
-                const frame = encoding.value.arm64.frame;
-
-                const fp = (try dwarfRegNative(&amp;context.cpu_state, fp_reg_num)).*;
-                const ip_ptr = fp + @sizeOf(usize);
-
-                var reg_addr = fp - @sizeOf(usize);
-                inline for (@typeInfo(@TypeOf(frame.x_reg_pairs)).@"struct".fields, 0..) |field, i| {
-                    if (@field(frame.x_reg_pairs, field.name) != 0) {
-                        (try dwarfRegNative(&amp;context.cpu_state, 19 + i)).* = @as(*const usize, @ptrFromInt(reg_addr)).*;
-                        reg_addr += @sizeOf(usize);
-                        (try dwarfRegNative(&amp;context.cpu_state, 20 + i)).* = @as(*const usize, @ptrFromInt(reg_addr)).*;
-                        reg_addr += @sizeOf(usize);
-                    }
-                }
-
-                // We intentionally skip restoring `frame.d_reg_pairs`; we know we don't support
-                // vector registers in the AArch64 `cpu_context` anyway, so there's no reason to
-                // fail a legitimate unwind just because we're asked to restore the registers here.
-                // If some weird/broken unwind info tells us to read them later, we will fail then.
-                reg_addr += 16 * @as(usize, @popCount(@as(u4, @bitCast(frame.d_reg_pairs))));
-
-                const new_ip = @as(*const usize, @ptrFromInt(ip_ptr)).*;
-                const new_fp = @as(*const usize, @ptrFromInt(fp)).*;
-
-                (try dwarfRegNative(&amp;context.cpu_state, fp_reg_num)).* = new_fp;
-                (try dwarfRegNative(&amp;context.cpu_state, ip_reg_num)).* = new_ip;
-
-                break :ip new_ip;
-            },
-        },
-        else =&gt; comptime unreachable, // unimplemented
-    };
-
-    const ret_addr = std.debug.stripInstructionPtrAuthCode(new_ip);
-
-    // Like `Dwarf.SelfUnwinder.next`, adjust our next lookup pc in case the `call` was this
-    // function's last instruction making `ret_addr` one byte past its end.
-    context.pc = ret_addr -| 1;
-
-    return ret_addr;
-}
-
-/// Acquires the mutex on success.
-fn findModule(si: *SelfInfo, gpa: Allocator, io: Io, address: usize) Error!*Module {
-    // This function is marked as deprecated; however, it is significantly more
-    // performant than `dladdr` (since the latter also does a very slow symbol
-    // lookup), so let's use it since it's still available.
-    const text_base = std.c._dyld_get_image_header_containing_address(
-        @ptrFromInt(address),
-    ) orelse return error.MissingDebugInfo;
-    try si.mutex.lock(io);
-    errdefer si.mutex.unlock(io);
-    const gop = try si.modules.getOrPutAdapted(gpa, @intFromPtr(text_base), Module.Adapter{});
-    errdefer comptime unreachable;
-    if (!gop.found_existing) gop.key_ptr.* = .{
-        .text_base = @intFromPtr(text_base),
-        .unwind = null,
-        .file = null,
-    };
-    return gop.key_ptr;
-}
-
-const Module = struct {
-    text_base: usize,
-    unwind: ?(Error!Unwind),
-    file: ?(Error!MachOFile),
-
-    const Adapter = struct {
-        pub fn hash(_: Adapter, text_base: usize) u32 {
-            return @truncate(std.hash.int(text_base));
-        }
-        pub fn eql(_: Adapter, a_text_base: usize, b_module: Module, b_index: usize) bool {
-            _ = b_index;
-            return a_text_base == b_module.text_base;
-        }
-    };
-    const Context = struct {
-        pub fn hash(_: Context, module: Module) u32 {
-            return @truncate(std.hash.int(module.text_base));
-        }
-        pub fn eql(_: Context, a_module: Module, b_module: Module, b_index: usize) bool {
-            _ = b_index;
-            return a_module.text_base == b_module.text_base;
-        }
-    };
-
-    const Unwind = struct {
-        /// The slide applied to the `__unwind_info` and `__eh_frame` sections.
-        /// So, `unwind_info.ptr` is this many bytes higher than the section's vmaddr.
-        vmaddr_slide: u64,
-        /// Backed by the in-memory section mapped by the loader.
-        unwind_info: ?[]const u8,
-        /// Backed by the in-memory `__eh_frame` section mapped by the loader.
-        dwarf: ?Dwarf.Unwind,
-    };
-
-    fn getUnwindInfo(module: *Module, gpa: Allocator) Error!*Unwind {
-        if (module.unwind == null) module.unwind = loadUnwindInfo(module, gpa);
-        return if (module.unwind.?) |*unwind| unwind else |err| err;
-    }
-    fn loadUnwindInfo(module: *const Module, gpa: Allocator) Error!Unwind {
-        const header: *std.macho.mach_header_64 = @ptrFromInt(module.text_base);
-
-        const raw_macho: [*]u8 = @ptrCast(header);
-        var it = macho.LoadCommandIterator.init(header, raw_macho[@sizeOf(macho.mach_header_64)..][0..header.sizeofcmds]) catch unreachable;
-        const sections, const text_vmaddr = while (it.next() catch unreachable) |load_cmd| {
-            if (load_cmd.hdr.cmd != .SEGMENT_64) continue;
-            const segment_cmd = load_cmd.cast(macho.segment_command_64).?;
-            if (!mem.eql(u8, segment_cmd.segName(), "__TEXT")) continue;
-            break .{ load_cmd.getSections(), segment_cmd.vmaddr };
-        } else unreachable;
-
-        const vmaddr_slide = module.text_base - text_vmaddr;
-
-        var opt_unwind_info: ?[]const u8 = null;
-        var opt_eh_frame: ?[]const u8 = null;
-        for (sections) |sect| {
-            if (mem.eql(u8, sect.sectName(), "__unwind_info")) {
-                const sect_ptr: [*]u8 = @ptrFromInt(@as(usize, @intCast(vmaddr_slide + sect.addr)));
-                opt_unwind_info = sect_ptr[0..@intCast(sect.size)];
-            } else if (mem.eql(u8, sect.sectName(), "__eh_frame")) {
-                const sect_ptr: [*]u8 = @ptrFromInt(@as(usize, @intCast(vmaddr_slide + sect.addr)));
-                opt_eh_frame = sect_ptr[0..@intCast(sect.size)];
-            }
-        }
-        const eh_frame = opt_eh_frame orelse return .{
-            .vmaddr_slide = vmaddr_slide,
-            .unwind_info = opt_unwind_info,
-            .dwarf = null,
-        };
-        var dwarf: Dwarf.Unwind = .initSection(.eh_frame, @intFromPtr(eh_frame.ptr) - vmaddr_slide, eh_frame);
-        errdefer dwarf.deinit(gpa);
-        // We don't need lookups, so this call is just for scanning CIEs.
-        dwarf.prepare(gpa, @sizeOf(usize), native_endian, false, true) catch |err| switch (err) {
-            error.ReadFailed =&gt; unreachable, // it's all fixed buffers
-            error.InvalidDebugInfo,
-            error.MissingDebugInfo,
-            error.OutOfMemory,
-            =&gt; |e| return e,
-            error.EndOfStream,
-            error.Overflow,
-            error.StreamTooLong,
-            error.InvalidOperand,
-            error.InvalidOpcode,
-            error.InvalidOperation,
-            =&gt; return error.InvalidDebugInfo,
-            error.UnsupportedAddrSize,
-            error.UnsupportedDwarfVersion,
-            error.UnimplementedUserOpcode,
-            =&gt; return error.UnsupportedDebugInfo,
-        };
-
-        return .{
-            .vmaddr_slide = vmaddr_slide,
-            .unwind_info = opt_unwind_info,
-            .dwarf = dwarf,
-        };
-    }
-
-    fn getFile(module: *Module, gpa: Allocator, io: Io) Error!*MachOFile {
-        if (module.file == null) {
-            const path = std.mem.span(
-                std.c.dyld_image_path_containing_address(@ptrFromInt(module.text_base)).?,
-            );
-            module.file = MachOFile.load(gpa, io, path, builtin.cpu.arch) catch |err| switch (err) {
-                error.InvalidMachO, error.InvalidDwarf =&gt; error.InvalidDebugInfo,
-                error.MissingDebugInfo, error.OutOfMemory, error.UnsupportedDebugInfo, error.ReadFailed =&gt; |e| e,
-            };
-        }
-        return if (module.file.?) |*f| f else |err| err;
-    }
-};
-
-const MachoSymbol = struct {
-    strx: u32,
-    addr: u64,
-    /// Value may be `unknown_ofile`.
-    ofile: u32,
-    const unknown_ofile = std.math.maxInt(u32);
-    fn addressLessThan(context: void, lhs: MachoSymbol, rhs: MachoSymbol) bool {
-        _ = context;
-        return lhs.addr &lt; rhs.addr;
-    }
-    /// Assumes that `symbols` is sorted in order of ascending `addr`.
-    fn find(symbols: []const MachoSymbol, address: usize) ?*const MachoSymbol {
-        if (symbols.len == 0) return null; // no potential match
-        if (address &lt; symbols[0].addr) return null; // address is before the lowest-address symbol
-        var left: usize = 0;
-        var len: usize = symbols.len;
-        while (len &gt; 1) {
-            const mid = left + len / 2;
-            if (address &lt; symbols[mid].addr) {
-                len /= 2;
-            } else {
-                left = mid;
-                len -= len / 2;
-            }
-        }
-        return &amp;symbols[left];
-    }
-
-    test find {
-        const symbols: []const MachoSymbol = &amp;.{
-            .{ .addr = 100, .strx = undefined, .ofile = undefined },
-            .{ .addr = 200, .strx = undefined, .ofile = undefined },
-            .{ .addr = 300, .strx = undefined, .ofile = undefined },
-        };
-
-        try testing.expectEqual(null, find(symbols, 0));
-        try testing.expectEqual(null, find(symbols, 99));
-        try testing.expectEqual(&amp;symbols[0], find(symbols, 100).?);
-        try testing.expectEqual(&amp;symbols[0], find(symbols, 150).?);
-        try testing.expectEqual(&amp;symbols[0], find(symbols, 199).?);
-
-        try testing.expectEqual(&amp;symbols[1], find(symbols, 200).?);
-        try testing.expectEqual(&amp;symbols[1], find(symbols, 250).?);
-        try testing.expectEqual(&amp;symbols[1], find(symbols, 299).?);
-
-        try testing.expectEqual(&amp;symbols[2], find(symbols, 300).?);
-        try testing.expectEqual(&amp;symbols[2], find(symbols, 301).?);
-        try testing.expectEqual(&amp;symbols[2], find(symbols, 5000).?);
-    }
-};
-test {
-    _ = MachoSymbol;
-}
-
-/// Uses `mmap` to map the file at `path` into memory.
-fn mapDebugInfoFile(io: Io, path: []const u8) ![]align(std.heap.page_size_min) const u8 {
-    const file = Io.Dir.cwd().openFile(io, path, .{}) catch |err| switch (err) {
-        error.FileNotFound =&gt; return error.MissingDebugInfo,
-        else =&gt; return error.ReadFailed,
-    };
-    defer file.close(io);
-
-    const file_end_pos = file.length(io) catch |err| switch (err) {
-        error.Unexpected =&gt; |e| return e,
-        else =&gt; return error.ReadFailed,
-    };
-    const file_len = std.math.cast(usize, file_end_pos) orelse return error.InvalidDebugInfo;
-
-    return posix.mmap(
-        null,
-        file_len,
-        .{ .READ = true },
-        .{ .TYPE = .SHARED },
-        file.handle,
-        0,
-    ) catch |err| switch (err) {
-        error.Unexpected =&gt; |e| return e,
-        else =&gt; return error.ReadFailed,
-    };
-}
-
-const std = @import("std");
-const Io = std.Io;
-const Allocator = std.mem.Allocator;
-const Dwarf = std.debug.Dwarf;
-const Error = std.debug.SelfInfoError;
-const MachOFile = std.debug.MachOFile;
-const assert = std.debug.assert;
-const posix = std.posix;
-const macho = std.macho;
-const mem = std.mem;
-const testing = std.testing;
-const dwarfRegNative = std.debug.Dwarf.SelfUnwinder.regNative;
-
-const builtin = @import("builtin");
-const native_endian = builtin.target.cpu.arch.endian();
-
-const SelfInfo = @This();</pre>
+    <pre><a id="L1"></a>mutex: Io.Mutex,
+<a id="L2"></a>/// Accessed through `Module.Adapter`.
+<a id="L3"></a>modules: std.ArrayHashMapUnmanaged(Module, void, Module.Context, false),
+<a id="L4"></a>
+<a id="L5"></a>pub const init: SelfInfo = .{
+<a id="L6"></a>    .mutex = .init,
+<a id="L7"></a>    .modules = .empty,
+<a id="L8"></a>};
+<a id="L9"></a>pub fn deinit(si: *SelfInfo, io: Io) void {
+<a id="L10"></a>    _ = io;
+<a id="L11"></a>    const gpa = std.debug.getDebugInfoAllocator();
+<a id="L12"></a>    for (si.modules.keys()) |*module| {
+<a id="L13"></a>        unwind: {
+<a id="L14"></a>            const u = &amp;(module.unwind orelse break :unwind catch break :unwind);
+<a id="L15"></a>            if (u.dwarf) |*dwarf| dwarf.deinit(gpa);
+<a id="L16"></a>        }
+<a id="L17"></a>        file: {
+<a id="L18"></a>            const f = &amp;(module.file orelse break :file catch break :file);
+<a id="L19"></a>            f.deinit(gpa);
+<a id="L20"></a>        }
+<a id="L21"></a>    }
+<a id="L22"></a>    si.modules.deinit(gpa);
+<a id="L23"></a>}
+<a id="L24"></a>
+<a id="L25"></a>pub fn getSymbols(
+<a id="L26"></a>    si: *SelfInfo,
+<a id="L27"></a>    io: Io,
+<a id="L28"></a>    symbol_allocator: Allocator,
+<a id="L29"></a>    text_arena: Allocator,
+<a id="L30"></a>    address: usize,
+<a id="L31"></a>    resolve_inline_callers: bool,
+<a id="L32"></a>    symbols: *std.ArrayList(std.debug.Symbol),
+<a id="L33"></a>) Error!void {
+<a id="L34"></a>    _ = resolve_inline_callers;
+<a id="L35"></a>    const gpa = std.debug.getDebugInfoAllocator();
+<a id="L36"></a>
+<a id="L37"></a>    const module = try si.findModule(gpa, io, address);
+<a id="L38"></a>    defer si.mutex.unlock(io);
+<a id="L39"></a>
+<a id="L40"></a>    const file = try module.getFile(gpa, io);
+<a id="L41"></a>
+<a id="L42"></a>    // This is not necessarily the same as the vmaddr_slide that dyld would report. This is
+<a id="L43"></a>    // because the segments in the file on disk might differ from the ones in memory. Normally
+<a id="L44"></a>    // we wouldn't necessarily expect that to work, but /usr/lib/dyld is incredibly annoying:
+<a id="L45"></a>    // it exists on disk (necessarily, because the kernel needs to load it!), but is also in
+<a id="L46"></a>    // the dyld cache (dyld actually restart itself from cache after loading it), and the two
+<a id="L47"></a>    // versions have (very) different segment base addresses. It's sort of like a large slide
+<a id="L48"></a>    // has been applied to all addresses in memory. For an optimal experience, we consider the
+<a id="L49"></a>    // on-disk vmaddr instead of the in-memory one.
+<a id="L50"></a>    const vaddr_offset = module.text_base - file.text_vmaddr;
+<a id="L51"></a>
+<a id="L52"></a>    const vaddr = address - vaddr_offset;
+<a id="L53"></a>
+<a id="L54"></a>    const ofile_dwarf, const ofile_vaddr = file.getDwarfForAddress(gpa, io, vaddr) catch {
+<a id="L55"></a>        // Return at least the symbol name if available.
+<a id="L56"></a>        return symbols.append(symbol_allocator, .{
+<a id="L57"></a>            .name = try file.lookupSymbolName(vaddr),
+<a id="L58"></a>            .compile_unit_name = null,
+<a id="L59"></a>            .source_location = null,
+<a id="L60"></a>        });
+<a id="L61"></a>    };
+<a id="L62"></a>
+<a id="L63"></a>    const compile_unit = ofile_dwarf.findCompileUnit(native_endian, ofile_vaddr) catch {
+<a id="L64"></a>        // Return at least the symbol name if available.
+<a id="L65"></a>        return symbols.append(symbol_allocator, .{
+<a id="L66"></a>            .name = try file.lookupSymbolName(vaddr),
+<a id="L67"></a>            .compile_unit_name = null,
+<a id="L68"></a>            .source_location = null,
+<a id="L69"></a>        });
+<a id="L70"></a>    };
+<a id="L71"></a>
+<a id="L72"></a>    try symbols.append(symbol_allocator, .{
+<a id="L73"></a>        .name = ofile_dwarf.getSymbolName(ofile_vaddr) orelse
+<a id="L74"></a>            try file.lookupSymbolName(vaddr),
+<a id="L75"></a>        .compile_unit_name = compile_unit.die.getAttrString(
+<a id="L76"></a>            ofile_dwarf,
+<a id="L77"></a>            native_endian,
+<a id="L78"></a>            std.dwarf.AT.name,
+<a id="L79"></a>            ofile_dwarf.section(.debug_str),
+<a id="L80"></a>            compile_unit,
+<a id="L81"></a>        ) catch |err| switch (err) {
+<a id="L82"></a>            error.MissingDebugInfo, error.InvalidDebugInfo =&gt; null,
+<a id="L83"></a>        },
+<a id="L84"></a>        .source_location = ofile_dwarf.getLineNumberInfo(
+<a id="L85"></a>            gpa,
+<a id="L86"></a>            text_arena,
+<a id="L87"></a>            native_endian,
+<a id="L88"></a>            compile_unit,
+<a id="L89"></a>            ofile_vaddr,
+<a id="L90"></a>        ) catch null,
+<a id="L91"></a>    });
+<a id="L92"></a>}
+<a id="L93"></a>pub fn getModuleName(si: *SelfInfo, io: Io, address: usize) Error![]const u8 {
+<a id="L94"></a>    _ = si;
+<a id="L95"></a>    _ = io;
+<a id="L96"></a>    // This function is marked as deprecated; however, it is significantly more
+<a id="L97"></a>    // performant than `dladdr` (since the latter also does a very slow symbol
+<a id="L98"></a>    // lookup), so let's use it since it's still available.
+<a id="L99"></a>    return std.mem.span(std.c.dyld_image_path_containing_address(
+<a id="L100"></a>        @ptrFromInt(address),
+<a id="L101"></a>    ) orelse return error.MissingDebugInfo);
+<a id="L102"></a>}
+<a id="L103"></a>pub fn getModuleSlide(si: *SelfInfo, io: Io, address: usize) Error!usize {
+<a id="L104"></a>    const gpa = std.debug.getDebugInfoAllocator();
+<a id="L105"></a>    const module = try si.findModule(gpa, io, address);
+<a id="L106"></a>    defer si.mutex.unlock(io);
+<a id="L107"></a>    const header: *std.macho.mach_header_64 = @ptrFromInt(module.text_base);
+<a id="L108"></a>    const raw_macho: [*]u8 = @ptrCast(header);
+<a id="L109"></a>    var it = macho.LoadCommandIterator.init(header, raw_macho[@sizeOf(macho.mach_header_64)..][0..header.sizeofcmds]) catch unreachable;
+<a id="L110"></a>    const text_vmaddr = while (it.next() catch unreachable) |load_cmd| {
+<a id="L111"></a>        if (load_cmd.hdr.cmd != .SEGMENT_64) continue;
+<a id="L112"></a>        const segment_cmd = load_cmd.cast(macho.segment_command_64).?;
+<a id="L113"></a>        if (!mem.eql(u8, segment_cmd.segName(), "__TEXT")) continue;
+<a id="L114"></a>        break segment_cmd.vmaddr;
+<a id="L115"></a>    } else unreachable;
+<a id="L116"></a>    return module.text_base - text_vmaddr;
+<a id="L117"></a>}
+<a id="L118"></a>
+<a id="L119"></a>pub const can_unwind: bool = true;
+<a id="L120"></a>pub const UnwindContext = std.debug.Dwarf.SelfUnwinder;
+<a id="L121"></a>/// Unwind a frame using MachO compact unwind info (from `__unwind_info`).
+<a id="L122"></a>/// If the compact encoding can't encode a way to unwind a frame, it will
+<a id="L123"></a>/// defer unwinding to DWARF, in which case `__eh_frame` will be used if available.
+<a id="L124"></a>pub fn unwindFrame(si: *SelfInfo, io: Io, context: *UnwindContext) Error!usize {
+<a id="L125"></a>    return unwindFrameInner(si, io, context) catch |err| switch (err) {
+<a id="L126"></a>        error.InvalidDebugInfo,
+<a id="L127"></a>        error.MissingDebugInfo,
+<a id="L128"></a>        error.UnsupportedDebugInfo,
+<a id="L129"></a>        error.ReadFailed,
+<a id="L130"></a>        error.OutOfMemory,
+<a id="L131"></a>        error.Unexpected,
+<a id="L132"></a>        error.Canceled,
+<a id="L133"></a>        =&gt; |e| return e,
+<a id="L134"></a>
+<a id="L135"></a>        error.UnsupportedRegister,
+<a id="L136"></a>        error.UnsupportedAddrSize,
+<a id="L137"></a>        error.UnimplementedUserOpcode,
+<a id="L138"></a>        =&gt; return error.UnsupportedDebugInfo,
+<a id="L139"></a>
+<a id="L140"></a>        error.Overflow,
+<a id="L141"></a>        error.EndOfStream,
+<a id="L142"></a>        error.StreamTooLong,
+<a id="L143"></a>        error.InvalidOpcode,
+<a id="L144"></a>        error.InvalidOperation,
+<a id="L145"></a>        error.InvalidOperand,
+<a id="L146"></a>        error.InvalidRegister,
+<a id="L147"></a>        error.IncompatibleRegisterSize,
+<a id="L148"></a>        =&gt; return error.InvalidDebugInfo,
+<a id="L149"></a>    };
+<a id="L150"></a>}
+<a id="L151"></a>fn unwindFrameInner(si: *SelfInfo, io: Io, context: *UnwindContext) !usize {
+<a id="L152"></a>    const gpa = std.debug.getDebugInfoAllocator();
+<a id="L153"></a>    const module = try si.findModule(gpa, io, context.pc);
+<a id="L154"></a>    defer si.mutex.unlock(io);
+<a id="L155"></a>
+<a id="L156"></a>    const unwind: *Module.Unwind = try module.getUnwindInfo(gpa);
+<a id="L157"></a>
+<a id="L158"></a>    const ip_reg_num = comptime Dwarf.ipRegNum(builtin.target.cpu.arch).?;
+<a id="L159"></a>    const fp_reg_num = comptime Dwarf.fpRegNum(builtin.target.cpu.arch);
+<a id="L160"></a>    const sp_reg_num = comptime Dwarf.spRegNum(builtin.target.cpu.arch);
+<a id="L161"></a>
+<a id="L162"></a>    const unwind_info = unwind.unwind_info orelse return error.MissingDebugInfo;
+<a id="L163"></a>    if (unwind_info.len &lt; @sizeOf(macho.unwind_info_section_header)) return error.InvalidDebugInfo;
+<a id="L164"></a>    const header: *align(1) const macho.unwind_info_section_header = @ptrCast(unwind_info);
+<a id="L165"></a>
+<a id="L166"></a>    const index_byte_count = header.indexCount * @sizeOf(macho.unwind_info_section_header_index_entry);
+<a id="L167"></a>    if (unwind_info.len &lt; header.indexSectionOffset + index_byte_count) return error.InvalidDebugInfo;
+<a id="L168"></a>    const indices: []align(1) const macho.unwind_info_section_header_index_entry = @ptrCast(unwind_info[header.indexSectionOffset..][0..index_byte_count]);
+<a id="L169"></a>    if (indices.len == 0) return error.MissingDebugInfo;
+<a id="L170"></a>
+<a id="L171"></a>    // offset of the PC into the `__TEXT` segment
+<a id="L172"></a>    const pc_text_offset = context.pc - module.text_base;
+<a id="L173"></a>
+<a id="L174"></a>    const start_offset: u32, const first_level_offset: u32 = index: {
+<a id="L175"></a>        var left: usize = 0;
+<a id="L176"></a>        var len: usize = indices.len;
+<a id="L177"></a>        while (len &gt; 1) {
+<a id="L178"></a>            const mid = left + len / 2;
+<a id="L179"></a>            if (pc_text_offset &lt; indices[mid].functionOffset) {
+<a id="L180"></a>                len /= 2;
+<a id="L181"></a>            } else {
+<a id="L182"></a>                left = mid;
+<a id="L183"></a>                len -= len / 2;
+<a id="L184"></a>            }
+<a id="L185"></a>        }
+<a id="L186"></a>        break :index .{ indices[left].secondLevelPagesSectionOffset, indices[left].functionOffset };
+<a id="L187"></a>    };
+<a id="L188"></a>    // An offset of 0 is a sentinel indicating a range does not have unwind info.
+<a id="L189"></a>    if (start_offset == 0) return error.MissingDebugInfo;
+<a id="L190"></a>
+<a id="L191"></a>    const common_encodings_byte_count = header.commonEncodingsArrayCount * @sizeOf(macho.compact_unwind_encoding_t);
+<a id="L192"></a>    if (unwind_info.len &lt; header.commonEncodingsArraySectionOffset + common_encodings_byte_count) return error.InvalidDebugInfo;
+<a id="L193"></a>    const common_encodings: []align(1) const macho.compact_unwind_encoding_t = @ptrCast(
+<a id="L194"></a>        unwind_info[header.commonEncodingsArraySectionOffset..][0..common_encodings_byte_count],
+<a id="L195"></a>    );
+<a id="L196"></a>
+<a id="L197"></a>    if (unwind_info.len &lt; start_offset + @sizeOf(macho.UNWIND_SECOND_LEVEL)) return error.InvalidDebugInfo;
+<a id="L198"></a>    const kind: *align(1) const macho.UNWIND_SECOND_LEVEL = @ptrCast(unwind_info[start_offset..]);
+<a id="L199"></a>
+<a id="L200"></a>    const entry: struct {
+<a id="L201"></a>        function_offset: usize,
+<a id="L202"></a>        raw_encoding: u32,
+<a id="L203"></a>    } = switch (kind.*) {
+<a id="L204"></a>        .REGULAR =&gt; entry: {
+<a id="L205"></a>            if (unwind_info.len &lt; start_offset + @sizeOf(macho.unwind_info_regular_second_level_page_header)) return error.InvalidDebugInfo;
+<a id="L206"></a>            const page_header: *align(1) const macho.unwind_info_regular_second_level_page_header = @ptrCast(unwind_info[start_offset..]);
+<a id="L207"></a>
+<a id="L208"></a>            const entries_byte_count = page_header.entryCount * @sizeOf(macho.unwind_info_regular_second_level_entry);
+<a id="L209"></a>            if (unwind_info.len &lt; start_offset + entries_byte_count) return error.InvalidDebugInfo;
+<a id="L210"></a>            const entries: []align(1) const macho.unwind_info_regular_second_level_entry = @ptrCast(
+<a id="L211"></a>                unwind_info[start_offset + page_header.entryPageOffset ..][0..entries_byte_count],
+<a id="L212"></a>            );
+<a id="L213"></a>            if (entries.len == 0) return error.InvalidDebugInfo;
+<a id="L214"></a>
+<a id="L215"></a>            var left: usize = 0;
+<a id="L216"></a>            var len: usize = entries.len;
+<a id="L217"></a>            while (len &gt; 1) {
+<a id="L218"></a>                const mid = left + len / 2;
+<a id="L219"></a>                if (pc_text_offset &lt; entries[mid].functionOffset) {
+<a id="L220"></a>                    len /= 2;
+<a id="L221"></a>                } else {
+<a id="L222"></a>                    left = mid;
+<a id="L223"></a>                    len -= len / 2;
+<a id="L224"></a>                }
+<a id="L225"></a>            }
+<a id="L226"></a>            break :entry .{
+<a id="L227"></a>                .function_offset = entries[left].functionOffset,
+<a id="L228"></a>                .raw_encoding = entries[left].encoding,
+<a id="L229"></a>            };
+<a id="L230"></a>        },
+<a id="L231"></a>        .COMPRESSED =&gt; entry: {
+<a id="L232"></a>            if (unwind_info.len &lt; start_offset + @sizeOf(macho.unwind_info_compressed_second_level_page_header)) return error.InvalidDebugInfo;
+<a id="L233"></a>            const page_header: *align(1) const macho.unwind_info_compressed_second_level_page_header = @ptrCast(unwind_info[start_offset..]);
+<a id="L234"></a>
+<a id="L235"></a>            const entries_byte_count = page_header.entryCount * @sizeOf(macho.UnwindInfoCompressedEntry);
+<a id="L236"></a>            if (unwind_info.len &lt; start_offset + entries_byte_count) return error.InvalidDebugInfo;
+<a id="L237"></a>            const entries: []align(1) const macho.UnwindInfoCompressedEntry = @ptrCast(
+<a id="L238"></a>                unwind_info[start_offset + page_header.entryPageOffset ..][0..entries_byte_count],
+<a id="L239"></a>            );
+<a id="L240"></a>            if (entries.len == 0) return error.InvalidDebugInfo;
+<a id="L241"></a>
+<a id="L242"></a>            var left: usize = 0;
+<a id="L243"></a>            var len: usize = entries.len;
+<a id="L244"></a>            while (len &gt; 1) {
+<a id="L245"></a>                const mid = left + len / 2;
+<a id="L246"></a>                if (pc_text_offset &lt; first_level_offset + entries[mid].funcOffset) {
+<a id="L247"></a>                    len /= 2;
+<a id="L248"></a>                } else {
+<a id="L249"></a>                    left = mid;
+<a id="L250"></a>                    len -= len / 2;
+<a id="L251"></a>                }
+<a id="L252"></a>            }
+<a id="L253"></a>            const entry = entries[left];
+<a id="L254"></a>
+<a id="L255"></a>            const function_offset = first_level_offset + entry.funcOffset;
+<a id="L256"></a>            if (entry.encodingIndex &lt; common_encodings.len) {
+<a id="L257"></a>                break :entry .{
+<a id="L258"></a>                    .function_offset = function_offset,
+<a id="L259"></a>                    .raw_encoding = common_encodings[entry.encodingIndex],
+<a id="L260"></a>                };
+<a id="L261"></a>            }
+<a id="L262"></a>
+<a id="L263"></a>            const local_index = entry.encodingIndex - common_encodings.len;
+<a id="L264"></a>            const local_encodings_byte_count = page_header.encodingsCount * @sizeOf(macho.compact_unwind_encoding_t);
+<a id="L265"></a>            if (unwind_info.len &lt; start_offset + page_header.encodingsPageOffset + local_encodings_byte_count) return error.InvalidDebugInfo;
+<a id="L266"></a>            const local_encodings: []align(1) const macho.compact_unwind_encoding_t = @ptrCast(
+<a id="L267"></a>                unwind_info[start_offset + page_header.encodingsPageOffset ..][0..local_encodings_byte_count],
+<a id="L268"></a>            );
+<a id="L269"></a>            if (local_index &gt;= local_encodings.len) return error.InvalidDebugInfo;
+<a id="L270"></a>            break :entry .{
+<a id="L271"></a>                .function_offset = function_offset,
+<a id="L272"></a>                .raw_encoding = local_encodings[local_index],
+<a id="L273"></a>            };
+<a id="L274"></a>        },
+<a id="L275"></a>        else =&gt; return error.InvalidDebugInfo,
+<a id="L276"></a>    };
+<a id="L277"></a>
+<a id="L278"></a>    if (entry.raw_encoding == 0) return error.MissingDebugInfo;
+<a id="L279"></a>
+<a id="L280"></a>    const encoding: macho.CompactUnwindEncoding = @bitCast(entry.raw_encoding);
+<a id="L281"></a>    const new_ip = switch (builtin.cpu.arch) {
+<a id="L282"></a>        .x86_64 =&gt; switch (encoding.mode.x86_64) {
+<a id="L283"></a>            .OLD =&gt; return error.UnsupportedDebugInfo,
+<a id="L284"></a>            .RBP_FRAME =&gt; ip: {
+<a id="L285"></a>                const frame = encoding.value.x86_64.frame;
+<a id="L286"></a>
+<a id="L287"></a>                const fp = (try dwarfRegNative(&amp;context.cpu_state, fp_reg_num)).*;
+<a id="L288"></a>                const new_sp = fp + 2 * @sizeOf(usize);
+<a id="L289"></a>
+<a id="L290"></a>                const ip_ptr = fp + @sizeOf(usize);
+<a id="L291"></a>                const new_ip = @as(*const usize, @ptrFromInt(ip_ptr)).*;
+<a id="L292"></a>                const new_fp = @as(*const usize, @ptrFromInt(fp)).*;
+<a id="L293"></a>
+<a id="L294"></a>                (try dwarfRegNative(&amp;context.cpu_state, fp_reg_num)).* = new_fp;
+<a id="L295"></a>                (try dwarfRegNative(&amp;context.cpu_state, sp_reg_num)).* = new_sp;
+<a id="L296"></a>                (try dwarfRegNative(&amp;context.cpu_state, ip_reg_num)).* = new_ip;
+<a id="L297"></a>
+<a id="L298"></a>                const regs: [5]u3 = .{
+<a id="L299"></a>                    frame.reg0,
+<a id="L300"></a>                    frame.reg1,
+<a id="L301"></a>                    frame.reg2,
+<a id="L302"></a>                    frame.reg3,
+<a id="L303"></a>                    frame.reg4,
+<a id="L304"></a>                };
+<a id="L305"></a>                for (regs, 0..) |reg, i| {
+<a id="L306"></a>                    if (reg == 0) continue;
+<a id="L307"></a>                    const addr = fp - frame.frame_offset * @sizeOf(usize) + i * @sizeOf(usize);
+<a id="L308"></a>                    const reg_number = try Dwarf.compactUnwindToDwarfRegNumber(reg);
+<a id="L309"></a>                    (try dwarfRegNative(&amp;context.cpu_state, reg_number)).* = @as(*const usize, @ptrFromInt(addr)).*;
+<a id="L310"></a>                }
+<a id="L311"></a>
+<a id="L312"></a>                break :ip new_ip;
+<a id="L313"></a>            },
+<a id="L314"></a>            .STACK_IMMD,
+<a id="L315"></a>            .STACK_IND,
+<a id="L316"></a>            =&gt; ip: {
+<a id="L317"></a>                const frameless = encoding.value.x86_64.frameless;
+<a id="L318"></a>
+<a id="L319"></a>                const sp = (try dwarfRegNative(&amp;context.cpu_state, sp_reg_num)).*;
+<a id="L320"></a>                const stack_size: usize = stack_size: {
+<a id="L321"></a>                    if (encoding.mode.x86_64 == .STACK_IMMD) {
+<a id="L322"></a>                        break :stack_size @as(usize, frameless.stack.direct.stack_size) * @sizeOf(usize);
+<a id="L323"></a>                    }
+<a id="L324"></a>                    // In .STACK_IND, the stack size is inferred from the subq instruction at the beginning of the function.
+<a id="L325"></a>                    const sub_offset_addr =
+<a id="L326"></a>                        module.text_base +
+<a id="L327"></a>                        entry.function_offset +
+<a id="L328"></a>                        frameless.stack.indirect.sub_offset;
+<a id="L329"></a>                    // `sub_offset_addr` points to the offset of the literal within the instruction
+<a id="L330"></a>                    const sub_operand = @as(*align(1) const u32, @ptrFromInt(sub_offset_addr)).*;
+<a id="L331"></a>                    break :stack_size sub_operand + @sizeOf(usize) * @as(usize, frameless.stack.indirect.stack_adjust);
+<a id="L332"></a>                };
+<a id="L333"></a>
+<a id="L334"></a>                // Decode the Lehmer-coded sequence of registers.
+<a id="L335"></a>                // For a description of the encoding see lib/libc/include/any-macos.13-any/mach-o/compact_unwind_encoding.h
+<a id="L336"></a>
+<a id="L337"></a>                // Decode the variable-based permutation number into its digits. Each digit represents
+<a id="L338"></a>                // an index into the list of register numbers that weren't yet used in the sequence at
+<a id="L339"></a>                // the time the digit was added.
+<a id="L340"></a>                const reg_count = frameless.stack_reg_count;
+<a id="L341"></a>                const ip_ptr = ip_ptr: {
+<a id="L342"></a>                    var digits: [6]u3 = undefined;
+<a id="L343"></a>                    var accumulator: usize = frameless.stack_reg_permutation;
+<a id="L344"></a>                    var base: usize = 2;
+<a id="L345"></a>                    for (0..reg_count) |i| {
+<a id="L346"></a>                        const div = accumulator / base;
+<a id="L347"></a>                        digits[digits.len - 1 - i] = @intCast(accumulator - base * div);
+<a id="L348"></a>                        accumulator = div;
+<a id="L349"></a>                        base += 1;
+<a id="L350"></a>                    }
+<a id="L351"></a>
+<a id="L352"></a>                    var registers: [6]u3 = undefined;
+<a id="L353"></a>                    var used_indices: [6]bool = @splat(false);
+<a id="L354"></a>                    for (digits[digits.len - reg_count ..], 0..) |target_unused_index, i| {
+<a id="L355"></a>                        var unused_count: u8 = 0;
+<a id="L356"></a>                        const unused_index = for (used_indices, 0..) |used, index| {
+<a id="L357"></a>                            if (!used) {
+<a id="L358"></a>                                if (target_unused_index == unused_count) break index;
+<a id="L359"></a>                                unused_count += 1;
+<a id="L360"></a>                            }
+<a id="L361"></a>                        } else unreachable;
+<a id="L362"></a>                        registers[i] = @intCast(unused_index + 1);
+<a id="L363"></a>                        used_indices[unused_index] = true;
+<a id="L364"></a>                    }
+<a id="L365"></a>
+<a id="L366"></a>                    var reg_addr = sp + stack_size - @sizeOf(usize) * @as(usize, reg_count + 1);
+<a id="L367"></a>                    for (0..reg_count) |i| {
+<a id="L368"></a>                        const reg_number = try Dwarf.compactUnwindToDwarfRegNumber(registers[i]);
+<a id="L369"></a>                        (try dwarfRegNative(&amp;context.cpu_state, reg_number)).* = @as(*const usize, @ptrFromInt(reg_addr)).*;
+<a id="L370"></a>                        reg_addr += @sizeOf(usize);
+<a id="L371"></a>                    }
+<a id="L372"></a>
+<a id="L373"></a>                    break :ip_ptr reg_addr;
+<a id="L374"></a>                };
+<a id="L375"></a>
+<a id="L376"></a>                const new_ip = @as(*const usize, @ptrFromInt(ip_ptr)).*;
+<a id="L377"></a>                const new_sp = ip_ptr + @sizeOf(usize);
+<a id="L378"></a>
+<a id="L379"></a>                (try dwarfRegNative(&amp;context.cpu_state, sp_reg_num)).* = new_sp;
+<a id="L380"></a>                (try dwarfRegNative(&amp;context.cpu_state, ip_reg_num)).* = new_ip;
+<a id="L381"></a>
+<a id="L382"></a>                break :ip new_ip;
+<a id="L383"></a>            },
+<a id="L384"></a>            .DWARF =&gt; {
+<a id="L385"></a>                const dwarf = &amp;(unwind.dwarf orelse return error.MissingDebugInfo);
+<a id="L386"></a>                const rules = try context.computeRules(gpa, dwarf, unwind.vmaddr_slide, encoding.value.x86_64.dwarf);
+<a id="L387"></a>                return context.next(gpa, &amp;rules);
+<a id="L388"></a>            },
+<a id="L389"></a>        },
+<a id="L390"></a>        .aarch64 =&gt; switch (encoding.mode.arm64) {
+<a id="L391"></a>            .OLD =&gt; return error.UnsupportedDebugInfo,
+<a id="L392"></a>            .FRAMELESS =&gt; ip: {
+<a id="L393"></a>                const sp = (try dwarfRegNative(&amp;context.cpu_state, sp_reg_num)).*;
+<a id="L394"></a>                const new_sp = sp + encoding.value.arm64.frameless.stack_size * 16;
+<a id="L395"></a>                const new_ip = (try dwarfRegNative(&amp;context.cpu_state, 30)).*;
+<a id="L396"></a>                (try dwarfRegNative(&amp;context.cpu_state, sp_reg_num)).* = new_sp;
+<a id="L397"></a>                break :ip new_ip;
+<a id="L398"></a>            },
+<a id="L399"></a>            .DWARF =&gt; {
+<a id="L400"></a>                const dwarf = &amp;(unwind.dwarf orelse return error.MissingDebugInfo);
+<a id="L401"></a>                const rules = try context.computeRules(gpa, dwarf, unwind.vmaddr_slide, encoding.value.arm64.dwarf);
+<a id="L402"></a>                return context.next(gpa, &amp;rules);
+<a id="L403"></a>            },
+<a id="L404"></a>            .FRAME =&gt; ip: {
+<a id="L405"></a>                const frame = encoding.value.arm64.frame;
+<a id="L406"></a>
+<a id="L407"></a>                const fp = (try dwarfRegNative(&amp;context.cpu_state, fp_reg_num)).*;
+<a id="L408"></a>                const ip_ptr = fp + @sizeOf(usize);
+<a id="L409"></a>
+<a id="L410"></a>                var reg_addr = fp - @sizeOf(usize);
+<a id="L411"></a>                inline for (@typeInfo(@TypeOf(frame.x_reg_pairs)).@"struct".fields, 0..) |field, i| {
+<a id="L412"></a>                    if (@field(frame.x_reg_pairs, field.name) != 0) {
+<a id="L413"></a>                        (try dwarfRegNative(&amp;context.cpu_state, 19 + i)).* = @as(*const usize, @ptrFromInt(reg_addr)).*;
+<a id="L414"></a>                        reg_addr += @sizeOf(usize);
+<a id="L415"></a>                        (try dwarfRegNative(&amp;context.cpu_state, 20 + i)).* = @as(*const usize, @ptrFromInt(reg_addr)).*;
+<a id="L416"></a>                        reg_addr += @sizeOf(usize);
+<a id="L417"></a>                    }
+<a id="L418"></a>                }
+<a id="L419"></a>
+<a id="L420"></a>                // We intentionally skip restoring `frame.d_reg_pairs`; we know we don't support
+<a id="L421"></a>                // vector registers in the AArch64 `cpu_context` anyway, so there's no reason to
+<a id="L422"></a>                // fail a legitimate unwind just because we're asked to restore the registers here.
+<a id="L423"></a>                // If some weird/broken unwind info tells us to read them later, we will fail then.
+<a id="L424"></a>                reg_addr += 16 * @as(usize, @popCount(@as(u4, @bitCast(frame.d_reg_pairs))));
+<a id="L425"></a>
+<a id="L426"></a>                const new_ip = @as(*const usize, @ptrFromInt(ip_ptr)).*;
+<a id="L427"></a>                const new_fp = @as(*const usize, @ptrFromInt(fp)).*;
+<a id="L428"></a>
+<a id="L429"></a>                (try dwarfRegNative(&amp;context.cpu_state, fp_reg_num)).* = new_fp;
+<a id="L430"></a>                (try dwarfRegNative(&amp;context.cpu_state, ip_reg_num)).* = new_ip;
+<a id="L431"></a>
+<a id="L432"></a>                break :ip new_ip;
+<a id="L433"></a>            },
+<a id="L434"></a>        },
+<a id="L435"></a>        else =&gt; comptime unreachable, // unimplemented
+<a id="L436"></a>    };
+<a id="L437"></a>
+<a id="L438"></a>    const ret_addr = std.debug.stripInstructionPtrAuthCode(new_ip);
+<a id="L439"></a>
+<a id="L440"></a>    // Like `Dwarf.SelfUnwinder.next`, adjust our next lookup pc in case the `call` was this
+<a id="L441"></a>    // function's last instruction making `ret_addr` one byte past its end.
+<a id="L442"></a>    context.pc = ret_addr -| 1;
+<a id="L443"></a>
+<a id="L444"></a>    return ret_addr;
+<a id="L445"></a>}
+<a id="L446"></a>
+<a id="L447"></a>/// Acquires the mutex on success.
+<a id="L448"></a>fn findModule(si: *SelfInfo, gpa: Allocator, io: Io, address: usize) Error!*Module {
+<a id="L449"></a>    // This function is marked as deprecated; however, it is significantly more
+<a id="L450"></a>    // performant than `dladdr` (since the latter also does a very slow symbol
+<a id="L451"></a>    // lookup), so let's use it since it's still available.
+<a id="L452"></a>    const text_base = std.c._dyld_get_image_header_containing_address(
+<a id="L453"></a>        @ptrFromInt(address),
+<a id="L454"></a>    ) orelse return error.MissingDebugInfo;
+<a id="L455"></a>    try si.mutex.lock(io);
+<a id="L456"></a>    errdefer si.mutex.unlock(io);
+<a id="L457"></a>    const gop = try si.modules.getOrPutAdapted(gpa, @intFromPtr(text_base), Module.Adapter{});
+<a id="L458"></a>    errdefer comptime unreachable;
+<a id="L459"></a>    if (!gop.found_existing) gop.key_ptr.* = .{
+<a id="L460"></a>        .text_base = @intFromPtr(text_base),
+<a id="L461"></a>        .unwind = null,
+<a id="L462"></a>        .file = null,
+<a id="L463"></a>    };
+<a id="L464"></a>    return gop.key_ptr;
+<a id="L465"></a>}
+<a id="L466"></a>
+<a id="L467"></a>const Module = struct {
+<a id="L468"></a>    text_base: usize,
+<a id="L469"></a>    unwind: ?(Error!Unwind),
+<a id="L470"></a>    file: ?(Error!MachOFile),
+<a id="L471"></a>
+<a id="L472"></a>    const Adapter = struct {
+<a id="L473"></a>        pub fn hash(_: Adapter, text_base: usize) u32 {
+<a id="L474"></a>            return @truncate(std.hash.int(text_base));
+<a id="L475"></a>        }
+<a id="L476"></a>        pub fn eql(_: Adapter, a_text_base: usize, b_module: Module, b_index: usize) bool {
+<a id="L477"></a>            _ = b_index;
+<a id="L478"></a>            return a_text_base == b_module.text_base;
+<a id="L479"></a>        }
+<a id="L480"></a>    };
+<a id="L481"></a>    const Context = struct {
+<a id="L482"></a>        pub fn hash(_: Context, module: Module) u32 {
+<a id="L483"></a>            return @truncate(std.hash.int(module.text_base));
+<a id="L484"></a>        }
+<a id="L485"></a>        pub fn eql(_: Context, a_module: Module, b_module: Module, b_index: usize) bool {
+<a id="L486"></a>            _ = b_index;
+<a id="L487"></a>            return a_module.text_base == b_module.text_base;
+<a id="L488"></a>        }
+<a id="L489"></a>    };
+<a id="L490"></a>
+<a id="L491"></a>    const Unwind = struct {
+<a id="L492"></a>        /// The slide applied to the `__unwind_info` and `__eh_frame` sections.
+<a id="L493"></a>        /// So, `unwind_info.ptr` is this many bytes higher than the section's vmaddr.
+<a id="L494"></a>        vmaddr_slide: u64,
+<a id="L495"></a>        /// Backed by the in-memory section mapped by the loader.
+<a id="L496"></a>        unwind_info: ?[]const u8,
+<a id="L497"></a>        /// Backed by the in-memory `__eh_frame` section mapped by the loader.
+<a id="L498"></a>        dwarf: ?Dwarf.Unwind,
+<a id="L499"></a>    };
+<a id="L500"></a>
+<a id="L501"></a>    fn getUnwindInfo(module: *Module, gpa: Allocator) Error!*Unwind {
+<a id="L502"></a>        if (module.unwind == null) module.unwind = loadUnwindInfo(module, gpa);
+<a id="L503"></a>        return if (module.unwind.?) |*unwind| unwind else |err| err;
+<a id="L504"></a>    }
+<a id="L505"></a>    fn loadUnwindInfo(module: *const Module, gpa: Allocator) Error!Unwind {
+<a id="L506"></a>        const header: *std.macho.mach_header_64 = @ptrFromInt(module.text_base);
+<a id="L507"></a>
+<a id="L508"></a>        const raw_macho: [*]u8 = @ptrCast(header);
+<a id="L509"></a>        var it = macho.LoadCommandIterator.init(header, raw_macho[@sizeOf(macho.mach_header_64)..][0..header.sizeofcmds]) catch unreachable;
+<a id="L510"></a>        const sections, const text_vmaddr = while (it.next() catch unreachable) |load_cmd| {
+<a id="L511"></a>            if (load_cmd.hdr.cmd != .SEGMENT_64) continue;
+<a id="L512"></a>            const segment_cmd = load_cmd.cast(macho.segment_command_64).?;
+<a id="L513"></a>            if (!mem.eql(u8, segment_cmd.segName(), "__TEXT")) continue;
+<a id="L514"></a>            break .{ load_cmd.getSections(), segment_cmd.vmaddr };
+<a id="L515"></a>        } else unreachable;
+<a id="L516"></a>
+<a id="L517"></a>        const vmaddr_slide = module.text_base - text_vmaddr;
+<a id="L518"></a>
+<a id="L519"></a>        var opt_unwind_info: ?[]const u8 = null;
+<a id="L520"></a>        var opt_eh_frame: ?[]const u8 = null;
+<a id="L521"></a>        for (sections) |sect| {
+<a id="L522"></a>            if (mem.eql(u8, sect.sectName(), "__unwind_info")) {
+<a id="L523"></a>                const sect_ptr: [*]u8 = @ptrFromInt(@as(usize, @intCast(vmaddr_slide + sect.addr)));
+<a id="L524"></a>                opt_unwind_info = sect_ptr[0..@intCast(sect.size)];
+<a id="L525"></a>            } else if (mem.eql(u8, sect.sectName(), "__eh_frame")) {
+<a id="L526"></a>                const sect_ptr: [*]u8 = @ptrFromInt(@as(usize, @intCast(vmaddr_slide + sect.addr)));
+<a id="L527"></a>                opt_eh_frame = sect_ptr[0..@intCast(sect.size)];
+<a id="L528"></a>            }
+<a id="L529"></a>        }
+<a id="L530"></a>        const eh_frame = opt_eh_frame orelse return .{
+<a id="L531"></a>            .vmaddr_slide = vmaddr_slide,
+<a id="L532"></a>            .unwind_info = opt_unwind_info,
+<a id="L533"></a>            .dwarf = null,
+<a id="L534"></a>        };
+<a id="L535"></a>        var dwarf: Dwarf.Unwind = .initSection(.eh_frame, @intFromPtr(eh_frame.ptr) - vmaddr_slide, eh_frame);
+<a id="L536"></a>        errdefer dwarf.deinit(gpa);
+<a id="L537"></a>        // We don't need lookups, so this call is just for scanning CIEs.
+<a id="L538"></a>        dwarf.prepare(gpa, @sizeOf(usize), native_endian, false, true) catch |err| switch (err) {
+<a id="L539"></a>            error.ReadFailed =&gt; unreachable, // it's all fixed buffers
+<a id="L540"></a>            error.InvalidDebugInfo,
+<a id="L541"></a>            error.MissingDebugInfo,
+<a id="L542"></a>            error.OutOfMemory,
+<a id="L543"></a>            =&gt; |e| return e,
+<a id="L544"></a>            error.EndOfStream,
+<a id="L545"></a>            error.Overflow,
+<a id="L546"></a>            error.StreamTooLong,
+<a id="L547"></a>            error.InvalidOperand,
+<a id="L548"></a>            error.InvalidOpcode,
+<a id="L549"></a>            error.InvalidOperation,
+<a id="L550"></a>            =&gt; return error.InvalidDebugInfo,
+<a id="L551"></a>            error.UnsupportedAddrSize,
+<a id="L552"></a>            error.UnsupportedDwarfVersion,
+<a id="L553"></a>            error.UnimplementedUserOpcode,
+<a id="L554"></a>            =&gt; return error.UnsupportedDebugInfo,
+<a id="L555"></a>        };
+<a id="L556"></a>
+<a id="L557"></a>        return .{
+<a id="L558"></a>            .vmaddr_slide = vmaddr_slide,
+<a id="L559"></a>            .unwind_info = opt_unwind_info,
+<a id="L560"></a>            .dwarf = dwarf,
+<a id="L561"></a>        };
+<a id="L562"></a>    }
+<a id="L563"></a>
+<a id="L564"></a>    fn getFile(module: *Module, gpa: Allocator, io: Io) Error!*MachOFile {
+<a id="L565"></a>        if (module.file == null) {
+<a id="L566"></a>            const path = std.mem.span(
+<a id="L567"></a>                std.c.dyld_image_path_containing_address(@ptrFromInt(module.text_base)).?,
+<a id="L568"></a>            );
+<a id="L569"></a>            module.file = MachOFile.load(gpa, io, path, builtin.cpu.arch) catch |err| switch (err) {
+<a id="L570"></a>                error.InvalidMachO, error.InvalidDwarf =&gt; error.InvalidDebugInfo,
+<a id="L571"></a>                error.MissingDebugInfo, error.OutOfMemory, error.UnsupportedDebugInfo, error.ReadFailed =&gt; |e| e,
+<a id="L572"></a>            };
+<a id="L573"></a>        }
+<a id="L574"></a>        return if (module.file.?) |*f| f else |err| err;
+<a id="L575"></a>    }
+<a id="L576"></a>};
+<a id="L577"></a>
+<a id="L578"></a>const MachoSymbol = struct {
+<a id="L579"></a>    strx: u32,
+<a id="L580"></a>    addr: u64,
+<a id="L581"></a>    /// Value may be `unknown_ofile`.
+<a id="L582"></a>    ofile: u32,
+<a id="L583"></a>    const unknown_ofile = std.math.maxInt(u32);
+<a id="L584"></a>    fn addressLessThan(context: void, lhs: MachoSymbol, rhs: MachoSymbol) bool {
+<a id="L585"></a>        _ = context;
+<a id="L586"></a>        return lhs.addr &lt; rhs.addr;
+<a id="L587"></a>    }
+<a id="L588"></a>    /// Assumes that `symbols` is sorted in order of ascending `addr`.
+<a id="L589"></a>    fn find(symbols: []const MachoSymbol, address: usize) ?*const MachoSymbol {
+<a id="L590"></a>        if (symbols.len == 0) return null; // no potential match
+<a id="L591"></a>        if (address &lt; symbols[0].addr) return null; // address is before the lowest-address symbol
+<a id="L592"></a>        var left: usize = 0;
+<a id="L593"></a>        var len: usize = symbols.len;
+<a id="L594"></a>        while (len &gt; 1) {
+<a id="L595"></a>            const mid = left + len / 2;
+<a id="L596"></a>            if (address &lt; symbols[mid].addr) {
+<a id="L597"></a>                len /= 2;
+<a id="L598"></a>            } else {
+<a id="L599"></a>                left = mid;
+<a id="L600"></a>                len -= len / 2;
+<a id="L601"></a>            }
+<a id="L602"></a>        }
+<a id="L603"></a>        return &amp;symbols[left];
+<a id="L604"></a>    }
+<a id="L605"></a>
+<a id="L606"></a>    test find {
+<a id="L607"></a>        const symbols: []const MachoSymbol = &amp;.{
+<a id="L608"></a>            .{ .addr = 100, .strx = undefined, .ofile = undefined },
+<a id="L609"></a>            .{ .addr = 200, .strx = undefined, .ofile = undefined },
+<a id="L610"></a>            .{ .addr = 300, .strx = undefined, .ofile = undefined },
+<a id="L611"></a>        };
+<a id="L612"></a>
+<a id="L613"></a>        try testing.expectEqual(null, find(symbols, 0));
+<a id="L614"></a>        try testing.expectEqual(null, find(symbols, 99));
+<a id="L615"></a>        try testing.expectEqual(&amp;symbols[0], find(symbols, 100).?);
+<a id="L616"></a>        try testing.expectEqual(&amp;symbols[0], find(symbols, 150).?);
+<a id="L617"></a>        try testing.expectEqual(&amp;symbols[0], find(symbols, 199).?);
+<a id="L618"></a>
+<a id="L619"></a>        try testing.expectEqual(&amp;symbols[1], find(symbols, 200).?);
+<a id="L620"></a>        try testing.expectEqual(&amp;symbols[1], find(symbols, 250).?);
+<a id="L621"></a>        try testing.expectEqual(&amp;symbols[1], find(symbols, 299).?);
+<a id="L622"></a>
+<a id="L623"></a>        try testing.expectEqual(&amp;symbols[2], find(symbols, 300).?);
+<a id="L624"></a>        try testing.expectEqual(&amp;symbols[2], find(symbols, 301).?);
+<a id="L625"></a>        try testing.expectEqual(&amp;symbols[2], find(symbols, 5000).?);
+<a id="L626"></a>    }
+<a id="L627"></a>};
+<a id="L628"></a>test {
+<a id="L629"></a>    _ = MachoSymbol;
+<a id="L630"></a>}
+<a id="L631"></a>
+<a id="L632"></a>/// Uses `mmap` to map the file at `path` into memory.
+<a id="L633"></a>fn mapDebugInfoFile(io: Io, path: []const u8) ![]align(std.heap.page_size_min) const u8 {
+<a id="L634"></a>    const file = Io.Dir.cwd().openFile(io, path, .{}) catch |err| switch (err) {
+<a id="L635"></a>        error.FileNotFound =&gt; return error.MissingDebugInfo,
+<a id="L636"></a>        else =&gt; return error.ReadFailed,
+<a id="L637"></a>    };
+<a id="L638"></a>    defer file.close(io);
+<a id="L639"></a>
+<a id="L640"></a>    const file_end_pos = file.length(io) catch |err| switch (err) {
+<a id="L641"></a>        error.Unexpected =&gt; |e| return e,
+<a id="L642"></a>        else =&gt; return error.ReadFailed,
+<a id="L643"></a>    };
+<a id="L644"></a>    const file_len = std.math.cast(usize, file_end_pos) orelse return error.InvalidDebugInfo;
+<a id="L645"></a>
+<a id="L646"></a>    return posix.mmap(
+<a id="L647"></a>        null,
+<a id="L648"></a>        file_len,
+<a id="L649"></a>        .{ .READ = true },
+<a id="L650"></a>        .{ .TYPE = .SHARED },
+<a id="L651"></a>        file.handle,
+<a id="L652"></a>        0,
+<a id="L653"></a>    ) catch |err| switch (err) {
+<a id="L654"></a>        error.Unexpected =&gt; |e| return e,
+<a id="L655"></a>        else =&gt; return error.ReadFailed,
+<a id="L656"></a>    };
+<a id="L657"></a>}
+<a id="L658"></a>
+<a id="L659"></a>const std = @import("std");
+<a id="L660"></a>const Io = std.Io;
+<a id="L661"></a>const Allocator = std.mem.Allocator;
+<a id="L662"></a>const Dwarf = std.debug.Dwarf;
+<a id="L663"></a>const Error = std.debug.SelfInfoError;
+<a id="L664"></a>const MachOFile = std.debug.MachOFile;
+<a id="L665"></a>const assert = std.debug.assert;
+<a id="L666"></a>const posix = std.posix;
+<a id="L667"></a>const macho = std.macho;
+<a id="L668"></a>const mem = std.mem;
+<a id="L669"></a>const testing = std.testing;
+<a id="L670"></a>const dwarfRegNative = std.debug.Dwarf.SelfUnwinder.regNative;
+<a id="L671"></a>
+<a id="L672"></a>const builtin = @import("builtin");
+<a id="L673"></a>const native_endian = builtin.target.cpu.arch.endian();
+<a id="L674"></a>
+<a id="L675"></a>const SelfInfo = @This();
+</pre>
 </body>
 </html>

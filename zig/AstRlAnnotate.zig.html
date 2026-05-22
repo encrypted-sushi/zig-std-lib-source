@@ -2,1152 +2,1155 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Source: zig-0.16.0-std/zig/AstRlAnnotate.zig</title>
+    <title>Source: zig/AstRlAnnotate.zig</title>
     <style>
         body { background: #1e1e1e; color: #d4d4d4; font-family: monospace; padding: 20px; }
         pre { white-space: pre-wrap; word-wrap: break-word; }
         .header { border-bottom: 1px solid #444; padding-bottom: 10px; margin-bottom: 20px; }
         a { color: #569cd6; }
+        a[id] { color: inherit; text-decoration: none; }
+        :target { background: #3a3a00; }
     </style>
 </head>
 <body>
     <div class="header">
-        <a href="/">Index</a> | <strong>File: zig-0.16.0-std/zig/AstRlAnnotate.zig</strong>
+        <a href="/">Index</a> | <strong>File: zig/AstRlAnnotate.zig</strong>
     </div>
-    <pre>//! AstRlAnnotate is a simple pass which runs over the AST before AstGen to
-//! determine which expressions require result locations.
-//!
-//! In some cases, AstGen can choose whether to provide a result pointer or to
-//! just use standard `break` instructions from a block. The latter choice can
-//! result in more efficient ZIR and runtime code, but does not allow for RLS to
-//! occur. Thus, we want to provide a real result pointer (from an alloc) only
-//! when necessary.
-//!
-//! To achieve this, we need to determine which expressions require a result
-//! pointer. This pass is responsible for analyzing all syntax forms which may
-//! provide a result location and, if sub-expressions consume this result
-//! pointer non-trivially (e.g. writing through field pointers), marking the
-//! node as requiring a result location.
-
-const std = @import("std");
-const AstRlAnnotate = @This();
-const Ast = std.zig.Ast;
-const Allocator = std.mem.Allocator;
-const AutoHashMapUnmanaged = std.AutoHashMapUnmanaged;
-const BuiltinFn = std.zig.BuiltinFn;
-const assert = std.debug.assert;
-
-gpa: Allocator,
-arena: Allocator,
-tree: *const Ast,
-
-/// Certain nodes are placed in this set under the following conditions:
-/// * if-else: either branch consumes the result location
-/// * labeled block: any break consumes the result location
-/// * switch: any prong consumes the result location
-/// * orelse/catch: the RHS expression consumes the result location
-/// * while/for: any break consumes the result location
-/// * @as: the second operand consumes the result location
-/// * const: the init expression consumes the result location
-/// * return: the return expression consumes the result location
-nodes_need_rl: RlNeededSet = .{},
-
-pub const RlNeededSet = AutoHashMapUnmanaged(Ast.Node.Index, void);
-
-const ResultInfo = packed struct {
-    /// Do we have a known result type?
-    have_type: bool,
-    /// Do we (potentially) have a result pointer? Note that this pointer's type
-    /// may not be known due to it being an inferred alloc.
-    have_ptr: bool,
-
-    const none: ResultInfo = .{ .have_type = false, .have_ptr = false };
-    const typed_ptr: ResultInfo = .{ .have_type = true, .have_ptr = true };
-    const inferred_ptr: ResultInfo = .{ .have_type = false, .have_ptr = true };
-    const type_only: ResultInfo = .{ .have_type = true, .have_ptr = false };
-};
-
-/// A labeled block or a loop. When this block is broken from, `consumes_res_ptr`
-/// should be set if the break expression consumed the result pointer.
-const Block = struct {
-    parent: ?*Block,
-    label: ?[]const u8,
-    is_loop: bool,
-    ri: ResultInfo,
-    consumes_res_ptr: bool,
-};
-
-pub fn annotate(gpa: Allocator, arena: Allocator, tree: Ast) Allocator.Error!RlNeededSet {
-    var astrl: AstRlAnnotate = .{
-        .gpa = gpa,
-        .arena = arena,
-        .tree = &amp;tree,
-    };
-    defer astrl.deinit(gpa);
-
-    if (tree.errors.len != 0) {
-        // We can't perform analysis on a broken AST. AstGen will not run in
-        // this case.
-        return .{};
-    }
-
-    for (tree.containerDeclRoot().ast.members) |member_node| {
-        _ = try astrl.expr(member_node, null, ResultInfo.none);
-    }
-
-    return astrl.nodes_need_rl.move();
-}
-
-fn deinit(astrl: *AstRlAnnotate, gpa: Allocator) void {
-    astrl.nodes_need_rl.deinit(gpa);
-}
-
-fn containerDecl(
-    astrl: *AstRlAnnotate,
-    block: ?*Block,
-    full: Ast.full.ContainerDecl,
-) !void {
-    const tree = astrl.tree;
-    switch (tree.tokenTag(full.ast.main_token)) {
-        .keyword_struct =&gt; {
-            if (full.ast.arg.unwrap()) |arg| {
-                _ = try astrl.expr(arg, block, ResultInfo.type_only);
-            }
-            for (full.ast.members) |member_node| {
-                _ = try astrl.expr(member_node, block, ResultInfo.none);
-            }
-        },
-        .keyword_union =&gt; {
-            if (full.ast.arg.unwrap()) |arg| {
-                _ = try astrl.expr(arg, block, ResultInfo.type_only);
-            }
-            for (full.ast.members) |member_node| {
-                _ = try astrl.expr(member_node, block, ResultInfo.none);
-            }
-        },
-        .keyword_enum =&gt; {
-            if (full.ast.arg.unwrap()) |arg| {
-                _ = try astrl.expr(arg, block, ResultInfo.type_only);
-            }
-            for (full.ast.members) |member_node| {
-                _ = try astrl.expr(member_node, block, ResultInfo.none);
-            }
-        },
-        .keyword_opaque =&gt; {
-            for (full.ast.members) |member_node| {
-                _ = try astrl.expr(member_node, block, ResultInfo.none);
-            }
-        },
-        else =&gt; unreachable,
-    }
-}
-
-/// Returns true if `rl` provides a result pointer and the expression consumes it.
-fn expr(astrl: *AstRlAnnotate, node: Ast.Node.Index, block: ?*Block, ri: ResultInfo) Allocator.Error!bool {
-    const tree = astrl.tree;
-    switch (tree.nodeTag(node)) {
-        .root,
-        .switch_case_one,
-        .switch_case_inline_one,
-        .switch_case,
-        .switch_case_inline,
-        .switch_range,
-        .for_range,
-        .asm_output,
-        .asm_input,
-        =&gt; unreachable,
-
-        .@"errdefer" =&gt; {
-            _ = try astrl.expr(tree.nodeData(node).opt_token_and_node[1], block, ResultInfo.none);
-            return false;
-        },
-        .@"defer" =&gt; {
-            _ = try astrl.expr(tree.nodeData(node).node, block, ResultInfo.none);
-            return false;
-        },
-
-        .container_field_init,
-        .container_field_align,
-        .container_field,
-        =&gt; {
-            const full = tree.fullContainerField(node).?;
-            const type_expr = full.ast.type_expr.unwrap().?;
-            _ = try astrl.expr(type_expr, block, ResultInfo.type_only);
-            if (full.ast.align_expr.unwrap()) |align_expr| {
-                _ = try astrl.expr(align_expr, block, ResultInfo.type_only);
-            }
-            if (full.ast.value_expr.unwrap()) |value_expr| {
-                _ = try astrl.expr(value_expr, block, ResultInfo.type_only);
-            }
-            return false;
-        },
-        .test_decl =&gt; {
-            _ = try astrl.expr(tree.nodeData(node).opt_token_and_node[1], block, ResultInfo.none);
-            return false;
-        },
-        .global_var_decl,
-        .local_var_decl,
-        .simple_var_decl,
-        .aligned_var_decl,
-        =&gt; {
-            const full = tree.fullVarDecl(node).?;
-            const init_ri = if (full.ast.type_node.unwrap()) |type_node| init_ri: {
-                _ = try astrl.expr(type_node, block, ResultInfo.type_only);
-                break :init_ri ResultInfo.typed_ptr;
-            } else ResultInfo.inferred_ptr;
-            const init_node = full.ast.init_node.unwrap() orelse {
-                // No init node, so we're done.
-                return false;
-            };
-            switch (tree.tokenTag(full.ast.mut_token)) {
-                .keyword_const =&gt; {
-                    const init_consumes_rl = try astrl.expr(init_node, block, init_ri);
-                    if (init_consumes_rl) {
-                        try astrl.nodes_need_rl.putNoClobber(astrl.gpa, node, {});
-                    }
-                    return false;
-                },
-                .keyword_var =&gt; {
-                    // We'll create an alloc either way, so don't care if the
-                    // result pointer is consumed.
-                    _ = try astrl.expr(init_node, block, init_ri);
-                    return false;
-                },
-                else =&gt; unreachable,
-            }
-        },
-        .assign_destructure =&gt; {
-            const full = tree.assignDestructure(node);
-            for (full.ast.variables) |variable_node| {
-                _ = try astrl.expr(variable_node, block, ResultInfo.none);
-            }
-            // We don't need to gather any meaningful data here, because destructures always use RLS
-            _ = try astrl.expr(full.ast.value_expr, block, ResultInfo.none);
-            return false;
-        },
-        .assign =&gt; {
-            const lhs, const rhs = tree.nodeData(node).node_and_node;
-            _ = try astrl.expr(lhs, block, ResultInfo.none);
-            _ = try astrl.expr(rhs, block, ResultInfo.typed_ptr);
-            return false;
-        },
-        .assign_shl,
-        .assign_shl_sat,
-        .assign_shr,
-        .assign_bit_and,
-        .assign_bit_or,
-        .assign_bit_xor,
-        .assign_div,
-        .assign_sub,
-        .assign_sub_wrap,
-        .assign_sub_sat,
-        .assign_mod,
-        .assign_add,
-        .assign_add_wrap,
-        .assign_add_sat,
-        .assign_mul,
-        .assign_mul_wrap,
-        .assign_mul_sat,
-        =&gt; {
-            const lhs, const rhs = tree.nodeData(node).node_and_node;
-            _ = try astrl.expr(lhs, block, ResultInfo.none);
-            _ = try astrl.expr(rhs, block, ResultInfo.none);
-            return false;
-        },
-        .shl, .shr =&gt; {
-            const lhs, const rhs = tree.nodeData(node).node_and_node;
-            _ = try astrl.expr(lhs, block, ResultInfo.none);
-            _ = try astrl.expr(rhs, block, ResultInfo.type_only);
-            return false;
-        },
-        .add,
-        .add_wrap,
-        .add_sat,
-        .sub,
-        .sub_wrap,
-        .sub_sat,
-        .mul,
-        .mul_wrap,
-        .mul_sat,
-        .div,
-        .mod,
-        .shl_sat,
-        .bit_and,
-        .bit_or,
-        .bit_xor,
-        .bang_equal,
-        .equal_equal,
-        .greater_than,
-        .greater_or_equal,
-        .less_than,
-        .less_or_equal,
-        .array_cat,
-        =&gt; {
-            const lhs, const rhs = tree.nodeData(node).node_and_node;
-            _ = try astrl.expr(lhs, block, ResultInfo.none);
-            _ = try astrl.expr(rhs, block, ResultInfo.none);
-            return false;
-        },
-
-        .array_mult =&gt; {
-            const lhs, const rhs = tree.nodeData(node).node_and_node;
-            _ = try astrl.expr(lhs, block, ResultInfo.none);
-            _ = try astrl.expr(rhs, block, ResultInfo.type_only);
-            return false;
-        },
-        .error_union, .merge_error_sets =&gt; {
-            const lhs, const rhs = tree.nodeData(node).node_and_node;
-            _ = try astrl.expr(lhs, block, ResultInfo.none);
-            _ = try astrl.expr(rhs, block, ResultInfo.none);
-            return false;
-        },
-        .bool_and,
-        .bool_or,
-        =&gt; {
-            const lhs, const rhs = tree.nodeData(node).node_and_node;
-            _ = try astrl.expr(lhs, block, ResultInfo.type_only);
-            _ = try astrl.expr(rhs, block, ResultInfo.type_only);
-            return false;
-        },
-        .bool_not =&gt; {
-            _ = try astrl.expr(tree.nodeData(node).node, block, ResultInfo.type_only);
-            return false;
-        },
-        .bit_not, .negation, .negation_wrap =&gt; {
-            _ = try astrl.expr(tree.nodeData(node).node, block, ResultInfo.none);
-            return false;
-        },
-
-        // These nodes are leaves and never consume a result location.
-        .identifier,
-        .string_literal,
-        .multiline_string_literal,
-        .number_literal,
-        .unreachable_literal,
-        .asm_simple,
-        .@"asm",
-        .enum_literal,
-        .error_value,
-        .anyframe_literal,
-        .@"continue",
-        .char_literal,
-        .error_set_decl,
-        =&gt; return false,
-
-        .builtin_call_two,
-        .builtin_call_two_comma,
-        .builtin_call,
-        .builtin_call_comma,
-        =&gt; {
-            var buf: [2]Ast.Node.Index = undefined;
-            const params = tree.builtinCallParams(&amp;buf, node).?;
-            return astrl.builtinCall(block, ri, node, params);
-        },
-
-        .call_one,
-        .call_one_comma,
-        .call,
-        .call_comma,
-        =&gt; {
-            var buf: [1]Ast.Node.Index = undefined;
-            const full = tree.fullCall(&amp;buf, node).?;
-            _ = try astrl.expr(full.ast.fn_expr, block, ResultInfo.none);
-            for (full.ast.params) |param_node| {
-                _ = try astrl.expr(param_node, block, ResultInfo.type_only);
-            }
-            return false; // TODO: once function calls are passed result locations this will change
-        },
-
-        .@"return" =&gt; {
-            if (tree.nodeData(node).opt_node.unwrap()) |lhs| {
-                const ret_val_consumes_rl = try astrl.expr(lhs, block, ResultInfo.typed_ptr);
-                if (ret_val_consumes_rl) {
-                    try astrl.nodes_need_rl.putNoClobber(astrl.gpa, node, {});
-                }
-            }
-            return false;
-        },
-
-        .field_access =&gt; {
-            const lhs, _ = tree.nodeData(node).node_and_token;
-            _ = try astrl.expr(lhs, block, ResultInfo.none);
-            return false;
-        },
-
-        .if_simple, .@"if" =&gt; {
-            const full = tree.fullIf(node).?;
-            if (full.error_token != null or full.payload_token != null) {
-                _ = try astrl.expr(full.ast.cond_expr, block, ResultInfo.none);
-            } else {
-                _ = try astrl.expr(full.ast.cond_expr, block, ResultInfo.type_only); // bool
-            }
-
-            if (full.ast.else_expr.unwrap()) |else_expr| {
-                const then_uses_rl = try astrl.expr(full.ast.then_expr, block, ri);
-                const else_uses_rl = try astrl.expr(else_expr, block, ri);
-                const uses_rl = then_uses_rl or else_uses_rl;
-                if (uses_rl) try astrl.nodes_need_rl.putNoClobber(astrl.gpa, node, {});
-                return uses_rl;
-            } else {
-                _ = try astrl.expr(full.ast.then_expr, block, ResultInfo.none);
-                return false;
-            }
-        },
-
-        .while_simple, .while_cont, .@"while" =&gt; {
-            const full = tree.fullWhile(node).?;
-            const label: ?[]const u8 = if (full.label_token) |label_token| label: {
-                break :label try astrl.identString(label_token);
-            } else null;
-            if (full.error_token != null or full.payload_token != null) {
-                _ = try astrl.expr(full.ast.cond_expr, block, ResultInfo.none);
-            } else {
-                _ = try astrl.expr(full.ast.cond_expr, block, ResultInfo.type_only); // bool
-            }
-            var new_block: Block = .{
-                .parent = block,
-                .label = label,
-                .is_loop = true,
-                .ri = ri,
-                .consumes_res_ptr = false,
-            };
-            if (full.ast.cont_expr.unwrap()) |cont_expr| {
-                _ = try astrl.expr(cont_expr, &amp;new_block, ResultInfo.none);
-            }
-            _ = try astrl.expr(full.ast.then_expr, &amp;new_block, ResultInfo.none);
-            const else_consumes_rl = if (full.ast.else_expr.unwrap()) |else_expr| else_rl: {
-                break :else_rl try astrl.expr(else_expr, block, ri);
-            } else false;
-            if (new_block.consumes_res_ptr or else_consumes_rl) {
-                try astrl.nodes_need_rl.putNoClobber(astrl.gpa, node, {});
-                return true;
-            } else {
-                return false;
-            }
-        },
-
-        .for_simple, .@"for" =&gt; {
-            const full = tree.fullFor(node).?;
-            const label: ?[]const u8 = if (full.label_token) |label_token| label: {
-                break :label try astrl.identString(label_token);
-            } else null;
-            for (full.ast.inputs) |input| {
-                if (tree.nodeTag(input) == .for_range) {
-                    const lhs, const opt_rhs = tree.nodeData(input).node_and_opt_node;
-                    _ = try astrl.expr(lhs, block, ResultInfo.type_only);
-                    if (opt_rhs.unwrap()) |rhs| {
-                        _ = try astrl.expr(rhs, block, ResultInfo.type_only);
-                    }
-                } else {
-                    _ = try astrl.expr(input, block, ResultInfo.none);
-                }
-            }
-            var new_block: Block = .{
-                .parent = block,
-                .label = label,
-                .is_loop = true,
-                .ri = ri,
-                .consumes_res_ptr = false,
-            };
-            _ = try astrl.expr(full.ast.then_expr, &amp;new_block, ResultInfo.none);
-            const else_consumes_rl = if (full.ast.else_expr.unwrap()) |else_expr| else_rl: {
-                break :else_rl try astrl.expr(else_expr, block, ri);
-            } else false;
-            if (new_block.consumes_res_ptr or else_consumes_rl) {
-                try astrl.nodes_need_rl.putNoClobber(astrl.gpa, node, {});
-                return true;
-            } else {
-                return false;
-            }
-        },
-
-        .slice_open =&gt; {
-            const sliced, const start = tree.nodeData(node).node_and_node;
-            _ = try astrl.expr(sliced, block, ResultInfo.none);
-            _ = try astrl.expr(start, block, ResultInfo.type_only);
-            return false;
-        },
-        .slice =&gt; {
-            const sliced, const extra_index = tree.nodeData(node).node_and_extra;
-            const extra = tree.extraData(extra_index, Ast.Node.Slice);
-            _ = try astrl.expr(sliced, block, ResultInfo.none);
-            _ = try astrl.expr(extra.start, block, ResultInfo.type_only);
-            _ = try astrl.expr(extra.end, block, ResultInfo.type_only);
-            return false;
-        },
-        .slice_sentinel =&gt; {
-            const sliced, const extra_index = tree.nodeData(node).node_and_extra;
-            const extra = tree.extraData(extra_index, Ast.Node.SliceSentinel);
-            _ = try astrl.expr(sliced, block, ResultInfo.none);
-            _ = try astrl.expr(extra.start, block, ResultInfo.type_only);
-            if (extra.end.unwrap()) |end| {
-                _ = try astrl.expr(end, block, ResultInfo.type_only);
-            }
-            _ = try astrl.expr(extra.sentinel, block, ResultInfo.none);
-            return false;
-        },
-        .deref =&gt; {
-            _ = try astrl.expr(tree.nodeData(node).node, block, ResultInfo.none);
-            return false;
-        },
-        .address_of =&gt; {
-            _ = try astrl.expr(tree.nodeData(node).node, block, ResultInfo.none);
-            return false;
-        },
-        .optional_type =&gt; {
-            _ = try astrl.expr(tree.nodeData(node).node, block, ResultInfo.type_only);
-            return false;
-        },
-        .@"try",
-        .@"nosuspend",
-        =&gt; return astrl.expr(tree.nodeData(node).node, block, ri),
-        .grouped_expression,
-        .unwrap_optional,
-        =&gt; return astrl.expr(tree.nodeData(node).node_and_token[0], block, ri),
-
-        .block_two,
-        .block_two_semicolon,
-        .block,
-        .block_semicolon,
-        =&gt; {
-            var buf: [2]Ast.Node.Index = undefined;
-            const statements = tree.blockStatements(&amp;buf, node).?;
-            return astrl.blockExpr(block, ri, node, statements);
-        },
-        .anyframe_type =&gt; {
-            _, const child_type = tree.nodeData(node).token_and_node;
-            _ = try astrl.expr(child_type, block, ResultInfo.type_only);
-            return false;
-        },
-        .@"catch", .@"orelse" =&gt; {
-            const lhs, const rhs = tree.nodeData(node).node_and_node;
-            _ = try astrl.expr(lhs, block, ResultInfo.none);
-            const rhs_consumes_rl = try astrl.expr(rhs, block, ri);
-            if (rhs_consumes_rl) {
-                try astrl.nodes_need_rl.putNoClobber(astrl.gpa, node, {});
-            }
-            return rhs_consumes_rl;
-        },
-
-        .ptr_type_aligned,
-        .ptr_type_sentinel,
-        .ptr_type,
-        .ptr_type_bit_range,
-        =&gt; {
-            const full = tree.fullPtrType(node).?;
-            _ = try astrl.expr(full.ast.child_type, block, ResultInfo.type_only);
-            if (full.ast.sentinel.unwrap()) |sentinel| {
-                _ = try astrl.expr(sentinel, block, ResultInfo.type_only);
-            }
-            if (full.ast.addrspace_node.unwrap()) |addrspace_node| {
-                _ = try astrl.expr(addrspace_node, block, ResultInfo.type_only);
-            }
-            if (full.ast.align_node.unwrap()) |align_node| {
-                _ = try astrl.expr(align_node, block, ResultInfo.type_only);
-            }
-            if (full.ast.bit_range_start.unwrap()) |bit_range_start| {
-                const bit_range_end = full.ast.bit_range_end.unwrap().?;
-                _ = try astrl.expr(bit_range_start, block, ResultInfo.type_only);
-                _ = try astrl.expr(bit_range_end, block, ResultInfo.type_only);
-            }
-            return false;
-        },
-
-        .container_decl,
-        .container_decl_trailing,
-        .container_decl_arg,
-        .container_decl_arg_trailing,
-        .container_decl_two,
-        .container_decl_two_trailing,
-        .tagged_union,
-        .tagged_union_trailing,
-        .tagged_union_enum_tag,
-        .tagged_union_enum_tag_trailing,
-        .tagged_union_two,
-        .tagged_union_two_trailing,
-        =&gt; {
-            var buf: [2]Ast.Node.Index = undefined;
-            try astrl.containerDecl(block, tree.fullContainerDecl(&amp;buf, node).?);
-            return false;
-        },
-
-        .@"break" =&gt; {
-            const opt_label, const opt_rhs = tree.nodeData(node).opt_token_and_opt_node;
-            const rhs = opt_rhs.unwrap() orelse {
-                // Breaks with void are not interesting
-                return false;
-            };
-
-            var opt_cur_block = block;
-            if (opt_label.unwrap()) |label_token| {
-                const break_label = try astrl.identString(label_token);
-                while (opt_cur_block) |cur_block| : (opt_cur_block = cur_block.parent) {
-                    const block_label = cur_block.label orelse continue;
-                    if (std.mem.eql(u8, block_label, break_label)) break;
-                }
-            } else {
-                // No label - we're breaking from a loop.
-                while (opt_cur_block) |cur_block| : (opt_cur_block = cur_block.parent) {
-                    if (cur_block.is_loop) break;
-                }
-            }
-
-            if (opt_cur_block) |target_block| {
-                const consumes_break_rl = try astrl.expr(rhs, block, target_block.ri);
-                if (consumes_break_rl) target_block.consumes_res_ptr = true;
-            } else {
-                // No corresponding scope to break from - AstGen will emit an error.
-                _ = try astrl.expr(rhs, block, ResultInfo.none);
-            }
-
-            return false;
-        },
-
-        .array_type =&gt; {
-            const lhs, const rhs = tree.nodeData(node).node_and_node;
-            _ = try astrl.expr(lhs, block, ResultInfo.type_only);
-            _ = try astrl.expr(rhs, block, ResultInfo.type_only);
-            return false;
-        },
-        .array_type_sentinel =&gt; {
-            const len_expr, const extra_index = tree.nodeData(node).node_and_extra;
-            const extra = tree.extraData(extra_index, Ast.Node.ArrayTypeSentinel);
-            _ = try astrl.expr(len_expr, block, ResultInfo.type_only);
-            _ = try astrl.expr(extra.elem_type, block, ResultInfo.type_only);
-            _ = try astrl.expr(extra.sentinel, block, ResultInfo.type_only);
-            return false;
-        },
-        .array_access =&gt; {
-            const lhs, const rhs = tree.nodeData(node).node_and_node;
-            _ = try astrl.expr(lhs, block, ResultInfo.none);
-            _ = try astrl.expr(rhs, block, ResultInfo.type_only);
-            return false;
-        },
-        .@"comptime" =&gt; {
-            // AstGen will emit an error if the scope is already comptime, so we can assume it is
-            // not. This means the result location is not forwarded.
-            _ = try astrl.expr(tree.nodeData(node).node, block, ResultInfo.none);
-            return false;
-        },
-        .@"switch", .switch_comma =&gt; {
-            const operand_node, const extra_index = tree.nodeData(node).node_and_extra;
-            const case_nodes = tree.extraDataSlice(tree.extraData(extra_index, Ast.Node.SubRange), Ast.Node.Index);
-
-            _ = try astrl.expr(operand_node, block, ResultInfo.none);
-
-            var any_prong_consumed_rl = false;
-            for (case_nodes) |case_node| {
-                const case = tree.fullSwitchCase(case_node).?;
-                for (case.ast.values) |item_node| {
-                    if (tree.nodeTag(item_node) == .switch_range) {
-                        const lhs, const rhs = tree.nodeData(item_node).node_and_node;
-                        _ = try astrl.expr(lhs, block, ResultInfo.none);
-                        _ = try astrl.expr(rhs, block, ResultInfo.none);
-                    } else {
-                        _ = try astrl.expr(item_node, block, ResultInfo.none);
-                    }
-                }
-                if (try astrl.expr(case.ast.target_expr, block, ri)) {
-                    any_prong_consumed_rl = true;
-                }
-            }
-            if (any_prong_consumed_rl) {
-                try astrl.nodes_need_rl.putNoClobber(astrl.gpa, node, {});
-            }
-            return any_prong_consumed_rl;
-        },
-        .@"suspend" =&gt; {
-            _ = try astrl.expr(tree.nodeData(node).node, block, ResultInfo.none);
-            return false;
-        },
-        .@"resume" =&gt; {
-            _ = try astrl.expr(tree.nodeData(node).node, block, ResultInfo.none);
-            return false;
-        },
-
-        .array_init_one,
-        .array_init_one_comma,
-        .array_init_dot_two,
-        .array_init_dot_two_comma,
-        .array_init_dot,
-        .array_init_dot_comma,
-        .array_init,
-        .array_init_comma,
-        =&gt; {
-            var buf: [2]Ast.Node.Index = undefined;
-            const full = tree.fullArrayInit(&amp;buf, node).?;
-
-            if (full.ast.type_expr.unwrap()) |type_expr| {
-                // Explicitly typed init does not participate in RLS
-                _ = try astrl.expr(type_expr, block, ResultInfo.none);
-                for (full.ast.elements) |elem_init| {
-                    _ = try astrl.expr(elem_init, block, ResultInfo.type_only);
-                }
-                return false;
-            }
-
-            if (ri.have_type) {
-                // Always forward type information
-                // If we have a result pointer, we use and forward it
-                for (full.ast.elements) |elem_init| {
-                    _ = try astrl.expr(elem_init, block, ri);
-                }
-                return ri.have_ptr;
-            } else {
-                // Untyped init does not consume result location
-                for (full.ast.elements) |elem_init| {
-                    _ = try astrl.expr(elem_init, block, ResultInfo.none);
-                }
-                return false;
-            }
-        },
-
-        .struct_init_one,
-        .struct_init_one_comma,
-        .struct_init_dot_two,
-        .struct_init_dot_two_comma,
-        .struct_init_dot,
-        .struct_init_dot_comma,
-        .struct_init,
-        .struct_init_comma,
-        =&gt; {
-            var buf: [2]Ast.Node.Index = undefined;
-            const full = tree.fullStructInit(&amp;buf, node).?;
-
-            if (full.ast.type_expr.unwrap()) |type_expr| {
-                // Explicitly typed init does not participate in RLS
-                _ = try astrl.expr(type_expr, block, ResultInfo.none);
-                for (full.ast.fields) |field_init| {
-                    _ = try astrl.expr(field_init, block, ResultInfo.type_only);
-                }
-                return false;
-            }
-
-            if (ri.have_type) {
-                // Always forward type information
-                // If we have a result pointer, we use and forward it
-                for (full.ast.fields) |field_init| {
-                    _ = try astrl.expr(field_init, block, ri);
-                }
-                return ri.have_ptr;
-            } else {
-                // Untyped init does not consume result location
-                for (full.ast.fields) |field_init| {
-                    _ = try astrl.expr(field_init, block, ResultInfo.none);
-                }
-                return false;
-            }
-        },
-
-        .fn_proto_simple,
-        .fn_proto_multi,
-        .fn_proto_one,
-        .fn_proto,
-        .fn_decl,
-        =&gt; |tag| {
-            var buf: [1]Ast.Node.Index = undefined;
-            const full = tree.fullFnProto(&amp;buf, node).?;
-            const body_node = if (tag == .fn_decl) tree.nodeData(node).node_and_node[1].toOptional() else .none;
-            {
-                var it = full.iterate(tree);
-                while (it.next()) |param| {
-                    if (param.anytype_ellipsis3 == null) {
-                        const type_expr = param.type_expr.?;
-                        _ = try astrl.expr(type_expr, block, ResultInfo.type_only);
-                    }
-                }
-            }
-            if (full.ast.align_expr.unwrap()) |align_expr| {
-                _ = try astrl.expr(align_expr, block, ResultInfo.type_only);
-            }
-            if (full.ast.addrspace_expr.unwrap()) |addrspace_expr| {
-                _ = try astrl.expr(addrspace_expr, block, ResultInfo.type_only);
-            }
-            if (full.ast.section_expr.unwrap()) |section_expr| {
-                _ = try astrl.expr(section_expr, block, ResultInfo.type_only);
-            }
-            if (full.ast.callconv_expr.unwrap()) |callconv_expr| {
-                _ = try astrl.expr(callconv_expr, block, ResultInfo.type_only);
-            }
-            const return_type = full.ast.return_type.unwrap().?;
-            _ = try astrl.expr(return_type, block, ResultInfo.type_only);
-            if (body_node.unwrap()) |body| {
-                _ = try astrl.expr(body, block, ResultInfo.none);
-            }
-            return false;
-        },
-    }
-}
-
-fn identString(astrl: *AstRlAnnotate, token: Ast.TokenIndex) ![]const u8 {
-    const tree = astrl.tree;
-    assert(tree.tokenTag(token) == .identifier);
-    const ident_name = tree.tokenSlice(token);
-    if (!std.mem.startsWith(u8, ident_name, "@")) {
-        return ident_name;
-    }
-    return std.zig.string_literal.parseAlloc(astrl.arena, ident_name[1..]) catch |err| switch (err) {
-        error.OutOfMemory =&gt; error.OutOfMemory,
-        error.InvalidLiteral =&gt; "", // This pass can safely return garbage on invalid AST
-    };
-}
-
-fn blockExpr(astrl: *AstRlAnnotate, parent_block: ?*Block, ri: ResultInfo, node: Ast.Node.Index, statements: []const Ast.Node.Index) !bool {
-    const tree = astrl.tree;
-
-    const lbrace = tree.nodeMainToken(node);
-    if (tree.isTokenPrecededByTags(lbrace, &amp;.{ .identifier, .colon })) {
-        // Labeled block
-        var new_block: Block = .{
-            .parent = parent_block,
-            .label = try astrl.identString(lbrace - 2),
-            .is_loop = false,
-            .ri = ri,
-            .consumes_res_ptr = false,
-        };
-        for (statements) |statement| {
-            _ = try astrl.expr(statement, &amp;new_block, ResultInfo.none);
-        }
-        if (new_block.consumes_res_ptr) {
-            try astrl.nodes_need_rl.putNoClobber(astrl.gpa, node, {});
-        }
-        return new_block.consumes_res_ptr;
-    } else {
-        // Unlabeled block
-        for (statements) |statement| {
-            _ = try astrl.expr(statement, parent_block, ResultInfo.none);
-        }
-        return false;
-    }
-}
-
-fn builtinCall(astrl: *AstRlAnnotate, block: ?*Block, ri: ResultInfo, node: Ast.Node.Index, args: []const Ast.Node.Index) !bool {
-    _ = ri; // Currently, no builtin consumes its result location.
-
-    const tree = astrl.tree;
-    const builtin_token = tree.nodeMainToken(node);
-    const builtin_name = tree.tokenSlice(builtin_token);
-    const info = BuiltinFn.list.get(builtin_name) orelse return false;
-    if (info.param_count) |expected| {
-        if (expected != args.len) return false;
-    }
-    switch (info.tag) {
-        .import =&gt; return false,
-        .branch_hint =&gt; {
-            _ = try astrl.expr(args[0], block, ResultInfo.type_only);
-            return false;
-        },
-        .compile_log, .TypeOf =&gt; {
-            for (args) |arg_node| {
-                _ = try astrl.expr(arg_node, block, ResultInfo.none);
-            }
-            return false;
-        },
-        .as =&gt; {
-            _ = try astrl.expr(args[0], block, ResultInfo.type_only);
-            _ = try astrl.expr(args[1], block, ResultInfo.type_only);
-            return false;
-        },
-        .bit_cast =&gt; {
-            _ = try astrl.expr(args[0], block, ResultInfo.none);
-            return false;
-        },
-        .union_init =&gt; {
-            _ = try astrl.expr(args[0], block, ResultInfo.type_only);
-            _ = try astrl.expr(args[1], block, ResultInfo.type_only);
-            _ = try astrl.expr(args[2], block, ResultInfo.type_only);
-            return false;
-        },
-        .c_import =&gt; {
-            _ = try astrl.expr(args[0], block, ResultInfo.none);
-            return false;
-        },
-        .min, .max =&gt; {
-            for (args) |arg_node| {
-                _ = try astrl.expr(arg_node, block, ResultInfo.none);
-            }
-            return false;
-        },
-        .@"export" =&gt; {
-            _ = try astrl.expr(args[0], block, ResultInfo.none);
-            _ = try astrl.expr(args[1], block, ResultInfo.type_only);
-            return false;
-        },
-        .@"extern" =&gt; {
-            _ = try astrl.expr(args[0], block, ResultInfo.type_only);
-            _ = try astrl.expr(args[1], block, ResultInfo.type_only);
-            return false;
-        },
-        // These builtins take no args and do not consume the result pointer.
-        .src,
-        .This,
-        .EnumLiteral,
-        .return_address,
-        .error_return_trace,
-        .frame,
-        .breakpoint,
-        .disable_instrumentation,
-        .disable_intrinsics,
-        .in_comptime,
-        .panic,
-        .trap,
-        .c_va_start,
-        =&gt; return false,
-        // TODO: this is a workaround for llvm/llvm-project#68409
-        // Zig tracking issue: #16876
-        .frame_address =&gt; return true,
-        // These builtins take a single argument with a known result type, but do not consume their
-        // result pointer.
-        .sqrt,
-        .sin,
-        .cos,
-        .tan,
-        .exp,
-        .exp2,
-        .log,
-        .log2,
-        .log10,
-        .floor,
-        .ceil,
-        .trunc,
-        .round,
-        .size_of,
-        .bit_size_of,
-        .align_of,
-        .compile_error,
-        .set_eval_branch_quota,
-        .int_from_bool,
-        .int_from_error,
-        .error_from_int,
-        .embed_file,
-        .error_name,
-        .set_runtime_safety,
-        .Tuple,
-        .c_undef,
-        .c_include,
-        .wasm_memory_size,
-        .splat,
-        .set_float_mode,
-        .type_info,
-        .work_item_id,
-        .work_group_size,
-        .work_group_id,
-        =&gt; {
-            _ = try astrl.expr(args[0], block, ResultInfo.type_only);
-            return false;
-        },
-        // These builtins take a single argument with no result information and do not consume their
-        // result pointer.
-        .int_from_ptr,
-        .int_from_enum,
-        .abs,
-        .tag_name,
-        .type_name,
-        .Frame,
-        .int_from_float,
-        .float_from_int,
-        .ptr_from_int,
-        .enum_from_int,
-        .float_cast,
-        .int_cast,
-        .truncate,
-        .error_cast,
-        .ptr_cast,
-        .align_cast,
-        .addrspace_cast,
-        .const_cast,
-        .volatile_cast,
-        .clz,
-        .ctz,
-        .pop_count,
-        .byte_swap,
-        .bit_reverse,
-        =&gt; {
-            _ = try astrl.expr(args[0], block, ResultInfo.none);
-            return false;
-        },
-        .div_exact,
-        .div_floor,
-        .div_trunc,
-        .mod,
-        .rem,
-        =&gt; {
-            _ = try astrl.expr(args[0], block, ResultInfo.none);
-            _ = try astrl.expr(args[1], block, ResultInfo.none);
-            return false;
-        },
-        .shl_exact, .shr_exact =&gt; {
-            _ = try astrl.expr(args[0], block, ResultInfo.none);
-            _ = try astrl.expr(args[1], block, ResultInfo.type_only);
-            return false;
-        },
-        .bit_offset_of,
-        .offset_of,
-        .has_decl,
-        .has_field,
-        .field,
-        .FieldType,
-        =&gt; {
-            _ = try astrl.expr(args[0], block, ResultInfo.type_only);
-            _ = try astrl.expr(args[1], block, ResultInfo.type_only);
-            return false;
-        },
-        .field_parent_ptr =&gt; {
-            _ = try astrl.expr(args[0], block, ResultInfo.type_only);
-            _ = try astrl.expr(args[1], block, ResultInfo.none);
-            return false;
-        },
-        .wasm_memory_grow =&gt; {
-            _ = try astrl.expr(args[0], block, ResultInfo.type_only);
-            _ = try astrl.expr(args[1], block, ResultInfo.type_only);
-            return false;
-        },
-        .c_define =&gt; {
-            _ = try astrl.expr(args[0], block, ResultInfo.type_only);
-            _ = try astrl.expr(args[1], block, ResultInfo.none);
-            return false;
-        },
-        .reduce =&gt; {
-            _ = try astrl.expr(args[0], block, ResultInfo.type_only);
-            _ = try astrl.expr(args[1], block, ResultInfo.none);
-            return false;
-        },
-        .add_with_overflow, .sub_with_overflow, .mul_with_overflow, .shl_with_overflow =&gt; {
-            _ = try astrl.expr(args[0], block, ResultInfo.none);
-            _ = try astrl.expr(args[1], block, ResultInfo.none);
-            return false;
-        },
-        .atomic_load =&gt; {
-            _ = try astrl.expr(args[0], block, ResultInfo.type_only);
-            _ = try astrl.expr(args[1], block, ResultInfo.none);
-            _ = try astrl.expr(args[2], block, ResultInfo.type_only);
-            return false;
-        },
-        .atomic_rmw =&gt; {
-            _ = try astrl.expr(args[0], block, ResultInfo.type_only);
-            _ = try astrl.expr(args[1], block, ResultInfo.none);
-            _ = try astrl.expr(args[2], block, ResultInfo.type_only);
-            _ = try astrl.expr(args[3], block, ResultInfo.type_only);
-            _ = try astrl.expr(args[4], block, ResultInfo.type_only);
-            return false;
-        },
-        .atomic_store =&gt; {
-            _ = try astrl.expr(args[0], block, ResultInfo.type_only);
-            _ = try astrl.expr(args[1], block, ResultInfo.none);
-            _ = try astrl.expr(args[2], block, ResultInfo.type_only);
-            _ = try astrl.expr(args[3], block, ResultInfo.type_only);
-            return false;
-        },
-        .mul_add =&gt; {
-            _ = try astrl.expr(args[0], block, ResultInfo.type_only);
-            _ = try astrl.expr(args[1], block, ResultInfo.type_only);
-            _ = try astrl.expr(args[2], block, ResultInfo.type_only);
-            return false;
-        },
-        .call =&gt; {
-            _ = try astrl.expr(args[0], block, ResultInfo.type_only);
-            _ = try astrl.expr(args[1], block, ResultInfo.none);
-            _ = try astrl.expr(args[2], block, ResultInfo.none);
-            return false;
-        },
-        .memcpy, .memmove =&gt; {
-            _ = try astrl.expr(args[0], block, ResultInfo.none);
-            _ = try astrl.expr(args[1], block, ResultInfo.none);
-            return false;
-        },
-        .memset =&gt; {
-            _ = try astrl.expr(args[0], block, ResultInfo.none);
-            _ = try astrl.expr(args[1], block, ResultInfo.type_only);
-            return false;
-        },
-        .shuffle =&gt; {
-            _ = try astrl.expr(args[0], block, ResultInfo.type_only);
-            _ = try astrl.expr(args[1], block, ResultInfo.none);
-            _ = try astrl.expr(args[2], block, ResultInfo.none);
-            _ = try astrl.expr(args[3], block, ResultInfo.none);
-            return false;
-        },
-        .select =&gt; {
-            _ = try astrl.expr(args[0], block, ResultInfo.type_only);
-            _ = try astrl.expr(args[1], block, ResultInfo.none);
-            _ = try astrl.expr(args[2], block, ResultInfo.none);
-            _ = try astrl.expr(args[3], block, ResultInfo.none);
-            return false;
-        },
-        .Int =&gt; {
-            _ = try astrl.expr(args[0], block, ResultInfo.type_only);
-            _ = try astrl.expr(args[1], block, ResultInfo.type_only);
-            return false;
-        },
-        .Pointer =&gt; {
-            _ = try astrl.expr(args[0], block, ResultInfo.type_only);
-            _ = try astrl.expr(args[1], block, ResultInfo.type_only);
-            _ = try astrl.expr(args[2], block, ResultInfo.type_only);
-            _ = try astrl.expr(args[3], block, ResultInfo.type_only);
-            return false;
-        },
-        .Fn =&gt; {
-            _ = try astrl.expr(args[0], block, ResultInfo.type_only);
-            _ = try astrl.expr(args[1], block, ResultInfo.type_only);
-            _ = try astrl.expr(args[2], block, ResultInfo.type_only);
-            _ = try astrl.expr(args[3], block, ResultInfo.type_only);
-            return false;
-        },
-        .Struct =&gt; {
-            _ = try astrl.expr(args[0], block, ResultInfo.type_only);
-            _ = try astrl.expr(args[1], block, ResultInfo.type_only);
-            _ = try astrl.expr(args[2], block, ResultInfo.type_only);
-            _ = try astrl.expr(args[3], block, ResultInfo.type_only);
-            _ = try astrl.expr(args[4], block, ResultInfo.type_only);
-            return false;
-        },
-        .Union =&gt; {
-            _ = try astrl.expr(args[0], block, ResultInfo.type_only);
-            _ = try astrl.expr(args[1], block, ResultInfo.type_only);
-            _ = try astrl.expr(args[2], block, ResultInfo.type_only);
-            _ = try astrl.expr(args[3], block, ResultInfo.type_only);
-            _ = try astrl.expr(args[4], block, ResultInfo.type_only);
-            return false;
-        },
-        .Enum =&gt; {
-            _ = try astrl.expr(args[0], block, ResultInfo.type_only);
-            _ = try astrl.expr(args[1], block, ResultInfo.type_only);
-            _ = try astrl.expr(args[2], block, ResultInfo.type_only);
-            _ = try astrl.expr(args[3], block, ResultInfo.type_only);
-            return false;
-        },
-        .Vector =&gt; {
-            _ = try astrl.expr(args[0], block, ResultInfo.type_only);
-            _ = try astrl.expr(args[1], block, ResultInfo.type_only);
-            return false;
-        },
-        .prefetch =&gt; {
-            _ = try astrl.expr(args[0], block, ResultInfo.none);
-            _ = try astrl.expr(args[1], block, ResultInfo.type_only);
-            return false;
-        },
-        .c_va_arg =&gt; {
-            _ = try astrl.expr(args[0], block, ResultInfo.none);
-            _ = try astrl.expr(args[1], block, ResultInfo.type_only);
-            return false;
-        },
-        .c_va_copy =&gt; {
-            _ = try astrl.expr(args[0], block, ResultInfo.none);
-            return false;
-        },
-        .c_va_end =&gt; {
-            _ = try astrl.expr(args[0], block, ResultInfo.none);
-            return false;
-        },
-        .cmpxchg_strong, .cmpxchg_weak =&gt; {
-            _ = try astrl.expr(args[0], block, ResultInfo.none);
-            _ = try astrl.expr(args[1], block, ResultInfo.type_only);
-            _ = try astrl.expr(args[2], block, ResultInfo.type_only);
-            _ = try astrl.expr(args[3], block, ResultInfo.type_only);
-            _ = try astrl.expr(args[4], block, ResultInfo.type_only);
-            return false;
-        },
-    }
-}</pre>
+    <pre><a id="L1"></a>//! AstRlAnnotate is a simple pass which runs over the AST before AstGen to
+<a id="L2"></a>//! determine which expressions require result locations.
+<a id="L3"></a>//!
+<a id="L4"></a>//! In some cases, AstGen can choose whether to provide a result pointer or to
+<a id="L5"></a>//! just use standard `break` instructions from a block. The latter choice can
+<a id="L6"></a>//! result in more efficient ZIR and runtime code, but does not allow for RLS to
+<a id="L7"></a>//! occur. Thus, we want to provide a real result pointer (from an alloc) only
+<a id="L8"></a>//! when necessary.
+<a id="L9"></a>//!
+<a id="L10"></a>//! To achieve this, we need to determine which expressions require a result
+<a id="L11"></a>//! pointer. This pass is responsible for analyzing all syntax forms which may
+<a id="L12"></a>//! provide a result location and, if sub-expressions consume this result
+<a id="L13"></a>//! pointer non-trivially (e.g. writing through field pointers), marking the
+<a id="L14"></a>//! node as requiring a result location.
+<a id="L15"></a>
+<a id="L16"></a>const std = @import("std");
+<a id="L17"></a>const AstRlAnnotate = @This();
+<a id="L18"></a>const Ast = std.zig.Ast;
+<a id="L19"></a>const Allocator = std.mem.Allocator;
+<a id="L20"></a>const AutoHashMapUnmanaged = std.AutoHashMapUnmanaged;
+<a id="L21"></a>const BuiltinFn = std.zig.BuiltinFn;
+<a id="L22"></a>const assert = std.debug.assert;
+<a id="L23"></a>
+<a id="L24"></a>gpa: Allocator,
+<a id="L25"></a>arena: Allocator,
+<a id="L26"></a>tree: *const Ast,
+<a id="L27"></a>
+<a id="L28"></a>/// Certain nodes are placed in this set under the following conditions:
+<a id="L29"></a>/// * if-else: either branch consumes the result location
+<a id="L30"></a>/// * labeled block: any break consumes the result location
+<a id="L31"></a>/// * switch: any prong consumes the result location
+<a id="L32"></a>/// * orelse/catch: the RHS expression consumes the result location
+<a id="L33"></a>/// * while/for: any break consumes the result location
+<a id="L34"></a>/// * @as: the second operand consumes the result location
+<a id="L35"></a>/// * const: the init expression consumes the result location
+<a id="L36"></a>/// * return: the return expression consumes the result location
+<a id="L37"></a>nodes_need_rl: RlNeededSet = .{},
+<a id="L38"></a>
+<a id="L39"></a>pub const RlNeededSet = AutoHashMapUnmanaged(Ast.Node.Index, void);
+<a id="L40"></a>
+<a id="L41"></a>const ResultInfo = packed struct {
+<a id="L42"></a>    /// Do we have a known result type?
+<a id="L43"></a>    have_type: bool,
+<a id="L44"></a>    /// Do we (potentially) have a result pointer? Note that this pointer's type
+<a id="L45"></a>    /// may not be known due to it being an inferred alloc.
+<a id="L46"></a>    have_ptr: bool,
+<a id="L47"></a>
+<a id="L48"></a>    const none: ResultInfo = .{ .have_type = false, .have_ptr = false };
+<a id="L49"></a>    const typed_ptr: ResultInfo = .{ .have_type = true, .have_ptr = true };
+<a id="L50"></a>    const inferred_ptr: ResultInfo = .{ .have_type = false, .have_ptr = true };
+<a id="L51"></a>    const type_only: ResultInfo = .{ .have_type = true, .have_ptr = false };
+<a id="L52"></a>};
+<a id="L53"></a>
+<a id="L54"></a>/// A labeled block or a loop. When this block is broken from, `consumes_res_ptr`
+<a id="L55"></a>/// should be set if the break expression consumed the result pointer.
+<a id="L56"></a>const Block = struct {
+<a id="L57"></a>    parent: ?*Block,
+<a id="L58"></a>    label: ?[]const u8,
+<a id="L59"></a>    is_loop: bool,
+<a id="L60"></a>    ri: ResultInfo,
+<a id="L61"></a>    consumes_res_ptr: bool,
+<a id="L62"></a>};
+<a id="L63"></a>
+<a id="L64"></a>pub fn annotate(gpa: Allocator, arena: Allocator, tree: Ast) Allocator.Error!RlNeededSet {
+<a id="L65"></a>    var astrl: AstRlAnnotate = .{
+<a id="L66"></a>        .gpa = gpa,
+<a id="L67"></a>        .arena = arena,
+<a id="L68"></a>        .tree = &amp;tree,
+<a id="L69"></a>    };
+<a id="L70"></a>    defer astrl.deinit(gpa);
+<a id="L71"></a>
+<a id="L72"></a>    if (tree.errors.len != 0) {
+<a id="L73"></a>        // We can't perform analysis on a broken AST. AstGen will not run in
+<a id="L74"></a>        // this case.
+<a id="L75"></a>        return .{};
+<a id="L76"></a>    }
+<a id="L77"></a>
+<a id="L78"></a>    for (tree.containerDeclRoot().ast.members) |member_node| {
+<a id="L79"></a>        _ = try astrl.expr(member_node, null, ResultInfo.none);
+<a id="L80"></a>    }
+<a id="L81"></a>
+<a id="L82"></a>    return astrl.nodes_need_rl.move();
+<a id="L83"></a>}
+<a id="L84"></a>
+<a id="L85"></a>fn deinit(astrl: *AstRlAnnotate, gpa: Allocator) void {
+<a id="L86"></a>    astrl.nodes_need_rl.deinit(gpa);
+<a id="L87"></a>}
+<a id="L88"></a>
+<a id="L89"></a>fn containerDecl(
+<a id="L90"></a>    astrl: *AstRlAnnotate,
+<a id="L91"></a>    block: ?*Block,
+<a id="L92"></a>    full: Ast.full.ContainerDecl,
+<a id="L93"></a>) !void {
+<a id="L94"></a>    const tree = astrl.tree;
+<a id="L95"></a>    switch (tree.tokenTag(full.ast.main_token)) {
+<a id="L96"></a>        .keyword_struct =&gt; {
+<a id="L97"></a>            if (full.ast.arg.unwrap()) |arg| {
+<a id="L98"></a>                _ = try astrl.expr(arg, block, ResultInfo.type_only);
+<a id="L99"></a>            }
+<a id="L100"></a>            for (full.ast.members) |member_node| {
+<a id="L101"></a>                _ = try astrl.expr(member_node, block, ResultInfo.none);
+<a id="L102"></a>            }
+<a id="L103"></a>        },
+<a id="L104"></a>        .keyword_union =&gt; {
+<a id="L105"></a>            if (full.ast.arg.unwrap()) |arg| {
+<a id="L106"></a>                _ = try astrl.expr(arg, block, ResultInfo.type_only);
+<a id="L107"></a>            }
+<a id="L108"></a>            for (full.ast.members) |member_node| {
+<a id="L109"></a>                _ = try astrl.expr(member_node, block, ResultInfo.none);
+<a id="L110"></a>            }
+<a id="L111"></a>        },
+<a id="L112"></a>        .keyword_enum =&gt; {
+<a id="L113"></a>            if (full.ast.arg.unwrap()) |arg| {
+<a id="L114"></a>                _ = try astrl.expr(arg, block, ResultInfo.type_only);
+<a id="L115"></a>            }
+<a id="L116"></a>            for (full.ast.members) |member_node| {
+<a id="L117"></a>                _ = try astrl.expr(member_node, block, ResultInfo.none);
+<a id="L118"></a>            }
+<a id="L119"></a>        },
+<a id="L120"></a>        .keyword_opaque =&gt; {
+<a id="L121"></a>            for (full.ast.members) |member_node| {
+<a id="L122"></a>                _ = try astrl.expr(member_node, block, ResultInfo.none);
+<a id="L123"></a>            }
+<a id="L124"></a>        },
+<a id="L125"></a>        else =&gt; unreachable,
+<a id="L126"></a>    }
+<a id="L127"></a>}
+<a id="L128"></a>
+<a id="L129"></a>/// Returns true if `rl` provides a result pointer and the expression consumes it.
+<a id="L130"></a>fn expr(astrl: *AstRlAnnotate, node: Ast.Node.Index, block: ?*Block, ri: ResultInfo) Allocator.Error!bool {
+<a id="L131"></a>    const tree = astrl.tree;
+<a id="L132"></a>    switch (tree.nodeTag(node)) {
+<a id="L133"></a>        .root,
+<a id="L134"></a>        .switch_case_one,
+<a id="L135"></a>        .switch_case_inline_one,
+<a id="L136"></a>        .switch_case,
+<a id="L137"></a>        .switch_case_inline,
+<a id="L138"></a>        .switch_range,
+<a id="L139"></a>        .for_range,
+<a id="L140"></a>        .asm_output,
+<a id="L141"></a>        .asm_input,
+<a id="L142"></a>        =&gt; unreachable,
+<a id="L143"></a>
+<a id="L144"></a>        .@"errdefer" =&gt; {
+<a id="L145"></a>            _ = try astrl.expr(tree.nodeData(node).opt_token_and_node[1], block, ResultInfo.none);
+<a id="L146"></a>            return false;
+<a id="L147"></a>        },
+<a id="L148"></a>        .@"defer" =&gt; {
+<a id="L149"></a>            _ = try astrl.expr(tree.nodeData(node).node, block, ResultInfo.none);
+<a id="L150"></a>            return false;
+<a id="L151"></a>        },
+<a id="L152"></a>
+<a id="L153"></a>        .container_field_init,
+<a id="L154"></a>        .container_field_align,
+<a id="L155"></a>        .container_field,
+<a id="L156"></a>        =&gt; {
+<a id="L157"></a>            const full = tree.fullContainerField(node).?;
+<a id="L158"></a>            const type_expr = full.ast.type_expr.unwrap().?;
+<a id="L159"></a>            _ = try astrl.expr(type_expr, block, ResultInfo.type_only);
+<a id="L160"></a>            if (full.ast.align_expr.unwrap()) |align_expr| {
+<a id="L161"></a>                _ = try astrl.expr(align_expr, block, ResultInfo.type_only);
+<a id="L162"></a>            }
+<a id="L163"></a>            if (full.ast.value_expr.unwrap()) |value_expr| {
+<a id="L164"></a>                _ = try astrl.expr(value_expr, block, ResultInfo.type_only);
+<a id="L165"></a>            }
+<a id="L166"></a>            return false;
+<a id="L167"></a>        },
+<a id="L168"></a>        .test_decl =&gt; {
+<a id="L169"></a>            _ = try astrl.expr(tree.nodeData(node).opt_token_and_node[1], block, ResultInfo.none);
+<a id="L170"></a>            return false;
+<a id="L171"></a>        },
+<a id="L172"></a>        .global_var_decl,
+<a id="L173"></a>        .local_var_decl,
+<a id="L174"></a>        .simple_var_decl,
+<a id="L175"></a>        .aligned_var_decl,
+<a id="L176"></a>        =&gt; {
+<a id="L177"></a>            const full = tree.fullVarDecl(node).?;
+<a id="L178"></a>            const init_ri = if (full.ast.type_node.unwrap()) |type_node| init_ri: {
+<a id="L179"></a>                _ = try astrl.expr(type_node, block, ResultInfo.type_only);
+<a id="L180"></a>                break :init_ri ResultInfo.typed_ptr;
+<a id="L181"></a>            } else ResultInfo.inferred_ptr;
+<a id="L182"></a>            const init_node = full.ast.init_node.unwrap() orelse {
+<a id="L183"></a>                // No init node, so we're done.
+<a id="L184"></a>                return false;
+<a id="L185"></a>            };
+<a id="L186"></a>            switch (tree.tokenTag(full.ast.mut_token)) {
+<a id="L187"></a>                .keyword_const =&gt; {
+<a id="L188"></a>                    const init_consumes_rl = try astrl.expr(init_node, block, init_ri);
+<a id="L189"></a>                    if (init_consumes_rl) {
+<a id="L190"></a>                        try astrl.nodes_need_rl.putNoClobber(astrl.gpa, node, {});
+<a id="L191"></a>                    }
+<a id="L192"></a>                    return false;
+<a id="L193"></a>                },
+<a id="L194"></a>                .keyword_var =&gt; {
+<a id="L195"></a>                    // We'll create an alloc either way, so don't care if the
+<a id="L196"></a>                    // result pointer is consumed.
+<a id="L197"></a>                    _ = try astrl.expr(init_node, block, init_ri);
+<a id="L198"></a>                    return false;
+<a id="L199"></a>                },
+<a id="L200"></a>                else =&gt; unreachable,
+<a id="L201"></a>            }
+<a id="L202"></a>        },
+<a id="L203"></a>        .assign_destructure =&gt; {
+<a id="L204"></a>            const full = tree.assignDestructure(node);
+<a id="L205"></a>            for (full.ast.variables) |variable_node| {
+<a id="L206"></a>                _ = try astrl.expr(variable_node, block, ResultInfo.none);
+<a id="L207"></a>            }
+<a id="L208"></a>            // We don't need to gather any meaningful data here, because destructures always use RLS
+<a id="L209"></a>            _ = try astrl.expr(full.ast.value_expr, block, ResultInfo.none);
+<a id="L210"></a>            return false;
+<a id="L211"></a>        },
+<a id="L212"></a>        .assign =&gt; {
+<a id="L213"></a>            const lhs, const rhs = tree.nodeData(node).node_and_node;
+<a id="L214"></a>            _ = try astrl.expr(lhs, block, ResultInfo.none);
+<a id="L215"></a>            _ = try astrl.expr(rhs, block, ResultInfo.typed_ptr);
+<a id="L216"></a>            return false;
+<a id="L217"></a>        },
+<a id="L218"></a>        .assign_shl,
+<a id="L219"></a>        .assign_shl_sat,
+<a id="L220"></a>        .assign_shr,
+<a id="L221"></a>        .assign_bit_and,
+<a id="L222"></a>        .assign_bit_or,
+<a id="L223"></a>        .assign_bit_xor,
+<a id="L224"></a>        .assign_div,
+<a id="L225"></a>        .assign_sub,
+<a id="L226"></a>        .assign_sub_wrap,
+<a id="L227"></a>        .assign_sub_sat,
+<a id="L228"></a>        .assign_mod,
+<a id="L229"></a>        .assign_add,
+<a id="L230"></a>        .assign_add_wrap,
+<a id="L231"></a>        .assign_add_sat,
+<a id="L232"></a>        .assign_mul,
+<a id="L233"></a>        .assign_mul_wrap,
+<a id="L234"></a>        .assign_mul_sat,
+<a id="L235"></a>        =&gt; {
+<a id="L236"></a>            const lhs, const rhs = tree.nodeData(node).node_and_node;
+<a id="L237"></a>            _ = try astrl.expr(lhs, block, ResultInfo.none);
+<a id="L238"></a>            _ = try astrl.expr(rhs, block, ResultInfo.none);
+<a id="L239"></a>            return false;
+<a id="L240"></a>        },
+<a id="L241"></a>        .shl, .shr =&gt; {
+<a id="L242"></a>            const lhs, const rhs = tree.nodeData(node).node_and_node;
+<a id="L243"></a>            _ = try astrl.expr(lhs, block, ResultInfo.none);
+<a id="L244"></a>            _ = try astrl.expr(rhs, block, ResultInfo.type_only);
+<a id="L245"></a>            return false;
+<a id="L246"></a>        },
+<a id="L247"></a>        .add,
+<a id="L248"></a>        .add_wrap,
+<a id="L249"></a>        .add_sat,
+<a id="L250"></a>        .sub,
+<a id="L251"></a>        .sub_wrap,
+<a id="L252"></a>        .sub_sat,
+<a id="L253"></a>        .mul,
+<a id="L254"></a>        .mul_wrap,
+<a id="L255"></a>        .mul_sat,
+<a id="L256"></a>        .div,
+<a id="L257"></a>        .mod,
+<a id="L258"></a>        .shl_sat,
+<a id="L259"></a>        .bit_and,
+<a id="L260"></a>        .bit_or,
+<a id="L261"></a>        .bit_xor,
+<a id="L262"></a>        .bang_equal,
+<a id="L263"></a>        .equal_equal,
+<a id="L264"></a>        .greater_than,
+<a id="L265"></a>        .greater_or_equal,
+<a id="L266"></a>        .less_than,
+<a id="L267"></a>        .less_or_equal,
+<a id="L268"></a>        .array_cat,
+<a id="L269"></a>        =&gt; {
+<a id="L270"></a>            const lhs, const rhs = tree.nodeData(node).node_and_node;
+<a id="L271"></a>            _ = try astrl.expr(lhs, block, ResultInfo.none);
+<a id="L272"></a>            _ = try astrl.expr(rhs, block, ResultInfo.none);
+<a id="L273"></a>            return false;
+<a id="L274"></a>        },
+<a id="L275"></a>
+<a id="L276"></a>        .array_mult =&gt; {
+<a id="L277"></a>            const lhs, const rhs = tree.nodeData(node).node_and_node;
+<a id="L278"></a>            _ = try astrl.expr(lhs, block, ResultInfo.none);
+<a id="L279"></a>            _ = try astrl.expr(rhs, block, ResultInfo.type_only);
+<a id="L280"></a>            return false;
+<a id="L281"></a>        },
+<a id="L282"></a>        .error_union, .merge_error_sets =&gt; {
+<a id="L283"></a>            const lhs, const rhs = tree.nodeData(node).node_and_node;
+<a id="L284"></a>            _ = try astrl.expr(lhs, block, ResultInfo.none);
+<a id="L285"></a>            _ = try astrl.expr(rhs, block, ResultInfo.none);
+<a id="L286"></a>            return false;
+<a id="L287"></a>        },
+<a id="L288"></a>        .bool_and,
+<a id="L289"></a>        .bool_or,
+<a id="L290"></a>        =&gt; {
+<a id="L291"></a>            const lhs, const rhs = tree.nodeData(node).node_and_node;
+<a id="L292"></a>            _ = try astrl.expr(lhs, block, ResultInfo.type_only);
+<a id="L293"></a>            _ = try astrl.expr(rhs, block, ResultInfo.type_only);
+<a id="L294"></a>            return false;
+<a id="L295"></a>        },
+<a id="L296"></a>        .bool_not =&gt; {
+<a id="L297"></a>            _ = try astrl.expr(tree.nodeData(node).node, block, ResultInfo.type_only);
+<a id="L298"></a>            return false;
+<a id="L299"></a>        },
+<a id="L300"></a>        .bit_not, .negation, .negation_wrap =&gt; {
+<a id="L301"></a>            _ = try astrl.expr(tree.nodeData(node).node, block, ResultInfo.none);
+<a id="L302"></a>            return false;
+<a id="L303"></a>        },
+<a id="L304"></a>
+<a id="L305"></a>        // These nodes are leaves and never consume a result location.
+<a id="L306"></a>        .identifier,
+<a id="L307"></a>        .string_literal,
+<a id="L308"></a>        .multiline_string_literal,
+<a id="L309"></a>        .number_literal,
+<a id="L310"></a>        .unreachable_literal,
+<a id="L311"></a>        .asm_simple,
+<a id="L312"></a>        .@"asm",
+<a id="L313"></a>        .enum_literal,
+<a id="L314"></a>        .error_value,
+<a id="L315"></a>        .anyframe_literal,
+<a id="L316"></a>        .@"continue",
+<a id="L317"></a>        .char_literal,
+<a id="L318"></a>        .error_set_decl,
+<a id="L319"></a>        =&gt; return false,
+<a id="L320"></a>
+<a id="L321"></a>        .builtin_call_two,
+<a id="L322"></a>        .builtin_call_two_comma,
+<a id="L323"></a>        .builtin_call,
+<a id="L324"></a>        .builtin_call_comma,
+<a id="L325"></a>        =&gt; {
+<a id="L326"></a>            var buf: [2]Ast.Node.Index = undefined;
+<a id="L327"></a>            const params = tree.builtinCallParams(&amp;buf, node).?;
+<a id="L328"></a>            return astrl.builtinCall(block, ri, node, params);
+<a id="L329"></a>        },
+<a id="L330"></a>
+<a id="L331"></a>        .call_one,
+<a id="L332"></a>        .call_one_comma,
+<a id="L333"></a>        .call,
+<a id="L334"></a>        .call_comma,
+<a id="L335"></a>        =&gt; {
+<a id="L336"></a>            var buf: [1]Ast.Node.Index = undefined;
+<a id="L337"></a>            const full = tree.fullCall(&amp;buf, node).?;
+<a id="L338"></a>            _ = try astrl.expr(full.ast.fn_expr, block, ResultInfo.none);
+<a id="L339"></a>            for (full.ast.params) |param_node| {
+<a id="L340"></a>                _ = try astrl.expr(param_node, block, ResultInfo.type_only);
+<a id="L341"></a>            }
+<a id="L342"></a>            return false; // TODO: once function calls are passed result locations this will change
+<a id="L343"></a>        },
+<a id="L344"></a>
+<a id="L345"></a>        .@"return" =&gt; {
+<a id="L346"></a>            if (tree.nodeData(node).opt_node.unwrap()) |lhs| {
+<a id="L347"></a>                const ret_val_consumes_rl = try astrl.expr(lhs, block, ResultInfo.typed_ptr);
+<a id="L348"></a>                if (ret_val_consumes_rl) {
+<a id="L349"></a>                    try astrl.nodes_need_rl.putNoClobber(astrl.gpa, node, {});
+<a id="L350"></a>                }
+<a id="L351"></a>            }
+<a id="L352"></a>            return false;
+<a id="L353"></a>        },
+<a id="L354"></a>
+<a id="L355"></a>        .field_access =&gt; {
+<a id="L356"></a>            const lhs, _ = tree.nodeData(node).node_and_token;
+<a id="L357"></a>            _ = try astrl.expr(lhs, block, ResultInfo.none);
+<a id="L358"></a>            return false;
+<a id="L359"></a>        },
+<a id="L360"></a>
+<a id="L361"></a>        .if_simple, .@"if" =&gt; {
+<a id="L362"></a>            const full = tree.fullIf(node).?;
+<a id="L363"></a>            if (full.error_token != null or full.payload_token != null) {
+<a id="L364"></a>                _ = try astrl.expr(full.ast.cond_expr, block, ResultInfo.none);
+<a id="L365"></a>            } else {
+<a id="L366"></a>                _ = try astrl.expr(full.ast.cond_expr, block, ResultInfo.type_only); // bool
+<a id="L367"></a>            }
+<a id="L368"></a>
+<a id="L369"></a>            if (full.ast.else_expr.unwrap()) |else_expr| {
+<a id="L370"></a>                const then_uses_rl = try astrl.expr(full.ast.then_expr, block, ri);
+<a id="L371"></a>                const else_uses_rl = try astrl.expr(else_expr, block, ri);
+<a id="L372"></a>                const uses_rl = then_uses_rl or else_uses_rl;
+<a id="L373"></a>                if (uses_rl) try astrl.nodes_need_rl.putNoClobber(astrl.gpa, node, {});
+<a id="L374"></a>                return uses_rl;
+<a id="L375"></a>            } else {
+<a id="L376"></a>                _ = try astrl.expr(full.ast.then_expr, block, ResultInfo.none);
+<a id="L377"></a>                return false;
+<a id="L378"></a>            }
+<a id="L379"></a>        },
+<a id="L380"></a>
+<a id="L381"></a>        .while_simple, .while_cont, .@"while" =&gt; {
+<a id="L382"></a>            const full = tree.fullWhile(node).?;
+<a id="L383"></a>            const label: ?[]const u8 = if (full.label_token) |label_token| label: {
+<a id="L384"></a>                break :label try astrl.identString(label_token);
+<a id="L385"></a>            } else null;
+<a id="L386"></a>            if (full.error_token != null or full.payload_token != null) {
+<a id="L387"></a>                _ = try astrl.expr(full.ast.cond_expr, block, ResultInfo.none);
+<a id="L388"></a>            } else {
+<a id="L389"></a>                _ = try astrl.expr(full.ast.cond_expr, block, ResultInfo.type_only); // bool
+<a id="L390"></a>            }
+<a id="L391"></a>            var new_block: Block = .{
+<a id="L392"></a>                .parent = block,
+<a id="L393"></a>                .label = label,
+<a id="L394"></a>                .is_loop = true,
+<a id="L395"></a>                .ri = ri,
+<a id="L396"></a>                .consumes_res_ptr = false,
+<a id="L397"></a>            };
+<a id="L398"></a>            if (full.ast.cont_expr.unwrap()) |cont_expr| {
+<a id="L399"></a>                _ = try astrl.expr(cont_expr, &amp;new_block, ResultInfo.none);
+<a id="L400"></a>            }
+<a id="L401"></a>            _ = try astrl.expr(full.ast.then_expr, &amp;new_block, ResultInfo.none);
+<a id="L402"></a>            const else_consumes_rl = if (full.ast.else_expr.unwrap()) |else_expr| else_rl: {
+<a id="L403"></a>                break :else_rl try astrl.expr(else_expr, block, ri);
+<a id="L404"></a>            } else false;
+<a id="L405"></a>            if (new_block.consumes_res_ptr or else_consumes_rl) {
+<a id="L406"></a>                try astrl.nodes_need_rl.putNoClobber(astrl.gpa, node, {});
+<a id="L407"></a>                return true;
+<a id="L408"></a>            } else {
+<a id="L409"></a>                return false;
+<a id="L410"></a>            }
+<a id="L411"></a>        },
+<a id="L412"></a>
+<a id="L413"></a>        .for_simple, .@"for" =&gt; {
+<a id="L414"></a>            const full = tree.fullFor(node).?;
+<a id="L415"></a>            const label: ?[]const u8 = if (full.label_token) |label_token| label: {
+<a id="L416"></a>                break :label try astrl.identString(label_token);
+<a id="L417"></a>            } else null;
+<a id="L418"></a>            for (full.ast.inputs) |input| {
+<a id="L419"></a>                if (tree.nodeTag(input) == .for_range) {
+<a id="L420"></a>                    const lhs, const opt_rhs = tree.nodeData(input).node_and_opt_node;
+<a id="L421"></a>                    _ = try astrl.expr(lhs, block, ResultInfo.type_only);
+<a id="L422"></a>                    if (opt_rhs.unwrap()) |rhs| {
+<a id="L423"></a>                        _ = try astrl.expr(rhs, block, ResultInfo.type_only);
+<a id="L424"></a>                    }
+<a id="L425"></a>                } else {
+<a id="L426"></a>                    _ = try astrl.expr(input, block, ResultInfo.none);
+<a id="L427"></a>                }
+<a id="L428"></a>            }
+<a id="L429"></a>            var new_block: Block = .{
+<a id="L430"></a>                .parent = block,
+<a id="L431"></a>                .label = label,
+<a id="L432"></a>                .is_loop = true,
+<a id="L433"></a>                .ri = ri,
+<a id="L434"></a>                .consumes_res_ptr = false,
+<a id="L435"></a>            };
+<a id="L436"></a>            _ = try astrl.expr(full.ast.then_expr, &amp;new_block, ResultInfo.none);
+<a id="L437"></a>            const else_consumes_rl = if (full.ast.else_expr.unwrap()) |else_expr| else_rl: {
+<a id="L438"></a>                break :else_rl try astrl.expr(else_expr, block, ri);
+<a id="L439"></a>            } else false;
+<a id="L440"></a>            if (new_block.consumes_res_ptr or else_consumes_rl) {
+<a id="L441"></a>                try astrl.nodes_need_rl.putNoClobber(astrl.gpa, node, {});
+<a id="L442"></a>                return true;
+<a id="L443"></a>            } else {
+<a id="L444"></a>                return false;
+<a id="L445"></a>            }
+<a id="L446"></a>        },
+<a id="L447"></a>
+<a id="L448"></a>        .slice_open =&gt; {
+<a id="L449"></a>            const sliced, const start = tree.nodeData(node).node_and_node;
+<a id="L450"></a>            _ = try astrl.expr(sliced, block, ResultInfo.none);
+<a id="L451"></a>            _ = try astrl.expr(start, block, ResultInfo.type_only);
+<a id="L452"></a>            return false;
+<a id="L453"></a>        },
+<a id="L454"></a>        .slice =&gt; {
+<a id="L455"></a>            const sliced, const extra_index = tree.nodeData(node).node_and_extra;
+<a id="L456"></a>            const extra = tree.extraData(extra_index, Ast.Node.Slice);
+<a id="L457"></a>            _ = try astrl.expr(sliced, block, ResultInfo.none);
+<a id="L458"></a>            _ = try astrl.expr(extra.start, block, ResultInfo.type_only);
+<a id="L459"></a>            _ = try astrl.expr(extra.end, block, ResultInfo.type_only);
+<a id="L460"></a>            return false;
+<a id="L461"></a>        },
+<a id="L462"></a>        .slice_sentinel =&gt; {
+<a id="L463"></a>            const sliced, const extra_index = tree.nodeData(node).node_and_extra;
+<a id="L464"></a>            const extra = tree.extraData(extra_index, Ast.Node.SliceSentinel);
+<a id="L465"></a>            _ = try astrl.expr(sliced, block, ResultInfo.none);
+<a id="L466"></a>            _ = try astrl.expr(extra.start, block, ResultInfo.type_only);
+<a id="L467"></a>            if (extra.end.unwrap()) |end| {
+<a id="L468"></a>                _ = try astrl.expr(end, block, ResultInfo.type_only);
+<a id="L469"></a>            }
+<a id="L470"></a>            _ = try astrl.expr(extra.sentinel, block, ResultInfo.none);
+<a id="L471"></a>            return false;
+<a id="L472"></a>        },
+<a id="L473"></a>        .deref =&gt; {
+<a id="L474"></a>            _ = try astrl.expr(tree.nodeData(node).node, block, ResultInfo.none);
+<a id="L475"></a>            return false;
+<a id="L476"></a>        },
+<a id="L477"></a>        .address_of =&gt; {
+<a id="L478"></a>            _ = try astrl.expr(tree.nodeData(node).node, block, ResultInfo.none);
+<a id="L479"></a>            return false;
+<a id="L480"></a>        },
+<a id="L481"></a>        .optional_type =&gt; {
+<a id="L482"></a>            _ = try astrl.expr(tree.nodeData(node).node, block, ResultInfo.type_only);
+<a id="L483"></a>            return false;
+<a id="L484"></a>        },
+<a id="L485"></a>        .@"try",
+<a id="L486"></a>        .@"nosuspend",
+<a id="L487"></a>        =&gt; return astrl.expr(tree.nodeData(node).node, block, ri),
+<a id="L488"></a>        .grouped_expression,
+<a id="L489"></a>        .unwrap_optional,
+<a id="L490"></a>        =&gt; return astrl.expr(tree.nodeData(node).node_and_token[0], block, ri),
+<a id="L491"></a>
+<a id="L492"></a>        .block_two,
+<a id="L493"></a>        .block_two_semicolon,
+<a id="L494"></a>        .block,
+<a id="L495"></a>        .block_semicolon,
+<a id="L496"></a>        =&gt; {
+<a id="L497"></a>            var buf: [2]Ast.Node.Index = undefined;
+<a id="L498"></a>            const statements = tree.blockStatements(&amp;buf, node).?;
+<a id="L499"></a>            return astrl.blockExpr(block, ri, node, statements);
+<a id="L500"></a>        },
+<a id="L501"></a>        .anyframe_type =&gt; {
+<a id="L502"></a>            _, const child_type = tree.nodeData(node).token_and_node;
+<a id="L503"></a>            _ = try astrl.expr(child_type, block, ResultInfo.type_only);
+<a id="L504"></a>            return false;
+<a id="L505"></a>        },
+<a id="L506"></a>        .@"catch", .@"orelse" =&gt; {
+<a id="L507"></a>            const lhs, const rhs = tree.nodeData(node).node_and_node;
+<a id="L508"></a>            _ = try astrl.expr(lhs, block, ResultInfo.none);
+<a id="L509"></a>            const rhs_consumes_rl = try astrl.expr(rhs, block, ri);
+<a id="L510"></a>            if (rhs_consumes_rl) {
+<a id="L511"></a>                try astrl.nodes_need_rl.putNoClobber(astrl.gpa, node, {});
+<a id="L512"></a>            }
+<a id="L513"></a>            return rhs_consumes_rl;
+<a id="L514"></a>        },
+<a id="L515"></a>
+<a id="L516"></a>        .ptr_type_aligned,
+<a id="L517"></a>        .ptr_type_sentinel,
+<a id="L518"></a>        .ptr_type,
+<a id="L519"></a>        .ptr_type_bit_range,
+<a id="L520"></a>        =&gt; {
+<a id="L521"></a>            const full = tree.fullPtrType(node).?;
+<a id="L522"></a>            _ = try astrl.expr(full.ast.child_type, block, ResultInfo.type_only);
+<a id="L523"></a>            if (full.ast.sentinel.unwrap()) |sentinel| {
+<a id="L524"></a>                _ = try astrl.expr(sentinel, block, ResultInfo.type_only);
+<a id="L525"></a>            }
+<a id="L526"></a>            if (full.ast.addrspace_node.unwrap()) |addrspace_node| {
+<a id="L527"></a>                _ = try astrl.expr(addrspace_node, block, ResultInfo.type_only);
+<a id="L528"></a>            }
+<a id="L529"></a>            if (full.ast.align_node.unwrap()) |align_node| {
+<a id="L530"></a>                _ = try astrl.expr(align_node, block, ResultInfo.type_only);
+<a id="L531"></a>            }
+<a id="L532"></a>            if (full.ast.bit_range_start.unwrap()) |bit_range_start| {
+<a id="L533"></a>                const bit_range_end = full.ast.bit_range_end.unwrap().?;
+<a id="L534"></a>                _ = try astrl.expr(bit_range_start, block, ResultInfo.type_only);
+<a id="L535"></a>                _ = try astrl.expr(bit_range_end, block, ResultInfo.type_only);
+<a id="L536"></a>            }
+<a id="L537"></a>            return false;
+<a id="L538"></a>        },
+<a id="L539"></a>
+<a id="L540"></a>        .container_decl,
+<a id="L541"></a>        .container_decl_trailing,
+<a id="L542"></a>        .container_decl_arg,
+<a id="L543"></a>        .container_decl_arg_trailing,
+<a id="L544"></a>        .container_decl_two,
+<a id="L545"></a>        .container_decl_two_trailing,
+<a id="L546"></a>        .tagged_union,
+<a id="L547"></a>        .tagged_union_trailing,
+<a id="L548"></a>        .tagged_union_enum_tag,
+<a id="L549"></a>        .tagged_union_enum_tag_trailing,
+<a id="L550"></a>        .tagged_union_two,
+<a id="L551"></a>        .tagged_union_two_trailing,
+<a id="L552"></a>        =&gt; {
+<a id="L553"></a>            var buf: [2]Ast.Node.Index = undefined;
+<a id="L554"></a>            try astrl.containerDecl(block, tree.fullContainerDecl(&amp;buf, node).?);
+<a id="L555"></a>            return false;
+<a id="L556"></a>        },
+<a id="L557"></a>
+<a id="L558"></a>        .@"break" =&gt; {
+<a id="L559"></a>            const opt_label, const opt_rhs = tree.nodeData(node).opt_token_and_opt_node;
+<a id="L560"></a>            const rhs = opt_rhs.unwrap() orelse {
+<a id="L561"></a>                // Breaks with void are not interesting
+<a id="L562"></a>                return false;
+<a id="L563"></a>            };
+<a id="L564"></a>
+<a id="L565"></a>            var opt_cur_block = block;
+<a id="L566"></a>            if (opt_label.unwrap()) |label_token| {
+<a id="L567"></a>                const break_label = try astrl.identString(label_token);
+<a id="L568"></a>                while (opt_cur_block) |cur_block| : (opt_cur_block = cur_block.parent) {
+<a id="L569"></a>                    const block_label = cur_block.label orelse continue;
+<a id="L570"></a>                    if (std.mem.eql(u8, block_label, break_label)) break;
+<a id="L571"></a>                }
+<a id="L572"></a>            } else {
+<a id="L573"></a>                // No label - we're breaking from a loop.
+<a id="L574"></a>                while (opt_cur_block) |cur_block| : (opt_cur_block = cur_block.parent) {
+<a id="L575"></a>                    if (cur_block.is_loop) break;
+<a id="L576"></a>                }
+<a id="L577"></a>            }
+<a id="L578"></a>
+<a id="L579"></a>            if (opt_cur_block) |target_block| {
+<a id="L580"></a>                const consumes_break_rl = try astrl.expr(rhs, block, target_block.ri);
+<a id="L581"></a>                if (consumes_break_rl) target_block.consumes_res_ptr = true;
+<a id="L582"></a>            } else {
+<a id="L583"></a>                // No corresponding scope to break from - AstGen will emit an error.
+<a id="L584"></a>                _ = try astrl.expr(rhs, block, ResultInfo.none);
+<a id="L585"></a>            }
+<a id="L586"></a>
+<a id="L587"></a>            return false;
+<a id="L588"></a>        },
+<a id="L589"></a>
+<a id="L590"></a>        .array_type =&gt; {
+<a id="L591"></a>            const lhs, const rhs = tree.nodeData(node).node_and_node;
+<a id="L592"></a>            _ = try astrl.expr(lhs, block, ResultInfo.type_only);
+<a id="L593"></a>            _ = try astrl.expr(rhs, block, ResultInfo.type_only);
+<a id="L594"></a>            return false;
+<a id="L595"></a>        },
+<a id="L596"></a>        .array_type_sentinel =&gt; {
+<a id="L597"></a>            const len_expr, const extra_index = tree.nodeData(node).node_and_extra;
+<a id="L598"></a>            const extra = tree.extraData(extra_index, Ast.Node.ArrayTypeSentinel);
+<a id="L599"></a>            _ = try astrl.expr(len_expr, block, ResultInfo.type_only);
+<a id="L600"></a>            _ = try astrl.expr(extra.elem_type, block, ResultInfo.type_only);
+<a id="L601"></a>            _ = try astrl.expr(extra.sentinel, block, ResultInfo.type_only);
+<a id="L602"></a>            return false;
+<a id="L603"></a>        },
+<a id="L604"></a>        .array_access =&gt; {
+<a id="L605"></a>            const lhs, const rhs = tree.nodeData(node).node_and_node;
+<a id="L606"></a>            _ = try astrl.expr(lhs, block, ResultInfo.none);
+<a id="L607"></a>            _ = try astrl.expr(rhs, block, ResultInfo.type_only);
+<a id="L608"></a>            return false;
+<a id="L609"></a>        },
+<a id="L610"></a>        .@"comptime" =&gt; {
+<a id="L611"></a>            // AstGen will emit an error if the scope is already comptime, so we can assume it is
+<a id="L612"></a>            // not. This means the result location is not forwarded.
+<a id="L613"></a>            _ = try astrl.expr(tree.nodeData(node).node, block, ResultInfo.none);
+<a id="L614"></a>            return false;
+<a id="L615"></a>        },
+<a id="L616"></a>        .@"switch", .switch_comma =&gt; {
+<a id="L617"></a>            const operand_node, const extra_index = tree.nodeData(node).node_and_extra;
+<a id="L618"></a>            const case_nodes = tree.extraDataSlice(tree.extraData(extra_index, Ast.Node.SubRange), Ast.Node.Index);
+<a id="L619"></a>
+<a id="L620"></a>            _ = try astrl.expr(operand_node, block, ResultInfo.none);
+<a id="L621"></a>
+<a id="L622"></a>            var any_prong_consumed_rl = false;
+<a id="L623"></a>            for (case_nodes) |case_node| {
+<a id="L624"></a>                const case = tree.fullSwitchCase(case_node).?;
+<a id="L625"></a>                for (case.ast.values) |item_node| {
+<a id="L626"></a>                    if (tree.nodeTag(item_node) == .switch_range) {
+<a id="L627"></a>                        const lhs, const rhs = tree.nodeData(item_node).node_and_node;
+<a id="L628"></a>                        _ = try astrl.expr(lhs, block, ResultInfo.none);
+<a id="L629"></a>                        _ = try astrl.expr(rhs, block, ResultInfo.none);
+<a id="L630"></a>                    } else {
+<a id="L631"></a>                        _ = try astrl.expr(item_node, block, ResultInfo.none);
+<a id="L632"></a>                    }
+<a id="L633"></a>                }
+<a id="L634"></a>                if (try astrl.expr(case.ast.target_expr, block, ri)) {
+<a id="L635"></a>                    any_prong_consumed_rl = true;
+<a id="L636"></a>                }
+<a id="L637"></a>            }
+<a id="L638"></a>            if (any_prong_consumed_rl) {
+<a id="L639"></a>                try astrl.nodes_need_rl.putNoClobber(astrl.gpa, node, {});
+<a id="L640"></a>            }
+<a id="L641"></a>            return any_prong_consumed_rl;
+<a id="L642"></a>        },
+<a id="L643"></a>        .@"suspend" =&gt; {
+<a id="L644"></a>            _ = try astrl.expr(tree.nodeData(node).node, block, ResultInfo.none);
+<a id="L645"></a>            return false;
+<a id="L646"></a>        },
+<a id="L647"></a>        .@"resume" =&gt; {
+<a id="L648"></a>            _ = try astrl.expr(tree.nodeData(node).node, block, ResultInfo.none);
+<a id="L649"></a>            return false;
+<a id="L650"></a>        },
+<a id="L651"></a>
+<a id="L652"></a>        .array_init_one,
+<a id="L653"></a>        .array_init_one_comma,
+<a id="L654"></a>        .array_init_dot_two,
+<a id="L655"></a>        .array_init_dot_two_comma,
+<a id="L656"></a>        .array_init_dot,
+<a id="L657"></a>        .array_init_dot_comma,
+<a id="L658"></a>        .array_init,
+<a id="L659"></a>        .array_init_comma,
+<a id="L660"></a>        =&gt; {
+<a id="L661"></a>            var buf: [2]Ast.Node.Index = undefined;
+<a id="L662"></a>            const full = tree.fullArrayInit(&amp;buf, node).?;
+<a id="L663"></a>
+<a id="L664"></a>            if (full.ast.type_expr.unwrap()) |type_expr| {
+<a id="L665"></a>                // Explicitly typed init does not participate in RLS
+<a id="L666"></a>                _ = try astrl.expr(type_expr, block, ResultInfo.none);
+<a id="L667"></a>                for (full.ast.elements) |elem_init| {
+<a id="L668"></a>                    _ = try astrl.expr(elem_init, block, ResultInfo.type_only);
+<a id="L669"></a>                }
+<a id="L670"></a>                return false;
+<a id="L671"></a>            }
+<a id="L672"></a>
+<a id="L673"></a>            if (ri.have_type) {
+<a id="L674"></a>                // Always forward type information
+<a id="L675"></a>                // If we have a result pointer, we use and forward it
+<a id="L676"></a>                for (full.ast.elements) |elem_init| {
+<a id="L677"></a>                    _ = try astrl.expr(elem_init, block, ri);
+<a id="L678"></a>                }
+<a id="L679"></a>                return ri.have_ptr;
+<a id="L680"></a>            } else {
+<a id="L681"></a>                // Untyped init does not consume result location
+<a id="L682"></a>                for (full.ast.elements) |elem_init| {
+<a id="L683"></a>                    _ = try astrl.expr(elem_init, block, ResultInfo.none);
+<a id="L684"></a>                }
+<a id="L685"></a>                return false;
+<a id="L686"></a>            }
+<a id="L687"></a>        },
+<a id="L688"></a>
+<a id="L689"></a>        .struct_init_one,
+<a id="L690"></a>        .struct_init_one_comma,
+<a id="L691"></a>        .struct_init_dot_two,
+<a id="L692"></a>        .struct_init_dot_two_comma,
+<a id="L693"></a>        .struct_init_dot,
+<a id="L694"></a>        .struct_init_dot_comma,
+<a id="L695"></a>        .struct_init,
+<a id="L696"></a>        .struct_init_comma,
+<a id="L697"></a>        =&gt; {
+<a id="L698"></a>            var buf: [2]Ast.Node.Index = undefined;
+<a id="L699"></a>            const full = tree.fullStructInit(&amp;buf, node).?;
+<a id="L700"></a>
+<a id="L701"></a>            if (full.ast.type_expr.unwrap()) |type_expr| {
+<a id="L702"></a>                // Explicitly typed init does not participate in RLS
+<a id="L703"></a>                _ = try astrl.expr(type_expr, block, ResultInfo.none);
+<a id="L704"></a>                for (full.ast.fields) |field_init| {
+<a id="L705"></a>                    _ = try astrl.expr(field_init, block, ResultInfo.type_only);
+<a id="L706"></a>                }
+<a id="L707"></a>                return false;
+<a id="L708"></a>            }
+<a id="L709"></a>
+<a id="L710"></a>            if (ri.have_type) {
+<a id="L711"></a>                // Always forward type information
+<a id="L712"></a>                // If we have a result pointer, we use and forward it
+<a id="L713"></a>                for (full.ast.fields) |field_init| {
+<a id="L714"></a>                    _ = try astrl.expr(field_init, block, ri);
+<a id="L715"></a>                }
+<a id="L716"></a>                return ri.have_ptr;
+<a id="L717"></a>            } else {
+<a id="L718"></a>                // Untyped init does not consume result location
+<a id="L719"></a>                for (full.ast.fields) |field_init| {
+<a id="L720"></a>                    _ = try astrl.expr(field_init, block, ResultInfo.none);
+<a id="L721"></a>                }
+<a id="L722"></a>                return false;
+<a id="L723"></a>            }
+<a id="L724"></a>        },
+<a id="L725"></a>
+<a id="L726"></a>        .fn_proto_simple,
+<a id="L727"></a>        .fn_proto_multi,
+<a id="L728"></a>        .fn_proto_one,
+<a id="L729"></a>        .fn_proto,
+<a id="L730"></a>        .fn_decl,
+<a id="L731"></a>        =&gt; |tag| {
+<a id="L732"></a>            var buf: [1]Ast.Node.Index = undefined;
+<a id="L733"></a>            const full = tree.fullFnProto(&amp;buf, node).?;
+<a id="L734"></a>            const body_node = if (tag == .fn_decl) tree.nodeData(node).node_and_node[1].toOptional() else .none;
+<a id="L735"></a>            {
+<a id="L736"></a>                var it = full.iterate(tree);
+<a id="L737"></a>                while (it.next()) |param| {
+<a id="L738"></a>                    if (param.anytype_ellipsis3 == null) {
+<a id="L739"></a>                        const type_expr = param.type_expr.?;
+<a id="L740"></a>                        _ = try astrl.expr(type_expr, block, ResultInfo.type_only);
+<a id="L741"></a>                    }
+<a id="L742"></a>                }
+<a id="L743"></a>            }
+<a id="L744"></a>            if (full.ast.align_expr.unwrap()) |align_expr| {
+<a id="L745"></a>                _ = try astrl.expr(align_expr, block, ResultInfo.type_only);
+<a id="L746"></a>            }
+<a id="L747"></a>            if (full.ast.addrspace_expr.unwrap()) |addrspace_expr| {
+<a id="L748"></a>                _ = try astrl.expr(addrspace_expr, block, ResultInfo.type_only);
+<a id="L749"></a>            }
+<a id="L750"></a>            if (full.ast.section_expr.unwrap()) |section_expr| {
+<a id="L751"></a>                _ = try astrl.expr(section_expr, block, ResultInfo.type_only);
+<a id="L752"></a>            }
+<a id="L753"></a>            if (full.ast.callconv_expr.unwrap()) |callconv_expr| {
+<a id="L754"></a>                _ = try astrl.expr(callconv_expr, block, ResultInfo.type_only);
+<a id="L755"></a>            }
+<a id="L756"></a>            const return_type = full.ast.return_type.unwrap().?;
+<a id="L757"></a>            _ = try astrl.expr(return_type, block, ResultInfo.type_only);
+<a id="L758"></a>            if (body_node.unwrap()) |body| {
+<a id="L759"></a>                _ = try astrl.expr(body, block, ResultInfo.none);
+<a id="L760"></a>            }
+<a id="L761"></a>            return false;
+<a id="L762"></a>        },
+<a id="L763"></a>    }
+<a id="L764"></a>}
+<a id="L765"></a>
+<a id="L766"></a>fn identString(astrl: *AstRlAnnotate, token: Ast.TokenIndex) ![]const u8 {
+<a id="L767"></a>    const tree = astrl.tree;
+<a id="L768"></a>    assert(tree.tokenTag(token) == .identifier);
+<a id="L769"></a>    const ident_name = tree.tokenSlice(token);
+<a id="L770"></a>    if (!std.mem.startsWith(u8, ident_name, "@")) {
+<a id="L771"></a>        return ident_name;
+<a id="L772"></a>    }
+<a id="L773"></a>    return std.zig.string_literal.parseAlloc(astrl.arena, ident_name[1..]) catch |err| switch (err) {
+<a id="L774"></a>        error.OutOfMemory =&gt; error.OutOfMemory,
+<a id="L775"></a>        error.InvalidLiteral =&gt; "", // This pass can safely return garbage on invalid AST
+<a id="L776"></a>    };
+<a id="L777"></a>}
+<a id="L778"></a>
+<a id="L779"></a>fn blockExpr(astrl: *AstRlAnnotate, parent_block: ?*Block, ri: ResultInfo, node: Ast.Node.Index, statements: []const Ast.Node.Index) !bool {
+<a id="L780"></a>    const tree = astrl.tree;
+<a id="L781"></a>
+<a id="L782"></a>    const lbrace = tree.nodeMainToken(node);
+<a id="L783"></a>    if (tree.isTokenPrecededByTags(lbrace, &amp;.{ .identifier, .colon })) {
+<a id="L784"></a>        // Labeled block
+<a id="L785"></a>        var new_block: Block = .{
+<a id="L786"></a>            .parent = parent_block,
+<a id="L787"></a>            .label = try astrl.identString(lbrace - 2),
+<a id="L788"></a>            .is_loop = false,
+<a id="L789"></a>            .ri = ri,
+<a id="L790"></a>            .consumes_res_ptr = false,
+<a id="L791"></a>        };
+<a id="L792"></a>        for (statements) |statement| {
+<a id="L793"></a>            _ = try astrl.expr(statement, &amp;new_block, ResultInfo.none);
+<a id="L794"></a>        }
+<a id="L795"></a>        if (new_block.consumes_res_ptr) {
+<a id="L796"></a>            try astrl.nodes_need_rl.putNoClobber(astrl.gpa, node, {});
+<a id="L797"></a>        }
+<a id="L798"></a>        return new_block.consumes_res_ptr;
+<a id="L799"></a>    } else {
+<a id="L800"></a>        // Unlabeled block
+<a id="L801"></a>        for (statements) |statement| {
+<a id="L802"></a>            _ = try astrl.expr(statement, parent_block, ResultInfo.none);
+<a id="L803"></a>        }
+<a id="L804"></a>        return false;
+<a id="L805"></a>    }
+<a id="L806"></a>}
+<a id="L807"></a>
+<a id="L808"></a>fn builtinCall(astrl: *AstRlAnnotate, block: ?*Block, ri: ResultInfo, node: Ast.Node.Index, args: []const Ast.Node.Index) !bool {
+<a id="L809"></a>    _ = ri; // Currently, no builtin consumes its result location.
+<a id="L810"></a>
+<a id="L811"></a>    const tree = astrl.tree;
+<a id="L812"></a>    const builtin_token = tree.nodeMainToken(node);
+<a id="L813"></a>    const builtin_name = tree.tokenSlice(builtin_token);
+<a id="L814"></a>    const info = BuiltinFn.list.get(builtin_name) orelse return false;
+<a id="L815"></a>    if (info.param_count) |expected| {
+<a id="L816"></a>        if (expected != args.len) return false;
+<a id="L817"></a>    }
+<a id="L818"></a>    switch (info.tag) {
+<a id="L819"></a>        .import =&gt; return false,
+<a id="L820"></a>        .branch_hint =&gt; {
+<a id="L821"></a>            _ = try astrl.expr(args[0], block, ResultInfo.type_only);
+<a id="L822"></a>            return false;
+<a id="L823"></a>        },
+<a id="L824"></a>        .compile_log, .TypeOf =&gt; {
+<a id="L825"></a>            for (args) |arg_node| {
+<a id="L826"></a>                _ = try astrl.expr(arg_node, block, ResultInfo.none);
+<a id="L827"></a>            }
+<a id="L828"></a>            return false;
+<a id="L829"></a>        },
+<a id="L830"></a>        .as =&gt; {
+<a id="L831"></a>            _ = try astrl.expr(args[0], block, ResultInfo.type_only);
+<a id="L832"></a>            _ = try astrl.expr(args[1], block, ResultInfo.type_only);
+<a id="L833"></a>            return false;
+<a id="L834"></a>        },
+<a id="L835"></a>        .bit_cast =&gt; {
+<a id="L836"></a>            _ = try astrl.expr(args[0], block, ResultInfo.none);
+<a id="L837"></a>            return false;
+<a id="L838"></a>        },
+<a id="L839"></a>        .union_init =&gt; {
+<a id="L840"></a>            _ = try astrl.expr(args[0], block, ResultInfo.type_only);
+<a id="L841"></a>            _ = try astrl.expr(args[1], block, ResultInfo.type_only);
+<a id="L842"></a>            _ = try astrl.expr(args[2], block, ResultInfo.type_only);
+<a id="L843"></a>            return false;
+<a id="L844"></a>        },
+<a id="L845"></a>        .c_import =&gt; {
+<a id="L846"></a>            _ = try astrl.expr(args[0], block, ResultInfo.none);
+<a id="L847"></a>            return false;
+<a id="L848"></a>        },
+<a id="L849"></a>        .min, .max =&gt; {
+<a id="L850"></a>            for (args) |arg_node| {
+<a id="L851"></a>                _ = try astrl.expr(arg_node, block, ResultInfo.none);
+<a id="L852"></a>            }
+<a id="L853"></a>            return false;
+<a id="L854"></a>        },
+<a id="L855"></a>        .@"export" =&gt; {
+<a id="L856"></a>            _ = try astrl.expr(args[0], block, ResultInfo.none);
+<a id="L857"></a>            _ = try astrl.expr(args[1], block, ResultInfo.type_only);
+<a id="L858"></a>            return false;
+<a id="L859"></a>        },
+<a id="L860"></a>        .@"extern" =&gt; {
+<a id="L861"></a>            _ = try astrl.expr(args[0], block, ResultInfo.type_only);
+<a id="L862"></a>            _ = try astrl.expr(args[1], block, ResultInfo.type_only);
+<a id="L863"></a>            return false;
+<a id="L864"></a>        },
+<a id="L865"></a>        // These builtins take no args and do not consume the result pointer.
+<a id="L866"></a>        .src,
+<a id="L867"></a>        .This,
+<a id="L868"></a>        .EnumLiteral,
+<a id="L869"></a>        .return_address,
+<a id="L870"></a>        .error_return_trace,
+<a id="L871"></a>        .frame,
+<a id="L872"></a>        .breakpoint,
+<a id="L873"></a>        .disable_instrumentation,
+<a id="L874"></a>        .disable_intrinsics,
+<a id="L875"></a>        .in_comptime,
+<a id="L876"></a>        .panic,
+<a id="L877"></a>        .trap,
+<a id="L878"></a>        .c_va_start,
+<a id="L879"></a>        =&gt; return false,
+<a id="L880"></a>        // TODO: this is a workaround for llvm/llvm-project#68409
+<a id="L881"></a>        // Zig tracking issue: #16876
+<a id="L882"></a>        .frame_address =&gt; return true,
+<a id="L883"></a>        // These builtins take a single argument with a known result type, but do not consume their
+<a id="L884"></a>        // result pointer.
+<a id="L885"></a>        .sqrt,
+<a id="L886"></a>        .sin,
+<a id="L887"></a>        .cos,
+<a id="L888"></a>        .tan,
+<a id="L889"></a>        .exp,
+<a id="L890"></a>        .exp2,
+<a id="L891"></a>        .log,
+<a id="L892"></a>        .log2,
+<a id="L893"></a>        .log10,
+<a id="L894"></a>        .floor,
+<a id="L895"></a>        .ceil,
+<a id="L896"></a>        .trunc,
+<a id="L897"></a>        .round,
+<a id="L898"></a>        .size_of,
+<a id="L899"></a>        .bit_size_of,
+<a id="L900"></a>        .align_of,
+<a id="L901"></a>        .compile_error,
+<a id="L902"></a>        .set_eval_branch_quota,
+<a id="L903"></a>        .int_from_bool,
+<a id="L904"></a>        .int_from_error,
+<a id="L905"></a>        .error_from_int,
+<a id="L906"></a>        .embed_file,
+<a id="L907"></a>        .error_name,
+<a id="L908"></a>        .set_runtime_safety,
+<a id="L909"></a>        .Tuple,
+<a id="L910"></a>        .c_undef,
+<a id="L911"></a>        .c_include,
+<a id="L912"></a>        .wasm_memory_size,
+<a id="L913"></a>        .splat,
+<a id="L914"></a>        .set_float_mode,
+<a id="L915"></a>        .type_info,
+<a id="L916"></a>        .work_item_id,
+<a id="L917"></a>        .work_group_size,
+<a id="L918"></a>        .work_group_id,
+<a id="L919"></a>        =&gt; {
+<a id="L920"></a>            _ = try astrl.expr(args[0], block, ResultInfo.type_only);
+<a id="L921"></a>            return false;
+<a id="L922"></a>        },
+<a id="L923"></a>        // These builtins take a single argument with no result information and do not consume their
+<a id="L924"></a>        // result pointer.
+<a id="L925"></a>        .int_from_ptr,
+<a id="L926"></a>        .int_from_enum,
+<a id="L927"></a>        .abs,
+<a id="L928"></a>        .tag_name,
+<a id="L929"></a>        .type_name,
+<a id="L930"></a>        .Frame,
+<a id="L931"></a>        .int_from_float,
+<a id="L932"></a>        .float_from_int,
+<a id="L933"></a>        .ptr_from_int,
+<a id="L934"></a>        .enum_from_int,
+<a id="L935"></a>        .float_cast,
+<a id="L936"></a>        .int_cast,
+<a id="L937"></a>        .truncate,
+<a id="L938"></a>        .error_cast,
+<a id="L939"></a>        .ptr_cast,
+<a id="L940"></a>        .align_cast,
+<a id="L941"></a>        .addrspace_cast,
+<a id="L942"></a>        .const_cast,
+<a id="L943"></a>        .volatile_cast,
+<a id="L944"></a>        .clz,
+<a id="L945"></a>        .ctz,
+<a id="L946"></a>        .pop_count,
+<a id="L947"></a>        .byte_swap,
+<a id="L948"></a>        .bit_reverse,
+<a id="L949"></a>        =&gt; {
+<a id="L950"></a>            _ = try astrl.expr(args[0], block, ResultInfo.none);
+<a id="L951"></a>            return false;
+<a id="L952"></a>        },
+<a id="L953"></a>        .div_exact,
+<a id="L954"></a>        .div_floor,
+<a id="L955"></a>        .div_trunc,
+<a id="L956"></a>        .mod,
+<a id="L957"></a>        .rem,
+<a id="L958"></a>        =&gt; {
+<a id="L959"></a>            _ = try astrl.expr(args[0], block, ResultInfo.none);
+<a id="L960"></a>            _ = try astrl.expr(args[1], block, ResultInfo.none);
+<a id="L961"></a>            return false;
+<a id="L962"></a>        },
+<a id="L963"></a>        .shl_exact, .shr_exact =&gt; {
+<a id="L964"></a>            _ = try astrl.expr(args[0], block, ResultInfo.none);
+<a id="L965"></a>            _ = try astrl.expr(args[1], block, ResultInfo.type_only);
+<a id="L966"></a>            return false;
+<a id="L967"></a>        },
+<a id="L968"></a>        .bit_offset_of,
+<a id="L969"></a>        .offset_of,
+<a id="L970"></a>        .has_decl,
+<a id="L971"></a>        .has_field,
+<a id="L972"></a>        .field,
+<a id="L973"></a>        .FieldType,
+<a id="L974"></a>        =&gt; {
+<a id="L975"></a>            _ = try astrl.expr(args[0], block, ResultInfo.type_only);
+<a id="L976"></a>            _ = try astrl.expr(args[1], block, ResultInfo.type_only);
+<a id="L977"></a>            return false;
+<a id="L978"></a>        },
+<a id="L979"></a>        .field_parent_ptr =&gt; {
+<a id="L980"></a>            _ = try astrl.expr(args[0], block, ResultInfo.type_only);
+<a id="L981"></a>            _ = try astrl.expr(args[1], block, ResultInfo.none);
+<a id="L982"></a>            return false;
+<a id="L983"></a>        },
+<a id="L984"></a>        .wasm_memory_grow =&gt; {
+<a id="L985"></a>            _ = try astrl.expr(args[0], block, ResultInfo.type_only);
+<a id="L986"></a>            _ = try astrl.expr(args[1], block, ResultInfo.type_only);
+<a id="L987"></a>            return false;
+<a id="L988"></a>        },
+<a id="L989"></a>        .c_define =&gt; {
+<a id="L990"></a>            _ = try astrl.expr(args[0], block, ResultInfo.type_only);
+<a id="L991"></a>            _ = try astrl.expr(args[1], block, ResultInfo.none);
+<a id="L992"></a>            return false;
+<a id="L993"></a>        },
+<a id="L994"></a>        .reduce =&gt; {
+<a id="L995"></a>            _ = try astrl.expr(args[0], block, ResultInfo.type_only);
+<a id="L996"></a>            _ = try astrl.expr(args[1], block, ResultInfo.none);
+<a id="L997"></a>            return false;
+<a id="L998"></a>        },
+<a id="L999"></a>        .add_with_overflow, .sub_with_overflow, .mul_with_overflow, .shl_with_overflow =&gt; {
+<a id="L1000"></a>            _ = try astrl.expr(args[0], block, ResultInfo.none);
+<a id="L1001"></a>            _ = try astrl.expr(args[1], block, ResultInfo.none);
+<a id="L1002"></a>            return false;
+<a id="L1003"></a>        },
+<a id="L1004"></a>        .atomic_load =&gt; {
+<a id="L1005"></a>            _ = try astrl.expr(args[0], block, ResultInfo.type_only);
+<a id="L1006"></a>            _ = try astrl.expr(args[1], block, ResultInfo.none);
+<a id="L1007"></a>            _ = try astrl.expr(args[2], block, ResultInfo.type_only);
+<a id="L1008"></a>            return false;
+<a id="L1009"></a>        },
+<a id="L1010"></a>        .atomic_rmw =&gt; {
+<a id="L1011"></a>            _ = try astrl.expr(args[0], block, ResultInfo.type_only);
+<a id="L1012"></a>            _ = try astrl.expr(args[1], block, ResultInfo.none);
+<a id="L1013"></a>            _ = try astrl.expr(args[2], block, ResultInfo.type_only);
+<a id="L1014"></a>            _ = try astrl.expr(args[3], block, ResultInfo.type_only);
+<a id="L1015"></a>            _ = try astrl.expr(args[4], block, ResultInfo.type_only);
+<a id="L1016"></a>            return false;
+<a id="L1017"></a>        },
+<a id="L1018"></a>        .atomic_store =&gt; {
+<a id="L1019"></a>            _ = try astrl.expr(args[0], block, ResultInfo.type_only);
+<a id="L1020"></a>            _ = try astrl.expr(args[1], block, ResultInfo.none);
+<a id="L1021"></a>            _ = try astrl.expr(args[2], block, ResultInfo.type_only);
+<a id="L1022"></a>            _ = try astrl.expr(args[3], block, ResultInfo.type_only);
+<a id="L1023"></a>            return false;
+<a id="L1024"></a>        },
+<a id="L1025"></a>        .mul_add =&gt; {
+<a id="L1026"></a>            _ = try astrl.expr(args[0], block, ResultInfo.type_only);
+<a id="L1027"></a>            _ = try astrl.expr(args[1], block, ResultInfo.type_only);
+<a id="L1028"></a>            _ = try astrl.expr(args[2], block, ResultInfo.type_only);
+<a id="L1029"></a>            return false;
+<a id="L1030"></a>        },
+<a id="L1031"></a>        .call =&gt; {
+<a id="L1032"></a>            _ = try astrl.expr(args[0], block, ResultInfo.type_only);
+<a id="L1033"></a>            _ = try astrl.expr(args[1], block, ResultInfo.none);
+<a id="L1034"></a>            _ = try astrl.expr(args[2], block, ResultInfo.none);
+<a id="L1035"></a>            return false;
+<a id="L1036"></a>        },
+<a id="L1037"></a>        .memcpy, .memmove =&gt; {
+<a id="L1038"></a>            _ = try astrl.expr(args[0], block, ResultInfo.none);
+<a id="L1039"></a>            _ = try astrl.expr(args[1], block, ResultInfo.none);
+<a id="L1040"></a>            return false;
+<a id="L1041"></a>        },
+<a id="L1042"></a>        .memset =&gt; {
+<a id="L1043"></a>            _ = try astrl.expr(args[0], block, ResultInfo.none);
+<a id="L1044"></a>            _ = try astrl.expr(args[1], block, ResultInfo.type_only);
+<a id="L1045"></a>            return false;
+<a id="L1046"></a>        },
+<a id="L1047"></a>        .shuffle =&gt; {
+<a id="L1048"></a>            _ = try astrl.expr(args[0], block, ResultInfo.type_only);
+<a id="L1049"></a>            _ = try astrl.expr(args[1], block, ResultInfo.none);
+<a id="L1050"></a>            _ = try astrl.expr(args[2], block, ResultInfo.none);
+<a id="L1051"></a>            _ = try astrl.expr(args[3], block, ResultInfo.none);
+<a id="L1052"></a>            return false;
+<a id="L1053"></a>        },
+<a id="L1054"></a>        .select =&gt; {
+<a id="L1055"></a>            _ = try astrl.expr(args[0], block, ResultInfo.type_only);
+<a id="L1056"></a>            _ = try astrl.expr(args[1], block, ResultInfo.none);
+<a id="L1057"></a>            _ = try astrl.expr(args[2], block, ResultInfo.none);
+<a id="L1058"></a>            _ = try astrl.expr(args[3], block, ResultInfo.none);
+<a id="L1059"></a>            return false;
+<a id="L1060"></a>        },
+<a id="L1061"></a>        .Int =&gt; {
+<a id="L1062"></a>            _ = try astrl.expr(args[0], block, ResultInfo.type_only);
+<a id="L1063"></a>            _ = try astrl.expr(args[1], block, ResultInfo.type_only);
+<a id="L1064"></a>            return false;
+<a id="L1065"></a>        },
+<a id="L1066"></a>        .Pointer =&gt; {
+<a id="L1067"></a>            _ = try astrl.expr(args[0], block, ResultInfo.type_only);
+<a id="L1068"></a>            _ = try astrl.expr(args[1], block, ResultInfo.type_only);
+<a id="L1069"></a>            _ = try astrl.expr(args[2], block, ResultInfo.type_only);
+<a id="L1070"></a>            _ = try astrl.expr(args[3], block, ResultInfo.type_only);
+<a id="L1071"></a>            return false;
+<a id="L1072"></a>        },
+<a id="L1073"></a>        .Fn =&gt; {
+<a id="L1074"></a>            _ = try astrl.expr(args[0], block, ResultInfo.type_only);
+<a id="L1075"></a>            _ = try astrl.expr(args[1], block, ResultInfo.type_only);
+<a id="L1076"></a>            _ = try astrl.expr(args[2], block, ResultInfo.type_only);
+<a id="L1077"></a>            _ = try astrl.expr(args[3], block, ResultInfo.type_only);
+<a id="L1078"></a>            return false;
+<a id="L1079"></a>        },
+<a id="L1080"></a>        .Struct =&gt; {
+<a id="L1081"></a>            _ = try astrl.expr(args[0], block, ResultInfo.type_only);
+<a id="L1082"></a>            _ = try astrl.expr(args[1], block, ResultInfo.type_only);
+<a id="L1083"></a>            _ = try astrl.expr(args[2], block, ResultInfo.type_only);
+<a id="L1084"></a>            _ = try astrl.expr(args[3], block, ResultInfo.type_only);
+<a id="L1085"></a>            _ = try astrl.expr(args[4], block, ResultInfo.type_only);
+<a id="L1086"></a>            return false;
+<a id="L1087"></a>        },
+<a id="L1088"></a>        .Union =&gt; {
+<a id="L1089"></a>            _ = try astrl.expr(args[0], block, ResultInfo.type_only);
+<a id="L1090"></a>            _ = try astrl.expr(args[1], block, ResultInfo.type_only);
+<a id="L1091"></a>            _ = try astrl.expr(args[2], block, ResultInfo.type_only);
+<a id="L1092"></a>            _ = try astrl.expr(args[3], block, ResultInfo.type_only);
+<a id="L1093"></a>            _ = try astrl.expr(args[4], block, ResultInfo.type_only);
+<a id="L1094"></a>            return false;
+<a id="L1095"></a>        },
+<a id="L1096"></a>        .Enum =&gt; {
+<a id="L1097"></a>            _ = try astrl.expr(args[0], block, ResultInfo.type_only);
+<a id="L1098"></a>            _ = try astrl.expr(args[1], block, ResultInfo.type_only);
+<a id="L1099"></a>            _ = try astrl.expr(args[2], block, ResultInfo.type_only);
+<a id="L1100"></a>            _ = try astrl.expr(args[3], block, ResultInfo.type_only);
+<a id="L1101"></a>            return false;
+<a id="L1102"></a>        },
+<a id="L1103"></a>        .Vector =&gt; {
+<a id="L1104"></a>            _ = try astrl.expr(args[0], block, ResultInfo.type_only);
+<a id="L1105"></a>            _ = try astrl.expr(args[1], block, ResultInfo.type_only);
+<a id="L1106"></a>            return false;
+<a id="L1107"></a>        },
+<a id="L1108"></a>        .prefetch =&gt; {
+<a id="L1109"></a>            _ = try astrl.expr(args[0], block, ResultInfo.none);
+<a id="L1110"></a>            _ = try astrl.expr(args[1], block, ResultInfo.type_only);
+<a id="L1111"></a>            return false;
+<a id="L1112"></a>        },
+<a id="L1113"></a>        .c_va_arg =&gt; {
+<a id="L1114"></a>            _ = try astrl.expr(args[0], block, ResultInfo.none);
+<a id="L1115"></a>            _ = try astrl.expr(args[1], block, ResultInfo.type_only);
+<a id="L1116"></a>            return false;
+<a id="L1117"></a>        },
+<a id="L1118"></a>        .c_va_copy =&gt; {
+<a id="L1119"></a>            _ = try astrl.expr(args[0], block, ResultInfo.none);
+<a id="L1120"></a>            return false;
+<a id="L1121"></a>        },
+<a id="L1122"></a>        .c_va_end =&gt; {
+<a id="L1123"></a>            _ = try astrl.expr(args[0], block, ResultInfo.none);
+<a id="L1124"></a>            return false;
+<a id="L1125"></a>        },
+<a id="L1126"></a>        .cmpxchg_strong, .cmpxchg_weak =&gt; {
+<a id="L1127"></a>            _ = try astrl.expr(args[0], block, ResultInfo.none);
+<a id="L1128"></a>            _ = try astrl.expr(args[1], block, ResultInfo.type_only);
+<a id="L1129"></a>            _ = try astrl.expr(args[2], block, ResultInfo.type_only);
+<a id="L1130"></a>            _ = try astrl.expr(args[3], block, ResultInfo.type_only);
+<a id="L1131"></a>            _ = try astrl.expr(args[4], block, ResultInfo.type_only);
+<a id="L1132"></a>            return false;
+<a id="L1133"></a>        },
+<a id="L1134"></a>    }
+<a id="L1135"></a>}
+</pre>
 </body>
 </html>

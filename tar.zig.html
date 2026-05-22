@@ -2,1241 +2,1244 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Source: zig-0.16.0-std/tar.zig</title>
+    <title>Source: tar.zig</title>
     <style>
         body { background: #1e1e1e; color: #d4d4d4; font-family: monospace; padding: 20px; }
         pre { white-space: pre-wrap; word-wrap: break-word; }
         .header { border-bottom: 1px solid #444; padding-bottom: 10px; margin-bottom: 20px; }
         a { color: #569cd6; }
+        a[id] { color: inherit; text-decoration: none; }
+        :target { background: #3a3a00; }
     </style>
 </head>
 <body>
     <div class="header">
-        <a href="/">Index</a> | <strong>File: zig-0.16.0-std/tar.zig</strong>
+        <a href="/">Index</a> | <strong>File: tar.zig</strong>
     </div>
-    <pre>//! Tar archive is single ordinary file which can contain many files (or
-//! directories, symlinks, ...). It's build by series of blocks each size of 512
-//! bytes. First block of each entry is header which defines type, name, size
-//! permissions and other attributes. Header is followed by series of blocks of
-//! file content, if any that entry has content. Content is padded to the block
-//! size, so next header always starts at block boundary.
-//!
-//! This simple format is extended by GNU and POSIX pax extensions to support
-//! file names longer than 256 bytes and additional attributes.
-//!
-//! This is not comprehensive tar parser. Here we are only file types needed to
-//! support Zig package manager; normal file, directory, symbolic link. And
-//! subset of attributes: name, size, permissions.
-//!
-//! GNU tar reference: https://www.gnu.org/software/tar/manual/html_node/Standard.html
-//! pax reference: https://pubs.opengroup.org/onlinepubs/9699919799/utilities/pax.html#tag_20_92_13
-
-const std = @import("std");
-const builtin = @import("builtin");
-const Io = std.Io;
-const assert = std.debug.assert;
-const testing = std.testing;
-
-pub const Writer = @import("tar/Writer.zig");
-
-/// Provide this to receive detailed error messages.
-/// When this is provided, some errors which would otherwise be returned
-/// immediately will instead be added to this structure. The API user must check
-/// the errors in diagnostics to know whether the operation succeeded or failed.
-pub const Diagnostics = struct {
-    allocator: std.mem.Allocator,
-    errors: std.ArrayList(Error) = .empty,
-
-    entries: usize = 0,
-    root_dir: []const u8 = "",
-
-    pub const Error = union(enum) {
-        unable_to_create_sym_link: struct {
-            code: anyerror,
-            file_name: []const u8,
-            link_name: []const u8,
-        },
-        unable_to_create_file: struct {
-            code: anyerror,
-            file_name: []const u8,
-        },
-        unsupported_file_type: struct {
-            file_name: []const u8,
-            file_type: Header.Kind,
-        },
-        components_outside_stripped_prefix: struct {
-            file_name: []const u8,
-        },
-    };
-
-    fn findRoot(d: *Diagnostics, kind: FileKind, path: []const u8) !void {
-        if (path.len == 0) return;
-
-        d.entries += 1;
-        const root_dir = rootDir(path, kind);
-        if (d.entries == 1) {
-            d.root_dir = try d.allocator.dupe(u8, root_dir);
-            return;
-        }
-        if (d.root_dir.len == 0 or std.mem.eql(u8, root_dir, d.root_dir))
-            return;
-        d.allocator.free(d.root_dir);
-        d.root_dir = "";
-    }
-
-    // Returns root dir of the path, assumes non empty path.
-    fn rootDir(path: []const u8, kind: FileKind) []const u8 {
-        const start_index: usize = if (path[0] == '/') 1 else 0;
-        const end_index: usize = if (path[path.len - 1] == '/') path.len - 1 else path.len;
-        const buf = path[start_index..end_index];
-        if (std.mem.findScalarPos(u8, buf, 0, '/')) |idx| {
-            return buf[0..idx];
-        }
-
-        return switch (kind) {
-            .file =&gt; "",
-            .sym_link =&gt; "",
-            .directory =&gt; buf,
-        };
-    }
-
-    test rootDir {
-        const expectEqualStrings = testing.expectEqualStrings;
-        try expectEqualStrings("", rootDir("a", .file));
-        try expectEqualStrings("a", rootDir("a", .directory));
-        try expectEqualStrings("b", rootDir("b", .directory));
-        try expectEqualStrings("c", rootDir("/c", .directory));
-        try expectEqualStrings("d", rootDir("/d/", .directory));
-        try expectEqualStrings("a", rootDir("a/b", .directory));
-        try expectEqualStrings("a", rootDir("a/b", .file));
-        try expectEqualStrings("a", rootDir("a/b/c", .directory));
-    }
-
-    pub fn deinit(d: *Diagnostics) void {
-        for (d.errors.items) |item| {
-            switch (item) {
-                .unable_to_create_sym_link =&gt; |info| {
-                    d.allocator.free(info.file_name);
-                    d.allocator.free(info.link_name);
-                },
-                .unable_to_create_file =&gt; |info| {
-                    d.allocator.free(info.file_name);
-                },
-                .unsupported_file_type =&gt; |info| {
-                    d.allocator.free(info.file_name);
-                },
-                .components_outside_stripped_prefix =&gt; |info| {
-                    d.allocator.free(info.file_name);
-                },
-            }
-        }
-        d.errors.deinit(d.allocator);
-        d.allocator.free(d.root_dir);
-        d.* = undefined;
-    }
-};
-
-/// Deprecated, renamed to `ExtractOptions`.
-pub const PipeOptions = ExtractOptions;
-
-pub const ExtractOptions = struct {
-    /// Number of directory levels to skip when extracting files.
-    strip_components: u32 = 0,
-    /// How to handle the "mode" property of files from within the tar file.
-    mode_mode: ModeMode = .executable_bit_only,
-    /// Prevents creation of empty directories.
-    exclude_empty_directories: bool = false,
-    /// Collects error messages during unpacking
-    diagnostics: ?*Diagnostics = null,
-
-    pub const ModeMode = enum {
-        /// The mode from the tar file is completely ignored. Files are created
-        /// with the default mode when creating files.
-        ignore,
-        /// The mode from the tar file is inspected for the owner executable bit
-        /// only. This bit is copied to the group and other executable bits.
-        /// Other bits of the mode are left as the default when creating files.
-        executable_bit_only,
-    };
-};
-
-const Header = struct {
-    const SIZE = 512;
-    const MAX_NAME_SIZE = 100 + 1 + 155; // name(100) + separator(1) + prefix(155)
-    const LINK_NAME_SIZE = 100;
-
-    bytes: *const [SIZE]u8,
-
-    const Kind = enum(u8) {
-        normal_alias = 0,
-        normal = '0',
-        hard_link = '1',
-        symbolic_link = '2',
-        character_special = '3',
-        block_special = '4',
-        directory = '5',
-        fifo = '6',
-        contiguous = '7',
-        global_extended_header = 'g',
-        extended_header = 'x',
-        // Types 'L' and 'K' are used by the GNU format for a meta file
-        // used to store the path or link name for the next file.
-        gnu_long_name = 'L',
-        gnu_long_link = 'K',
-        gnu_sparse = 'S',
-        solaris_extended_header = 'X',
-        _,
-    };
-
-    /// Includes prefix concatenated, if any.
-    /// TODO: check against "../" and other nefarious things
-    pub fn fullName(header: Header, buffer: []u8) ![]const u8 {
-        const n = name(header);
-        const p = prefix(header);
-        if (buffer.len &lt; n.len + p.len + 1) return error.TarInsufficientBuffer;
-        if (!is_ustar(header) or p.len == 0) {
-            @memcpy(buffer[0..n.len], n);
-            return buffer[0..n.len];
-        }
-        @memcpy(buffer[0..p.len], p);
-        buffer[p.len] = '/';
-        @memcpy(buffer[p.len + 1 ..][0..n.len], n);
-        return buffer[0 .. p.len + 1 + n.len];
-    }
-
-    /// When kind is symbolic_link linked-to name (target_path) is specified in
-    /// the linkname field.
-    pub fn linkName(header: Header, buffer: []u8) ![]const u8 {
-        const link_name = header.str(157, 100);
-        if (link_name.len == 0) {
-            return buffer[0..0];
-        }
-        if (buffer.len &lt; link_name.len) return error.TarInsufficientBuffer;
-        const buf = buffer[0..link_name.len];
-        @memcpy(buf, link_name);
-        return buf;
-    }
-
-    pub fn name(header: Header) []const u8 {
-        return header.str(0, 100);
-    }
-
-    pub fn mode(header: Header) !u32 {
-        return @intCast(try header.octal(100, 8));
-    }
-
-    pub fn size(header: Header) !u64 {
-        const start = 124;
-        const len = 12;
-        const raw = header.bytes[start..][0..len];
-        //  If the leading byte is 0xff (255), all the bytes of the field
-        //  (including the leading byte) are concatenated in big-endian order,
-        //  with the result being a negative number expressed in two’s
-        //  complement form.
-        if (raw[0] == 0xff) return error.TarNumericValueNegative;
-        // If the leading byte is 0x80 (128), the non-leading bytes of the
-        // field are concatenated in big-endian order.
-        if (raw[0] == 0x80) {
-            if (raw[1] != 0 or raw[2] != 0 or raw[3] != 0) return error.TarNumericValueTooBig;
-            return std.mem.readInt(u64, raw[4..12], .big);
-        }
-        return try header.octal(start, len);
-    }
-
-    pub fn chksum(header: Header) !u64 {
-        return header.octal(148, 8);
-    }
-
-    pub fn is_ustar(header: Header) bool {
-        const magic = header.bytes[257..][0..6];
-        return std.mem.eql(u8, magic[0..5], "ustar") and (magic[5] == 0 or magic[5] == ' ');
-    }
-
-    pub fn prefix(header: Header) []const u8 {
-        return header.str(345, 155);
-    }
-
-    pub fn kind(header: Header) Kind {
-        const result: Kind = @enumFromInt(header.bytes[156]);
-        if (result == .normal_alias) return .normal;
-        return result;
-    }
-
-    fn str(header: Header, start: usize, len: usize) []const u8 {
-        return nullStr(header.bytes[start .. start + len]);
-    }
-
-    fn octal(header: Header, start: usize, len: usize) !u64 {
-        const raw = header.bytes[start..][0..len];
-        // Zero-filled octal number in ASCII. Each numeric field of width w
-        // contains w minus 1 digits, and a null
-        const ltrimmed = std.mem.trimStart(u8, raw, "0 ");
-        const rtrimmed = std.mem.trimEnd(u8, ltrimmed, " \x00");
-        if (rtrimmed.len == 0) return 0;
-        return std.fmt.parseInt(u64, rtrimmed, 8) catch return error.TarHeader;
-    }
-
-    const Chksums = struct {
-        unsigned: u64,
-        signed: i64,
-    };
-
-    // Sum of all bytes in the header block. The chksum field is treated as if
-    // it were filled with spaces (ASCII 32).
-    fn computeChksum(header: Header) Chksums {
-        var cs: Chksums = .{ .signed = 0, .unsigned = 0 };
-        for (header.bytes, 0..) |v, i| {
-            const b = if (148 &lt;= i and i &lt; 156) 32 else v; // Treating chksum bytes as spaces.
-            cs.unsigned += b;
-            cs.signed += @as(i8, @bitCast(b));
-        }
-        return cs;
-    }
-
-    // Checks calculated chksum with value of chksum field.
-    // Returns error or valid chksum value.
-    // Zero value indicates empty block.
-    pub fn checkChksum(header: Header) !u64 {
-        const field = try header.chksum();
-        const cs = header.computeChksum();
-        if (field == 0 and cs.unsigned == 256) return 0;
-        if (field != cs.unsigned and field != cs.signed) return error.TarHeaderChksum;
-        return field;
-    }
-};
-
-// Breaks string on first null character.
-fn nullStr(str: []const u8) []const u8 {
-    for (str, 0..) |c, i| {
-        if (c == 0) return str[0..i];
-    }
-    return str;
-}
-
-/// Type of the file returned by iterator `next` method.
-pub const FileKind = enum {
-    directory,
-    sym_link,
-    file,
-};
-
-/// Iterator over entries in the tar file represented by reader.
-pub const Iterator = struct {
-    reader: *Io.Reader,
-    diagnostics: ?*Diagnostics = null,
-
-    // buffers for heeader and file attributes
-    header_buffer: [Header.SIZE]u8 = undefined,
-    file_name_buffer: []u8,
-    link_name_buffer: []u8,
-
-    // bytes of padding to the end of the block
-    padding: usize = 0,
-    // not consumed bytes of file from last next iteration
-    unread_file_bytes: u64 = 0,
-
-    /// Options for iterator.
-    /// Buffers should be provided by the caller.
-    pub const Options = struct {
-        /// Use a buffer with length `std.fs.max_path_bytes` to match file system capabilities.
-        file_name_buffer: []u8,
-        /// Use a buffer with length `std.fs.max_path_bytes` to match file system capabilities.
-        link_name_buffer: []u8,
-        /// Collects error messages during unpacking
-        diagnostics: ?*Diagnostics = null,
-    };
-
-    /// Iterates over files in tar archive.
-    /// `next` returns each file in tar archive.
-    pub fn init(reader: *Io.Reader, options: Options) Iterator {
-        return .{
-            .reader = reader,
-            .diagnostics = options.diagnostics,
-            .file_name_buffer = options.file_name_buffer,
-            .link_name_buffer = options.link_name_buffer,
-        };
-    }
-
-    pub const File = struct {
-        name: []const u8, // name of file, symlink or directory
-        link_name: []const u8, // target name of symlink
-        size: u64 = 0, // size of the file in bytes
-        mode: u32 = 0,
-        kind: FileKind = .file,
-    };
-
-    fn readHeader(self: *Iterator) !?Header {
-        if (self.padding &gt; 0) {
-            try self.reader.discardAll(self.padding);
-        }
-        const n = try self.reader.readSliceShort(&amp;self.header_buffer);
-        if (n == 0) return null;
-        if (n &lt; Header.SIZE) return error.UnexpectedEndOfStream;
-        const header = Header{ .bytes = self.header_buffer[0..Header.SIZE] };
-        if (try header.checkChksum() == 0) return null;
-        return header;
-    }
-
-    fn readString(self: *Iterator, size: usize, buffer: []u8) ![]const u8 {
-        if (size &gt; buffer.len) return error.TarInsufficientBuffer;
-        const buf = buffer[0..size];
-        try self.reader.readSliceAll(buf);
-        return nullStr(buf);
-    }
-
-    fn newFile(self: *Iterator) File {
-        return .{
-            .name = self.file_name_buffer[0..0],
-            .link_name = self.link_name_buffer[0..0],
-        };
-    }
-
-    // Number of padding bytes in the last file block.
-    fn blockPadding(size: u64) usize {
-        const block_rounded = std.mem.alignForward(u64, size, Header.SIZE); // size rounded to te block boundary
-        return @intCast(block_rounded - size);
-    }
-
-    /// Iterates through the tar archive as if it is a series of files.
-    /// Internally, the tar format often uses entries (header with optional
-    /// content) to add meta data that describes the next file. These
-    /// entries should not normally be visible to the outside. As such, this
-    /// loop iterates through one or more entries until it collects a all
-    /// file attributes.
-    pub fn next(self: *Iterator) !?File {
-        if (self.unread_file_bytes &gt; 0) {
-            // If file content was not consumed by caller
-            try self.reader.discardAll64(self.unread_file_bytes);
-            self.unread_file_bytes = 0;
-        }
-        var file: File = self.newFile();
-
-        while (try self.readHeader()) |header| {
-            const kind = header.kind();
-            const size: u64 = try header.size();
-            self.padding = blockPadding(size);
-
-            switch (kind) {
-                // File types to return upstream
-                .directory, .normal, .symbolic_link =&gt; {
-                    file.kind = switch (kind) {
-                        .directory =&gt; .directory,
-                        .normal =&gt; .file,
-                        .symbolic_link =&gt; .sym_link,
-                        else =&gt; unreachable,
-                    };
-                    file.mode = try header.mode();
-
-                    // set file attributes if not already set by prefix/extended headers
-                    if (file.size == 0) {
-                        file.size = size;
-                    }
-                    if (file.link_name.len == 0) {
-                        file.link_name = try header.linkName(self.link_name_buffer);
-                    }
-                    if (file.name.len == 0) {
-                        file.name = try header.fullName(self.file_name_buffer);
-                    }
-
-                    self.padding = blockPadding(file.size);
-                    self.unread_file_bytes = file.size;
-                    return file;
-                },
-                // Prefix header types
-                .gnu_long_name =&gt; {
-                    file.name = try self.readString(@intCast(size), self.file_name_buffer);
-                },
-                .gnu_long_link =&gt; {
-                    file.link_name = try self.readString(@intCast(size), self.link_name_buffer);
-                },
-                .extended_header =&gt; {
-                    // Use just attributes from last extended header.
-                    file = self.newFile();
-
-                    var rdr: PaxIterator = .{
-                        .reader = self.reader,
-                        .size = @intCast(size),
-                    };
-                    while (try rdr.next()) |attr| {
-                        switch (attr.kind) {
-                            .path =&gt; {
-                                file.name = try attr.value(self.file_name_buffer);
-                            },
-                            .linkpath =&gt; {
-                                file.link_name = try attr.value(self.link_name_buffer);
-                            },
-                            .size =&gt; {
-                                var buf: [pax_max_size_attr_len]u8 = undefined;
-                                file.size = try std.fmt.parseInt(u64, try attr.value(&amp;buf), 10);
-                            },
-                        }
-                    }
-                },
-                // Ignored header type
-                .global_extended_header =&gt; {
-                    self.reader.discardAll64(size) catch return error.TarHeadersTooBig;
-                },
-                // All other are unsupported header types
-                else =&gt; {
-                    const d = self.diagnostics orelse return error.TarUnsupportedHeader;
-                    try d.errors.append(d.allocator, .{ .unsupported_file_type = .{
-                        .file_name = try d.allocator.dupe(u8, header.name()),
-                        .file_type = kind,
-                    } });
-                    if (kind == .gnu_sparse) {
-                        try self.skipGnuSparseExtendedHeaders(header);
-                    }
-                    self.reader.discardAll64(size) catch return error.TarHeadersTooBig;
-                },
-            }
-        }
-        return null;
-    }
-
-    pub fn streamRemaining(it: *Iterator, file: File, w: *Io.Writer) Io.Reader.StreamError!void {
-        try it.reader.streamExact64(w, file.size);
-        it.unread_file_bytes = 0;
-    }
-
-    fn skipGnuSparseExtendedHeaders(self: *Iterator, header: Header) !void {
-        var is_extended = header.bytes[482] &gt; 0;
-        while (is_extended) {
-            var buf: [Header.SIZE]u8 = undefined;
-            try self.reader.readSliceAll(&amp;buf);
-            is_extended = buf[504] &gt; 0;
-        }
-    }
-};
-
-const PaxAttributeKind = enum {
-    path,
-    linkpath,
-    size,
-};
-
-// maxInt(u64) has 20 chars, base 10 in practice we got 24 chars
-const pax_max_size_attr_len = 64;
-
-pub const PaxIterator = struct {
-    size: usize, // cumulative size of all pax attributes
-    reader: *Io.Reader,
-
-    const Self = @This();
-
-    const Attribute = struct {
-        kind: PaxAttributeKind,
-        len: usize, // length of the attribute value
-        reader: *Io.Reader, // reader positioned at value start
-
-        // Copies pax attribute value into destination buffer.
-        // Must be called with destination buffer of size at least Attribute.len.
-        pub fn value(self: Attribute, dst: []u8) ![]const u8 {
-            if (self.len &gt; dst.len) return error.TarInsufficientBuffer;
-            // assert(self.len &lt;= dst.len);
-            const buf = dst[0..self.len];
-            const n = try self.reader.readSliceShort(buf);
-            if (n &lt; self.len) return error.UnexpectedEndOfStream;
-            try validateAttributeEnding(self.reader);
-            if (hasNull(buf)) return error.PaxNullInValue;
-            return buf;
-        }
-    };
-
-    // Iterates over pax attributes. Returns known only known attributes.
-    // Caller has to call value in Attribute, to advance reader across value.
-    pub fn next(self: *Self) !?Attribute {
-        // Pax extended header consists of one or more attributes, each constructed as follows:
-        // "%d %s=%s\n", &lt;length&gt;, &lt;keyword&gt;, &lt;value&gt;
-        while (self.size &gt; 0) {
-            const length_buf = try self.reader.takeSentinel(' ');
-            const length = try std.fmt.parseInt(usize, length_buf, 10); // record length in bytes
-
-            const keyword = try self.reader.takeSentinel('=');
-            if (hasNull(keyword)) return error.PaxNullInKeyword;
-
-            // calculate value_len
-            const value_start = length_buf.len + keyword.len + 2; // 2 separators
-            if (length &lt; value_start + 1 or self.size &lt; length) return error.UnexpectedEndOfStream;
-            const value_len = length - value_start - 1; // \n separator at end
-            self.size -= length;
-
-            const kind: PaxAttributeKind = if (eql(keyword, "path"))
-                .path
-            else if (eql(keyword, "linkpath"))
-                .linkpath
-            else if (eql(keyword, "size"))
-                .size
-            else {
-                try self.reader.discardAll(value_len);
-                try validateAttributeEnding(self.reader);
-                continue;
-            };
-            if (kind == .size and value_len &gt; pax_max_size_attr_len) {
-                return error.PaxSizeAttrOverflow;
-            }
-            return .{
-                .kind = kind,
-                .len = value_len,
-                .reader = self.reader,
-            };
-        }
-
-        return null;
-    }
-
-    fn eql(a: []const u8, b: []const u8) bool {
-        return std.mem.eql(u8, a, b);
-    }
-
-    fn hasNull(str: []const u8) bool {
-        return (std.mem.findScalar(u8, str, 0)) != null;
-    }
-
-    // Checks that each record ends with new line.
-    fn validateAttributeEnding(reader: *Io.Reader) !void {
-        if (try reader.takeByte() != '\n') return error.PaxInvalidAttributeEnd;
-    }
-};
-
-/// Deprecated, renamed to `extract`.
-pub const pipeToFileSystem = extract;
-
-/// Ingests tar file from `reader`, populating file contents within `dir`. If
-/// any file would be extracted outside of `dir`, an error is return instead.
-pub fn extract(io: Io, dir: Io.Dir, reader: *Io.Reader, options: ExtractOptions) !void {
-    var file_name_buffer: [Io.Dir.max_path_bytes]u8 = undefined;
-    var link_name_buffer: [Io.Dir.max_path_bytes]u8 = undefined;
-    var sanitize_buffer: [Io.Dir.max_path_bytes]u8 = undefined;
-    var file_contents_buffer: [1024]u8 = undefined;
-    var it: Iterator = .init(reader, .{
-        .file_name_buffer = &amp;file_name_buffer,
-        .link_name_buffer = &amp;link_name_buffer,
-        .diagnostics = options.diagnostics,
-    });
-
-    while (try it.next()) |file| {
-        const n = sanitizePath(&amp;sanitize_buffer, file.name, options.strip_components) catch 0;
-        if (n == 0 and file.kind != .directory) {
-            const d = options.diagnostics orelse return error.TarComponentsOutsideStrippedPrefix;
-            try d.errors.append(d.allocator, .{ .components_outside_stripped_prefix = .{
-                .file_name = try d.allocator.dupe(u8, file.name),
-            } });
-            continue;
-        }
-        const file_name = sanitize_buffer[0..n];
-        if (options.diagnostics) |d| {
-            try d.findRoot(file.kind, file_name);
-        }
-
-        switch (file.kind) {
-            .directory =&gt; {
-                if (file_name.len &gt; 0 and !options.exclude_empty_directories) {
-                    try dir.createDirPath(io, file_name);
-                }
-            },
-            .file =&gt; {
-                if (createDirAndFile(io, dir, file_name, filePermissions(file.mode, options))) |fs_file| {
-                    defer fs_file.close(io);
-                    var file_writer = fs_file.writer(io, &amp;file_contents_buffer);
-                    try it.streamRemaining(file, &amp;file_writer.interface);
-                    try file_writer.interface.flush();
-                } else |err| {
-                    const d = options.diagnostics orelse return err;
-                    try d.errors.append(d.allocator, .{ .unable_to_create_file = .{
-                        .code = err,
-                        .file_name = try d.allocator.dupe(u8, file_name),
-                    } });
-                }
-            },
-            .sym_link =&gt; {
-                const link_name = file.link_name;
-                createDirAndSymlink(io, dir, link_name, file_name) catch |err| {
-                    const d = options.diagnostics orelse return error.UnableToCreateSymLink;
-                    try d.errors.append(d.allocator, .{ .unable_to_create_sym_link = .{
-                        .code = err,
-                        .file_name = try d.allocator.dupe(u8, file_name),
-                        .link_name = try d.allocator.dupe(u8, link_name),
-                    } });
-                };
-            },
-        }
-    }
-}
-
-fn createDirAndFile(io: Io, dir: Io.Dir, file_name: []const u8, permissions: Io.File.Permissions) !Io.File {
-    const fs_file = dir.createFile(io, file_name, .{ .exclusive = true, .permissions = permissions }) catch |err| {
-        if (err == error.FileNotFound) {
-            if (std.fs.path.dirname(file_name)) |dir_name| {
-                try dir.createDirPath(io, dir_name);
-                return try dir.createFile(io, file_name, .{ .exclusive = true, .permissions = permissions });
-            }
-        }
-        return err;
-    };
-    return fs_file;
-}
-
-// Creates a symbolic link at path `file_name` which points to `link_name`.
-fn createDirAndSymlink(io: Io, dir: Io.Dir, link_name: []const u8, file_name: []const u8) !void {
-    dir.symLink(io, link_name, file_name, .{}) catch |err| {
-        if (err == error.FileNotFound) {
-            if (std.fs.path.dirname(file_name)) |dir_name| {
-                try dir.createDirPath(io, dir_name);
-                return try dir.symLink(io, link_name, file_name, .{});
-            }
-        }
-        return err;
-    };
-}
-
-fn sanitizePath(buffer: []u8, path: []const u8, strip_components: u32) error{Invalid}!usize {
-    if (path.len == 0 or path[0] == '/') return error.Invalid;
-    var i: usize = 0;
-    var c = strip_components;
-    var it = std.mem.tokenizeScalar(u8, path, '/');
-    while (it.next()) |component| {
-        if (std.mem.eql(u8, component, ".")) continue;
-        if (std.mem.eql(u8, component, "..")) {
-            if (i == 0) return error.Invalid;
-            while (true) {
-                const ends_with_slash = buffer[i - 1] == '/';
-                i -= 1;
-                if (ends_with_slash or i == 0) break;
-            }
-            continue;
-        }
-        if (c &gt; 0) {
-            c -= 1;
-            continue;
-        }
-        if (i &gt; 0) {
-            buffer[i] = '/';
-            i += 1;
-        }
-        @memcpy(buffer[i..][0..component.len], component);
-        i += component.len;
-    }
-    if (c &gt; 0) return error.Invalid;
-    return i;
-}
-
-fn testSanitizePath(expected: []const u8, input: []const u8, strip: u32) !void {
-    var buffer: [Io.Dir.max_path_bytes]u8 = undefined;
-    const result = buffer[0..try sanitizePath(&amp;buffer, input, strip)];
-    try testing.expectEqualStrings(expected, result);
-}
-
-fn testSanitizePathError(expected: anyerror, input: []const u8, strip: u32) !void {
-    var buffer: [Io.Dir.max_path_bytes]u8 = undefined;
-    try testing.expectError(expected, sanitizePath(&amp;buffer, input, strip));
-}
-
-test sanitizePath {
-    try testSanitizePath("a/b/c", "a/b/c", 0);
-    try testSanitizePath("a/b/c", "a/x/y/../../b/c", 0);
-    try testSanitizePath("b/c", "a/b/c", 1);
-    try testSanitizePath("c", "a/b/c", 2);
-    try testSanitizePath("", "a/b/c", 3);
-    try testSanitizePath("", "a/b/c/../../..", 0);
-    try testSanitizePathError(error.Invalid, "a/b/c", 4);
-    try testSanitizePathError(error.Invalid, "..", 0);
-    try testSanitizePathError(error.Invalid, "a/b/../../..", 0);
-    try testSanitizePathError(error.Invalid, "a/b/../..", 1);
-}
-
-test PaxIterator {
-    const Attr = struct {
-        kind: PaxAttributeKind,
-        value: []const u8 = undefined,
-        err: ?anyerror = null,
-    };
-    const cases = [_]struct {
-        data: []const u8,
-        attrs: []const Attr,
-        err: ?anyerror = null,
-    }{
-        .{ // valid but unknown keys
-            .data =
-            \\30 mtime=1350244992.023960108
-            \\6 k=1
-            \\13 key1=val1
-            \\10 a=name
-            \\9 a=name
-            \\
-            ,
-            .attrs = &amp;[_]Attr{},
-        },
-        .{ // mix of known and unknown keys
-            .data =
-            \\6 k=1
-            \\13 path=name
-            \\17 linkpath=link
-            \\13 key1=val1
-            \\12 size=123
-            \\13 key2=val2
-            \\
-            ,
-            .attrs = &amp;[_]Attr{
-                .{ .kind = .path, .value = "name" },
-                .{ .kind = .linkpath, .value = "link" },
-                .{ .kind = .size, .value = "123" },
-            },
-        },
-        .{ // too short size of the second key-value pair
-            .data =
-            \\13 path=name
-            \\10 linkpath=value
-            \\
-            ,
-            .attrs = &amp;[_]Attr{
-                .{ .kind = .path, .value = "name" },
-            },
-            .err = error.UnexpectedEndOfStream,
-        },
-        .{ // too long size of the second key-value pair
-            .data =
-            \\13 path=name
-            \\6 k=1
-            \\19 linkpath=value
-            \\
-            ,
-            .attrs = &amp;[_]Attr{
-                .{ .kind = .path, .value = "name" },
-            },
-            .err = error.UnexpectedEndOfStream,
-        },
-
-        .{ // too long size of the second key-value pair
-            .data =
-            \\13 path=name
-            \\19 linkpath=value
-            \\6 k=1
-            \\
-            ,
-            .attrs = &amp;[_]Attr{
-                .{ .kind = .path, .value = "name" },
-                .{ .kind = .linkpath, .err = error.PaxInvalidAttributeEnd },
-            },
-        },
-        .{ // null in keyword is not valid
-            .data = "13 path=name\n" ++ "7 k\x00b=1\n",
-            .attrs = &amp;[_]Attr{
-                .{ .kind = .path, .value = "name" },
-            },
-            .err = error.PaxNullInKeyword,
-        },
-        .{ // null in value is not valid
-            .data = "23 path=name\x00with null\n",
-            .attrs = &amp;[_]Attr{
-                .{ .kind = .path, .err = error.PaxNullInValue },
-            },
-        },
-        .{ // 1000 characters path
-            .data = "1011 path=" ++ "0123456789" ** 100 ++ "\n",
-            .attrs = &amp;[_]Attr{
-                .{ .kind = .path, .value = "0123456789" ** 100 },
-            },
-        },
-    };
-    var buffer: [1024]u8 = undefined;
-
-    outer: for (cases) |case| {
-        var reader: Io.Reader = .fixed(case.data);
-        var it: PaxIterator = .{
-            .size = case.data.len,
-            .reader = &amp;reader,
-        };
-
-        var i: usize = 0;
-        while (it.next() catch |err| {
-            if (case.err) |e| {
-                try testing.expectEqual(e, err);
-                continue;
-            }
-            return err;
-        }) |attr| : (i += 1) {
-            const exp = case.attrs[i];
-            try testing.expectEqual(exp.kind, attr.kind);
-            const value = attr.value(&amp;buffer) catch |err| {
-                if (exp.err) |e| {
-                    try testing.expectEqual(e, err);
-                    break :outer;
-                }
-                return err;
-            };
-            try testing.expectEqualStrings(exp.value, value);
-        }
-        try testing.expectEqual(case.attrs.len, i);
-        try testing.expect(case.err == null);
-    }
-}
-
-test "header parse size" {
-    const cases = [_]struct {
-        in: []const u8,
-        want: u64 = 0,
-        err: ?anyerror = null,
-    }{
-        // Test base-256 (binary) encoded values.
-        .{ .in = "", .want = 0 },
-        .{ .in = "\x80", .want = 0 },
-        .{ .in = "\x80\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01", .want = 1 },
-        .{ .in = "\x80\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01\x02", .want = 0x0102 },
-        .{ .in = "\x80\x00\x00\x00\x01\x02\x03\x04\x05\x06\x07\x08", .want = 0x0102030405060708 },
-        .{ .in = "\x80\x00\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09", .err = error.TarNumericValueTooBig },
-        .{ .in = "\x80\x00\x00\x00\x07\x76\xa2\x22\xeb\x8a\x72\x61", .want = 537795476381659745 },
-        .{ .in = "\x80\x80\x80\x00\x01\x02\x03\x04\x05\x06\x07\x08", .err = error.TarNumericValueTooBig },
-
-        // // Test base-8 (octal) encoded values.
-        .{ .in = "00000000227\x00", .want = 0o227 },
-        .{ .in = "  000000227\x00", .want = 0o227 },
-        .{ .in = "00000000228\x00", .err = error.TarHeader },
-        .{ .in = "11111111111\x00", .want = 0o11111111111 },
-    };
-
-    for (cases) |case| {
-        var bytes = [_]u8{0} ** Header.SIZE;
-        @memcpy(bytes[124 .. 124 + case.in.len], case.in);
-        var header = Header{ .bytes = &amp;bytes };
-        if (case.err) |err| {
-            try testing.expectError(err, header.size());
-        } else {
-            try testing.expectEqual(case.want, try header.size());
-        }
-    }
-}
-
-test "header parse mode" {
-    const cases = [_]struct {
-        in: []const u8,
-        want: u64 = 0,
-        err: ?anyerror = null,
-    }{
-        .{ .in = "0000644\x00", .want = 0o644 },
-        .{ .in = "0000777\x00", .want = 0o777 },
-        .{ .in = "7777777\x00", .want = 0o7777777 },
-        .{ .in = "7777778\x00", .err = error.TarHeader },
-        .{ .in = "77777777", .want = 0o77777777 },
-        .{ .in = "777777777777", .want = 0o77777777 },
-    };
-    for (cases) |case| {
-        var bytes = [_]u8{0} ** Header.SIZE;
-        @memcpy(bytes[100 .. 100 + case.in.len], case.in);
-        var header = Header{ .bytes = &amp;bytes };
-        if (case.err) |err| {
-            try testing.expectError(err, header.mode());
-        } else {
-            try testing.expectEqual(case.want, try header.mode());
-        }
-    }
-}
-
-test "create file and symlink" {
-    const io = testing.io;
-
-    var root = testing.tmpDir(.{});
-    defer root.cleanup();
-
-    var file = try createDirAndFile(io, root.dir, "file1", .default_file);
-    file.close(io);
-    file = try createDirAndFile(io, root.dir, "a/b/c/file2", .default_file);
-    file.close(io);
-
-    createDirAndSymlink(io, root.dir, "a/b/c/file2", "symlink1") catch |err| switch (err) {
-        // On Windows, symlinks require developer mode/admin privileges and the underlying filesystem must support symlinks
-        error.AccessDenied, error.PermissionDenied, error.FileSystem =&gt; if (builtin.os.tag == .windows) return error.SkipZigTest else return err,
-        else =&gt; return err,
-    };
-    try createDirAndSymlink(io, root.dir, "../../../file1", "d/e/f/symlink2");
-
-    // Danglink symlnik, file created later
-    try createDirAndSymlink(io, root.dir, "../../../g/h/i/file4", "j/k/l/symlink3");
-    file = try createDirAndFile(io, root.dir, "g/h/i/file4", .default_file);
-    file.close(io);
-}
-
-test Iterator {
-    // Example tar file is created from this tree structure:
-    // $ tree example
-    //    example
-    //    ├── a
-    //    │   └── file
-    //    ├── b
-    //    │   └── symlink -&gt; ../a/file
-    //    └── empty
-    // $ cat example/a/file
-    //   content
-    // $ tar -cf example.tar example
-    // $ tar -tvf example.tar
-    //    example/
-    //    example/b/
-    //    example/b/symlink -&gt; ../a/file
-    //    example/a/
-    //    example/a/file
-    //    example/empty/
-
-    const data = @embedFile("tar/testdata/example.tar");
-    var reader: Io.Reader = .fixed(data);
-
-    // User provided buffers to the iterator
-    var file_name_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    var link_name_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    // Create iterator
-    var it: Iterator = .init(&amp;reader, .{
-        .file_name_buffer = &amp;file_name_buffer,
-        .link_name_buffer = &amp;link_name_buffer,
-    });
-    // Iterate over files in example.tar
-    var file_no: usize = 0;
-    while (try it.next()) |file| : (file_no += 1) {
-        switch (file.kind) {
-            .directory =&gt; {
-                switch (file_no) {
-                    0 =&gt; try testing.expectEqualStrings("example/", file.name),
-                    1 =&gt; try testing.expectEqualStrings("example/b/", file.name),
-                    3 =&gt; try testing.expectEqualStrings("example/a/", file.name),
-                    5 =&gt; try testing.expectEqualStrings("example/empty/", file.name),
-                    else =&gt; unreachable,
-                }
-            },
-            .file =&gt; {
-                try testing.expectEqualStrings("example/a/file", file.name);
-                var buf: [16]u8 = undefined;
-                var w: Io.Writer = .fixed(&amp;buf);
-                try it.streamRemaining(file, &amp;w);
-                try testing.expectEqualStrings("content\n", w.buffered());
-            },
-            .sym_link =&gt; {
-                try testing.expectEqualStrings("example/b/symlink", file.name);
-                try testing.expectEqualStrings("../a/file", file.link_name);
-            },
-        }
-    }
-}
-
-test extract {
-    const io = testing.io;
-    // Example tar file is created from this tree structure:
-    // $ tree example
-    //    example
-    //    ├── a
-    //    │   └── file
-    //    ├── b
-    //    │   └── symlink -&gt; ../a/file
-    //    └── empty
-    // $ cat example/a/file
-    //   content
-    // $ tar -cf example.tar example
-    // $ tar -tvf example.tar
-    //    example/
-    //    example/b/
-    //    example/b/symlink -&gt; ../a/file
-    //    example/a/
-    //    example/a/file
-    //    example/empty/
-
-    const data = @embedFile("tar/testdata/example.tar");
-    var reader: Io.Reader = .fixed(data);
-
-    var tmp = testing.tmpDir(.{ .follow_symlinks = false });
-    defer tmp.cleanup();
-    const dir = tmp.dir;
-
-    // Save tar from reader to the file system `dir`
-    extract(io, dir, &amp;reader, .{
-        .mode_mode = .ignore,
-        .strip_components = 1,
-        .exclude_empty_directories = true,
-    }) catch |err| {
-        // Skip on platform which don't support symlinks
-        if (err == error.UnableToCreateSymLink) return error.SkipZigTest;
-        return err;
-    };
-
-    try testing.expectError(error.FileNotFound, dir.statFile(io, "empty", .{}));
-    try testing.expect((try dir.statFile(io, "a/file", .{})).kind == .file);
-    try testing.expect((try dir.statFile(io, "b/symlink", .{})).kind == .file); // statFile follows symlink
-
-    var buf: [32]u8 = undefined;
-    try testing.expectEqualSlices(
-        u8,
-        "../a/file",
-        normalizePath(buf[0..try dir.readLink(io, "b/symlink", &amp;buf)]),
-    );
-}
-
-test "extract root_dir" {
-    const io = testing.io;
-    const data = @embedFile("tar/testdata/example.tar");
-    var reader: Io.Reader = .fixed(data);
-
-    // with strip_components = 1
-    {
-        var tmp = testing.tmpDir(.{ .follow_symlinks = false });
-        defer tmp.cleanup();
-        var diagnostics: Diagnostics = .{ .allocator = testing.allocator };
-        defer diagnostics.deinit();
-
-        extract(io, tmp.dir, &amp;reader, .{
-            .strip_components = 1,
-            .diagnostics = &amp;diagnostics,
-        }) catch |err| {
-            // Skip on platform which don't support symlinks
-            if (err == error.UnableToCreateSymLink) return error.SkipZigTest;
-            return err;
-        };
-
-        // there is no root_dir
-        try testing.expectEqual(0, diagnostics.root_dir.len);
-        try testing.expectEqual(5, diagnostics.entries);
-    }
-
-    // with strip_components = 0
-    {
-        reader = .fixed(data);
-        var tmp = testing.tmpDir(.{ .follow_symlinks = false });
-        defer tmp.cleanup();
-        var diagnostics: Diagnostics = .{ .allocator = testing.allocator };
-        defer diagnostics.deinit();
-
-        extract(io, tmp.dir, &amp;reader, .{
-            .strip_components = 0,
-            .diagnostics = &amp;diagnostics,
-        }) catch |err| {
-            // Skip on platform which don't support symlinks
-            if (err == error.UnableToCreateSymLink) return error.SkipZigTest;
-            return err;
-        };
-
-        // root_dir found
-        try testing.expectEqualStrings("example", diagnostics.root_dir);
-        try testing.expectEqual(6, diagnostics.entries);
-    }
-}
-
-test "findRoot with single file archive" {
-    const io = testing.io;
-    const data = @embedFile("tar/testdata/22752.tar");
-    var reader: Io.Reader = .fixed(data);
-
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var diagnostics: Diagnostics = .{ .allocator = testing.allocator };
-    defer diagnostics.deinit();
-    try extract(io, tmp.dir, &amp;reader, .{ .diagnostics = &amp;diagnostics });
-
-    try testing.expectEqualStrings("", diagnostics.root_dir);
-}
-
-test "findRoot without explicit root dir" {
-    const io = testing.io;
-    const data = @embedFile("tar/testdata/19820.tar");
-    var reader: Io.Reader = .fixed(data);
-
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var diagnostics: Diagnostics = .{ .allocator = testing.allocator };
-    defer diagnostics.deinit();
-    try extract(io, tmp.dir, &amp;reader, .{ .diagnostics = &amp;diagnostics });
-
-    try testing.expectEqualStrings("root", diagnostics.root_dir);
-}
-
-test "extract strip_components" {
-    const io = testing.io;
-    const data = @embedFile("tar/testdata/example.tar");
-    var reader: Io.Reader = .fixed(data);
-
-    var tmp = testing.tmpDir(.{ .follow_symlinks = false });
-    defer tmp.cleanup();
-    var diagnostics: Diagnostics = .{ .allocator = testing.allocator };
-    defer diagnostics.deinit();
-
-    extract(io, tmp.dir, &amp;reader, .{
-        .strip_components = 3,
-        .diagnostics = &amp;diagnostics,
-    }) catch |err| {
-        // Skip on platform which don't support symlinks
-        if (err == error.UnableToCreateSymLink) return error.SkipZigTest;
-        return err;
-    };
-
-    try testing.expectEqual(2, diagnostics.errors.items.len);
-    try testing.expectEqualStrings("example/b/symlink", diagnostics.errors.items[0].components_outside_stripped_prefix.file_name);
-    try testing.expectEqualStrings("example/a/file", diagnostics.errors.items[1].components_outside_stripped_prefix.file_name);
-}
-
-fn normalizePath(bytes: []u8) []u8 {
-    const canonical_sep = std.fs.path.sep_posix;
-    if (std.fs.path.sep == canonical_sep) return bytes;
-    std.mem.replaceScalar(u8, bytes, std.fs.path.sep, canonical_sep);
-    return bytes;
-}
-
-// File system mode based on tar header mode and mode_mode options.
-fn filePermissions(mode: u32, options: ExtractOptions) Io.File.Permissions {
-    return if (!Io.File.Permissions.has_executable_bit or options.mode_mode == .ignore or (mode &amp; 0o100) == 0)
-        .default_file
-    else
-        .executable_file;
-}
-
-test filePermissions {
-    if (!Io.File.Permissions.has_executable_bit) return error.SkipZigTest;
-    try testing.expectEqual(Io.File.Permissions.default_file, filePermissions(0o744, .{ .mode_mode = .ignore }));
-    try testing.expectEqual(Io.File.Permissions.executable_file, filePermissions(0o744, .{}));
-    try testing.expectEqual(Io.File.Permissions.default_file, filePermissions(0o644, .{}));
-    try testing.expectEqual(Io.File.Permissions.default_file, filePermissions(0o655, .{}));
-}
-
-test "executable bit" {
-    if (!Io.File.Permissions.has_executable_bit) return error.SkipZigTest;
-
-    const io = testing.io;
-    const S = std.posix.S;
-    const data = @embedFile("tar/testdata/example.tar");
-
-    for ([_]ExtractOptions.ModeMode{ .ignore, .executable_bit_only }) |opt| {
-        var reader: Io.Reader = .fixed(data);
-
-        var tmp = testing.tmpDir(.{ .follow_symlinks = false });
-        //defer tmp.cleanup();
-
-        extract(io, tmp.dir, &amp;reader, .{
-            .strip_components = 1,
-            .exclude_empty_directories = true,
-            .mode_mode = opt,
-        }) catch |err| {
-            // Skip on platform which don't support symlinks
-            if (err == error.UnableToCreateSymLink) return error.SkipZigTest;
-            return err;
-        };
-
-        const fs = try tmp.dir.statFile(io, "a/file", .{});
-        try testing.expect(fs.kind == .file);
-
-        const mode = fs.permissions.toMode();
-
-        if (opt == .executable_bit_only) {
-            // Executable bit is set for user, group and others
-            try testing.expect(mode &amp; S.IXUSR &gt; 0);
-            try testing.expect(mode &amp; S.IXGRP &gt; 0);
-            try testing.expect(mode &amp; S.IXOTH &gt; 0);
-        }
-        if (opt == .ignore) {
-            try testing.expect(mode &amp; S.IXUSR == 0);
-            try testing.expect(mode &amp; S.IXGRP == 0);
-            try testing.expect(mode &amp; S.IXOTH == 0);
-        }
-    }
-}
-
-test {
-    _ = @import("tar/test.zig");
-    _ = Writer;
-    _ = Diagnostics;
-}</pre>
+    <pre><a id="L1"></a>//! Tar archive is single ordinary file which can contain many files (or
+<a id="L2"></a>//! directories, symlinks, ...). It's build by series of blocks each size of 512
+<a id="L3"></a>//! bytes. First block of each entry is header which defines type, name, size
+<a id="L4"></a>//! permissions and other attributes. Header is followed by series of blocks of
+<a id="L5"></a>//! file content, if any that entry has content. Content is padded to the block
+<a id="L6"></a>//! size, so next header always starts at block boundary.
+<a id="L7"></a>//!
+<a id="L8"></a>//! This simple format is extended by GNU and POSIX pax extensions to support
+<a id="L9"></a>//! file names longer than 256 bytes and additional attributes.
+<a id="L10"></a>//!
+<a id="L11"></a>//! This is not comprehensive tar parser. Here we are only file types needed to
+<a id="L12"></a>//! support Zig package manager; normal file, directory, symbolic link. And
+<a id="L13"></a>//! subset of attributes: name, size, permissions.
+<a id="L14"></a>//!
+<a id="L15"></a>//! GNU tar reference: https://www.gnu.org/software/tar/manual/html_node/Standard.html
+<a id="L16"></a>//! pax reference: https://pubs.opengroup.org/onlinepubs/9699919799/utilities/pax.html#tag_20_92_13
+<a id="L17"></a>
+<a id="L18"></a>const std = @import("std");
+<a id="L19"></a>const builtin = @import("builtin");
+<a id="L20"></a>const Io = std.Io;
+<a id="L21"></a>const assert = std.debug.assert;
+<a id="L22"></a>const testing = std.testing;
+<a id="L23"></a>
+<a id="L24"></a>pub const Writer = @import("tar/Writer.zig");
+<a id="L25"></a>
+<a id="L26"></a>/// Provide this to receive detailed error messages.
+<a id="L27"></a>/// When this is provided, some errors which would otherwise be returned
+<a id="L28"></a>/// immediately will instead be added to this structure. The API user must check
+<a id="L29"></a>/// the errors in diagnostics to know whether the operation succeeded or failed.
+<a id="L30"></a>pub const Diagnostics = struct {
+<a id="L31"></a>    allocator: std.mem.Allocator,
+<a id="L32"></a>    errors: std.ArrayList(Error) = .empty,
+<a id="L33"></a>
+<a id="L34"></a>    entries: usize = 0,
+<a id="L35"></a>    root_dir: []const u8 = "",
+<a id="L36"></a>
+<a id="L37"></a>    pub const Error = union(enum) {
+<a id="L38"></a>        unable_to_create_sym_link: struct {
+<a id="L39"></a>            code: anyerror,
+<a id="L40"></a>            file_name: []const u8,
+<a id="L41"></a>            link_name: []const u8,
+<a id="L42"></a>        },
+<a id="L43"></a>        unable_to_create_file: struct {
+<a id="L44"></a>            code: anyerror,
+<a id="L45"></a>            file_name: []const u8,
+<a id="L46"></a>        },
+<a id="L47"></a>        unsupported_file_type: struct {
+<a id="L48"></a>            file_name: []const u8,
+<a id="L49"></a>            file_type: Header.Kind,
+<a id="L50"></a>        },
+<a id="L51"></a>        components_outside_stripped_prefix: struct {
+<a id="L52"></a>            file_name: []const u8,
+<a id="L53"></a>        },
+<a id="L54"></a>    };
+<a id="L55"></a>
+<a id="L56"></a>    fn findRoot(d: *Diagnostics, kind: FileKind, path: []const u8) !void {
+<a id="L57"></a>        if (path.len == 0) return;
+<a id="L58"></a>
+<a id="L59"></a>        d.entries += 1;
+<a id="L60"></a>        const root_dir = rootDir(path, kind);
+<a id="L61"></a>        if (d.entries == 1) {
+<a id="L62"></a>            d.root_dir = try d.allocator.dupe(u8, root_dir);
+<a id="L63"></a>            return;
+<a id="L64"></a>        }
+<a id="L65"></a>        if (d.root_dir.len == 0 or std.mem.eql(u8, root_dir, d.root_dir))
+<a id="L66"></a>            return;
+<a id="L67"></a>        d.allocator.free(d.root_dir);
+<a id="L68"></a>        d.root_dir = "";
+<a id="L69"></a>    }
+<a id="L70"></a>
+<a id="L71"></a>    // Returns root dir of the path, assumes non empty path.
+<a id="L72"></a>    fn rootDir(path: []const u8, kind: FileKind) []const u8 {
+<a id="L73"></a>        const start_index: usize = if (path[0] == '/') 1 else 0;
+<a id="L74"></a>        const end_index: usize = if (path[path.len - 1] == '/') path.len - 1 else path.len;
+<a id="L75"></a>        const buf = path[start_index..end_index];
+<a id="L76"></a>        if (std.mem.findScalarPos(u8, buf, 0, '/')) |idx| {
+<a id="L77"></a>            return buf[0..idx];
+<a id="L78"></a>        }
+<a id="L79"></a>
+<a id="L80"></a>        return switch (kind) {
+<a id="L81"></a>            .file =&gt; "",
+<a id="L82"></a>            .sym_link =&gt; "",
+<a id="L83"></a>            .directory =&gt; buf,
+<a id="L84"></a>        };
+<a id="L85"></a>    }
+<a id="L86"></a>
+<a id="L87"></a>    test rootDir {
+<a id="L88"></a>        const expectEqualStrings = testing.expectEqualStrings;
+<a id="L89"></a>        try expectEqualStrings("", rootDir("a", .file));
+<a id="L90"></a>        try expectEqualStrings("a", rootDir("a", .directory));
+<a id="L91"></a>        try expectEqualStrings("b", rootDir("b", .directory));
+<a id="L92"></a>        try expectEqualStrings("c", rootDir("/c", .directory));
+<a id="L93"></a>        try expectEqualStrings("d", rootDir("/d/", .directory));
+<a id="L94"></a>        try expectEqualStrings("a", rootDir("a/b", .directory));
+<a id="L95"></a>        try expectEqualStrings("a", rootDir("a/b", .file));
+<a id="L96"></a>        try expectEqualStrings("a", rootDir("a/b/c", .directory));
+<a id="L97"></a>    }
+<a id="L98"></a>
+<a id="L99"></a>    pub fn deinit(d: *Diagnostics) void {
+<a id="L100"></a>        for (d.errors.items) |item| {
+<a id="L101"></a>            switch (item) {
+<a id="L102"></a>                .unable_to_create_sym_link =&gt; |info| {
+<a id="L103"></a>                    d.allocator.free(info.file_name);
+<a id="L104"></a>                    d.allocator.free(info.link_name);
+<a id="L105"></a>                },
+<a id="L106"></a>                .unable_to_create_file =&gt; |info| {
+<a id="L107"></a>                    d.allocator.free(info.file_name);
+<a id="L108"></a>                },
+<a id="L109"></a>                .unsupported_file_type =&gt; |info| {
+<a id="L110"></a>                    d.allocator.free(info.file_name);
+<a id="L111"></a>                },
+<a id="L112"></a>                .components_outside_stripped_prefix =&gt; |info| {
+<a id="L113"></a>                    d.allocator.free(info.file_name);
+<a id="L114"></a>                },
+<a id="L115"></a>            }
+<a id="L116"></a>        }
+<a id="L117"></a>        d.errors.deinit(d.allocator);
+<a id="L118"></a>        d.allocator.free(d.root_dir);
+<a id="L119"></a>        d.* = undefined;
+<a id="L120"></a>    }
+<a id="L121"></a>};
+<a id="L122"></a>
+<a id="L123"></a>/// Deprecated, renamed to `ExtractOptions`.
+<a id="L124"></a>pub const PipeOptions = ExtractOptions;
+<a id="L125"></a>
+<a id="L126"></a>pub const ExtractOptions = struct {
+<a id="L127"></a>    /// Number of directory levels to skip when extracting files.
+<a id="L128"></a>    strip_components: u32 = 0,
+<a id="L129"></a>    /// How to handle the "mode" property of files from within the tar file.
+<a id="L130"></a>    mode_mode: ModeMode = .executable_bit_only,
+<a id="L131"></a>    /// Prevents creation of empty directories.
+<a id="L132"></a>    exclude_empty_directories: bool = false,
+<a id="L133"></a>    /// Collects error messages during unpacking
+<a id="L134"></a>    diagnostics: ?*Diagnostics = null,
+<a id="L135"></a>
+<a id="L136"></a>    pub const ModeMode = enum {
+<a id="L137"></a>        /// The mode from the tar file is completely ignored. Files are created
+<a id="L138"></a>        /// with the default mode when creating files.
+<a id="L139"></a>        ignore,
+<a id="L140"></a>        /// The mode from the tar file is inspected for the owner executable bit
+<a id="L141"></a>        /// only. This bit is copied to the group and other executable bits.
+<a id="L142"></a>        /// Other bits of the mode are left as the default when creating files.
+<a id="L143"></a>        executable_bit_only,
+<a id="L144"></a>    };
+<a id="L145"></a>};
+<a id="L146"></a>
+<a id="L147"></a>const Header = struct {
+<a id="L148"></a>    const SIZE = 512;
+<a id="L149"></a>    const MAX_NAME_SIZE = 100 + 1 + 155; // name(100) + separator(1) + prefix(155)
+<a id="L150"></a>    const LINK_NAME_SIZE = 100;
+<a id="L151"></a>
+<a id="L152"></a>    bytes: *const [SIZE]u8,
+<a id="L153"></a>
+<a id="L154"></a>    const Kind = enum(u8) {
+<a id="L155"></a>        normal_alias = 0,
+<a id="L156"></a>        normal = '0',
+<a id="L157"></a>        hard_link = '1',
+<a id="L158"></a>        symbolic_link = '2',
+<a id="L159"></a>        character_special = '3',
+<a id="L160"></a>        block_special = '4',
+<a id="L161"></a>        directory = '5',
+<a id="L162"></a>        fifo = '6',
+<a id="L163"></a>        contiguous = '7',
+<a id="L164"></a>        global_extended_header = 'g',
+<a id="L165"></a>        extended_header = 'x',
+<a id="L166"></a>        // Types 'L' and 'K' are used by the GNU format for a meta file
+<a id="L167"></a>        // used to store the path or link name for the next file.
+<a id="L168"></a>        gnu_long_name = 'L',
+<a id="L169"></a>        gnu_long_link = 'K',
+<a id="L170"></a>        gnu_sparse = 'S',
+<a id="L171"></a>        solaris_extended_header = 'X',
+<a id="L172"></a>        _,
+<a id="L173"></a>    };
+<a id="L174"></a>
+<a id="L175"></a>    /// Includes prefix concatenated, if any.
+<a id="L176"></a>    /// TODO: check against "../" and other nefarious things
+<a id="L177"></a>    pub fn fullName(header: Header, buffer: []u8) ![]const u8 {
+<a id="L178"></a>        const n = name(header);
+<a id="L179"></a>        const p = prefix(header);
+<a id="L180"></a>        if (buffer.len &lt; n.len + p.len + 1) return error.TarInsufficientBuffer;
+<a id="L181"></a>        if (!is_ustar(header) or p.len == 0) {
+<a id="L182"></a>            @memcpy(buffer[0..n.len], n);
+<a id="L183"></a>            return buffer[0..n.len];
+<a id="L184"></a>        }
+<a id="L185"></a>        @memcpy(buffer[0..p.len], p);
+<a id="L186"></a>        buffer[p.len] = '/';
+<a id="L187"></a>        @memcpy(buffer[p.len + 1 ..][0..n.len], n);
+<a id="L188"></a>        return buffer[0 .. p.len + 1 + n.len];
+<a id="L189"></a>    }
+<a id="L190"></a>
+<a id="L191"></a>    /// When kind is symbolic_link linked-to name (target_path) is specified in
+<a id="L192"></a>    /// the linkname field.
+<a id="L193"></a>    pub fn linkName(header: Header, buffer: []u8) ![]const u8 {
+<a id="L194"></a>        const link_name = header.str(157, 100);
+<a id="L195"></a>        if (link_name.len == 0) {
+<a id="L196"></a>            return buffer[0..0];
+<a id="L197"></a>        }
+<a id="L198"></a>        if (buffer.len &lt; link_name.len) return error.TarInsufficientBuffer;
+<a id="L199"></a>        const buf = buffer[0..link_name.len];
+<a id="L200"></a>        @memcpy(buf, link_name);
+<a id="L201"></a>        return buf;
+<a id="L202"></a>    }
+<a id="L203"></a>
+<a id="L204"></a>    pub fn name(header: Header) []const u8 {
+<a id="L205"></a>        return header.str(0, 100);
+<a id="L206"></a>    }
+<a id="L207"></a>
+<a id="L208"></a>    pub fn mode(header: Header) !u32 {
+<a id="L209"></a>        return @intCast(try header.octal(100, 8));
+<a id="L210"></a>    }
+<a id="L211"></a>
+<a id="L212"></a>    pub fn size(header: Header) !u64 {
+<a id="L213"></a>        const start = 124;
+<a id="L214"></a>        const len = 12;
+<a id="L215"></a>        const raw = header.bytes[start..][0..len];
+<a id="L216"></a>        //  If the leading byte is 0xff (255), all the bytes of the field
+<a id="L217"></a>        //  (including the leading byte) are concatenated in big-endian order,
+<a id="L218"></a>        //  with the result being a negative number expressed in two’s
+<a id="L219"></a>        //  complement form.
+<a id="L220"></a>        if (raw[0] == 0xff) return error.TarNumericValueNegative;
+<a id="L221"></a>        // If the leading byte is 0x80 (128), the non-leading bytes of the
+<a id="L222"></a>        // field are concatenated in big-endian order.
+<a id="L223"></a>        if (raw[0] == 0x80) {
+<a id="L224"></a>            if (raw[1] != 0 or raw[2] != 0 or raw[3] != 0) return error.TarNumericValueTooBig;
+<a id="L225"></a>            return std.mem.readInt(u64, raw[4..12], .big);
+<a id="L226"></a>        }
+<a id="L227"></a>        return try header.octal(start, len);
+<a id="L228"></a>    }
+<a id="L229"></a>
+<a id="L230"></a>    pub fn chksum(header: Header) !u64 {
+<a id="L231"></a>        return header.octal(148, 8);
+<a id="L232"></a>    }
+<a id="L233"></a>
+<a id="L234"></a>    pub fn is_ustar(header: Header) bool {
+<a id="L235"></a>        const magic = header.bytes[257..][0..6];
+<a id="L236"></a>        return std.mem.eql(u8, magic[0..5], "ustar") and (magic[5] == 0 or magic[5] == ' ');
+<a id="L237"></a>    }
+<a id="L238"></a>
+<a id="L239"></a>    pub fn prefix(header: Header) []const u8 {
+<a id="L240"></a>        return header.str(345, 155);
+<a id="L241"></a>    }
+<a id="L242"></a>
+<a id="L243"></a>    pub fn kind(header: Header) Kind {
+<a id="L244"></a>        const result: Kind = @enumFromInt(header.bytes[156]);
+<a id="L245"></a>        if (result == .normal_alias) return .normal;
+<a id="L246"></a>        return result;
+<a id="L247"></a>    }
+<a id="L248"></a>
+<a id="L249"></a>    fn str(header: Header, start: usize, len: usize) []const u8 {
+<a id="L250"></a>        return nullStr(header.bytes[start .. start + len]);
+<a id="L251"></a>    }
+<a id="L252"></a>
+<a id="L253"></a>    fn octal(header: Header, start: usize, len: usize) !u64 {
+<a id="L254"></a>        const raw = header.bytes[start..][0..len];
+<a id="L255"></a>        // Zero-filled octal number in ASCII. Each numeric field of width w
+<a id="L256"></a>        // contains w minus 1 digits, and a null
+<a id="L257"></a>        const ltrimmed = std.mem.trimStart(u8, raw, "0 ");
+<a id="L258"></a>        const rtrimmed = std.mem.trimEnd(u8, ltrimmed, " \x00");
+<a id="L259"></a>        if (rtrimmed.len == 0) return 0;
+<a id="L260"></a>        return std.fmt.parseInt(u64, rtrimmed, 8) catch return error.TarHeader;
+<a id="L261"></a>    }
+<a id="L262"></a>
+<a id="L263"></a>    const Chksums = struct {
+<a id="L264"></a>        unsigned: u64,
+<a id="L265"></a>        signed: i64,
+<a id="L266"></a>    };
+<a id="L267"></a>
+<a id="L268"></a>    // Sum of all bytes in the header block. The chksum field is treated as if
+<a id="L269"></a>    // it were filled with spaces (ASCII 32).
+<a id="L270"></a>    fn computeChksum(header: Header) Chksums {
+<a id="L271"></a>        var cs: Chksums = .{ .signed = 0, .unsigned = 0 };
+<a id="L272"></a>        for (header.bytes, 0..) |v, i| {
+<a id="L273"></a>            const b = if (148 &lt;= i and i &lt; 156) 32 else v; // Treating chksum bytes as spaces.
+<a id="L274"></a>            cs.unsigned += b;
+<a id="L275"></a>            cs.signed += @as(i8, @bitCast(b));
+<a id="L276"></a>        }
+<a id="L277"></a>        return cs;
+<a id="L278"></a>    }
+<a id="L279"></a>
+<a id="L280"></a>    // Checks calculated chksum with value of chksum field.
+<a id="L281"></a>    // Returns error or valid chksum value.
+<a id="L282"></a>    // Zero value indicates empty block.
+<a id="L283"></a>    pub fn checkChksum(header: Header) !u64 {
+<a id="L284"></a>        const field = try header.chksum();
+<a id="L285"></a>        const cs = header.computeChksum();
+<a id="L286"></a>        if (field == 0 and cs.unsigned == 256) return 0;
+<a id="L287"></a>        if (field != cs.unsigned and field != cs.signed) return error.TarHeaderChksum;
+<a id="L288"></a>        return field;
+<a id="L289"></a>    }
+<a id="L290"></a>};
+<a id="L291"></a>
+<a id="L292"></a>// Breaks string on first null character.
+<a id="L293"></a>fn nullStr(str: []const u8) []const u8 {
+<a id="L294"></a>    for (str, 0..) |c, i| {
+<a id="L295"></a>        if (c == 0) return str[0..i];
+<a id="L296"></a>    }
+<a id="L297"></a>    return str;
+<a id="L298"></a>}
+<a id="L299"></a>
+<a id="L300"></a>/// Type of the file returned by iterator `next` method.
+<a id="L301"></a>pub const FileKind = enum {
+<a id="L302"></a>    directory,
+<a id="L303"></a>    sym_link,
+<a id="L304"></a>    file,
+<a id="L305"></a>};
+<a id="L306"></a>
+<a id="L307"></a>/// Iterator over entries in the tar file represented by reader.
+<a id="L308"></a>pub const Iterator = struct {
+<a id="L309"></a>    reader: *Io.Reader,
+<a id="L310"></a>    diagnostics: ?*Diagnostics = null,
+<a id="L311"></a>
+<a id="L312"></a>    // buffers for heeader and file attributes
+<a id="L313"></a>    header_buffer: [Header.SIZE]u8 = undefined,
+<a id="L314"></a>    file_name_buffer: []u8,
+<a id="L315"></a>    link_name_buffer: []u8,
+<a id="L316"></a>
+<a id="L317"></a>    // bytes of padding to the end of the block
+<a id="L318"></a>    padding: usize = 0,
+<a id="L319"></a>    // not consumed bytes of file from last next iteration
+<a id="L320"></a>    unread_file_bytes: u64 = 0,
+<a id="L321"></a>
+<a id="L322"></a>    /// Options for iterator.
+<a id="L323"></a>    /// Buffers should be provided by the caller.
+<a id="L324"></a>    pub const Options = struct {
+<a id="L325"></a>        /// Use a buffer with length `std.fs.max_path_bytes` to match file system capabilities.
+<a id="L326"></a>        file_name_buffer: []u8,
+<a id="L327"></a>        /// Use a buffer with length `std.fs.max_path_bytes` to match file system capabilities.
+<a id="L328"></a>        link_name_buffer: []u8,
+<a id="L329"></a>        /// Collects error messages during unpacking
+<a id="L330"></a>        diagnostics: ?*Diagnostics = null,
+<a id="L331"></a>    };
+<a id="L332"></a>
+<a id="L333"></a>    /// Iterates over files in tar archive.
+<a id="L334"></a>    /// `next` returns each file in tar archive.
+<a id="L335"></a>    pub fn init(reader: *Io.Reader, options: Options) Iterator {
+<a id="L336"></a>        return .{
+<a id="L337"></a>            .reader = reader,
+<a id="L338"></a>            .diagnostics = options.diagnostics,
+<a id="L339"></a>            .file_name_buffer = options.file_name_buffer,
+<a id="L340"></a>            .link_name_buffer = options.link_name_buffer,
+<a id="L341"></a>        };
+<a id="L342"></a>    }
+<a id="L343"></a>
+<a id="L344"></a>    pub const File = struct {
+<a id="L345"></a>        name: []const u8, // name of file, symlink or directory
+<a id="L346"></a>        link_name: []const u8, // target name of symlink
+<a id="L347"></a>        size: u64 = 0, // size of the file in bytes
+<a id="L348"></a>        mode: u32 = 0,
+<a id="L349"></a>        kind: FileKind = .file,
+<a id="L350"></a>    };
+<a id="L351"></a>
+<a id="L352"></a>    fn readHeader(self: *Iterator) !?Header {
+<a id="L353"></a>        if (self.padding &gt; 0) {
+<a id="L354"></a>            try self.reader.discardAll(self.padding);
+<a id="L355"></a>        }
+<a id="L356"></a>        const n = try self.reader.readSliceShort(&amp;self.header_buffer);
+<a id="L357"></a>        if (n == 0) return null;
+<a id="L358"></a>        if (n &lt; Header.SIZE) return error.UnexpectedEndOfStream;
+<a id="L359"></a>        const header = Header{ .bytes = self.header_buffer[0..Header.SIZE] };
+<a id="L360"></a>        if (try header.checkChksum() == 0) return null;
+<a id="L361"></a>        return header;
+<a id="L362"></a>    }
+<a id="L363"></a>
+<a id="L364"></a>    fn readString(self: *Iterator, size: usize, buffer: []u8) ![]const u8 {
+<a id="L365"></a>        if (size &gt; buffer.len) return error.TarInsufficientBuffer;
+<a id="L366"></a>        const buf = buffer[0..size];
+<a id="L367"></a>        try self.reader.readSliceAll(buf);
+<a id="L368"></a>        return nullStr(buf);
+<a id="L369"></a>    }
+<a id="L370"></a>
+<a id="L371"></a>    fn newFile(self: *Iterator) File {
+<a id="L372"></a>        return .{
+<a id="L373"></a>            .name = self.file_name_buffer[0..0],
+<a id="L374"></a>            .link_name = self.link_name_buffer[0..0],
+<a id="L375"></a>        };
+<a id="L376"></a>    }
+<a id="L377"></a>
+<a id="L378"></a>    // Number of padding bytes in the last file block.
+<a id="L379"></a>    fn blockPadding(size: u64) usize {
+<a id="L380"></a>        const block_rounded = std.mem.alignForward(u64, size, Header.SIZE); // size rounded to te block boundary
+<a id="L381"></a>        return @intCast(block_rounded - size);
+<a id="L382"></a>    }
+<a id="L383"></a>
+<a id="L384"></a>    /// Iterates through the tar archive as if it is a series of files.
+<a id="L385"></a>    /// Internally, the tar format often uses entries (header with optional
+<a id="L386"></a>    /// content) to add meta data that describes the next file. These
+<a id="L387"></a>    /// entries should not normally be visible to the outside. As such, this
+<a id="L388"></a>    /// loop iterates through one or more entries until it collects a all
+<a id="L389"></a>    /// file attributes.
+<a id="L390"></a>    pub fn next(self: *Iterator) !?File {
+<a id="L391"></a>        if (self.unread_file_bytes &gt; 0) {
+<a id="L392"></a>            // If file content was not consumed by caller
+<a id="L393"></a>            try self.reader.discardAll64(self.unread_file_bytes);
+<a id="L394"></a>            self.unread_file_bytes = 0;
+<a id="L395"></a>        }
+<a id="L396"></a>        var file: File = self.newFile();
+<a id="L397"></a>
+<a id="L398"></a>        while (try self.readHeader()) |header| {
+<a id="L399"></a>            const kind = header.kind();
+<a id="L400"></a>            const size: u64 = try header.size();
+<a id="L401"></a>            self.padding = blockPadding(size);
+<a id="L402"></a>
+<a id="L403"></a>            switch (kind) {
+<a id="L404"></a>                // File types to return upstream
+<a id="L405"></a>                .directory, .normal, .symbolic_link =&gt; {
+<a id="L406"></a>                    file.kind = switch (kind) {
+<a id="L407"></a>                        .directory =&gt; .directory,
+<a id="L408"></a>                        .normal =&gt; .file,
+<a id="L409"></a>                        .symbolic_link =&gt; .sym_link,
+<a id="L410"></a>                        else =&gt; unreachable,
+<a id="L411"></a>                    };
+<a id="L412"></a>                    file.mode = try header.mode();
+<a id="L413"></a>
+<a id="L414"></a>                    // set file attributes if not already set by prefix/extended headers
+<a id="L415"></a>                    if (file.size == 0) {
+<a id="L416"></a>                        file.size = size;
+<a id="L417"></a>                    }
+<a id="L418"></a>                    if (file.link_name.len == 0) {
+<a id="L419"></a>                        file.link_name = try header.linkName(self.link_name_buffer);
+<a id="L420"></a>                    }
+<a id="L421"></a>                    if (file.name.len == 0) {
+<a id="L422"></a>                        file.name = try header.fullName(self.file_name_buffer);
+<a id="L423"></a>                    }
+<a id="L424"></a>
+<a id="L425"></a>                    self.padding = blockPadding(file.size);
+<a id="L426"></a>                    self.unread_file_bytes = file.size;
+<a id="L427"></a>                    return file;
+<a id="L428"></a>                },
+<a id="L429"></a>                // Prefix header types
+<a id="L430"></a>                .gnu_long_name =&gt; {
+<a id="L431"></a>                    file.name = try self.readString(@intCast(size), self.file_name_buffer);
+<a id="L432"></a>                },
+<a id="L433"></a>                .gnu_long_link =&gt; {
+<a id="L434"></a>                    file.link_name = try self.readString(@intCast(size), self.link_name_buffer);
+<a id="L435"></a>                },
+<a id="L436"></a>                .extended_header =&gt; {
+<a id="L437"></a>                    // Use just attributes from last extended header.
+<a id="L438"></a>                    file = self.newFile();
+<a id="L439"></a>
+<a id="L440"></a>                    var rdr: PaxIterator = .{
+<a id="L441"></a>                        .reader = self.reader,
+<a id="L442"></a>                        .size = @intCast(size),
+<a id="L443"></a>                    };
+<a id="L444"></a>                    while (try rdr.next()) |attr| {
+<a id="L445"></a>                        switch (attr.kind) {
+<a id="L446"></a>                            .path =&gt; {
+<a id="L447"></a>                                file.name = try attr.value(self.file_name_buffer);
+<a id="L448"></a>                            },
+<a id="L449"></a>                            .linkpath =&gt; {
+<a id="L450"></a>                                file.link_name = try attr.value(self.link_name_buffer);
+<a id="L451"></a>                            },
+<a id="L452"></a>                            .size =&gt; {
+<a id="L453"></a>                                var buf: [pax_max_size_attr_len]u8 = undefined;
+<a id="L454"></a>                                file.size = try std.fmt.parseInt(u64, try attr.value(&amp;buf), 10);
+<a id="L455"></a>                            },
+<a id="L456"></a>                        }
+<a id="L457"></a>                    }
+<a id="L458"></a>                },
+<a id="L459"></a>                // Ignored header type
+<a id="L460"></a>                .global_extended_header =&gt; {
+<a id="L461"></a>                    self.reader.discardAll64(size) catch return error.TarHeadersTooBig;
+<a id="L462"></a>                },
+<a id="L463"></a>                // All other are unsupported header types
+<a id="L464"></a>                else =&gt; {
+<a id="L465"></a>                    const d = self.diagnostics orelse return error.TarUnsupportedHeader;
+<a id="L466"></a>                    try d.errors.append(d.allocator, .{ .unsupported_file_type = .{
+<a id="L467"></a>                        .file_name = try d.allocator.dupe(u8, header.name()),
+<a id="L468"></a>                        .file_type = kind,
+<a id="L469"></a>                    } });
+<a id="L470"></a>                    if (kind == .gnu_sparse) {
+<a id="L471"></a>                        try self.skipGnuSparseExtendedHeaders(header);
+<a id="L472"></a>                    }
+<a id="L473"></a>                    self.reader.discardAll64(size) catch return error.TarHeadersTooBig;
+<a id="L474"></a>                },
+<a id="L475"></a>            }
+<a id="L476"></a>        }
+<a id="L477"></a>        return null;
+<a id="L478"></a>    }
+<a id="L479"></a>
+<a id="L480"></a>    pub fn streamRemaining(it: *Iterator, file: File, w: *Io.Writer) Io.Reader.StreamError!void {
+<a id="L481"></a>        try it.reader.streamExact64(w, file.size);
+<a id="L482"></a>        it.unread_file_bytes = 0;
+<a id="L483"></a>    }
+<a id="L484"></a>
+<a id="L485"></a>    fn skipGnuSparseExtendedHeaders(self: *Iterator, header: Header) !void {
+<a id="L486"></a>        var is_extended = header.bytes[482] &gt; 0;
+<a id="L487"></a>        while (is_extended) {
+<a id="L488"></a>            var buf: [Header.SIZE]u8 = undefined;
+<a id="L489"></a>            try self.reader.readSliceAll(&amp;buf);
+<a id="L490"></a>            is_extended = buf[504] &gt; 0;
+<a id="L491"></a>        }
+<a id="L492"></a>    }
+<a id="L493"></a>};
+<a id="L494"></a>
+<a id="L495"></a>const PaxAttributeKind = enum {
+<a id="L496"></a>    path,
+<a id="L497"></a>    linkpath,
+<a id="L498"></a>    size,
+<a id="L499"></a>};
+<a id="L500"></a>
+<a id="L501"></a>// maxInt(u64) has 20 chars, base 10 in practice we got 24 chars
+<a id="L502"></a>const pax_max_size_attr_len = 64;
+<a id="L503"></a>
+<a id="L504"></a>pub const PaxIterator = struct {
+<a id="L505"></a>    size: usize, // cumulative size of all pax attributes
+<a id="L506"></a>    reader: *Io.Reader,
+<a id="L507"></a>
+<a id="L508"></a>    const Self = @This();
+<a id="L509"></a>
+<a id="L510"></a>    const Attribute = struct {
+<a id="L511"></a>        kind: PaxAttributeKind,
+<a id="L512"></a>        len: usize, // length of the attribute value
+<a id="L513"></a>        reader: *Io.Reader, // reader positioned at value start
+<a id="L514"></a>
+<a id="L515"></a>        // Copies pax attribute value into destination buffer.
+<a id="L516"></a>        // Must be called with destination buffer of size at least Attribute.len.
+<a id="L517"></a>        pub fn value(self: Attribute, dst: []u8) ![]const u8 {
+<a id="L518"></a>            if (self.len &gt; dst.len) return error.TarInsufficientBuffer;
+<a id="L519"></a>            // assert(self.len &lt;= dst.len);
+<a id="L520"></a>            const buf = dst[0..self.len];
+<a id="L521"></a>            const n = try self.reader.readSliceShort(buf);
+<a id="L522"></a>            if (n &lt; self.len) return error.UnexpectedEndOfStream;
+<a id="L523"></a>            try validateAttributeEnding(self.reader);
+<a id="L524"></a>            if (hasNull(buf)) return error.PaxNullInValue;
+<a id="L525"></a>            return buf;
+<a id="L526"></a>        }
+<a id="L527"></a>    };
+<a id="L528"></a>
+<a id="L529"></a>    // Iterates over pax attributes. Returns known only known attributes.
+<a id="L530"></a>    // Caller has to call value in Attribute, to advance reader across value.
+<a id="L531"></a>    pub fn next(self: *Self) !?Attribute {
+<a id="L532"></a>        // Pax extended header consists of one or more attributes, each constructed as follows:
+<a id="L533"></a>        // "%d %s=%s\n", &lt;length&gt;, &lt;keyword&gt;, &lt;value&gt;
+<a id="L534"></a>        while (self.size &gt; 0) {
+<a id="L535"></a>            const length_buf = try self.reader.takeSentinel(' ');
+<a id="L536"></a>            const length = try std.fmt.parseInt(usize, length_buf, 10); // record length in bytes
+<a id="L537"></a>
+<a id="L538"></a>            const keyword = try self.reader.takeSentinel('=');
+<a id="L539"></a>            if (hasNull(keyword)) return error.PaxNullInKeyword;
+<a id="L540"></a>
+<a id="L541"></a>            // calculate value_len
+<a id="L542"></a>            const value_start = length_buf.len + keyword.len + 2; // 2 separators
+<a id="L543"></a>            if (length &lt; value_start + 1 or self.size &lt; length) return error.UnexpectedEndOfStream;
+<a id="L544"></a>            const value_len = length - value_start - 1; // \n separator at end
+<a id="L545"></a>            self.size -= length;
+<a id="L546"></a>
+<a id="L547"></a>            const kind: PaxAttributeKind = if (eql(keyword, "path"))
+<a id="L548"></a>                .path
+<a id="L549"></a>            else if (eql(keyword, "linkpath"))
+<a id="L550"></a>                .linkpath
+<a id="L551"></a>            else if (eql(keyword, "size"))
+<a id="L552"></a>                .size
+<a id="L553"></a>            else {
+<a id="L554"></a>                try self.reader.discardAll(value_len);
+<a id="L555"></a>                try validateAttributeEnding(self.reader);
+<a id="L556"></a>                continue;
+<a id="L557"></a>            };
+<a id="L558"></a>            if (kind == .size and value_len &gt; pax_max_size_attr_len) {
+<a id="L559"></a>                return error.PaxSizeAttrOverflow;
+<a id="L560"></a>            }
+<a id="L561"></a>            return .{
+<a id="L562"></a>                .kind = kind,
+<a id="L563"></a>                .len = value_len,
+<a id="L564"></a>                .reader = self.reader,
+<a id="L565"></a>            };
+<a id="L566"></a>        }
+<a id="L567"></a>
+<a id="L568"></a>        return null;
+<a id="L569"></a>    }
+<a id="L570"></a>
+<a id="L571"></a>    fn eql(a: []const u8, b: []const u8) bool {
+<a id="L572"></a>        return std.mem.eql(u8, a, b);
+<a id="L573"></a>    }
+<a id="L574"></a>
+<a id="L575"></a>    fn hasNull(str: []const u8) bool {
+<a id="L576"></a>        return (std.mem.findScalar(u8, str, 0)) != null;
+<a id="L577"></a>    }
+<a id="L578"></a>
+<a id="L579"></a>    // Checks that each record ends with new line.
+<a id="L580"></a>    fn validateAttributeEnding(reader: *Io.Reader) !void {
+<a id="L581"></a>        if (try reader.takeByte() != '\n') return error.PaxInvalidAttributeEnd;
+<a id="L582"></a>    }
+<a id="L583"></a>};
+<a id="L584"></a>
+<a id="L585"></a>/// Deprecated, renamed to `extract`.
+<a id="L586"></a>pub const pipeToFileSystem = extract;
+<a id="L587"></a>
+<a id="L588"></a>/// Ingests tar file from `reader`, populating file contents within `dir`. If
+<a id="L589"></a>/// any file would be extracted outside of `dir`, an error is return instead.
+<a id="L590"></a>pub fn extract(io: Io, dir: Io.Dir, reader: *Io.Reader, options: ExtractOptions) !void {
+<a id="L591"></a>    var file_name_buffer: [Io.Dir.max_path_bytes]u8 = undefined;
+<a id="L592"></a>    var link_name_buffer: [Io.Dir.max_path_bytes]u8 = undefined;
+<a id="L593"></a>    var sanitize_buffer: [Io.Dir.max_path_bytes]u8 = undefined;
+<a id="L594"></a>    var file_contents_buffer: [1024]u8 = undefined;
+<a id="L595"></a>    var it: Iterator = .init(reader, .{
+<a id="L596"></a>        .file_name_buffer = &amp;file_name_buffer,
+<a id="L597"></a>        .link_name_buffer = &amp;link_name_buffer,
+<a id="L598"></a>        .diagnostics = options.diagnostics,
+<a id="L599"></a>    });
+<a id="L600"></a>
+<a id="L601"></a>    while (try it.next()) |file| {
+<a id="L602"></a>        const n = sanitizePath(&amp;sanitize_buffer, file.name, options.strip_components) catch 0;
+<a id="L603"></a>        if (n == 0 and file.kind != .directory) {
+<a id="L604"></a>            const d = options.diagnostics orelse return error.TarComponentsOutsideStrippedPrefix;
+<a id="L605"></a>            try d.errors.append(d.allocator, .{ .components_outside_stripped_prefix = .{
+<a id="L606"></a>                .file_name = try d.allocator.dupe(u8, file.name),
+<a id="L607"></a>            } });
+<a id="L608"></a>            continue;
+<a id="L609"></a>        }
+<a id="L610"></a>        const file_name = sanitize_buffer[0..n];
+<a id="L611"></a>        if (options.diagnostics) |d| {
+<a id="L612"></a>            try d.findRoot(file.kind, file_name);
+<a id="L613"></a>        }
+<a id="L614"></a>
+<a id="L615"></a>        switch (file.kind) {
+<a id="L616"></a>            .directory =&gt; {
+<a id="L617"></a>                if (file_name.len &gt; 0 and !options.exclude_empty_directories) {
+<a id="L618"></a>                    try dir.createDirPath(io, file_name);
+<a id="L619"></a>                }
+<a id="L620"></a>            },
+<a id="L621"></a>            .file =&gt; {
+<a id="L622"></a>                if (createDirAndFile(io, dir, file_name, filePermissions(file.mode, options))) |fs_file| {
+<a id="L623"></a>                    defer fs_file.close(io);
+<a id="L624"></a>                    var file_writer = fs_file.writer(io, &amp;file_contents_buffer);
+<a id="L625"></a>                    try it.streamRemaining(file, &amp;file_writer.interface);
+<a id="L626"></a>                    try file_writer.interface.flush();
+<a id="L627"></a>                } else |err| {
+<a id="L628"></a>                    const d = options.diagnostics orelse return err;
+<a id="L629"></a>                    try d.errors.append(d.allocator, .{ .unable_to_create_file = .{
+<a id="L630"></a>                        .code = err,
+<a id="L631"></a>                        .file_name = try d.allocator.dupe(u8, file_name),
+<a id="L632"></a>                    } });
+<a id="L633"></a>                }
+<a id="L634"></a>            },
+<a id="L635"></a>            .sym_link =&gt; {
+<a id="L636"></a>                const link_name = file.link_name;
+<a id="L637"></a>                createDirAndSymlink(io, dir, link_name, file_name) catch |err| {
+<a id="L638"></a>                    const d = options.diagnostics orelse return error.UnableToCreateSymLink;
+<a id="L639"></a>                    try d.errors.append(d.allocator, .{ .unable_to_create_sym_link = .{
+<a id="L640"></a>                        .code = err,
+<a id="L641"></a>                        .file_name = try d.allocator.dupe(u8, file_name),
+<a id="L642"></a>                        .link_name = try d.allocator.dupe(u8, link_name),
+<a id="L643"></a>                    } });
+<a id="L644"></a>                };
+<a id="L645"></a>            },
+<a id="L646"></a>        }
+<a id="L647"></a>    }
+<a id="L648"></a>}
+<a id="L649"></a>
+<a id="L650"></a>fn createDirAndFile(io: Io, dir: Io.Dir, file_name: []const u8, permissions: Io.File.Permissions) !Io.File {
+<a id="L651"></a>    const fs_file = dir.createFile(io, file_name, .{ .exclusive = true, .permissions = permissions }) catch |err| {
+<a id="L652"></a>        if (err == error.FileNotFound) {
+<a id="L653"></a>            if (std.fs.path.dirname(file_name)) |dir_name| {
+<a id="L654"></a>                try dir.createDirPath(io, dir_name);
+<a id="L655"></a>                return try dir.createFile(io, file_name, .{ .exclusive = true, .permissions = permissions });
+<a id="L656"></a>            }
+<a id="L657"></a>        }
+<a id="L658"></a>        return err;
+<a id="L659"></a>    };
+<a id="L660"></a>    return fs_file;
+<a id="L661"></a>}
+<a id="L662"></a>
+<a id="L663"></a>// Creates a symbolic link at path `file_name` which points to `link_name`.
+<a id="L664"></a>fn createDirAndSymlink(io: Io, dir: Io.Dir, link_name: []const u8, file_name: []const u8) !void {
+<a id="L665"></a>    dir.symLink(io, link_name, file_name, .{}) catch |err| {
+<a id="L666"></a>        if (err == error.FileNotFound) {
+<a id="L667"></a>            if (std.fs.path.dirname(file_name)) |dir_name| {
+<a id="L668"></a>                try dir.createDirPath(io, dir_name);
+<a id="L669"></a>                return try dir.symLink(io, link_name, file_name, .{});
+<a id="L670"></a>            }
+<a id="L671"></a>        }
+<a id="L672"></a>        return err;
+<a id="L673"></a>    };
+<a id="L674"></a>}
+<a id="L675"></a>
+<a id="L676"></a>fn sanitizePath(buffer: []u8, path: []const u8, strip_components: u32) error{Invalid}!usize {
+<a id="L677"></a>    if (path.len == 0 or path[0] == '/') return error.Invalid;
+<a id="L678"></a>    var i: usize = 0;
+<a id="L679"></a>    var c = strip_components;
+<a id="L680"></a>    var it = std.mem.tokenizeScalar(u8, path, '/');
+<a id="L681"></a>    while (it.next()) |component| {
+<a id="L682"></a>        if (std.mem.eql(u8, component, ".")) continue;
+<a id="L683"></a>        if (std.mem.eql(u8, component, "..")) {
+<a id="L684"></a>            if (i == 0) return error.Invalid;
+<a id="L685"></a>            while (true) {
+<a id="L686"></a>                const ends_with_slash = buffer[i - 1] == '/';
+<a id="L687"></a>                i -= 1;
+<a id="L688"></a>                if (ends_with_slash or i == 0) break;
+<a id="L689"></a>            }
+<a id="L690"></a>            continue;
+<a id="L691"></a>        }
+<a id="L692"></a>        if (c &gt; 0) {
+<a id="L693"></a>            c -= 1;
+<a id="L694"></a>            continue;
+<a id="L695"></a>        }
+<a id="L696"></a>        if (i &gt; 0) {
+<a id="L697"></a>            buffer[i] = '/';
+<a id="L698"></a>            i += 1;
+<a id="L699"></a>        }
+<a id="L700"></a>        @memcpy(buffer[i..][0..component.len], component);
+<a id="L701"></a>        i += component.len;
+<a id="L702"></a>    }
+<a id="L703"></a>    if (c &gt; 0) return error.Invalid;
+<a id="L704"></a>    return i;
+<a id="L705"></a>}
+<a id="L706"></a>
+<a id="L707"></a>fn testSanitizePath(expected: []const u8, input: []const u8, strip: u32) !void {
+<a id="L708"></a>    var buffer: [Io.Dir.max_path_bytes]u8 = undefined;
+<a id="L709"></a>    const result = buffer[0..try sanitizePath(&amp;buffer, input, strip)];
+<a id="L710"></a>    try testing.expectEqualStrings(expected, result);
+<a id="L711"></a>}
+<a id="L712"></a>
+<a id="L713"></a>fn testSanitizePathError(expected: anyerror, input: []const u8, strip: u32) !void {
+<a id="L714"></a>    var buffer: [Io.Dir.max_path_bytes]u8 = undefined;
+<a id="L715"></a>    try testing.expectError(expected, sanitizePath(&amp;buffer, input, strip));
+<a id="L716"></a>}
+<a id="L717"></a>
+<a id="L718"></a>test sanitizePath {
+<a id="L719"></a>    try testSanitizePath("a/b/c", "a/b/c", 0);
+<a id="L720"></a>    try testSanitizePath("a/b/c", "a/x/y/../../b/c", 0);
+<a id="L721"></a>    try testSanitizePath("b/c", "a/b/c", 1);
+<a id="L722"></a>    try testSanitizePath("c", "a/b/c", 2);
+<a id="L723"></a>    try testSanitizePath("", "a/b/c", 3);
+<a id="L724"></a>    try testSanitizePath("", "a/b/c/../../..", 0);
+<a id="L725"></a>    try testSanitizePathError(error.Invalid, "a/b/c", 4);
+<a id="L726"></a>    try testSanitizePathError(error.Invalid, "..", 0);
+<a id="L727"></a>    try testSanitizePathError(error.Invalid, "a/b/../../..", 0);
+<a id="L728"></a>    try testSanitizePathError(error.Invalid, "a/b/../..", 1);
+<a id="L729"></a>}
+<a id="L730"></a>
+<a id="L731"></a>test PaxIterator {
+<a id="L732"></a>    const Attr = struct {
+<a id="L733"></a>        kind: PaxAttributeKind,
+<a id="L734"></a>        value: []const u8 = undefined,
+<a id="L735"></a>        err: ?anyerror = null,
+<a id="L736"></a>    };
+<a id="L737"></a>    const cases = [_]struct {
+<a id="L738"></a>        data: []const u8,
+<a id="L739"></a>        attrs: []const Attr,
+<a id="L740"></a>        err: ?anyerror = null,
+<a id="L741"></a>    }{
+<a id="L742"></a>        .{ // valid but unknown keys
+<a id="L743"></a>            .data =
+<a id="L744"></a>            \\30 mtime=1350244992.023960108
+<a id="L745"></a>            \\6 k=1
+<a id="L746"></a>            \\13 key1=val1
+<a id="L747"></a>            \\10 a=name
+<a id="L748"></a>            \\9 a=name
+<a id="L749"></a>            \\
+<a id="L750"></a>            ,
+<a id="L751"></a>            .attrs = &amp;[_]Attr{},
+<a id="L752"></a>        },
+<a id="L753"></a>        .{ // mix of known and unknown keys
+<a id="L754"></a>            .data =
+<a id="L755"></a>            \\6 k=1
+<a id="L756"></a>            \\13 path=name
+<a id="L757"></a>            \\17 linkpath=link
+<a id="L758"></a>            \\13 key1=val1
+<a id="L759"></a>            \\12 size=123
+<a id="L760"></a>            \\13 key2=val2
+<a id="L761"></a>            \\
+<a id="L762"></a>            ,
+<a id="L763"></a>            .attrs = &amp;[_]Attr{
+<a id="L764"></a>                .{ .kind = .path, .value = "name" },
+<a id="L765"></a>                .{ .kind = .linkpath, .value = "link" },
+<a id="L766"></a>                .{ .kind = .size, .value = "123" },
+<a id="L767"></a>            },
+<a id="L768"></a>        },
+<a id="L769"></a>        .{ // too short size of the second key-value pair
+<a id="L770"></a>            .data =
+<a id="L771"></a>            \\13 path=name
+<a id="L772"></a>            \\10 linkpath=value
+<a id="L773"></a>            \\
+<a id="L774"></a>            ,
+<a id="L775"></a>            .attrs = &amp;[_]Attr{
+<a id="L776"></a>                .{ .kind = .path, .value = "name" },
+<a id="L777"></a>            },
+<a id="L778"></a>            .err = error.UnexpectedEndOfStream,
+<a id="L779"></a>        },
+<a id="L780"></a>        .{ // too long size of the second key-value pair
+<a id="L781"></a>            .data =
+<a id="L782"></a>            \\13 path=name
+<a id="L783"></a>            \\6 k=1
+<a id="L784"></a>            \\19 linkpath=value
+<a id="L785"></a>            \\
+<a id="L786"></a>            ,
+<a id="L787"></a>            .attrs = &amp;[_]Attr{
+<a id="L788"></a>                .{ .kind = .path, .value = "name" },
+<a id="L789"></a>            },
+<a id="L790"></a>            .err = error.UnexpectedEndOfStream,
+<a id="L791"></a>        },
+<a id="L792"></a>
+<a id="L793"></a>        .{ // too long size of the second key-value pair
+<a id="L794"></a>            .data =
+<a id="L795"></a>            \\13 path=name
+<a id="L796"></a>            \\19 linkpath=value
+<a id="L797"></a>            \\6 k=1
+<a id="L798"></a>            \\
+<a id="L799"></a>            ,
+<a id="L800"></a>            .attrs = &amp;[_]Attr{
+<a id="L801"></a>                .{ .kind = .path, .value = "name" },
+<a id="L802"></a>                .{ .kind = .linkpath, .err = error.PaxInvalidAttributeEnd },
+<a id="L803"></a>            },
+<a id="L804"></a>        },
+<a id="L805"></a>        .{ // null in keyword is not valid
+<a id="L806"></a>            .data = "13 path=name\n" ++ "7 k\x00b=1\n",
+<a id="L807"></a>            .attrs = &amp;[_]Attr{
+<a id="L808"></a>                .{ .kind = .path, .value = "name" },
+<a id="L809"></a>            },
+<a id="L810"></a>            .err = error.PaxNullInKeyword,
+<a id="L811"></a>        },
+<a id="L812"></a>        .{ // null in value is not valid
+<a id="L813"></a>            .data = "23 path=name\x00with null\n",
+<a id="L814"></a>            .attrs = &amp;[_]Attr{
+<a id="L815"></a>                .{ .kind = .path, .err = error.PaxNullInValue },
+<a id="L816"></a>            },
+<a id="L817"></a>        },
+<a id="L818"></a>        .{ // 1000 characters path
+<a id="L819"></a>            .data = "1011 path=" ++ "0123456789" ** 100 ++ "\n",
+<a id="L820"></a>            .attrs = &amp;[_]Attr{
+<a id="L821"></a>                .{ .kind = .path, .value = "0123456789" ** 100 },
+<a id="L822"></a>            },
+<a id="L823"></a>        },
+<a id="L824"></a>    };
+<a id="L825"></a>    var buffer: [1024]u8 = undefined;
+<a id="L826"></a>
+<a id="L827"></a>    outer: for (cases) |case| {
+<a id="L828"></a>        var reader: Io.Reader = .fixed(case.data);
+<a id="L829"></a>        var it: PaxIterator = .{
+<a id="L830"></a>            .size = case.data.len,
+<a id="L831"></a>            .reader = &amp;reader,
+<a id="L832"></a>        };
+<a id="L833"></a>
+<a id="L834"></a>        var i: usize = 0;
+<a id="L835"></a>        while (it.next() catch |err| {
+<a id="L836"></a>            if (case.err) |e| {
+<a id="L837"></a>                try testing.expectEqual(e, err);
+<a id="L838"></a>                continue;
+<a id="L839"></a>            }
+<a id="L840"></a>            return err;
+<a id="L841"></a>        }) |attr| : (i += 1) {
+<a id="L842"></a>            const exp = case.attrs[i];
+<a id="L843"></a>            try testing.expectEqual(exp.kind, attr.kind);
+<a id="L844"></a>            const value = attr.value(&amp;buffer) catch |err| {
+<a id="L845"></a>                if (exp.err) |e| {
+<a id="L846"></a>                    try testing.expectEqual(e, err);
+<a id="L847"></a>                    break :outer;
+<a id="L848"></a>                }
+<a id="L849"></a>                return err;
+<a id="L850"></a>            };
+<a id="L851"></a>            try testing.expectEqualStrings(exp.value, value);
+<a id="L852"></a>        }
+<a id="L853"></a>        try testing.expectEqual(case.attrs.len, i);
+<a id="L854"></a>        try testing.expect(case.err == null);
+<a id="L855"></a>    }
+<a id="L856"></a>}
+<a id="L857"></a>
+<a id="L858"></a>test "header parse size" {
+<a id="L859"></a>    const cases = [_]struct {
+<a id="L860"></a>        in: []const u8,
+<a id="L861"></a>        want: u64 = 0,
+<a id="L862"></a>        err: ?anyerror = null,
+<a id="L863"></a>    }{
+<a id="L864"></a>        // Test base-256 (binary) encoded values.
+<a id="L865"></a>        .{ .in = "", .want = 0 },
+<a id="L866"></a>        .{ .in = "\x80", .want = 0 },
+<a id="L867"></a>        .{ .in = "\x80\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01", .want = 1 },
+<a id="L868"></a>        .{ .in = "\x80\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01\x02", .want = 0x0102 },
+<a id="L869"></a>        .{ .in = "\x80\x00\x00\x00\x01\x02\x03\x04\x05\x06\x07\x08", .want = 0x0102030405060708 },
+<a id="L870"></a>        .{ .in = "\x80\x00\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09", .err = error.TarNumericValueTooBig },
+<a id="L871"></a>        .{ .in = "\x80\x00\x00\x00\x07\x76\xa2\x22\xeb\x8a\x72\x61", .want = 537795476381659745 },
+<a id="L872"></a>        .{ .in = "\x80\x80\x80\x00\x01\x02\x03\x04\x05\x06\x07\x08", .err = error.TarNumericValueTooBig },
+<a id="L873"></a>
+<a id="L874"></a>        // // Test base-8 (octal) encoded values.
+<a id="L875"></a>        .{ .in = "00000000227\x00", .want = 0o227 },
+<a id="L876"></a>        .{ .in = "  000000227\x00", .want = 0o227 },
+<a id="L877"></a>        .{ .in = "00000000228\x00", .err = error.TarHeader },
+<a id="L878"></a>        .{ .in = "11111111111\x00", .want = 0o11111111111 },
+<a id="L879"></a>    };
+<a id="L880"></a>
+<a id="L881"></a>    for (cases) |case| {
+<a id="L882"></a>        var bytes = [_]u8{0} ** Header.SIZE;
+<a id="L883"></a>        @memcpy(bytes[124 .. 124 + case.in.len], case.in);
+<a id="L884"></a>        var header = Header{ .bytes = &amp;bytes };
+<a id="L885"></a>        if (case.err) |err| {
+<a id="L886"></a>            try testing.expectError(err, header.size());
+<a id="L887"></a>        } else {
+<a id="L888"></a>            try testing.expectEqual(case.want, try header.size());
+<a id="L889"></a>        }
+<a id="L890"></a>    }
+<a id="L891"></a>}
+<a id="L892"></a>
+<a id="L893"></a>test "header parse mode" {
+<a id="L894"></a>    const cases = [_]struct {
+<a id="L895"></a>        in: []const u8,
+<a id="L896"></a>        want: u64 = 0,
+<a id="L897"></a>        err: ?anyerror = null,
+<a id="L898"></a>    }{
+<a id="L899"></a>        .{ .in = "0000644\x00", .want = 0o644 },
+<a id="L900"></a>        .{ .in = "0000777\x00", .want = 0o777 },
+<a id="L901"></a>        .{ .in = "7777777\x00", .want = 0o7777777 },
+<a id="L902"></a>        .{ .in = "7777778\x00", .err = error.TarHeader },
+<a id="L903"></a>        .{ .in = "77777777", .want = 0o77777777 },
+<a id="L904"></a>        .{ .in = "777777777777", .want = 0o77777777 },
+<a id="L905"></a>    };
+<a id="L906"></a>    for (cases) |case| {
+<a id="L907"></a>        var bytes = [_]u8{0} ** Header.SIZE;
+<a id="L908"></a>        @memcpy(bytes[100 .. 100 + case.in.len], case.in);
+<a id="L909"></a>        var header = Header{ .bytes = &amp;bytes };
+<a id="L910"></a>        if (case.err) |err| {
+<a id="L911"></a>            try testing.expectError(err, header.mode());
+<a id="L912"></a>        } else {
+<a id="L913"></a>            try testing.expectEqual(case.want, try header.mode());
+<a id="L914"></a>        }
+<a id="L915"></a>    }
+<a id="L916"></a>}
+<a id="L917"></a>
+<a id="L918"></a>test "create file and symlink" {
+<a id="L919"></a>    const io = testing.io;
+<a id="L920"></a>
+<a id="L921"></a>    var root = testing.tmpDir(.{});
+<a id="L922"></a>    defer root.cleanup();
+<a id="L923"></a>
+<a id="L924"></a>    var file = try createDirAndFile(io, root.dir, "file1", .default_file);
+<a id="L925"></a>    file.close(io);
+<a id="L926"></a>    file = try createDirAndFile(io, root.dir, "a/b/c/file2", .default_file);
+<a id="L927"></a>    file.close(io);
+<a id="L928"></a>
+<a id="L929"></a>    createDirAndSymlink(io, root.dir, "a/b/c/file2", "symlink1") catch |err| switch (err) {
+<a id="L930"></a>        // On Windows, symlinks require developer mode/admin privileges and the underlying filesystem must support symlinks
+<a id="L931"></a>        error.AccessDenied, error.PermissionDenied, error.FileSystem =&gt; if (builtin.os.tag == .windows) return error.SkipZigTest else return err,
+<a id="L932"></a>        else =&gt; return err,
+<a id="L933"></a>    };
+<a id="L934"></a>    try createDirAndSymlink(io, root.dir, "../../../file1", "d/e/f/symlink2");
+<a id="L935"></a>
+<a id="L936"></a>    // Danglink symlnik, file created later
+<a id="L937"></a>    try createDirAndSymlink(io, root.dir, "../../../g/h/i/file4", "j/k/l/symlink3");
+<a id="L938"></a>    file = try createDirAndFile(io, root.dir, "g/h/i/file4", .default_file);
+<a id="L939"></a>    file.close(io);
+<a id="L940"></a>}
+<a id="L941"></a>
+<a id="L942"></a>test Iterator {
+<a id="L943"></a>    // Example tar file is created from this tree structure:
+<a id="L944"></a>    // $ tree example
+<a id="L945"></a>    //    example
+<a id="L946"></a>    //    ├── a
+<a id="L947"></a>    //    │   └── file
+<a id="L948"></a>    //    ├── b
+<a id="L949"></a>    //    │   └── symlink -&gt; ../a/file
+<a id="L950"></a>    //    └── empty
+<a id="L951"></a>    // $ cat example/a/file
+<a id="L952"></a>    //   content
+<a id="L953"></a>    // $ tar -cf example.tar example
+<a id="L954"></a>    // $ tar -tvf example.tar
+<a id="L955"></a>    //    example/
+<a id="L956"></a>    //    example/b/
+<a id="L957"></a>    //    example/b/symlink -&gt; ../a/file
+<a id="L958"></a>    //    example/a/
+<a id="L959"></a>    //    example/a/file
+<a id="L960"></a>    //    example/empty/
+<a id="L961"></a>
+<a id="L962"></a>    const data = @embedFile("tar/testdata/example.tar");
+<a id="L963"></a>    var reader: Io.Reader = .fixed(data);
+<a id="L964"></a>
+<a id="L965"></a>    // User provided buffers to the iterator
+<a id="L966"></a>    var file_name_buffer: [std.fs.max_path_bytes]u8 = undefined;
+<a id="L967"></a>    var link_name_buffer: [std.fs.max_path_bytes]u8 = undefined;
+<a id="L968"></a>    // Create iterator
+<a id="L969"></a>    var it: Iterator = .init(&amp;reader, .{
+<a id="L970"></a>        .file_name_buffer = &amp;file_name_buffer,
+<a id="L971"></a>        .link_name_buffer = &amp;link_name_buffer,
+<a id="L972"></a>    });
+<a id="L973"></a>    // Iterate over files in example.tar
+<a id="L974"></a>    var file_no: usize = 0;
+<a id="L975"></a>    while (try it.next()) |file| : (file_no += 1) {
+<a id="L976"></a>        switch (file.kind) {
+<a id="L977"></a>            .directory =&gt; {
+<a id="L978"></a>                switch (file_no) {
+<a id="L979"></a>                    0 =&gt; try testing.expectEqualStrings("example/", file.name),
+<a id="L980"></a>                    1 =&gt; try testing.expectEqualStrings("example/b/", file.name),
+<a id="L981"></a>                    3 =&gt; try testing.expectEqualStrings("example/a/", file.name),
+<a id="L982"></a>                    5 =&gt; try testing.expectEqualStrings("example/empty/", file.name),
+<a id="L983"></a>                    else =&gt; unreachable,
+<a id="L984"></a>                }
+<a id="L985"></a>            },
+<a id="L986"></a>            .file =&gt; {
+<a id="L987"></a>                try testing.expectEqualStrings("example/a/file", file.name);
+<a id="L988"></a>                var buf: [16]u8 = undefined;
+<a id="L989"></a>                var w: Io.Writer = .fixed(&amp;buf);
+<a id="L990"></a>                try it.streamRemaining(file, &amp;w);
+<a id="L991"></a>                try testing.expectEqualStrings("content\n", w.buffered());
+<a id="L992"></a>            },
+<a id="L993"></a>            .sym_link =&gt; {
+<a id="L994"></a>                try testing.expectEqualStrings("example/b/symlink", file.name);
+<a id="L995"></a>                try testing.expectEqualStrings("../a/file", file.link_name);
+<a id="L996"></a>            },
+<a id="L997"></a>        }
+<a id="L998"></a>    }
+<a id="L999"></a>}
+<a id="L1000"></a>
+<a id="L1001"></a>test extract {
+<a id="L1002"></a>    const io = testing.io;
+<a id="L1003"></a>    // Example tar file is created from this tree structure:
+<a id="L1004"></a>    // $ tree example
+<a id="L1005"></a>    //    example
+<a id="L1006"></a>    //    ├── a
+<a id="L1007"></a>    //    │   └── file
+<a id="L1008"></a>    //    ├── b
+<a id="L1009"></a>    //    │   └── symlink -&gt; ../a/file
+<a id="L1010"></a>    //    └── empty
+<a id="L1011"></a>    // $ cat example/a/file
+<a id="L1012"></a>    //   content
+<a id="L1013"></a>    // $ tar -cf example.tar example
+<a id="L1014"></a>    // $ tar -tvf example.tar
+<a id="L1015"></a>    //    example/
+<a id="L1016"></a>    //    example/b/
+<a id="L1017"></a>    //    example/b/symlink -&gt; ../a/file
+<a id="L1018"></a>    //    example/a/
+<a id="L1019"></a>    //    example/a/file
+<a id="L1020"></a>    //    example/empty/
+<a id="L1021"></a>
+<a id="L1022"></a>    const data = @embedFile("tar/testdata/example.tar");
+<a id="L1023"></a>    var reader: Io.Reader = .fixed(data);
+<a id="L1024"></a>
+<a id="L1025"></a>    var tmp = testing.tmpDir(.{ .follow_symlinks = false });
+<a id="L1026"></a>    defer tmp.cleanup();
+<a id="L1027"></a>    const dir = tmp.dir;
+<a id="L1028"></a>
+<a id="L1029"></a>    // Save tar from reader to the file system `dir`
+<a id="L1030"></a>    extract(io, dir, &amp;reader, .{
+<a id="L1031"></a>        .mode_mode = .ignore,
+<a id="L1032"></a>        .strip_components = 1,
+<a id="L1033"></a>        .exclude_empty_directories = true,
+<a id="L1034"></a>    }) catch |err| {
+<a id="L1035"></a>        // Skip on platform which don't support symlinks
+<a id="L1036"></a>        if (err == error.UnableToCreateSymLink) return error.SkipZigTest;
+<a id="L1037"></a>        return err;
+<a id="L1038"></a>    };
+<a id="L1039"></a>
+<a id="L1040"></a>    try testing.expectError(error.FileNotFound, dir.statFile(io, "empty", .{}));
+<a id="L1041"></a>    try testing.expect((try dir.statFile(io, "a/file", .{})).kind == .file);
+<a id="L1042"></a>    try testing.expect((try dir.statFile(io, "b/symlink", .{})).kind == .file); // statFile follows symlink
+<a id="L1043"></a>
+<a id="L1044"></a>    var buf: [32]u8 = undefined;
+<a id="L1045"></a>    try testing.expectEqualSlices(
+<a id="L1046"></a>        u8,
+<a id="L1047"></a>        "../a/file",
+<a id="L1048"></a>        normalizePath(buf[0..try dir.readLink(io, "b/symlink", &amp;buf)]),
+<a id="L1049"></a>    );
+<a id="L1050"></a>}
+<a id="L1051"></a>
+<a id="L1052"></a>test "extract root_dir" {
+<a id="L1053"></a>    const io = testing.io;
+<a id="L1054"></a>    const data = @embedFile("tar/testdata/example.tar");
+<a id="L1055"></a>    var reader: Io.Reader = .fixed(data);
+<a id="L1056"></a>
+<a id="L1057"></a>    // with strip_components = 1
+<a id="L1058"></a>    {
+<a id="L1059"></a>        var tmp = testing.tmpDir(.{ .follow_symlinks = false });
+<a id="L1060"></a>        defer tmp.cleanup();
+<a id="L1061"></a>        var diagnostics: Diagnostics = .{ .allocator = testing.allocator };
+<a id="L1062"></a>        defer diagnostics.deinit();
+<a id="L1063"></a>
+<a id="L1064"></a>        extract(io, tmp.dir, &amp;reader, .{
+<a id="L1065"></a>            .strip_components = 1,
+<a id="L1066"></a>            .diagnostics = &amp;diagnostics,
+<a id="L1067"></a>        }) catch |err| {
+<a id="L1068"></a>            // Skip on platform which don't support symlinks
+<a id="L1069"></a>            if (err == error.UnableToCreateSymLink) return error.SkipZigTest;
+<a id="L1070"></a>            return err;
+<a id="L1071"></a>        };
+<a id="L1072"></a>
+<a id="L1073"></a>        // there is no root_dir
+<a id="L1074"></a>        try testing.expectEqual(0, diagnostics.root_dir.len);
+<a id="L1075"></a>        try testing.expectEqual(5, diagnostics.entries);
+<a id="L1076"></a>    }
+<a id="L1077"></a>
+<a id="L1078"></a>    // with strip_components = 0
+<a id="L1079"></a>    {
+<a id="L1080"></a>        reader = .fixed(data);
+<a id="L1081"></a>        var tmp = testing.tmpDir(.{ .follow_symlinks = false });
+<a id="L1082"></a>        defer tmp.cleanup();
+<a id="L1083"></a>        var diagnostics: Diagnostics = .{ .allocator = testing.allocator };
+<a id="L1084"></a>        defer diagnostics.deinit();
+<a id="L1085"></a>
+<a id="L1086"></a>        extract(io, tmp.dir, &amp;reader, .{
+<a id="L1087"></a>            .strip_components = 0,
+<a id="L1088"></a>            .diagnostics = &amp;diagnostics,
+<a id="L1089"></a>        }) catch |err| {
+<a id="L1090"></a>            // Skip on platform which don't support symlinks
+<a id="L1091"></a>            if (err == error.UnableToCreateSymLink) return error.SkipZigTest;
+<a id="L1092"></a>            return err;
+<a id="L1093"></a>        };
+<a id="L1094"></a>
+<a id="L1095"></a>        // root_dir found
+<a id="L1096"></a>        try testing.expectEqualStrings("example", diagnostics.root_dir);
+<a id="L1097"></a>        try testing.expectEqual(6, diagnostics.entries);
+<a id="L1098"></a>    }
+<a id="L1099"></a>}
+<a id="L1100"></a>
+<a id="L1101"></a>test "findRoot with single file archive" {
+<a id="L1102"></a>    const io = testing.io;
+<a id="L1103"></a>    const data = @embedFile("tar/testdata/22752.tar");
+<a id="L1104"></a>    var reader: Io.Reader = .fixed(data);
+<a id="L1105"></a>
+<a id="L1106"></a>    var tmp = testing.tmpDir(.{});
+<a id="L1107"></a>    defer tmp.cleanup();
+<a id="L1108"></a>
+<a id="L1109"></a>    var diagnostics: Diagnostics = .{ .allocator = testing.allocator };
+<a id="L1110"></a>    defer diagnostics.deinit();
+<a id="L1111"></a>    try extract(io, tmp.dir, &amp;reader, .{ .diagnostics = &amp;diagnostics });
+<a id="L1112"></a>
+<a id="L1113"></a>    try testing.expectEqualStrings("", diagnostics.root_dir);
+<a id="L1114"></a>}
+<a id="L1115"></a>
+<a id="L1116"></a>test "findRoot without explicit root dir" {
+<a id="L1117"></a>    const io = testing.io;
+<a id="L1118"></a>    const data = @embedFile("tar/testdata/19820.tar");
+<a id="L1119"></a>    var reader: Io.Reader = .fixed(data);
+<a id="L1120"></a>
+<a id="L1121"></a>    var tmp = testing.tmpDir(.{});
+<a id="L1122"></a>    defer tmp.cleanup();
+<a id="L1123"></a>
+<a id="L1124"></a>    var diagnostics: Diagnostics = .{ .allocator = testing.allocator };
+<a id="L1125"></a>    defer diagnostics.deinit();
+<a id="L1126"></a>    try extract(io, tmp.dir, &amp;reader, .{ .diagnostics = &amp;diagnostics });
+<a id="L1127"></a>
+<a id="L1128"></a>    try testing.expectEqualStrings("root", diagnostics.root_dir);
+<a id="L1129"></a>}
+<a id="L1130"></a>
+<a id="L1131"></a>test "extract strip_components" {
+<a id="L1132"></a>    const io = testing.io;
+<a id="L1133"></a>    const data = @embedFile("tar/testdata/example.tar");
+<a id="L1134"></a>    var reader: Io.Reader = .fixed(data);
+<a id="L1135"></a>
+<a id="L1136"></a>    var tmp = testing.tmpDir(.{ .follow_symlinks = false });
+<a id="L1137"></a>    defer tmp.cleanup();
+<a id="L1138"></a>    var diagnostics: Diagnostics = .{ .allocator = testing.allocator };
+<a id="L1139"></a>    defer diagnostics.deinit();
+<a id="L1140"></a>
+<a id="L1141"></a>    extract(io, tmp.dir, &amp;reader, .{
+<a id="L1142"></a>        .strip_components = 3,
+<a id="L1143"></a>        .diagnostics = &amp;diagnostics,
+<a id="L1144"></a>    }) catch |err| {
+<a id="L1145"></a>        // Skip on platform which don't support symlinks
+<a id="L1146"></a>        if (err == error.UnableToCreateSymLink) return error.SkipZigTest;
+<a id="L1147"></a>        return err;
+<a id="L1148"></a>    };
+<a id="L1149"></a>
+<a id="L1150"></a>    try testing.expectEqual(2, diagnostics.errors.items.len);
+<a id="L1151"></a>    try testing.expectEqualStrings("example/b/symlink", diagnostics.errors.items[0].components_outside_stripped_prefix.file_name);
+<a id="L1152"></a>    try testing.expectEqualStrings("example/a/file", diagnostics.errors.items[1].components_outside_stripped_prefix.file_name);
+<a id="L1153"></a>}
+<a id="L1154"></a>
+<a id="L1155"></a>fn normalizePath(bytes: []u8) []u8 {
+<a id="L1156"></a>    const canonical_sep = std.fs.path.sep_posix;
+<a id="L1157"></a>    if (std.fs.path.sep == canonical_sep) return bytes;
+<a id="L1158"></a>    std.mem.replaceScalar(u8, bytes, std.fs.path.sep, canonical_sep);
+<a id="L1159"></a>    return bytes;
+<a id="L1160"></a>}
+<a id="L1161"></a>
+<a id="L1162"></a>// File system mode based on tar header mode and mode_mode options.
+<a id="L1163"></a>fn filePermissions(mode: u32, options: ExtractOptions) Io.File.Permissions {
+<a id="L1164"></a>    return if (!Io.File.Permissions.has_executable_bit or options.mode_mode == .ignore or (mode &amp; 0o100) == 0)
+<a id="L1165"></a>        .default_file
+<a id="L1166"></a>    else
+<a id="L1167"></a>        .executable_file;
+<a id="L1168"></a>}
+<a id="L1169"></a>
+<a id="L1170"></a>test filePermissions {
+<a id="L1171"></a>    if (!Io.File.Permissions.has_executable_bit) return error.SkipZigTest;
+<a id="L1172"></a>    try testing.expectEqual(Io.File.Permissions.default_file, filePermissions(0o744, .{ .mode_mode = .ignore }));
+<a id="L1173"></a>    try testing.expectEqual(Io.File.Permissions.executable_file, filePermissions(0o744, .{}));
+<a id="L1174"></a>    try testing.expectEqual(Io.File.Permissions.default_file, filePermissions(0o644, .{}));
+<a id="L1175"></a>    try testing.expectEqual(Io.File.Permissions.default_file, filePermissions(0o655, .{}));
+<a id="L1176"></a>}
+<a id="L1177"></a>
+<a id="L1178"></a>test "executable bit" {
+<a id="L1179"></a>    if (!Io.File.Permissions.has_executable_bit) return error.SkipZigTest;
+<a id="L1180"></a>
+<a id="L1181"></a>    const io = testing.io;
+<a id="L1182"></a>    const S = std.posix.S;
+<a id="L1183"></a>    const data = @embedFile("tar/testdata/example.tar");
+<a id="L1184"></a>
+<a id="L1185"></a>    for ([_]ExtractOptions.ModeMode{ .ignore, .executable_bit_only }) |opt| {
+<a id="L1186"></a>        var reader: Io.Reader = .fixed(data);
+<a id="L1187"></a>
+<a id="L1188"></a>        var tmp = testing.tmpDir(.{ .follow_symlinks = false });
+<a id="L1189"></a>        //defer tmp.cleanup();
+<a id="L1190"></a>
+<a id="L1191"></a>        extract(io, tmp.dir, &amp;reader, .{
+<a id="L1192"></a>            .strip_components = 1,
+<a id="L1193"></a>            .exclude_empty_directories = true,
+<a id="L1194"></a>            .mode_mode = opt,
+<a id="L1195"></a>        }) catch |err| {
+<a id="L1196"></a>            // Skip on platform which don't support symlinks
+<a id="L1197"></a>            if (err == error.UnableToCreateSymLink) return error.SkipZigTest;
+<a id="L1198"></a>            return err;
+<a id="L1199"></a>        };
+<a id="L1200"></a>
+<a id="L1201"></a>        const fs = try tmp.dir.statFile(io, "a/file", .{});
+<a id="L1202"></a>        try testing.expect(fs.kind == .file);
+<a id="L1203"></a>
+<a id="L1204"></a>        const mode = fs.permissions.toMode();
+<a id="L1205"></a>
+<a id="L1206"></a>        if (opt == .executable_bit_only) {
+<a id="L1207"></a>            // Executable bit is set for user, group and others
+<a id="L1208"></a>            try testing.expect(mode &amp; S.IXUSR &gt; 0);
+<a id="L1209"></a>            try testing.expect(mode &amp; S.IXGRP &gt; 0);
+<a id="L1210"></a>            try testing.expect(mode &amp; S.IXOTH &gt; 0);
+<a id="L1211"></a>        }
+<a id="L1212"></a>        if (opt == .ignore) {
+<a id="L1213"></a>            try testing.expect(mode &amp; S.IXUSR == 0);
+<a id="L1214"></a>            try testing.expect(mode &amp; S.IXGRP == 0);
+<a id="L1215"></a>            try testing.expect(mode &amp; S.IXOTH == 0);
+<a id="L1216"></a>        }
+<a id="L1217"></a>    }
+<a id="L1218"></a>}
+<a id="L1219"></a>
+<a id="L1220"></a>test {
+<a id="L1221"></a>    _ = @import("tar/test.zig");
+<a id="L1222"></a>    _ = Writer;
+<a id="L1223"></a>    _ = Diagnostics;
+<a id="L1224"></a>}
+</pre>
 </body>
 </html>

@@ -2,262 +2,265 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Source: zig-0.16.0-std/heap/PageAllocator.zig</title>
+    <title>Source: heap/PageAllocator.zig</title>
     <style>
         body { background: #1e1e1e; color: #d4d4d4; font-family: monospace; padding: 20px; }
         pre { white-space: pre-wrap; word-wrap: break-word; }
         .header { border-bottom: 1px solid #444; padding-bottom: 10px; margin-bottom: 20px; }
         a { color: #569cd6; }
+        a[id] { color: inherit; text-decoration: none; }
+        :target { background: #3a3a00; }
     </style>
 </head>
 <body>
     <div class="header">
-        <a href="/">Index</a> | <strong>File: zig-0.16.0-std/heap/PageAllocator.zig</strong>
+        <a href="/">Index</a> | <strong>File: heap/PageAllocator.zig</strong>
     </div>
-    <pre>const builtin = @import("builtin");
-const native_os = builtin.os.tag;
-
-const std = @import("../std.zig");
-const Allocator = std.mem.Allocator;
-const Alignment = std.mem.Alignment;
-const mem = std.mem;
-const maxInt = std.math.maxInt;
-const assert = std.debug.assert;
-const windows = std.os.windows;
-const ntdll = std.os.windows.ntdll;
-const posix = std.posix;
-const page_size_min = std.heap.page_size_min;
-
-pub const vtable: Allocator.VTable = .{
-    .alloc = alloc,
-    .resize = resize,
-    .remap = remap,
-    .free = free,
-};
-
-/// Hhinting is disabled on operating systems that make an effort to not reuse
-/// mappings. For example, OpenBSD aggressively randomizes addresses of mappings
-/// that don't provide a hint (for security reasons, but it serves our needs
-/// too).
-const enable_hints = switch (builtin.target.os.tag) {
-    .openbsd =&gt; false,
-    else =&gt; true,
-};
-
-/// On operating systems that don't immediately map in the whole stack, we need
-/// to be careful to not hint into the pages after the stack guard gap, which
-/// the stack will expand into. The easiest way to avoid that is to hint in the
-/// same direction as stack growth.
-const stack_direction = builtin.target.stackGrowth();
-
-/// When hinting upwards, this points to the next page that we hope to allocate
-/// at; when hinting downwards, this points to the beginning of the last
-/// successful allocation.
-///
-/// TODO: Utilize this on Windows.
-var addr_hint: ?[*]align(page_size_min) u8 = null;
-
-pub fn map(n: usize, alignment: Alignment) ?[*]u8 {
-    const page_size = std.heap.pageSize();
-    if (n &gt;= maxInt(usize) - page_size) return null;
-    const alignment_bytes = alignment.toByteUnits();
-
-    if (native_os == .windows) {
-        var base_addr: ?*anyopaque = null;
-        var size: windows.SIZE_T = n;
-
-        const current_process = windows.GetCurrentProcess();
-        var status = ntdll.NtAllocateVirtualMemory(current_process, @ptrCast(&amp;base_addr), 0, &amp;size, .{ .COMMIT = true, .RESERVE = true }, .{ .READWRITE = true });
-
-        if (status == .SUCCESS and mem.isAligned(@intFromPtr(base_addr), alignment_bytes)) {
-            return @ptrCast(base_addr);
-        }
-
-        if (status == .SUCCESS) {
-            var region_size: windows.SIZE_T = 0;
-            _ = ntdll.NtFreeVirtualMemory(current_process, @ptrCast(&amp;base_addr), &amp;region_size, .{ .RELEASE = true });
-        }
-
-        const overalloc_len = n + alignment_bytes - page_size;
-        const page_aligned_len = mem.alignForward(usize, n, page_size);
-
-        base_addr = null;
-        size = overalloc_len;
-
-        status = ntdll.NtAllocateVirtualMemory(current_process, @ptrCast(&amp;base_addr), 0, &amp;size, .{ .RESERVE = true, .RESERVE_PLACEHOLDER = true }, .{ .NOACCESS = true });
-
-        if (status != .SUCCESS) return null;
-
-        const placeholder_addr = @intFromPtr(base_addr);
-        const aligned_addr = mem.alignForward(usize, placeholder_addr, alignment_bytes);
-        const prefix_size = aligned_addr - placeholder_addr;
-
-        if (prefix_size &gt; 0) {
-            var prefix_base = base_addr;
-            var prefix_size_param: windows.SIZE_T = prefix_size;
-            _ = ntdll.NtFreeVirtualMemory(current_process, @ptrCast(&amp;prefix_base), &amp;prefix_size_param, .{ .RELEASE = true, .PRESERVE_PLACEHOLDER = true });
-        }
-
-        const suffix_start = aligned_addr + page_aligned_len;
-        const suffix_size = (placeholder_addr + overalloc_len) - suffix_start;
-        if (suffix_size &gt; 0) {
-            var suffix_base = @as(?*anyopaque, @ptrFromInt(suffix_start));
-            var suffix_size_param: windows.SIZE_T = suffix_size;
-            _ = ntdll.NtFreeVirtualMemory(current_process, @ptrCast(&amp;suffix_base), &amp;suffix_size_param, .{ .RELEASE = true, .PRESERVE_PLACEHOLDER = true });
-        }
-
-        base_addr = @ptrFromInt(aligned_addr);
-        size = page_aligned_len;
-
-        status = ntdll.NtAllocateVirtualMemory(current_process, @ptrCast(&amp;base_addr), 0, &amp;size, .{ .COMMIT = true }, .{ .READWRITE = true });
-
-        if (status == .SUCCESS) {
-            return @ptrCast(base_addr);
-        }
-
-        base_addr = @as(?*anyopaque, @ptrFromInt(aligned_addr));
-        size = page_aligned_len;
-        _ = ntdll.NtFreeVirtualMemory(current_process, @ptrCast(&amp;base_addr), &amp;size, .{ .RELEASE = true });
-
-        return null;
-    }
-
-    const page_aligned_len = mem.alignForward(usize, n, page_size);
-    const max_drop_len = alignment_bytes -| page_size;
-    const overalloc_len = page_aligned_len + max_drop_len;
-
-    const maybe_unaligned_hint, const hint = blk: {
-        if (!enable_hints) break :blk .{ null, null };
-
-        const maybe_unaligned_hint = @atomicLoad(@TypeOf(addr_hint), &amp;addr_hint, .unordered);
-
-        // For the very first mmap, let the kernel pick a good starting address;
-        // we'll begin doing our hinting from there.
-        if (maybe_unaligned_hint == null) break :blk .{ null, null };
-
-        // Aligning hint does not use mem.alignPointer, because it is slow.
-        // Aligning hint does not use mem.alignForward, because it asserts that there will be no overflow.
-        const hint: ?[*]align(page_size_min) u8 = @ptrFromInt(switch (stack_direction) {
-            .down =&gt; ((@intFromPtr(maybe_unaligned_hint) -% page_aligned_len) &amp; ~(alignment_bytes - 1)) -% max_drop_len,
-            .up =&gt; (@intFromPtr(maybe_unaligned_hint) +% (alignment_bytes - 1)) &amp; ~(alignment_bytes - 1),
-        });
-
-        break :blk .{ maybe_unaligned_hint, hint };
-    };
-
-    const slice = posix.mmap(
-        hint,
-        overalloc_len,
-        .{ .READ = true, .WRITE = true },
-        .{ .TYPE = .PRIVATE, .ANONYMOUS = true },
-        -1,
-        0,
-    ) catch return null;
-    const result_ptr = mem.alignPointer(slice.ptr, alignment_bytes).?;
-
-    // Unmap the extra bytes that were only requested in order to guarantee
-    // that the range of memory we were provided had a proper alignment in it
-    // somewhere. The extra bytes could be at the beginning, or end, or both.
-    const drop_len = result_ptr - slice.ptr;
-    if (drop_len != 0) posix.munmap(slice[0..drop_len]);
-    const remaining_len = overalloc_len - drop_len;
-    if (remaining_len &gt; page_aligned_len) posix.munmap(@alignCast(result_ptr[page_aligned_len..remaining_len]));
-
-    if (enable_hints) {
-        const new_hint: [*]align(page_size_min) u8 = @alignCast(result_ptr + switch (stack_direction) {
-            .up =&gt; page_aligned_len,
-            .down =&gt; 0,
-        });
-        _ = @cmpxchgStrong(@TypeOf(addr_hint), &amp;addr_hint, maybe_unaligned_hint, new_hint, .monotonic, .monotonic);
-    }
-
-    return result_ptr;
-}
-
-fn alloc(context: *anyopaque, n: usize, alignment: Alignment, ra: usize) ?[*]u8 {
-    _ = context;
-    _ = ra;
-    assert(n &gt; 0);
-    return map(n, alignment);
-}
-
-fn resize(context: *anyopaque, memory: []u8, alignment: Alignment, new_len: usize, return_address: usize) bool {
-    _ = context;
-    _ = return_address;
-    return realloc(memory, alignment, new_len, false) != null;
-}
-
-fn remap(context: *anyopaque, memory: []u8, alignment: Alignment, new_len: usize, return_address: usize) ?[*]u8 {
-    _ = context;
-    _ = return_address;
-    return realloc(memory, alignment, new_len, true);
-}
-
-fn free(context: *anyopaque, memory: []u8, alignment: Alignment, return_address: usize) void {
-    _ = context;
-    _ = return_address;
-    _ = alignment;
-    return unmap(@alignCast(memory));
-}
-
-pub fn unmap(memory: []align(page_size_min) u8) void {
-    if (native_os == .windows) {
-        var base_addr: ?*anyopaque = memory.ptr;
-        var region_size: windows.SIZE_T = 0;
-        _ = ntdll.NtFreeVirtualMemory(windows.GetCurrentProcess(), @ptrCast(&amp;base_addr), &amp;region_size, .{ .RELEASE = true });
-    } else {
-        const page_aligned_len = mem.alignForward(usize, memory.len, std.heap.pageSize());
-        posix.munmap(memory.ptr[0..page_aligned_len]);
-    }
-}
-
-pub fn realloc(uncasted_memory: []u8, alignment: Alignment, new_len: usize, may_move: bool) ?[*]u8 {
-    const memory: []align(page_size_min) u8 = @alignCast(uncasted_memory);
-    const page_size = std.heap.pageSize();
-    if (alignment.toByteUnits() &gt; page_size) return null;
-    const new_size_aligned = mem.alignForward(usize, new_len, page_size);
-
-    if (native_os == .windows) {
-        if (new_len &lt;= memory.len) {
-            const base_addr = @intFromPtr(memory.ptr);
-            const old_addr_end = base_addr + memory.len;
-            const new_addr_end = mem.alignForward(usize, base_addr + new_len, page_size);
-            if (old_addr_end &gt; new_addr_end) {
-                var decommit_addr: ?*anyopaque = @ptrFromInt(new_addr_end);
-                var decommit_size: windows.SIZE_T = old_addr_end - new_addr_end;
-
-                _ = ntdll.NtAllocateVirtualMemory(windows.GetCurrentProcess(), @ptrCast(&amp;decommit_addr), 0, &amp;decommit_size, .{ .RESET = true }, .{ .NOACCESS = true });
-            }
-            return memory.ptr;
-        }
-        const old_size_aligned = mem.alignForward(usize, memory.len, page_size);
-        if (new_size_aligned &lt;= old_size_aligned) {
-            return memory.ptr;
-        }
-        return null;
-    }
-
-    const page_aligned_len = mem.alignForward(usize, memory.len, page_size);
-    if (new_size_aligned == page_aligned_len)
-        return memory.ptr;
-
-    // When the stack grows down, only use `mremap` if the allocation may move.
-    // Otherwise, we might grow the allocation and intrude on virtual address
-    // space which we want to keep available to the stack.
-    if (posix.MREMAP != void and (stack_direction == .up or may_move)) {
-        // TODO: if the next_mmap_addr_hint is within the remapped range, update it
-        const new_memory = posix.mremap(memory.ptr, page_aligned_len, new_size_aligned, .{ .MAYMOVE = may_move }, null) catch return null;
-        return new_memory.ptr;
-    }
-
-    if (new_size_aligned &lt; page_aligned_len) {
-        const ptr = memory.ptr + new_size_aligned;
-        // TODO: if the next_mmap_addr_hint is within the unmapped range, update it
-        posix.munmap(@alignCast(ptr[0 .. page_aligned_len - new_size_aligned]));
-        return memory.ptr;
-    }
-
-    return null;
-}</pre>
+    <pre><a id="L1"></a>const builtin = @import("builtin");
+<a id="L2"></a>const native_os = builtin.os.tag;
+<a id="L3"></a>
+<a id="L4"></a>const std = @import("../std.zig");
+<a id="L5"></a>const Allocator = std.mem.Allocator;
+<a id="L6"></a>const Alignment = std.mem.Alignment;
+<a id="L7"></a>const mem = std.mem;
+<a id="L8"></a>const maxInt = std.math.maxInt;
+<a id="L9"></a>const assert = std.debug.assert;
+<a id="L10"></a>const windows = std.os.windows;
+<a id="L11"></a>const ntdll = std.os.windows.ntdll;
+<a id="L12"></a>const posix = std.posix;
+<a id="L13"></a>const page_size_min = std.heap.page_size_min;
+<a id="L14"></a>
+<a id="L15"></a>pub const vtable: Allocator.VTable = .{
+<a id="L16"></a>    .alloc = alloc,
+<a id="L17"></a>    .resize = resize,
+<a id="L18"></a>    .remap = remap,
+<a id="L19"></a>    .free = free,
+<a id="L20"></a>};
+<a id="L21"></a>
+<a id="L22"></a>/// Hhinting is disabled on operating systems that make an effort to not reuse
+<a id="L23"></a>/// mappings. For example, OpenBSD aggressively randomizes addresses of mappings
+<a id="L24"></a>/// that don't provide a hint (for security reasons, but it serves our needs
+<a id="L25"></a>/// too).
+<a id="L26"></a>const enable_hints = switch (builtin.target.os.tag) {
+<a id="L27"></a>    .openbsd =&gt; false,
+<a id="L28"></a>    else =&gt; true,
+<a id="L29"></a>};
+<a id="L30"></a>
+<a id="L31"></a>/// On operating systems that don't immediately map in the whole stack, we need
+<a id="L32"></a>/// to be careful to not hint into the pages after the stack guard gap, which
+<a id="L33"></a>/// the stack will expand into. The easiest way to avoid that is to hint in the
+<a id="L34"></a>/// same direction as stack growth.
+<a id="L35"></a>const stack_direction = builtin.target.stackGrowth();
+<a id="L36"></a>
+<a id="L37"></a>/// When hinting upwards, this points to the next page that we hope to allocate
+<a id="L38"></a>/// at; when hinting downwards, this points to the beginning of the last
+<a id="L39"></a>/// successful allocation.
+<a id="L40"></a>///
+<a id="L41"></a>/// TODO: Utilize this on Windows.
+<a id="L42"></a>var addr_hint: ?[*]align(page_size_min) u8 = null;
+<a id="L43"></a>
+<a id="L44"></a>pub fn map(n: usize, alignment: Alignment) ?[*]u8 {
+<a id="L45"></a>    const page_size = std.heap.pageSize();
+<a id="L46"></a>    if (n &gt;= maxInt(usize) - page_size) return null;
+<a id="L47"></a>    const alignment_bytes = alignment.toByteUnits();
+<a id="L48"></a>
+<a id="L49"></a>    if (native_os == .windows) {
+<a id="L50"></a>        var base_addr: ?*anyopaque = null;
+<a id="L51"></a>        var size: windows.SIZE_T = n;
+<a id="L52"></a>
+<a id="L53"></a>        const current_process = windows.GetCurrentProcess();
+<a id="L54"></a>        var status = ntdll.NtAllocateVirtualMemory(current_process, @ptrCast(&amp;base_addr), 0, &amp;size, .{ .COMMIT = true, .RESERVE = true }, .{ .READWRITE = true });
+<a id="L55"></a>
+<a id="L56"></a>        if (status == .SUCCESS and mem.isAligned(@intFromPtr(base_addr), alignment_bytes)) {
+<a id="L57"></a>            return @ptrCast(base_addr);
+<a id="L58"></a>        }
+<a id="L59"></a>
+<a id="L60"></a>        if (status == .SUCCESS) {
+<a id="L61"></a>            var region_size: windows.SIZE_T = 0;
+<a id="L62"></a>            _ = ntdll.NtFreeVirtualMemory(current_process, @ptrCast(&amp;base_addr), &amp;region_size, .{ .RELEASE = true });
+<a id="L63"></a>        }
+<a id="L64"></a>
+<a id="L65"></a>        const overalloc_len = n + alignment_bytes - page_size;
+<a id="L66"></a>        const page_aligned_len = mem.alignForward(usize, n, page_size);
+<a id="L67"></a>
+<a id="L68"></a>        base_addr = null;
+<a id="L69"></a>        size = overalloc_len;
+<a id="L70"></a>
+<a id="L71"></a>        status = ntdll.NtAllocateVirtualMemory(current_process, @ptrCast(&amp;base_addr), 0, &amp;size, .{ .RESERVE = true, .RESERVE_PLACEHOLDER = true }, .{ .NOACCESS = true });
+<a id="L72"></a>
+<a id="L73"></a>        if (status != .SUCCESS) return null;
+<a id="L74"></a>
+<a id="L75"></a>        const placeholder_addr = @intFromPtr(base_addr);
+<a id="L76"></a>        const aligned_addr = mem.alignForward(usize, placeholder_addr, alignment_bytes);
+<a id="L77"></a>        const prefix_size = aligned_addr - placeholder_addr;
+<a id="L78"></a>
+<a id="L79"></a>        if (prefix_size &gt; 0) {
+<a id="L80"></a>            var prefix_base = base_addr;
+<a id="L81"></a>            var prefix_size_param: windows.SIZE_T = prefix_size;
+<a id="L82"></a>            _ = ntdll.NtFreeVirtualMemory(current_process, @ptrCast(&amp;prefix_base), &amp;prefix_size_param, .{ .RELEASE = true, .PRESERVE_PLACEHOLDER = true });
+<a id="L83"></a>        }
+<a id="L84"></a>
+<a id="L85"></a>        const suffix_start = aligned_addr + page_aligned_len;
+<a id="L86"></a>        const suffix_size = (placeholder_addr + overalloc_len) - suffix_start;
+<a id="L87"></a>        if (suffix_size &gt; 0) {
+<a id="L88"></a>            var suffix_base = @as(?*anyopaque, @ptrFromInt(suffix_start));
+<a id="L89"></a>            var suffix_size_param: windows.SIZE_T = suffix_size;
+<a id="L90"></a>            _ = ntdll.NtFreeVirtualMemory(current_process, @ptrCast(&amp;suffix_base), &amp;suffix_size_param, .{ .RELEASE = true, .PRESERVE_PLACEHOLDER = true });
+<a id="L91"></a>        }
+<a id="L92"></a>
+<a id="L93"></a>        base_addr = @ptrFromInt(aligned_addr);
+<a id="L94"></a>        size = page_aligned_len;
+<a id="L95"></a>
+<a id="L96"></a>        status = ntdll.NtAllocateVirtualMemory(current_process, @ptrCast(&amp;base_addr), 0, &amp;size, .{ .COMMIT = true }, .{ .READWRITE = true });
+<a id="L97"></a>
+<a id="L98"></a>        if (status == .SUCCESS) {
+<a id="L99"></a>            return @ptrCast(base_addr);
+<a id="L100"></a>        }
+<a id="L101"></a>
+<a id="L102"></a>        base_addr = @as(?*anyopaque, @ptrFromInt(aligned_addr));
+<a id="L103"></a>        size = page_aligned_len;
+<a id="L104"></a>        _ = ntdll.NtFreeVirtualMemory(current_process, @ptrCast(&amp;base_addr), &amp;size, .{ .RELEASE = true });
+<a id="L105"></a>
+<a id="L106"></a>        return null;
+<a id="L107"></a>    }
+<a id="L108"></a>
+<a id="L109"></a>    const page_aligned_len = mem.alignForward(usize, n, page_size);
+<a id="L110"></a>    const max_drop_len = alignment_bytes -| page_size;
+<a id="L111"></a>    const overalloc_len = page_aligned_len + max_drop_len;
+<a id="L112"></a>
+<a id="L113"></a>    const maybe_unaligned_hint, const hint = blk: {
+<a id="L114"></a>        if (!enable_hints) break :blk .{ null, null };
+<a id="L115"></a>
+<a id="L116"></a>        const maybe_unaligned_hint = @atomicLoad(@TypeOf(addr_hint), &amp;addr_hint, .unordered);
+<a id="L117"></a>
+<a id="L118"></a>        // For the very first mmap, let the kernel pick a good starting address;
+<a id="L119"></a>        // we'll begin doing our hinting from there.
+<a id="L120"></a>        if (maybe_unaligned_hint == null) break :blk .{ null, null };
+<a id="L121"></a>
+<a id="L122"></a>        // Aligning hint does not use mem.alignPointer, because it is slow.
+<a id="L123"></a>        // Aligning hint does not use mem.alignForward, because it asserts that there will be no overflow.
+<a id="L124"></a>        const hint: ?[*]align(page_size_min) u8 = @ptrFromInt(switch (stack_direction) {
+<a id="L125"></a>            .down =&gt; ((@intFromPtr(maybe_unaligned_hint) -% page_aligned_len) &amp; ~(alignment_bytes - 1)) -% max_drop_len,
+<a id="L126"></a>            .up =&gt; (@intFromPtr(maybe_unaligned_hint) +% (alignment_bytes - 1)) &amp; ~(alignment_bytes - 1),
+<a id="L127"></a>        });
+<a id="L128"></a>
+<a id="L129"></a>        break :blk .{ maybe_unaligned_hint, hint };
+<a id="L130"></a>    };
+<a id="L131"></a>
+<a id="L132"></a>    const slice = posix.mmap(
+<a id="L133"></a>        hint,
+<a id="L134"></a>        overalloc_len,
+<a id="L135"></a>        .{ .READ = true, .WRITE = true },
+<a id="L136"></a>        .{ .TYPE = .PRIVATE, .ANONYMOUS = true },
+<a id="L137"></a>        -1,
+<a id="L138"></a>        0,
+<a id="L139"></a>    ) catch return null;
+<a id="L140"></a>    const result_ptr = mem.alignPointer(slice.ptr, alignment_bytes).?;
+<a id="L141"></a>
+<a id="L142"></a>    // Unmap the extra bytes that were only requested in order to guarantee
+<a id="L143"></a>    // that the range of memory we were provided had a proper alignment in it
+<a id="L144"></a>    // somewhere. The extra bytes could be at the beginning, or end, or both.
+<a id="L145"></a>    const drop_len = result_ptr - slice.ptr;
+<a id="L146"></a>    if (drop_len != 0) posix.munmap(slice[0..drop_len]);
+<a id="L147"></a>    const remaining_len = overalloc_len - drop_len;
+<a id="L148"></a>    if (remaining_len &gt; page_aligned_len) posix.munmap(@alignCast(result_ptr[page_aligned_len..remaining_len]));
+<a id="L149"></a>
+<a id="L150"></a>    if (enable_hints) {
+<a id="L151"></a>        const new_hint: [*]align(page_size_min) u8 = @alignCast(result_ptr + switch (stack_direction) {
+<a id="L152"></a>            .up =&gt; page_aligned_len,
+<a id="L153"></a>            .down =&gt; 0,
+<a id="L154"></a>        });
+<a id="L155"></a>        _ = @cmpxchgStrong(@TypeOf(addr_hint), &amp;addr_hint, maybe_unaligned_hint, new_hint, .monotonic, .monotonic);
+<a id="L156"></a>    }
+<a id="L157"></a>
+<a id="L158"></a>    return result_ptr;
+<a id="L159"></a>}
+<a id="L160"></a>
+<a id="L161"></a>fn alloc(context: *anyopaque, n: usize, alignment: Alignment, ra: usize) ?[*]u8 {
+<a id="L162"></a>    _ = context;
+<a id="L163"></a>    _ = ra;
+<a id="L164"></a>    assert(n &gt; 0);
+<a id="L165"></a>    return map(n, alignment);
+<a id="L166"></a>}
+<a id="L167"></a>
+<a id="L168"></a>fn resize(context: *anyopaque, memory: []u8, alignment: Alignment, new_len: usize, return_address: usize) bool {
+<a id="L169"></a>    _ = context;
+<a id="L170"></a>    _ = return_address;
+<a id="L171"></a>    return realloc(memory, alignment, new_len, false) != null;
+<a id="L172"></a>}
+<a id="L173"></a>
+<a id="L174"></a>fn remap(context: *anyopaque, memory: []u8, alignment: Alignment, new_len: usize, return_address: usize) ?[*]u8 {
+<a id="L175"></a>    _ = context;
+<a id="L176"></a>    _ = return_address;
+<a id="L177"></a>    return realloc(memory, alignment, new_len, true);
+<a id="L178"></a>}
+<a id="L179"></a>
+<a id="L180"></a>fn free(context: *anyopaque, memory: []u8, alignment: Alignment, return_address: usize) void {
+<a id="L181"></a>    _ = context;
+<a id="L182"></a>    _ = return_address;
+<a id="L183"></a>    _ = alignment;
+<a id="L184"></a>    return unmap(@alignCast(memory));
+<a id="L185"></a>}
+<a id="L186"></a>
+<a id="L187"></a>pub fn unmap(memory: []align(page_size_min) u8) void {
+<a id="L188"></a>    if (native_os == .windows) {
+<a id="L189"></a>        var base_addr: ?*anyopaque = memory.ptr;
+<a id="L190"></a>        var region_size: windows.SIZE_T = 0;
+<a id="L191"></a>        _ = ntdll.NtFreeVirtualMemory(windows.GetCurrentProcess(), @ptrCast(&amp;base_addr), &amp;region_size, .{ .RELEASE = true });
+<a id="L192"></a>    } else {
+<a id="L193"></a>        const page_aligned_len = mem.alignForward(usize, memory.len, std.heap.pageSize());
+<a id="L194"></a>        posix.munmap(memory.ptr[0..page_aligned_len]);
+<a id="L195"></a>    }
+<a id="L196"></a>}
+<a id="L197"></a>
+<a id="L198"></a>pub fn realloc(uncasted_memory: []u8, alignment: Alignment, new_len: usize, may_move: bool) ?[*]u8 {
+<a id="L199"></a>    const memory: []align(page_size_min) u8 = @alignCast(uncasted_memory);
+<a id="L200"></a>    const page_size = std.heap.pageSize();
+<a id="L201"></a>    if (alignment.toByteUnits() &gt; page_size) return null;
+<a id="L202"></a>    const new_size_aligned = mem.alignForward(usize, new_len, page_size);
+<a id="L203"></a>
+<a id="L204"></a>    if (native_os == .windows) {
+<a id="L205"></a>        if (new_len &lt;= memory.len) {
+<a id="L206"></a>            const base_addr = @intFromPtr(memory.ptr);
+<a id="L207"></a>            const old_addr_end = base_addr + memory.len;
+<a id="L208"></a>            const new_addr_end = mem.alignForward(usize, base_addr + new_len, page_size);
+<a id="L209"></a>            if (old_addr_end &gt; new_addr_end) {
+<a id="L210"></a>                var decommit_addr: ?*anyopaque = @ptrFromInt(new_addr_end);
+<a id="L211"></a>                var decommit_size: windows.SIZE_T = old_addr_end - new_addr_end;
+<a id="L212"></a>
+<a id="L213"></a>                _ = ntdll.NtAllocateVirtualMemory(windows.GetCurrentProcess(), @ptrCast(&amp;decommit_addr), 0, &amp;decommit_size, .{ .RESET = true }, .{ .NOACCESS = true });
+<a id="L214"></a>            }
+<a id="L215"></a>            return memory.ptr;
+<a id="L216"></a>        }
+<a id="L217"></a>        const old_size_aligned = mem.alignForward(usize, memory.len, page_size);
+<a id="L218"></a>        if (new_size_aligned &lt;= old_size_aligned) {
+<a id="L219"></a>            return memory.ptr;
+<a id="L220"></a>        }
+<a id="L221"></a>        return null;
+<a id="L222"></a>    }
+<a id="L223"></a>
+<a id="L224"></a>    const page_aligned_len = mem.alignForward(usize, memory.len, page_size);
+<a id="L225"></a>    if (new_size_aligned == page_aligned_len)
+<a id="L226"></a>        return memory.ptr;
+<a id="L227"></a>
+<a id="L228"></a>    // When the stack grows down, only use `mremap` if the allocation may move.
+<a id="L229"></a>    // Otherwise, we might grow the allocation and intrude on virtual address
+<a id="L230"></a>    // space which we want to keep available to the stack.
+<a id="L231"></a>    if (posix.MREMAP != void and (stack_direction == .up or may_move)) {
+<a id="L232"></a>        // TODO: if the next_mmap_addr_hint is within the remapped range, update it
+<a id="L233"></a>        const new_memory = posix.mremap(memory.ptr, page_aligned_len, new_size_aligned, .{ .MAYMOVE = may_move }, null) catch return null;
+<a id="L234"></a>        return new_memory.ptr;
+<a id="L235"></a>    }
+<a id="L236"></a>
+<a id="L237"></a>    if (new_size_aligned &lt; page_aligned_len) {
+<a id="L238"></a>        const ptr = memory.ptr + new_size_aligned;
+<a id="L239"></a>        // TODO: if the next_mmap_addr_hint is within the unmapped range, update it
+<a id="L240"></a>        posix.munmap(@alignCast(ptr[0 .. page_aligned_len - new_size_aligned]));
+<a id="L241"></a>        return memory.ptr;
+<a id="L242"></a>    }
+<a id="L243"></a>
+<a id="L244"></a>    return null;
+<a id="L245"></a>}
+</pre>
 </body>
 </html>

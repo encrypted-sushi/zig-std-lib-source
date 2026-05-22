@@ -2,357 +2,360 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Source: zig-0.16.0-std/crypto/aes_gcm_siv.zig</title>
+    <title>Source: crypto/aes_gcm_siv.zig</title>
     <style>
         body { background: #1e1e1e; color: #d4d4d4; font-family: monospace; padding: 20px; }
         pre { white-space: pre-wrap; word-wrap: break-word; }
         .header { border-bottom: 1px solid #444; padding-bottom: 10px; margin-bottom: 20px; }
         a { color: #569cd6; }
+        a[id] { color: inherit; text-decoration: none; }
+        :target { background: #3a3a00; }
     </style>
 </head>
 <body>
     <div class="header">
-        <a href="/">Index</a> | <strong>File: zig-0.16.0-std/crypto/aes_gcm_siv.zig</strong>
+        <a href="/">Index</a> | <strong>File: crypto/aes_gcm_siv.zig</strong>
     </div>
-    <pre>const std = @import("std");
-const assert = std.debug.assert;
-const crypto = std.crypto;
-const debug = std.debug;
-const mem = std.mem;
-const math = std.math;
-const modes = @import("modes.zig");
-const Polyval = @import("ghash_polyval.zig").Polyval;
-const AuthenticationError = crypto.errors.AuthenticationError;
-
-pub const Aes128GcmSiv = AesGcmSiv(crypto.core.aes.Aes128);
-pub const Aes256GcmSiv = AesGcmSiv(crypto.core.aes.Aes256);
-
-/// AES-GCM-SIV: Authenticated encryption that remains secure even if you accidentally reuse a nonce.
-///
-/// What it does: Encrypts data and protects it from tampering. You can also attach
-/// unencrypted metadata (like headers) that will be authenticated but not encrypted.
-///
-/// When to use AES-GCM-SIV:
-/// - When you can't guarantee unique nonces (though you should still try to use unique nonces)
-///
-/// When to use regular AES-GCM instead:
-/// - When you can guarantee unique nonces (e.g., using a counter)
-/// - When you need slightly better performance
-///
-/// Security: If you accidentally reuse a nonce with the same key, AES-GCM-SIV only
-/// reveals whether two messages are identical. Regular AES-GCM would be catastrophically
-/// broken in this scenario, potentially revealing the authentication key.
-///
-/// Performance: Slightly slower than AES-GCM due to the additional key derivation step.
-///
-/// Defined in RFC 8452.
-fn AesGcmSiv(comptime Aes: anytype) type {
-    debug.assert(Aes.block.block_length == 16);
-
-    return struct {
-        pub const tag_length = 16;
-        pub const nonce_length = 12;
-        pub const key_length = Aes.key_bits / 8;
-
-        const zeros: [16]u8 = @splat(0);
-
-        /// Derives the authentication and message encryption keys from the master key and nonce.
-        /// This implements the key derivation as specified in RFC 8452 Section 4.
-        /// Generates a 128-bit authentication key for POLYVAL and a message encryption key
-        /// (128 or 256 bits depending on the AES variant).
-        fn deriveKeys(message_key: *[key_length]u8, auth_key: *[16]u8, key: [key_length]u8, nonce: [nonce_length]u8) void {
-            const aes = Aes.initEnc(key);
-
-            // Derive authentication and message keys per RFC 8452 Section 4
-            // Each encryption produces 16 bytes, but we only use first 8 bytes of each block
-
-            if (key_length == 16) {
-                // AES-128-GCM-SIV: Process 4 blocks in parallel
-                var key_blocks: [4 * 16]u8 = undefined;
-                var cipher_outs: [4 * 16]u8 = undefined;
-
-                // Set up all 4 blocks with counters 0-3 and nonce
-                inline for (0..4) |i| {
-                    mem.writeInt(u32, key_blocks[i * 16 ..][0..4], @intCast(i), .little);
-                    key_blocks[i * 16 + 4 .. i * 16 + 16].* = nonce;
-                }
-
-                // Encrypt all 4 blocks in parallel
-                aes.encryptWide(4, &amp;cipher_outs, &amp;key_blocks);
-
-                // Extract the key material (first 8 bytes of each block)
-                @memcpy(auth_key[0..8], cipher_outs[0..8]);
-                @memcpy(auth_key[8..16], cipher_outs[16..24]);
-                @memcpy(message_key[0..8], cipher_outs[32..40]);
-                @memcpy(message_key[8..16], cipher_outs[48..56]);
-            } else {
-                // AES-256-GCM-SIV: Process 6 blocks in parallel
-                var key_blocks: [6 * 16]u8 = undefined;
-                var cipher_outs: [6 * 16]u8 = undefined;
-
-                // Set up all 6 blocks with counters 0-5 and nonce
-                inline for (0..6) |i| {
-                    mem.writeInt(u32, key_blocks[i * 16 ..][0..4], @intCast(i), .little);
-                    key_blocks[i * 16 + 4 .. i * 16 + 16].* = nonce;
-                }
-
-                // Encrypt all 6 blocks in parallel
-                aes.encryptWide(6, &amp;cipher_outs, &amp;key_blocks);
-
-                // Extract the key material (first 8 bytes of each block)
-                @memcpy(auth_key[0..8], cipher_outs[0..8]);
-                @memcpy(auth_key[8..16], cipher_outs[16..24]);
-                @memcpy(message_key[0..8], cipher_outs[32..40]);
-                @memcpy(message_key[8..16], cipher_outs[48..56]);
-                @memcpy(message_key[16..24], cipher_outs[64..72]);
-                @memcpy(message_key[24..32], cipher_outs[80..88]);
-            }
-        }
-
-        /// Encrypts and authenticates a message using AES-GCM-SIV.
-        ///
-        /// `c`: The ciphertext buffer to write the encrypted data to.
-        /// `tag`: The authentication tag buffer to write the computed tag to.
-        /// `m`: The plaintext message to encrypt.
-        /// `ad`: The associated data to authenticate.
-        /// `npub`: The nonce to use for encryption.
-        /// `key`: The encryption key.
-        pub fn encrypt(c: []u8, tag: *[tag_length]u8, m: []const u8, ad: []const u8, npub: [nonce_length]u8, key: [key_length]u8) void {
-            debug.assert(c.len == m.len);
-            debug.assert(m.len &lt;= (1 &lt;&lt; 36));
-            debug.assert(ad.len &lt;= (1 &lt;&lt; 36));
-
-            var auth_key: [16]u8 = undefined;
-            var message_key: [key_length]u8 = undefined;
-            deriveKeys(&amp;message_key, &amp;auth_key, key, npub);
-
-            // Calculate POLYVAL over additional data and plaintext
-            const block_count = (math.divCeil(usize, ad.len, Polyval.block_length) catch unreachable) +
-                (math.divCeil(usize, m.len, Polyval.block_length) catch unreachable) + 1;
-            var mac = Polyval.initForBlockCount(&amp;auth_key, block_count);
-
-            // Process additional data
-            mac.update(ad);
-            mac.pad();
-
-            // Process plaintext
-            mac.update(m);
-            mac.pad();
-
-            // Length block
-            var length_block: [16]u8 = undefined;
-            mem.writeInt(u64, length_block[0..8], @as(u64, ad.len) * 8, .little);
-            mem.writeInt(u64, length_block[8..16], @as(u64, m.len) * 8, .little);
-            mac.update(&amp;length_block);
-
-            // Get POLYVAL result
-            var s: [16]u8 = undefined;
-            mac.final(&amp;s);
-
-            // XOR with nonce to get pre-tag
-            for (npub, 0..) |b, i| {
-                s[i] ^= b;
-            }
-
-            // Clear most significant bit of last byte
-            s[15] &amp;= 0x7f;
-
-            // Encrypt to get tag
-            const tag_aes = Aes.initEnc(message_key);
-            tag_aes.encrypt(tag, &amp;s);
-
-            // Use tag as initial counter for CTR mode
-            var counter: [16]u8 = tag.*;
-            counter[15] |= 0x80; // Set most significant bit
-
-            // Encrypt message using CTR mode with 32-bit little-endian counter
-            const aes_ctx = Aes.initEnc(message_key);
-            modes.ctrSlice(@TypeOf(aes_ctx), aes_ctx, c, m, counter, .little, 0, 4);
-        }
-
-        /// Decrypts and authenticates a message using AES-GCM-SIV.
-        ///
-        /// `m`: Message buffer to write the decrypted data to.
-        /// `c`: The ciphertext to decrypt.
-        /// `tag`: The authentication tag.
-        /// `ad`: The associated data.
-        /// `npub`: The nonce.
-        /// `key`: The decryption key.
-        /// Asserts `c.len == m.len`.
-        pub fn decrypt(m: []u8, c: []const u8, tag: [tag_length]u8, ad: []const u8, npub: [nonce_length]u8, key: [key_length]u8) AuthenticationError!void {
-            assert(c.len == m.len);
-            assert(c.len &lt;= (1 &lt;&lt; 36));
-            assert(ad.len &lt;= (1 &lt;&lt; 36));
-
-            var auth_key: [16]u8 = undefined;
-            var message_key: [key_length]u8 = undefined;
-            deriveKeys(&amp;message_key, &amp;auth_key, key, npub);
-
-            // Decrypt message using CTR mode with 32-bit little-endian counter
-            var counter: [16]u8 = tag;
-            counter[15] |= 0x80; // Set most significant bit
-
-            const aes_ctx = Aes.initEnc(message_key);
-            modes.ctrSlice(@TypeOf(aes_ctx), aes_ctx, m, c, counter, .little, 0, 4);
-
-            // Verify tag by recalculating POLYVAL
-            const block_count = (math.divCeil(usize, ad.len, Polyval.block_length) catch unreachable) +
-                (math.divCeil(usize, m.len, Polyval.block_length) catch unreachable) + 1;
-            var mac = Polyval.initForBlockCount(&amp;auth_key, block_count);
-
-            // Process additional data
-            mac.update(ad);
-            mac.pad();
-
-            // Process decrypted plaintext
-            mac.update(m);
-            mac.pad();
-
-            // Length block
-            var length_block: [16]u8 = undefined;
-            mem.writeInt(u64, length_block[0..8], @as(u64, ad.len) * 8, .little);
-            mem.writeInt(u64, length_block[8..16], @as(u64, m.len) * 8, .little);
-            mac.update(&amp;length_block);
-
-            // Get POLYVAL result
-            var s: [16]u8 = undefined;
-            mac.final(&amp;s);
-
-            // XOR with nonce to get pre-tag
-            for (npub, 0..) |b, i| {
-                s[i] ^= b;
-            }
-
-            // Clear most significant bit of last byte
-            s[15] &amp;= 0x7f;
-
-            // Encrypt to get expected tag
-            const tag_aes = Aes.initEnc(message_key);
-            var computed_tag: [tag_length]u8 = undefined;
-            tag_aes.encrypt(&amp;computed_tag, &amp;s);
-
-            // Verify tag
-            const verify = crypto.timing_safe.eql([tag_length]u8, computed_tag, tag);
-            if (!verify) {
-                crypto.secureZero(u8, &amp;computed_tag);
-                @memset(m, undefined);
-                return error.AuthenticationFailed;
-            }
-        }
-    };
-}
-
-const htest = @import("test.zig");
-const testing = std.testing;
-
-test "Aes128GcmSiv - RFC 8452 Test Vector 1" {
-    // Test vector from RFC 8452 Appendix C.1
-    const key = [_]u8{
-        0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    };
-    const nonce = [_]u8{
-        0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00,
-    };
-    const ad = "";
-    const m = "";
-    var c: [m.len]u8 = undefined;
-    var tag: [Aes128GcmSiv.tag_length]u8 = undefined;
-
-    Aes128GcmSiv.encrypt(&amp;c, &amp;tag, m, ad, nonce, key);
-    try htest.assertEqual("dc20e2d83f25705bb49e439eca56de25", &amp;tag);
-}
-
-test "Aes128GcmSiv - RFC 8452 Test Vector 2" {
-    // Test vector from RFC 8452 Appendix C.1
-    const key = [_]u8{
-        0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    };
-    const nonce = [_]u8{
-        0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00,
-    };
-    const plaintext = [_]u8{
-        0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    };
-    const ad = "";
-    var c: [plaintext.len]u8 = undefined;
-    var tag: [Aes128GcmSiv.tag_length]u8 = undefined;
-
-    Aes128GcmSiv.encrypt(&amp;c, &amp;tag, &amp;plaintext, ad, nonce, key);
-    try htest.assertEqual("b5d839330ac7b786", &amp;c);
-    try htest.assertEqual("578782fff6013b815b287c22493a364c", &amp;tag);
-
-    var m2: [plaintext.len]u8 = undefined;
-    try Aes128GcmSiv.decrypt(&amp;m2, &amp;c, tag, ad, nonce, key);
-    try testing.expectEqualSlices(u8, &amp;plaintext, &amp;m2);
-}
-
-test "Aes128GcmSiv - RFC 8452 Test Vector 3" {
-    // Test vector from RFC 8452 Appendix C.1
-    const key = [_]u8{
-        0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    };
-    const nonce = [_]u8{
-        0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00,
-    };
-    const plaintext = [_]u8{
-        0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00,
-    };
-    const ad = "";
-    var c: [plaintext.len]u8 = undefined;
-    var tag: [Aes128GcmSiv.tag_length]u8 = undefined;
-
-    Aes128GcmSiv.encrypt(&amp;c, &amp;tag, &amp;plaintext, ad, nonce, key);
-    try htest.assertEqual("7323ea61d05932260047d942", &amp;c);
-    try htest.assertEqual("a4978db357391a0bc4fdec8b0d106639", &amp;tag);
-
-    var m2: [plaintext.len]u8 = undefined;
-    try Aes128GcmSiv.decrypt(&amp;m2, &amp;c, tag, ad, nonce, key);
-    try testing.expectEqualSlices(u8, &amp;plaintext, &amp;m2);
-}
-
-test "Aes256GcmSiv - RFC 8452 Test Vector" {
-    // Test vector from RFC 8452 Appendix C.2
-    const key = [_]u8{
-        0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    };
-    const nonce = [_]u8{
-        0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00,
-    };
-    const ad = "";
-    const m = "";
-    var c: [m.len]u8 = undefined;
-    var tag: [Aes256GcmSiv.tag_length]u8 = undefined;
-
-    Aes256GcmSiv.encrypt(&amp;c, &amp;tag, m, ad, nonce, key);
-    try htest.assertEqual("07f5f4169bbf55a8400cd47ea6fd400f", &amp;tag);
-}
-
-test "Aes128GcmSiv - Decrypt with wrong tag" {
-    const key: [Aes128GcmSiv.key_length]u8 = @splat(0x69);
-    const nonce: [Aes128GcmSiv.nonce_length]u8 = @splat(0x42);
-    const m = "Test message";
-    const ad = "";
-    var c: [m.len]u8 = undefined;
-    var tag: [Aes128GcmSiv.tag_length]u8 = undefined;
-
-    Aes128GcmSiv.encrypt(&amp;c, &amp;tag, m, ad, nonce, key);
-
-    // Corrupt the tag
-    tag[0] ^= 0x01;
-
-    var m2: [m.len]u8 = undefined;
-    try testing.expectError(error.AuthenticationFailed, Aes128GcmSiv.decrypt(&amp;m2, &amp;c, tag, ad, nonce, key));
-}</pre>
+    <pre><a id="L1"></a>const std = @import("std");
+<a id="L2"></a>const assert = std.debug.assert;
+<a id="L3"></a>const crypto = std.crypto;
+<a id="L4"></a>const debug = std.debug;
+<a id="L5"></a>const mem = std.mem;
+<a id="L6"></a>const math = std.math;
+<a id="L7"></a>const modes = @import("modes.zig");
+<a id="L8"></a>const Polyval = @import("ghash_polyval.zig").Polyval;
+<a id="L9"></a>const AuthenticationError = crypto.errors.AuthenticationError;
+<a id="L10"></a>
+<a id="L11"></a>pub const Aes128GcmSiv = AesGcmSiv(crypto.core.aes.Aes128);
+<a id="L12"></a>pub const Aes256GcmSiv = AesGcmSiv(crypto.core.aes.Aes256);
+<a id="L13"></a>
+<a id="L14"></a>/// AES-GCM-SIV: Authenticated encryption that remains secure even if you accidentally reuse a nonce.
+<a id="L15"></a>///
+<a id="L16"></a>/// What it does: Encrypts data and protects it from tampering. You can also attach
+<a id="L17"></a>/// unencrypted metadata (like headers) that will be authenticated but not encrypted.
+<a id="L18"></a>///
+<a id="L19"></a>/// When to use AES-GCM-SIV:
+<a id="L20"></a>/// - When you can't guarantee unique nonces (though you should still try to use unique nonces)
+<a id="L21"></a>///
+<a id="L22"></a>/// When to use regular AES-GCM instead:
+<a id="L23"></a>/// - When you can guarantee unique nonces (e.g., using a counter)
+<a id="L24"></a>/// - When you need slightly better performance
+<a id="L25"></a>///
+<a id="L26"></a>/// Security: If you accidentally reuse a nonce with the same key, AES-GCM-SIV only
+<a id="L27"></a>/// reveals whether two messages are identical. Regular AES-GCM would be catastrophically
+<a id="L28"></a>/// broken in this scenario, potentially revealing the authentication key.
+<a id="L29"></a>///
+<a id="L30"></a>/// Performance: Slightly slower than AES-GCM due to the additional key derivation step.
+<a id="L31"></a>///
+<a id="L32"></a>/// Defined in RFC 8452.
+<a id="L33"></a>fn AesGcmSiv(comptime Aes: anytype) type {
+<a id="L34"></a>    debug.assert(Aes.block.block_length == 16);
+<a id="L35"></a>
+<a id="L36"></a>    return struct {
+<a id="L37"></a>        pub const tag_length = 16;
+<a id="L38"></a>        pub const nonce_length = 12;
+<a id="L39"></a>        pub const key_length = Aes.key_bits / 8;
+<a id="L40"></a>
+<a id="L41"></a>        const zeros: [16]u8 = @splat(0);
+<a id="L42"></a>
+<a id="L43"></a>        /// Derives the authentication and message encryption keys from the master key and nonce.
+<a id="L44"></a>        /// This implements the key derivation as specified in RFC 8452 Section 4.
+<a id="L45"></a>        /// Generates a 128-bit authentication key for POLYVAL and a message encryption key
+<a id="L46"></a>        /// (128 or 256 bits depending on the AES variant).
+<a id="L47"></a>        fn deriveKeys(message_key: *[key_length]u8, auth_key: *[16]u8, key: [key_length]u8, nonce: [nonce_length]u8) void {
+<a id="L48"></a>            const aes = Aes.initEnc(key);
+<a id="L49"></a>
+<a id="L50"></a>            // Derive authentication and message keys per RFC 8452 Section 4
+<a id="L51"></a>            // Each encryption produces 16 bytes, but we only use first 8 bytes of each block
+<a id="L52"></a>
+<a id="L53"></a>            if (key_length == 16) {
+<a id="L54"></a>                // AES-128-GCM-SIV: Process 4 blocks in parallel
+<a id="L55"></a>                var key_blocks: [4 * 16]u8 = undefined;
+<a id="L56"></a>                var cipher_outs: [4 * 16]u8 = undefined;
+<a id="L57"></a>
+<a id="L58"></a>                // Set up all 4 blocks with counters 0-3 and nonce
+<a id="L59"></a>                inline for (0..4) |i| {
+<a id="L60"></a>                    mem.writeInt(u32, key_blocks[i * 16 ..][0..4], @intCast(i), .little);
+<a id="L61"></a>                    key_blocks[i * 16 + 4 .. i * 16 + 16].* = nonce;
+<a id="L62"></a>                }
+<a id="L63"></a>
+<a id="L64"></a>                // Encrypt all 4 blocks in parallel
+<a id="L65"></a>                aes.encryptWide(4, &amp;cipher_outs, &amp;key_blocks);
+<a id="L66"></a>
+<a id="L67"></a>                // Extract the key material (first 8 bytes of each block)
+<a id="L68"></a>                @memcpy(auth_key[0..8], cipher_outs[0..8]);
+<a id="L69"></a>                @memcpy(auth_key[8..16], cipher_outs[16..24]);
+<a id="L70"></a>                @memcpy(message_key[0..8], cipher_outs[32..40]);
+<a id="L71"></a>                @memcpy(message_key[8..16], cipher_outs[48..56]);
+<a id="L72"></a>            } else {
+<a id="L73"></a>                // AES-256-GCM-SIV: Process 6 blocks in parallel
+<a id="L74"></a>                var key_blocks: [6 * 16]u8 = undefined;
+<a id="L75"></a>                var cipher_outs: [6 * 16]u8 = undefined;
+<a id="L76"></a>
+<a id="L77"></a>                // Set up all 6 blocks with counters 0-5 and nonce
+<a id="L78"></a>                inline for (0..6) |i| {
+<a id="L79"></a>                    mem.writeInt(u32, key_blocks[i * 16 ..][0..4], @intCast(i), .little);
+<a id="L80"></a>                    key_blocks[i * 16 + 4 .. i * 16 + 16].* = nonce;
+<a id="L81"></a>                }
+<a id="L82"></a>
+<a id="L83"></a>                // Encrypt all 6 blocks in parallel
+<a id="L84"></a>                aes.encryptWide(6, &amp;cipher_outs, &amp;key_blocks);
+<a id="L85"></a>
+<a id="L86"></a>                // Extract the key material (first 8 bytes of each block)
+<a id="L87"></a>                @memcpy(auth_key[0..8], cipher_outs[0..8]);
+<a id="L88"></a>                @memcpy(auth_key[8..16], cipher_outs[16..24]);
+<a id="L89"></a>                @memcpy(message_key[0..8], cipher_outs[32..40]);
+<a id="L90"></a>                @memcpy(message_key[8..16], cipher_outs[48..56]);
+<a id="L91"></a>                @memcpy(message_key[16..24], cipher_outs[64..72]);
+<a id="L92"></a>                @memcpy(message_key[24..32], cipher_outs[80..88]);
+<a id="L93"></a>            }
+<a id="L94"></a>        }
+<a id="L95"></a>
+<a id="L96"></a>        /// Encrypts and authenticates a message using AES-GCM-SIV.
+<a id="L97"></a>        ///
+<a id="L98"></a>        /// `c`: The ciphertext buffer to write the encrypted data to.
+<a id="L99"></a>        /// `tag`: The authentication tag buffer to write the computed tag to.
+<a id="L100"></a>        /// `m`: The plaintext message to encrypt.
+<a id="L101"></a>        /// `ad`: The associated data to authenticate.
+<a id="L102"></a>        /// `npub`: The nonce to use for encryption.
+<a id="L103"></a>        /// `key`: The encryption key.
+<a id="L104"></a>        pub fn encrypt(c: []u8, tag: *[tag_length]u8, m: []const u8, ad: []const u8, npub: [nonce_length]u8, key: [key_length]u8) void {
+<a id="L105"></a>            debug.assert(c.len == m.len);
+<a id="L106"></a>            debug.assert(m.len &lt;= (1 &lt;&lt; 36));
+<a id="L107"></a>            debug.assert(ad.len &lt;= (1 &lt;&lt; 36));
+<a id="L108"></a>
+<a id="L109"></a>            var auth_key: [16]u8 = undefined;
+<a id="L110"></a>            var message_key: [key_length]u8 = undefined;
+<a id="L111"></a>            deriveKeys(&amp;message_key, &amp;auth_key, key, npub);
+<a id="L112"></a>
+<a id="L113"></a>            // Calculate POLYVAL over additional data and plaintext
+<a id="L114"></a>            const block_count = (math.divCeil(usize, ad.len, Polyval.block_length) catch unreachable) +
+<a id="L115"></a>                (math.divCeil(usize, m.len, Polyval.block_length) catch unreachable) + 1;
+<a id="L116"></a>            var mac = Polyval.initForBlockCount(&amp;auth_key, block_count);
+<a id="L117"></a>
+<a id="L118"></a>            // Process additional data
+<a id="L119"></a>            mac.update(ad);
+<a id="L120"></a>            mac.pad();
+<a id="L121"></a>
+<a id="L122"></a>            // Process plaintext
+<a id="L123"></a>            mac.update(m);
+<a id="L124"></a>            mac.pad();
+<a id="L125"></a>
+<a id="L126"></a>            // Length block
+<a id="L127"></a>            var length_block: [16]u8 = undefined;
+<a id="L128"></a>            mem.writeInt(u64, length_block[0..8], @as(u64, ad.len) * 8, .little);
+<a id="L129"></a>            mem.writeInt(u64, length_block[8..16], @as(u64, m.len) * 8, .little);
+<a id="L130"></a>            mac.update(&amp;length_block);
+<a id="L131"></a>
+<a id="L132"></a>            // Get POLYVAL result
+<a id="L133"></a>            var s: [16]u8 = undefined;
+<a id="L134"></a>            mac.final(&amp;s);
+<a id="L135"></a>
+<a id="L136"></a>            // XOR with nonce to get pre-tag
+<a id="L137"></a>            for (npub, 0..) |b, i| {
+<a id="L138"></a>                s[i] ^= b;
+<a id="L139"></a>            }
+<a id="L140"></a>
+<a id="L141"></a>            // Clear most significant bit of last byte
+<a id="L142"></a>            s[15] &amp;= 0x7f;
+<a id="L143"></a>
+<a id="L144"></a>            // Encrypt to get tag
+<a id="L145"></a>            const tag_aes = Aes.initEnc(message_key);
+<a id="L146"></a>            tag_aes.encrypt(tag, &amp;s);
+<a id="L147"></a>
+<a id="L148"></a>            // Use tag as initial counter for CTR mode
+<a id="L149"></a>            var counter: [16]u8 = tag.*;
+<a id="L150"></a>            counter[15] |= 0x80; // Set most significant bit
+<a id="L151"></a>
+<a id="L152"></a>            // Encrypt message using CTR mode with 32-bit little-endian counter
+<a id="L153"></a>            const aes_ctx = Aes.initEnc(message_key);
+<a id="L154"></a>            modes.ctrSlice(@TypeOf(aes_ctx), aes_ctx, c, m, counter, .little, 0, 4);
+<a id="L155"></a>        }
+<a id="L156"></a>
+<a id="L157"></a>        /// Decrypts and authenticates a message using AES-GCM-SIV.
+<a id="L158"></a>        ///
+<a id="L159"></a>        /// `m`: Message buffer to write the decrypted data to.
+<a id="L160"></a>        /// `c`: The ciphertext to decrypt.
+<a id="L161"></a>        /// `tag`: The authentication tag.
+<a id="L162"></a>        /// `ad`: The associated data.
+<a id="L163"></a>        /// `npub`: The nonce.
+<a id="L164"></a>        /// `key`: The decryption key.
+<a id="L165"></a>        /// Asserts `c.len == m.len`.
+<a id="L166"></a>        pub fn decrypt(m: []u8, c: []const u8, tag: [tag_length]u8, ad: []const u8, npub: [nonce_length]u8, key: [key_length]u8) AuthenticationError!void {
+<a id="L167"></a>            assert(c.len == m.len);
+<a id="L168"></a>            assert(c.len &lt;= (1 &lt;&lt; 36));
+<a id="L169"></a>            assert(ad.len &lt;= (1 &lt;&lt; 36));
+<a id="L170"></a>
+<a id="L171"></a>            var auth_key: [16]u8 = undefined;
+<a id="L172"></a>            var message_key: [key_length]u8 = undefined;
+<a id="L173"></a>            deriveKeys(&amp;message_key, &amp;auth_key, key, npub);
+<a id="L174"></a>
+<a id="L175"></a>            // Decrypt message using CTR mode with 32-bit little-endian counter
+<a id="L176"></a>            var counter: [16]u8 = tag;
+<a id="L177"></a>            counter[15] |= 0x80; // Set most significant bit
+<a id="L178"></a>
+<a id="L179"></a>            const aes_ctx = Aes.initEnc(message_key);
+<a id="L180"></a>            modes.ctrSlice(@TypeOf(aes_ctx), aes_ctx, m, c, counter, .little, 0, 4);
+<a id="L181"></a>
+<a id="L182"></a>            // Verify tag by recalculating POLYVAL
+<a id="L183"></a>            const block_count = (math.divCeil(usize, ad.len, Polyval.block_length) catch unreachable) +
+<a id="L184"></a>                (math.divCeil(usize, m.len, Polyval.block_length) catch unreachable) + 1;
+<a id="L185"></a>            var mac = Polyval.initForBlockCount(&amp;auth_key, block_count);
+<a id="L186"></a>
+<a id="L187"></a>            // Process additional data
+<a id="L188"></a>            mac.update(ad);
+<a id="L189"></a>            mac.pad();
+<a id="L190"></a>
+<a id="L191"></a>            // Process decrypted plaintext
+<a id="L192"></a>            mac.update(m);
+<a id="L193"></a>            mac.pad();
+<a id="L194"></a>
+<a id="L195"></a>            // Length block
+<a id="L196"></a>            var length_block: [16]u8 = undefined;
+<a id="L197"></a>            mem.writeInt(u64, length_block[0..8], @as(u64, ad.len) * 8, .little);
+<a id="L198"></a>            mem.writeInt(u64, length_block[8..16], @as(u64, m.len) * 8, .little);
+<a id="L199"></a>            mac.update(&amp;length_block);
+<a id="L200"></a>
+<a id="L201"></a>            // Get POLYVAL result
+<a id="L202"></a>            var s: [16]u8 = undefined;
+<a id="L203"></a>            mac.final(&amp;s);
+<a id="L204"></a>
+<a id="L205"></a>            // XOR with nonce to get pre-tag
+<a id="L206"></a>            for (npub, 0..) |b, i| {
+<a id="L207"></a>                s[i] ^= b;
+<a id="L208"></a>            }
+<a id="L209"></a>
+<a id="L210"></a>            // Clear most significant bit of last byte
+<a id="L211"></a>            s[15] &amp;= 0x7f;
+<a id="L212"></a>
+<a id="L213"></a>            // Encrypt to get expected tag
+<a id="L214"></a>            const tag_aes = Aes.initEnc(message_key);
+<a id="L215"></a>            var computed_tag: [tag_length]u8 = undefined;
+<a id="L216"></a>            tag_aes.encrypt(&amp;computed_tag, &amp;s);
+<a id="L217"></a>
+<a id="L218"></a>            // Verify tag
+<a id="L219"></a>            const verify = crypto.timing_safe.eql([tag_length]u8, computed_tag, tag);
+<a id="L220"></a>            if (!verify) {
+<a id="L221"></a>                crypto.secureZero(u8, &amp;computed_tag);
+<a id="L222"></a>                @memset(m, undefined);
+<a id="L223"></a>                return error.AuthenticationFailed;
+<a id="L224"></a>            }
+<a id="L225"></a>        }
+<a id="L226"></a>    };
+<a id="L227"></a>}
+<a id="L228"></a>
+<a id="L229"></a>const htest = @import("test.zig");
+<a id="L230"></a>const testing = std.testing;
+<a id="L231"></a>
+<a id="L232"></a>test "Aes128GcmSiv - RFC 8452 Test Vector 1" {
+<a id="L233"></a>    // Test vector from RFC 8452 Appendix C.1
+<a id="L234"></a>    const key = [_]u8{
+<a id="L235"></a>        0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+<a id="L236"></a>        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+<a id="L237"></a>    };
+<a id="L238"></a>    const nonce = [_]u8{
+<a id="L239"></a>        0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+<a id="L240"></a>        0x00, 0x00, 0x00, 0x00,
+<a id="L241"></a>    };
+<a id="L242"></a>    const ad = "";
+<a id="L243"></a>    const m = "";
+<a id="L244"></a>    var c: [m.len]u8 = undefined;
+<a id="L245"></a>    var tag: [Aes128GcmSiv.tag_length]u8 = undefined;
+<a id="L246"></a>
+<a id="L247"></a>    Aes128GcmSiv.encrypt(&amp;c, &amp;tag, m, ad, nonce, key);
+<a id="L248"></a>    try htest.assertEqual("dc20e2d83f25705bb49e439eca56de25", &amp;tag);
+<a id="L249"></a>}
+<a id="L250"></a>
+<a id="L251"></a>test "Aes128GcmSiv - RFC 8452 Test Vector 2" {
+<a id="L252"></a>    // Test vector from RFC 8452 Appendix C.1
+<a id="L253"></a>    const key = [_]u8{
+<a id="L254"></a>        0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+<a id="L255"></a>        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+<a id="L256"></a>    };
+<a id="L257"></a>    const nonce = [_]u8{
+<a id="L258"></a>        0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+<a id="L259"></a>        0x00, 0x00, 0x00, 0x00,
+<a id="L260"></a>    };
+<a id="L261"></a>    const plaintext = [_]u8{
+<a id="L262"></a>        0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+<a id="L263"></a>    };
+<a id="L264"></a>    const ad = "";
+<a id="L265"></a>    var c: [plaintext.len]u8 = undefined;
+<a id="L266"></a>    var tag: [Aes128GcmSiv.tag_length]u8 = undefined;
+<a id="L267"></a>
+<a id="L268"></a>    Aes128GcmSiv.encrypt(&amp;c, &amp;tag, &amp;plaintext, ad, nonce, key);
+<a id="L269"></a>    try htest.assertEqual("b5d839330ac7b786", &amp;c);
+<a id="L270"></a>    try htest.assertEqual("578782fff6013b815b287c22493a364c", &amp;tag);
+<a id="L271"></a>
+<a id="L272"></a>    var m2: [plaintext.len]u8 = undefined;
+<a id="L273"></a>    try Aes128GcmSiv.decrypt(&amp;m2, &amp;c, tag, ad, nonce, key);
+<a id="L274"></a>    try testing.expectEqualSlices(u8, &amp;plaintext, &amp;m2);
+<a id="L275"></a>}
+<a id="L276"></a>
+<a id="L277"></a>test "Aes128GcmSiv - RFC 8452 Test Vector 3" {
+<a id="L278"></a>    // Test vector from RFC 8452 Appendix C.1
+<a id="L279"></a>    const key = [_]u8{
+<a id="L280"></a>        0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+<a id="L281"></a>        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+<a id="L282"></a>    };
+<a id="L283"></a>    const nonce = [_]u8{
+<a id="L284"></a>        0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+<a id="L285"></a>        0x00, 0x00, 0x00, 0x00,
+<a id="L286"></a>    };
+<a id="L287"></a>    const plaintext = [_]u8{
+<a id="L288"></a>        0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+<a id="L289"></a>        0x00, 0x00, 0x00, 0x00,
+<a id="L290"></a>    };
+<a id="L291"></a>    const ad = "";
+<a id="L292"></a>    var c: [plaintext.len]u8 = undefined;
+<a id="L293"></a>    var tag: [Aes128GcmSiv.tag_length]u8 = undefined;
+<a id="L294"></a>
+<a id="L295"></a>    Aes128GcmSiv.encrypt(&amp;c, &amp;tag, &amp;plaintext, ad, nonce, key);
+<a id="L296"></a>    try htest.assertEqual("7323ea61d05932260047d942", &amp;c);
+<a id="L297"></a>    try htest.assertEqual("a4978db357391a0bc4fdec8b0d106639", &amp;tag);
+<a id="L298"></a>
+<a id="L299"></a>    var m2: [plaintext.len]u8 = undefined;
+<a id="L300"></a>    try Aes128GcmSiv.decrypt(&amp;m2, &amp;c, tag, ad, nonce, key);
+<a id="L301"></a>    try testing.expectEqualSlices(u8, &amp;plaintext, &amp;m2);
+<a id="L302"></a>}
+<a id="L303"></a>
+<a id="L304"></a>test "Aes256GcmSiv - RFC 8452 Test Vector" {
+<a id="L305"></a>    // Test vector from RFC 8452 Appendix C.2
+<a id="L306"></a>    const key = [_]u8{
+<a id="L307"></a>        0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+<a id="L308"></a>        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+<a id="L309"></a>        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+<a id="L310"></a>        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+<a id="L311"></a>    };
+<a id="L312"></a>    const nonce = [_]u8{
+<a id="L313"></a>        0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+<a id="L314"></a>        0x00, 0x00, 0x00, 0x00,
+<a id="L315"></a>    };
+<a id="L316"></a>    const ad = "";
+<a id="L317"></a>    const m = "";
+<a id="L318"></a>    var c: [m.len]u8 = undefined;
+<a id="L319"></a>    var tag: [Aes256GcmSiv.tag_length]u8 = undefined;
+<a id="L320"></a>
+<a id="L321"></a>    Aes256GcmSiv.encrypt(&amp;c, &amp;tag, m, ad, nonce, key);
+<a id="L322"></a>    try htest.assertEqual("07f5f4169bbf55a8400cd47ea6fd400f", &amp;tag);
+<a id="L323"></a>}
+<a id="L324"></a>
+<a id="L325"></a>test "Aes128GcmSiv - Decrypt with wrong tag" {
+<a id="L326"></a>    const key: [Aes128GcmSiv.key_length]u8 = @splat(0x69);
+<a id="L327"></a>    const nonce: [Aes128GcmSiv.nonce_length]u8 = @splat(0x42);
+<a id="L328"></a>    const m = "Test message";
+<a id="L329"></a>    const ad = "";
+<a id="L330"></a>    var c: [m.len]u8 = undefined;
+<a id="L331"></a>    var tag: [Aes128GcmSiv.tag_length]u8 = undefined;
+<a id="L332"></a>
+<a id="L333"></a>    Aes128GcmSiv.encrypt(&amp;c, &amp;tag, m, ad, nonce, key);
+<a id="L334"></a>
+<a id="L335"></a>    // Corrupt the tag
+<a id="L336"></a>    tag[0] ^= 0x01;
+<a id="L337"></a>
+<a id="L338"></a>    var m2: [m.len]u8 = undefined;
+<a id="L339"></a>    try testing.expectError(error.AuthenticationFailed, Aes128GcmSiv.decrypt(&amp;m2, &amp;c, tag, ad, nonce, key));
+<a id="L340"></a>}
+</pre>
 </body>
 </html>

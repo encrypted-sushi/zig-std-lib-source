@@ -2,1616 +2,1619 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Source: zig-0.16.0-std/Build/Cache.zig</title>
+    <title>Source: Build/Cache.zig</title>
     <style>
         body { background: #1e1e1e; color: #d4d4d4; font-family: monospace; padding: 20px; }
         pre { white-space: pre-wrap; word-wrap: break-word; }
         .header { border-bottom: 1px solid #444; padding-bottom: 10px; margin-bottom: 20px; }
         a { color: #569cd6; }
+        a[id] { color: inherit; text-decoration: none; }
+        :target { background: #3a3a00; }
     </style>
 </head>
 <body>
     <div class="header">
-        <a href="/">Index</a> | <strong>File: zig-0.16.0-std/Build/Cache.zig</strong>
+        <a href="/">Index</a> | <strong>File: Build/Cache.zig</strong>
     </div>
-    <pre>//! Manages `zig-cache` directories.
-//! This is not a general-purpose cache. It is designed to be fast and simple,
-//! not to withstand attacks using specially-crafted input.
-
-const Cache = @This();
-const builtin = @import("builtin");
-
-const std = @import("std");
-const Io = std.Io;
-const crypto = std.crypto;
-const assert = std.debug.assert;
-const testing = std.testing;
-const mem = std.mem;
-const fmt = std.fmt;
-const Allocator = std.mem.Allocator;
-const log = std.log.scoped(.cache);
-
-gpa: Allocator,
-io: Io,
-manifest_dir: Io.Dir,
-hash: HashHelper = .{},
-/// This value is accessed from multiple threads, protected by mutex.
-recent_problematic_timestamp: Io.Timestamp = .zero,
-mutex: Io.Mutex = .init,
-
-/// A set of strings such as the zig library directory or project source root, which
-/// are stripped from the file paths before putting into the cache. They
-/// are replaced with single-character indicators. This is not to save
-/// space but to eliminate absolute file paths. This improves portability
-/// and usefulness of the cache for advanced use cases.
-prefixes_buffer: [4]Directory = undefined,
-prefixes_len: usize = 0,
-/// Used to identify prefixes. References external memory.
-cwd: []const u8,
-
-pub const Path = @import("Cache/Path.zig");
-pub const Directory = @import("Cache/Directory.zig");
-pub const DepTokenizer = @import("Cache/DepTokenizer.zig");
-
-pub fn addPrefix(cache: *Cache, directory: Directory) void {
-    cache.prefixes_buffer[cache.prefixes_len] = directory;
-    cache.prefixes_len += 1;
-}
-
-/// Be sure to call `Manifest.deinit` after successful initialization.
-pub fn obtain(cache: *Cache) Manifest {
-    return .{
-        .cache = cache,
-        .hash = cache.hash,
-        .manifest_file = null,
-        .manifest_dirty = false,
-        .hex_digest = undefined,
-    };
-}
-
-pub fn prefixes(cache: *const Cache) []const Directory {
-    return cache.prefixes_buffer[0..cache.prefixes_len];
-}
-
-const PrefixedPath = struct {
-    prefix: u8,
-    sub_path: []const u8,
-
-    fn eql(a: PrefixedPath, b: PrefixedPath) bool {
-        return a.prefix == b.prefix and std.mem.eql(u8, a.sub_path, b.sub_path);
-    }
-
-    fn hash(pp: PrefixedPath) u32 {
-        return @truncate(std.hash.Wyhash.hash(pp.prefix, pp.sub_path));
-    }
-};
-
-fn findPrefix(cache: *const Cache, file_path: []const u8) !PrefixedPath {
-    const gpa = cache.gpa;
-    const resolved_path = try std.fs.path.resolve(gpa, &amp;.{file_path});
-    errdefer gpa.free(resolved_path);
-    return findPrefixResolved(cache, resolved_path);
-}
-
-/// Takes ownership of `resolved_path` on success.
-fn findPrefixResolved(cache: *const Cache, resolved_path: []u8) !PrefixedPath {
-    const gpa = cache.gpa;
-    const cwd = cache.cwd;
-    const prefixes_slice = cache.prefixes();
-    var i: u8 = 1; // Start at 1 to skip over checking the null prefix.
-    while (i &lt; prefixes_slice.len) : (i += 1) {
-        const p = prefixes_slice[i].path.?;
-        const sub_path = getPrefixSubpath(gpa, cwd, p, resolved_path) catch |err| switch (err) {
-            error.NotASubPath =&gt; continue,
-            else =&gt; |e| return e,
-        };
-        // Free the resolved path since we're not going to return it
-        gpa.free(resolved_path);
-        return PrefixedPath{
-            .prefix = i,
-            .sub_path = sub_path,
-        };
-    }
-
-    return PrefixedPath{
-        .prefix = 0,
-        .sub_path = resolved_path,
-    };
-}
-
-fn getPrefixSubpath(gpa: Allocator, cwd: []const u8, prefix: []const u8, path: []u8) ![]u8 {
-    const relative = try std.fs.path.relative(gpa, cwd, null, prefix, path);
-    errdefer gpa.free(relative);
-    var component_iterator: std.fs.path.NativeComponentIterator = .init(relative);
-    if (component_iterator.root() != null) {
-        return error.NotASubPath;
-    }
-    const first_component = component_iterator.first();
-    if (first_component != null and std.mem.eql(u8, first_component.?.name, "..")) {
-        return error.NotASubPath;
-    }
-    return relative;
-}
-
-/// This is 128 bits - Even with 2^54 cache entries, the probably of a collision would be under 10^-6
-pub const bin_digest_len = 16;
-pub const hex_digest_len = bin_digest_len * 2;
-pub const BinDigest = [bin_digest_len]u8;
-pub const HexDigest = [hex_digest_len]u8;
-
-/// This is currently just an arbitrary non-empty string that can't match another manifest line.
-const manifest_header = "0";
-pub const manifest_file_size_max = 100 * 1024 * 1024;
-
-/// The type used for hashing file contents. Currently, this is SipHash128(1, 3), because it
-/// provides enough collision resistance for the Manifest use cases, while being one of our
-/// fastest options right now.
-pub const Hasher = crypto.auth.siphash.SipHash128(1, 3);
-
-/// Initial state with random bytes, that can be copied.
-/// Refresh this with new random bytes when the manifest
-/// format is modified in a non-backwards-compatible way.
-pub const hasher_init: Hasher = Hasher.init(&amp;.{
-    0x33, 0x52, 0xa2, 0x84,
-    0xcf, 0x17, 0x56, 0x57,
-    0x01, 0xbb, 0xcd, 0xe4,
-    0x77, 0xd6, 0xf0, 0x60,
-});
-
-pub const File = struct {
-    prefixed_path: PrefixedPath,
-    max_file_size: ?usize,
-    /// Populated if the user calls `addOpenedFile`.
-    /// The handle is not owned here.
-    handle: ?Io.File,
-    stat: Stat,
-    bin_digest: BinDigest,
-    contents: ?[]const u8,
-
-    pub const Stat = struct {
-        inode: Io.File.INode,
-        size: u64,
-        mtime: Io.Timestamp,
-
-        pub fn fromFs(fs_stat: Io.File.Stat) Stat {
-            return .{
-                .inode = fs_stat.inode,
-                .size = fs_stat.size,
-                .mtime = fs_stat.mtime,
-            };
-        }
-    };
-
-    pub fn deinit(self: *File, gpa: Allocator) void {
-        gpa.free(self.prefixed_path.sub_path);
-        if (self.contents) |contents| {
-            gpa.free(contents);
-            self.contents = null;
-        }
-        self.* = undefined;
-    }
-
-    pub fn updateMaxSize(file: *File, new_max_size: ?usize) void {
-        const new = new_max_size orelse return;
-        file.max_file_size = if (file.max_file_size) |old| @max(old, new) else new;
-    }
-
-    pub fn updateHandle(file: *File, new_handle: ?Io.File) void {
-        const handle = new_handle orelse return;
-        file.handle = handle;
-    }
-};
-
-pub const HashHelper = struct {
-    hasher: Hasher = hasher_init,
-
-    /// Record a slice of bytes as a dependency of the process being cached.
-    pub fn addBytes(hh: *HashHelper, bytes: []const u8) void {
-        hh.hasher.update(mem.asBytes(&amp;bytes.len));
-        hh.hasher.update(bytes);
-    }
-
-    pub fn addOptionalBytes(hh: *HashHelper, optional_bytes: ?[]const u8) void {
-        hh.add(optional_bytes != null);
-        hh.addBytes(optional_bytes orelse return);
-    }
-
-    pub fn addListOfBytes(hh: *HashHelper, list_of_bytes: []const []const u8) void {
-        hh.add(list_of_bytes.len);
-        for (list_of_bytes) |bytes| hh.addBytes(bytes);
-    }
-
-    pub fn addOptionalListOfBytes(hh: *HashHelper, optional_list_of_bytes: ?[]const []const u8) void {
-        hh.add(optional_list_of_bytes != null);
-        hh.addListOfBytes(optional_list_of_bytes orelse return);
-    }
-
-    /// Convert the input value into bytes and record it as a dependency of the process being cached.
-    pub fn add(hh: *HashHelper, x: anytype) void {
-        switch (@TypeOf(x)) {
-            std.SemanticVersion =&gt; {
-                hh.add(x.major);
-                hh.add(x.minor);
-                hh.add(x.patch);
-            },
-            std.Target.Os.TaggedVersionRange =&gt; {
-                switch (x) {
-                    .hurd =&gt; |hurd| {
-                        hh.add(hurd.range.min);
-                        hh.add(hurd.range.max);
-                        hh.add(hurd.glibc);
-                    },
-                    .linux =&gt; |linux| {
-                        hh.add(linux.range.min);
-                        hh.add(linux.range.max);
-                        hh.add(linux.glibc);
-                        hh.add(linux.android);
-                    },
-                    .windows =&gt; |windows| {
-                        hh.add(windows.min);
-                        hh.add(windows.max);
-                    },
-                    .semver =&gt; |semver| {
-                        hh.add(semver.min);
-                        hh.add(semver.max);
-                    },
-                    .none =&gt; {},
-                }
-            },
-            std.zig.BuildId =&gt; switch (x) {
-                .none, .fast, .uuid, .sha1, .md5 =&gt; hh.add(std.meta.activeTag(x)),
-                .hexstring =&gt; |hex_string| hh.addBytes(hex_string.toSlice()),
-            },
-            else =&gt; switch (@typeInfo(@TypeOf(x))) {
-                .bool, .int, .@"enum", .array =&gt; hh.addBytes(mem.asBytes(&amp;x)),
-                else =&gt; @compileError("unable to hash type " ++ @typeName(@TypeOf(x))),
-            },
-        }
-    }
-
-    pub fn addOptional(hh: *HashHelper, optional: anytype) void {
-        hh.add(optional != null);
-        hh.add(optional orelse return);
-    }
-
-    /// Returns a hex encoded hash of the inputs, without modifying state.
-    pub fn peek(hh: HashHelper) [hex_digest_len]u8 {
-        var copy = hh;
-        return copy.final();
-    }
-
-    pub fn peekBin(hh: HashHelper) BinDigest {
-        var copy = hh;
-        var bin_digest: BinDigest = undefined;
-        copy.hasher.final(&amp;bin_digest);
-        return bin_digest;
-    }
-
-    /// Returns a hex encoded hash of the inputs, mutating the state of the hasher.
-    pub fn final(hh: *HashHelper) HexDigest {
-        var bin_digest: BinDigest = undefined;
-        hh.hasher.final(&amp;bin_digest);
-        return binToHex(bin_digest);
-    }
-
-    pub fn oneShot(bytes: []const u8) [hex_digest_len]u8 {
-        var hasher: Hasher = hasher_init;
-        hasher.update(bytes);
-        var bin_digest: BinDigest = undefined;
-        hasher.final(&amp;bin_digest);
-        return binToHex(bin_digest);
-    }
-};
-
-pub fn binToHex(bin_digest: BinDigest) HexDigest {
-    var out_digest: HexDigest = undefined;
-    var w: std.Io.Writer = .fixed(&amp;out_digest);
-    w.printHex(&amp;bin_digest, .lower) catch unreachable;
-    return out_digest;
-}
-
-pub const Lock = struct {
-    manifest_file: Io.File,
-
-    pub fn release(lock: *Lock, io: Io) void {
-        if (builtin.os.tag == .windows) {
-            // Windows does not guarantee that locks are immediately unlocked when
-            // the file handle is closed. See LockFileEx documentation.
-            lock.manifest_file.unlock(io);
-        }
-
-        lock.manifest_file.close(io);
-        lock.* = undefined;
-    }
-};
-
-pub const Manifest = struct {
-    cache: *Cache,
-    /// Current state for incremental hashing.
-    hash: HashHelper,
-    manifest_file: ?Io.File,
-    manifest_dirty: bool,
-    /// Set this flag to true before calling hit() in order to indicate that
-    /// upon a cache hit, the code using the cache will not modify the files
-    /// within the cache directory. This allows multiple processes to utilize
-    /// the same cache directory at the same time.
-    want_shared_lock: bool = true,
-    have_exclusive_lock: bool = false,
-    // Indicate that we want isProblematicTimestamp to perform a filesystem write in
-    // order to obtain a problematic timestamp for the next call. Calls after that
-    // will then use the same timestamp, to avoid unnecessary filesystem writes.
-    want_refresh_timestamp: bool = true,
-    files: Files = .{},
-    hex_digest: HexDigest,
-    diagnostic: Diagnostic = .none,
-    /// Keeps track of the last time we performed a file system write to observe
-    /// what time the file system thinks it is, according to its own granularity.
-    recent_problematic_timestamp: Io.Timestamp = .zero,
-
-    pub const Diagnostic = union(enum) {
-        none,
-        manifest_create: Io.File.OpenError,
-        manifest_read: Io.File.Reader.Error,
-        manifest_lock: Io.File.LockError,
-        file_open: FileOp,
-        file_stat: FileOp,
-        file_read: FileOp,
-        file_hash: FileOp,
-
-        pub const FileOp = struct {
-            file_index: usize,
-            err: anyerror,
-        };
-    };
-
-    pub const Files = std.ArrayHashMapUnmanaged(File, void, FilesContext, false);
-
-    pub const FilesContext = struct {
-        pub fn hash(fc: FilesContext, file: File) u32 {
-            _ = fc;
-            return file.prefixed_path.hash();
-        }
-
-        pub fn eql(fc: FilesContext, a: File, b: File, b_index: usize) bool {
-            _ = fc;
-            _ = b_index;
-            return a.prefixed_path.eql(b.prefixed_path);
-        }
-    };
-
-    const FilesAdapter = struct {
-        pub fn eql(context: @This(), a: PrefixedPath, b: File, b_index: usize) bool {
-            _ = context;
-            _ = b_index;
-            return a.eql(b.prefixed_path);
-        }
-
-        pub fn hash(context: @This(), key: PrefixedPath) u32 {
-            _ = context;
-            return key.hash();
-        }
-    };
-
-    /// Add a file as a dependency of process being cached. When `hit` is
-    /// called, the file's contents will be checked to ensure that it matches
-    /// the contents from previous times.
-    ///
-    /// Max file size will be used to determine the amount of space the file contents
-    /// are allowed to take up in memory. If max_file_size is null, then the contents
-    /// will not be loaded into memory.
-    ///
-    /// Returns the index of the entry in the `files` array list. You can use it
-    /// to access the contents of the file after calling `hit()` like so:
-    ///
-    /// ```
-    /// var file_contents = cache_hash.files.keys()[file_index].contents.?;
-    /// ```
-    pub fn addFilePath(m: *Manifest, file_path: Path, max_file_size: ?usize) !usize {
-        return addOpenedFile(m, file_path, null, max_file_size);
-    }
-
-    /// Same as `addFilePath` except the file has already been opened.
-    pub fn addOpenedFile(m: *Manifest, path: Path, handle: ?Io.File, max_file_size: ?usize) !usize {
-        const gpa = m.cache.gpa;
-        try m.files.ensureUnusedCapacity(gpa, 1);
-        const resolved_path = try std.fs.path.resolve(gpa, &amp;.{
-            path.root_dir.path orelse ".",
-            path.subPathOrDot(),
-        });
-        errdefer gpa.free(resolved_path);
-        const prefixed_path = try m.cache.findPrefixResolved(resolved_path);
-        return addFileInner(m, prefixed_path, handle, max_file_size);
-    }
-
-    /// Deprecated; use `addFilePath`.
-    pub fn addFile(self: *Manifest, file_path: []const u8, max_file_size: ?usize) !usize {
-        assert(self.manifest_file == null);
-
-        const gpa = self.cache.gpa;
-        try self.files.ensureUnusedCapacity(gpa, 1);
-        const prefixed_path = try self.cache.findPrefix(file_path);
-        errdefer gpa.free(prefixed_path.sub_path);
-
-        return addFileInner(self, prefixed_path, null, max_file_size);
-    }
-
-    fn addFileInner(self: *Manifest, prefixed_path: PrefixedPath, handle: ?Io.File, max_file_size: ?usize) usize {
-        const gop = self.files.getOrPutAssumeCapacityAdapted(prefixed_path, FilesAdapter{});
-        if (gop.found_existing) {
-            self.cache.gpa.free(prefixed_path.sub_path);
-            gop.key_ptr.updateMaxSize(max_file_size);
-            gop.key_ptr.updateHandle(handle);
-            return gop.index;
-        }
-        gop.key_ptr.* = .{
-            .prefixed_path = prefixed_path,
-            .contents = null,
-            .max_file_size = max_file_size,
-            .stat = undefined,
-            .bin_digest = undefined,
-            .handle = handle,
-        };
-
-        self.hash.add(prefixed_path.prefix);
-        self.hash.addBytes(prefixed_path.sub_path);
-
-        return gop.index;
-    }
-
-    /// Deprecated, use `addOptionalFilePath`.
-    pub fn addOptionalFile(self: *Manifest, optional_file_path: ?[]const u8) !void {
-        self.hash.add(optional_file_path != null);
-        const file_path = optional_file_path orelse return;
-        _ = try self.addFile(file_path, null);
-    }
-
-    pub fn addOptionalFilePath(self: *Manifest, optional_file_path: ?Path) !void {
-        self.hash.add(optional_file_path != null);
-        const file_path = optional_file_path orelse return;
-        _ = try self.addFilePath(file_path, null);
-    }
-
-    pub fn addListOfFiles(self: *Manifest, list_of_files: []const []const u8) !void {
-        self.hash.add(list_of_files.len);
-        for (list_of_files) |file_path| {
-            _ = try self.addFile(file_path, null);
-        }
-    }
-
-    pub fn addDepFile(self: *Manifest, dir: Io.Dir, dep_file_sub_path: []const u8) !void {
-        assert(self.manifest_file == null);
-        return self.addDepFileMaybePost(dir, dep_file_sub_path);
-    }
-
-    pub const HitError = error{
-        /// Unable to check the cache for a reason that has been recorded into
-        /// the `diagnostic` field.
-        CacheCheckFailed,
-        /// A cache manifest file exists however it could not be parsed.
-        InvalidFormat,
-        OutOfMemory,
-        Canceled,
-    };
-
-    /// Check the cache to see if the input exists in it. If it exists, returns `true`.
-    /// A hex encoding of its hash is available by calling `final`.
-    ///
-    /// This function will also acquire an exclusive lock to the manifest file. This means
-    /// that a process holding a Manifest will block any other process attempting to
-    /// acquire the lock. If `want_shared_lock` is `true`, a cache hit guarantees the
-    /// manifest file to be locked in shared mode, and a cache miss guarantees the manifest
-    /// file to be locked in exclusive mode.
-    ///
-    /// The lock on the manifest file is released when `deinit` is called. As another
-    /// option, one may call `toOwnedLock` to obtain a smaller object which can represent
-    /// the lock. `deinit` is safe to call whether or not `toOwnedLock` has been called.
-    pub fn hit(self: *Manifest) HitError!bool {
-        assert(self.manifest_file == null);
-
-        self.diagnostic = .none;
-
-        const ext = ".txt";
-        var manifest_file_path: [hex_digest_len + ext.len]u8 = undefined;
-
-        var bin_digest: BinDigest = undefined;
-        self.hash.hasher.final(&amp;bin_digest);
-
-        self.hex_digest = binToHex(bin_digest);
-
-        @memcpy(manifest_file_path[0..self.hex_digest.len], &amp;self.hex_digest);
-        manifest_file_path[hex_digest_len..][0..ext.len].* = ext.*;
-
-        const io = self.cache.io;
-
-        // We'll try to open the cache with an exclusive lock, but if that would block
-        // and `want_shared_lock` is set, a shared lock might be sufficient, so we'll
-        // open with a shared lock instead.
-        while (true) {
-            if (self.cache.manifest_dir.createFile(io, &amp;manifest_file_path, .{
-                .read = true,
-                .truncate = false,
-                .lock = .exclusive,
-                .lock_nonblocking = self.want_shared_lock,
-            })) |manifest_file| {
-                self.manifest_file = manifest_file;
-                self.have_exclusive_lock = true;
-                break;
-            } else |err| switch (err) {
-                error.WouldBlock =&gt; {
-                    self.manifest_file = self.cache.manifest_dir.openFile(io, &amp;manifest_file_path, .{
-                        .mode = .read_write,
-                        .lock = .shared,
-                    }) catch |e| {
-                        self.diagnostic = .{ .manifest_create = e };
-                        return error.CacheCheckFailed;
-                    };
-                    break;
-                },
-                error.FileNotFound =&gt; {
-                    // There are no dir components, so the only possibility
-                    // should be that the directory behind the handle has been
-                    // deleted, however we have observed on macOS two processes
-                    // racing to do openat() with O_CREAT manifest in ENOENT.
-                    //
-                    // As a workaround, we retry with exclusive=true which
-                    // disambiguates by returning EEXIST, indicating original
-                    // failure was a race, or ENOENT, indicating deletion of
-                    // the directory of our open handle.
-                    if (!builtin.os.tag.isDarwin()) {
-                        self.diagnostic = .{ .manifest_create = error.FileNotFound };
-                        return error.CacheCheckFailed;
-                    }
-
-                    if (self.cache.manifest_dir.createFile(io, &amp;manifest_file_path, .{
-                        .read = true,
-                        .truncate = false,
-                        .lock = .exclusive,
-                        .lock_nonblocking = self.want_shared_lock,
-                        .exclusive = true,
-                    })) |manifest_file| {
-                        self.manifest_file = manifest_file;
-                        self.have_exclusive_lock = true;
-                        break;
-                    } else |excl_err| switch (excl_err) {
-                        error.WouldBlock, error.PathAlreadyExists =&gt; continue,
-                        error.FileNotFound =&gt; {
-                            self.diagnostic = .{ .manifest_create = error.FileNotFound };
-                            return error.CacheCheckFailed;
-                        },
-                        error.Canceled =&gt; return error.Canceled,
-                        else =&gt; |e| {
-                            self.diagnostic = .{ .manifest_create = e };
-                            return error.CacheCheckFailed;
-                        },
-                    }
-                },
-                error.Canceled =&gt; return error.Canceled,
-                else =&gt; |e| {
-                    self.diagnostic = .{ .manifest_create = e };
-                    return error.CacheCheckFailed;
-                },
-            }
-        }
-
-        self.want_refresh_timestamp = true;
-
-        const input_file_count = self.files.entries.len;
-
-        // We're going to construct a second hash. Its input will begin with the digest we've
-        // already computed (`bin_digest`), and then it'll have the digests of each input file,
-        // including "post" files (see `addFilePost`). If this is a hit, we learn the set of "post"
-        // files from the manifest on disk. If this is a miss, we'll learn those from future calls
-        // to `addFilePost` etc. As such, the state of `self.hash.hasher` after this function
-        // depends on whether this is a hit or a miss.
-        //
-        // If we return `true` indicating a cache hit, then `self.hash.hasher` must already include
-        // the digests of the "post" files, so the caller can call `final`. Otherwise, on a cache
-        // miss, `self.hash.hasher` will include the digests of all non-"post" files -- that is,
-        // the ones we've already been told about. The rest will be discovered through calls to
-        // `addFilePost` etc, which will update the hasher. After all files are added, the user can
-        // use `final`, and will at some point `writeManifest` the file list to disk.
-
-        self.hash.hasher = hasher_init;
-        self.hash.hasher.update(&amp;bin_digest);
-
-        hit: {
-            const file_digests_populated: usize = digests: {
-                switch (try self.hitWithCurrentLock()) {
-                    .hit =&gt; break :hit,
-                    .miss =&gt; |m| if (!try self.upgradeToExclusiveLock()) {
-                        break :digests m.file_digests_populated;
-                    },
-                }
-                // We've just had a miss with the shared lock, and upgraded to an exclusive lock. Someone
-                // else might have modified the digest, so we need to check again before deciding to miss.
-                // Before trying again, we must reset `self.hash.hasher` and `self.files`.
-                // This is basically just the first half of `unhit`.
-                self.hash.hasher = hasher_init;
-                self.hash.hasher.update(&amp;bin_digest);
-                while (self.files.count() != input_file_count) {
-                    var file = self.files.pop().?;
-                    file.key.deinit(self.cache.gpa);
-                }
-                switch (try self.hitWithCurrentLock()) {
-                    .hit =&gt; break :hit,
-                    .miss =&gt; |m| break :digests m.file_digests_populated,
-                }
-            };
-
-            // This is a guaranteed cache miss. We're almost ready to return `false`, but there's a
-            // little bookkeeping to do first. The first `file_digests_populated` entries in `files`
-            // have their `bin_digest` populated; there may be some left in `input_file_count` which
-            // we'll need to populate ourselves. Other than that, this is basically `unhit`.
-            self.manifest_dirty = true;
-            self.hash.hasher = hasher_init;
-            self.hash.hasher.update(&amp;bin_digest);
-            while (self.files.count() != input_file_count) {
-                var file = self.files.pop().?;
-                file.key.deinit(self.cache.gpa);
-            }
-            for (self.files.keys(), 0..) |*file, idx| {
-                if (idx &lt; file_digests_populated) {
-                    // `bin_digest` is already populated by `hitWithCurrentLock`, so we can use it directly.
-                    self.hash.hasher.update(&amp;file.bin_digest);
-                } else {
-                    self.populateFileHash(file) catch |err| {
-                        self.diagnostic = .{ .file_hash = .{
-                            .file_index = idx,
-                            .err = err,
-                        } };
-                        return error.CacheCheckFailed;
-                    };
-                }
-            }
-            return false;
-        }
-
-        if (self.want_shared_lock) {
-            self.downgradeToSharedLock() catch |err| {
-                self.diagnostic = .{ .manifest_lock = err };
-                return error.CacheCheckFailed;
-            };
-        }
-
-        return true;
-    }
-
-    /// Assumes that `self.hash.hasher` has been updated only with the original digest and that
-    /// `self.files` contains only the original input files.
-    fn hitWithCurrentLock(self: *Manifest) HitError!union(enum) {
-        hit,
-        miss: struct {
-            file_digests_populated: usize,
-        },
-    } {
-        const gpa = self.cache.gpa;
-        const io = self.cache.io;
-        const input_file_count = self.files.entries.len;
-        var tiny_buffer: [1]u8 = undefined; // allows allocRemaining to detect limit exceeded
-        var manifest_reader = self.manifest_file.?.reader(io, &amp;tiny_buffer); // Reads positionally from zero.
-        const limit: std.Io.Limit = .limited(manifest_file_size_max);
-        const file_contents = manifest_reader.interface.allocRemaining(gpa, limit) catch |err| switch (err) {
-            error.OutOfMemory =&gt; return error.OutOfMemory,
-            error.StreamTooLong =&gt; return error.OutOfMemory,
-            error.ReadFailed =&gt; {
-                self.diagnostic = .{ .manifest_read = manifest_reader.err.? };
-                return error.CacheCheckFailed;
-            },
-        };
-        defer gpa.free(file_contents);
-
-        var any_file_changed = false;
-        var line_iter = mem.tokenizeScalar(u8, file_contents, '\n');
-        var idx: usize = 0;
-        const header_valid = valid: {
-            const line = line_iter.next() orelse break :valid false;
-            break :valid std.mem.eql(u8, line, manifest_header);
-        };
-        if (!header_valid) {
-            return .{ .miss = .{ .file_digests_populated = 0 } };
-        }
-        while (line_iter.next()) |line| {
-            defer idx += 1;
-
-            var iter = mem.tokenizeScalar(u8, line, ' ');
-            const size = iter.next() orelse return error.InvalidFormat;
-            const inode = iter.next() orelse return error.InvalidFormat;
-            const mtime_nsec_str = iter.next() orelse return error.InvalidFormat;
-            const digest_str = iter.next() orelse return error.InvalidFormat;
-            const prefix_str = iter.next() orelse return error.InvalidFormat;
-            const file_path = iter.rest();
-
-            const stat_size = fmt.parseInt(u64, size, 10) catch return error.InvalidFormat;
-            const stat_inode = fmt.parseInt(Io.File.INode, inode, 10) catch return error.InvalidFormat;
-            const stat_mtime = fmt.parseInt(i64, mtime_nsec_str, 10) catch return error.InvalidFormat;
-            const file_bin_digest = b: {
-                if (digest_str.len != hex_digest_len) return error.InvalidFormat;
-                var bd: BinDigest = undefined;
-                _ = fmt.hexToBytes(&amp;bd, digest_str) catch return error.InvalidFormat;
-                break :b bd;
-            };
-
-            const prefix = fmt.parseInt(u8, prefix_str, 10) catch return error.InvalidFormat;
-            if (prefix &gt;= self.cache.prefixes_len) return error.InvalidFormat;
-
-            if (file_path.len == 0) return error.InvalidFormat;
-
-            const cache_hash_file = f: {
-                const prefixed_path: PrefixedPath = .{
-                    .prefix = prefix,
-                    .sub_path = file_path, // expires with file_contents
-                };
-                if (idx &lt; input_file_count) {
-                    const file = &amp;self.files.keys()[idx];
-                    if (!file.prefixed_path.eql(prefixed_path))
-                        return error.InvalidFormat;
-
-                    file.stat = .{
-                        .size = stat_size,
-                        .inode = stat_inode,
-                        .mtime = .{ .nanoseconds = stat_mtime },
-                    };
-                    file.bin_digest = file_bin_digest;
-                    break :f file;
-                }
-                const gop = try self.files.getOrPutAdapted(gpa, prefixed_path, FilesAdapter{});
-                errdefer _ = self.files.pop();
-                if (!gop.found_existing) {
-                    gop.key_ptr.* = .{
-                        .prefixed_path = .{
-                            .prefix = prefix,
-                            .sub_path = try gpa.dupe(u8, file_path),
-                        },
-                        .contents = null,
-                        .max_file_size = null,
-                        .handle = null,
-                        .stat = .{
-                            .size = stat_size,
-                            .inode = stat_inode,
-                            .mtime = .{ .nanoseconds = stat_mtime },
-                        },
-                        .bin_digest = file_bin_digest,
-                    };
-                }
-                break :f gop.key_ptr;
-            };
-
-            const pp = cache_hash_file.prefixed_path;
-            const dir = self.cache.prefixes()[pp.prefix].handle;
-            const this_file = dir.openFile(io, pp.sub_path, .{ .mode = .read_only }) catch |err| switch (err) {
-                error.FileNotFound =&gt; {
-                    // Every digest before this one has been populated successfully.
-                    return .{ .miss = .{ .file_digests_populated = idx } };
-                },
-                error.Canceled =&gt; return error.Canceled,
-                else =&gt; |e| {
-                    self.diagnostic = .{ .file_open = .{
-                        .file_index = idx,
-                        .err = e,
-                    } };
-                    return error.CacheCheckFailed;
-                },
-            };
-            defer this_file.close(io);
-
-            const actual_stat = this_file.stat(io) catch |err| {
-                self.diagnostic = .{ .file_stat = .{
-                    .file_index = idx,
-                    .err = err,
-                } };
-                return error.CacheCheckFailed;
-            };
-            const size_match = actual_stat.size == cache_hash_file.stat.size;
-            const mtime_match = actual_stat.mtime.nanoseconds == cache_hash_file.stat.mtime.nanoseconds;
-            const inode_match = actual_stat.inode == cache_hash_file.stat.inode;
-
-            if (!size_match or !mtime_match or !inode_match) {
-                cache_hash_file.stat = .{
-                    .size = actual_stat.size,
-                    .mtime = actual_stat.mtime,
-                    .inode = actual_stat.inode,
-                };
-
-                if (try self.isProblematicTimestamp(cache_hash_file.stat.mtime)) {
-                    // The actual file has an unreliable timestamp, force it to be hashed
-                    cache_hash_file.stat.mtime = .zero;
-                    cache_hash_file.stat.inode = 0;
-                }
-
-                var actual_digest: BinDigest = undefined;
-                hashFile(io, this_file, &amp;actual_digest) catch |err| {
-                    self.diagnostic = .{ .file_read = .{
-                        .file_index = idx,
-                        .err = err,
-                    } };
-                    return error.CacheCheckFailed;
-                };
-
-                if (!mem.eql(u8, &amp;cache_hash_file.bin_digest, &amp;actual_digest)) {
-                    cache_hash_file.bin_digest = actual_digest;
-                    // keep going until we have the input file digests
-                    any_file_changed = true;
-                }
-            }
-
-            if (!any_file_changed) {
-                self.hash.hasher.update(&amp;cache_hash_file.bin_digest);
-            }
-        }
-
-        // If the manifest was somehow missing one of our input files, or if any file hash has changed,
-        // then this is a cache miss. However, we have successfully populated some or all of the file
-        // digests.
-        if (any_file_changed or idx &lt; input_file_count) {
-            return .{ .miss = .{ .file_digests_populated = idx } };
-        }
-
-        return .hit;
-    }
-
-    /// Reset `self.hash.hasher` to the state it should be in after `hit` returns `false`.
-    /// The hasher contains the original input digest, and all original input file digests (i.e.
-    /// not including post files).
-    /// Assumes that `bin_digest` is populated for all files up to `input_file_count`. As such,
-    /// this is not necessarily safe to call within `hit`.
-    pub fn unhit(self: *Manifest, bin_digest: BinDigest, input_file_count: usize) void {
-        // Reset the hash.
-        self.hash.hasher = hasher_init;
-        self.hash.hasher.update(&amp;bin_digest);
-
-        // Remove files not in the initial hash.
-        while (self.files.count() != input_file_count) {
-            var file = self.files.pop().?;
-            file.key.deinit(self.cache.gpa);
-        }
-
-        for (self.files.keys()) |file| {
-            self.hash.hasher.update(&amp;file.bin_digest);
-        }
-    }
-
-    fn isProblematicTimestamp(man: *Manifest, timestamp: Io.Timestamp) error{Canceled}!bool {
-        const io = man.cache.io;
-
-        // If the file_time is prior to the most recent problematic timestamp
-        // then we don't need to access the filesystem.
-        if (timestamp.nanoseconds &lt; man.recent_problematic_timestamp.nanoseconds)
-            return false;
-
-        // Next we will check the globally shared Cache timestamp, which is accessed
-        // from multiple threads.
-        try man.cache.mutex.lock(io);
-        defer man.cache.mutex.unlock(io);
-
-        // Save the global one to our local one to avoid locking next time.
-        man.recent_problematic_timestamp = man.cache.recent_problematic_timestamp;
-        if (timestamp.nanoseconds &lt; man.recent_problematic_timestamp.nanoseconds)
-            return false;
-
-        // This flag prevents multiple filesystem writes for the same hit() call.
-        if (man.want_refresh_timestamp) {
-            man.want_refresh_timestamp = false;
-
-            var file = man.cache.manifest_dir.createFile(io, "timestamp", .{
-                .read = true,
-                .truncate = true,
-            }) catch |err| switch (err) {
-                error.Canceled =&gt; return error.Canceled,
-                else =&gt; return true,
-            };
-            defer file.close(io);
-
-            // Save locally and also save globally (we still hold the global lock).
-            const stat = file.stat(io) catch |err| switch (err) {
-                error.Canceled =&gt; return error.Canceled,
-                else =&gt; return true,
-            };
-            man.recent_problematic_timestamp = stat.mtime;
-            man.cache.recent_problematic_timestamp = man.recent_problematic_timestamp;
-        }
-
-        return timestamp.nanoseconds &gt;= man.recent_problematic_timestamp.nanoseconds;
-    }
-
-    fn populateFileHash(self: *Manifest, ch_file: *File) !void {
-        const io = self.cache.io;
-
-        if (ch_file.handle) |handle| {
-            return populateFileHashHandle(self, ch_file, handle);
-        } else {
-            const pp = ch_file.prefixed_path;
-            const dir = self.cache.prefixes()[pp.prefix].handle;
-            const handle = try dir.openFile(io, pp.sub_path, .{});
-            defer handle.close(io);
-            return populateFileHashHandle(self, ch_file, handle);
-        }
-    }
-
-    fn populateFileHashHandle(self: *Manifest, ch_file: *File, io_file: Io.File) !void {
-        const io = self.cache.io;
-        const gpa = self.cache.gpa;
-
-        const actual_stat = try io_file.stat(io);
-        ch_file.stat = .{
-            .size = actual_stat.size,
-            .mtime = actual_stat.mtime,
-            .inode = actual_stat.inode,
-        };
-
-        if (try self.isProblematicTimestamp(ch_file.stat.mtime)) {
-            // The actual file has an unreliable timestamp, force it to be hashed
-            ch_file.stat.mtime = .zero;
-            ch_file.stat.inode = 0;
-        }
-
-        if (ch_file.max_file_size) |max_file_size| {
-            if (ch_file.stat.size &gt; max_file_size) return error.FileTooBig;
-
-            // Hash while reading from disk, to keep the contents in the cpu
-            // cache while doing hashing.
-            const contents = try gpa.alloc(u8, @intCast(ch_file.stat.size));
-            errdefer gpa.free(contents);
-
-            var hasher = hasher_init;
-            var off: usize = 0;
-            while (true) {
-                const bytes_read = try io_file.readPositional(io, &amp;.{contents[off..]}, off);
-                if (bytes_read == 0) break;
-                hasher.update(contents[off..][0..bytes_read]);
-                off += bytes_read;
-            }
-            hasher.final(&amp;ch_file.bin_digest);
-
-            ch_file.contents = contents;
-        } else {
-            try hashFile(io, io_file, &amp;ch_file.bin_digest);
-        }
-
-        self.hash.hasher.update(&amp;ch_file.bin_digest);
-    }
-
-    /// Add a file as a dependency of process being cached, after the initial hash has been
-    /// calculated. This is useful for processes that don't know all the files that
-    /// are depended on ahead of time. For example, a source file that can import other files
-    /// will need to be recompiled if the imported file is changed.
-    pub fn addFilePostFetch(self: *Manifest, file_path: []const u8, max_file_size: usize) ![]const u8 {
-        assert(self.manifest_file != null);
-
-        const gpa = self.cache.gpa;
-        const prefixed_path = try self.cache.findPrefix(file_path);
-        errdefer gpa.free(prefixed_path.sub_path);
-
-        const gop = try self.files.getOrPutAdapted(gpa, prefixed_path, FilesAdapter{});
-        errdefer _ = self.files.pop();
-
-        if (gop.found_existing) {
-            gpa.free(prefixed_path.sub_path);
-            return gop.key_ptr.contents.?;
-        }
-
-        gop.key_ptr.* = .{
-            .prefixed_path = prefixed_path,
-            .max_file_size = max_file_size,
-            .stat = undefined,
-            .bin_digest = undefined,
-            .contents = null,
-        };
-
-        self.files.lockPointers();
-        defer self.files.unlockPointers();
-
-        try self.populateFileHash(gop.key_ptr);
-        return gop.key_ptr.contents.?;
-    }
-
-    /// Add a file as a dependency of process being cached, after the initial hash has been
-    /// calculated.
-    ///
-    /// This is useful for processes that don't know the all the files that are
-    /// depended on ahead of time. For example, a source file that can import
-    /// other files will need to be recompiled if the imported file is changed.
-    pub fn addFilePost(self: *Manifest, file_path: []const u8) !void {
-        assert(self.manifest_file != null);
-
-        const gpa = self.cache.gpa;
-        const prefixed_path = try self.cache.findPrefix(file_path);
-        errdefer gpa.free(prefixed_path.sub_path);
-
-        const gop = try self.files.getOrPutAdapted(gpa, prefixed_path, FilesAdapter{});
-        errdefer _ = self.files.pop();
-
-        if (gop.found_existing) {
-            gpa.free(prefixed_path.sub_path);
-            return;
-        }
-
-        gop.key_ptr.* = .{
-            .prefixed_path = prefixed_path,
-            .max_file_size = null,
-            .handle = null,
-            .stat = undefined,
-            .bin_digest = undefined,
-            .contents = null,
-        };
-
-        self.files.lockPointers();
-        defer self.files.unlockPointers();
-
-        try self.populateFileHash(gop.key_ptr);
-    }
-
-    /// Like `addFilePost` but when the file contents have already been loaded from disk.
-    pub fn addFilePostContents(
-        self: *Manifest,
-        file_path: []const u8,
-        bytes: []const u8,
-        stat: File.Stat,
-    ) !void {
-        assert(self.manifest_file != null);
-        const gpa = self.cache.gpa;
-
-        const prefixed_path = try self.cache.findPrefix(file_path);
-        errdefer gpa.free(prefixed_path.sub_path);
-
-        const gop = try self.files.getOrPutAdapted(gpa, prefixed_path, FilesAdapter{});
-        errdefer _ = self.files.pop();
-
-        if (gop.found_existing) {
-            gpa.free(prefixed_path.sub_path);
-            return;
-        }
-
-        const new_file = gop.key_ptr;
-
-        new_file.* = .{
-            .prefixed_path = prefixed_path,
-            .max_file_size = null,
-            .handle = null,
-            .stat = stat,
-            .bin_digest = undefined,
-            .contents = null,
-        };
-
-        if (try self.isProblematicTimestamp(new_file.stat.mtime)) {
-            // The actual file has an unreliable timestamp, force it to be hashed
-            new_file.stat.mtime = .zero;
-            new_file.stat.inode = 0;
-        }
-
-        {
-            var hasher = hasher_init;
-            hasher.update(bytes);
-            hasher.final(&amp;new_file.bin_digest);
-        }
-
-        self.hash.hasher.update(&amp;new_file.bin_digest);
-    }
-
-    pub fn addDepFilePost(self: *Manifest, dir: Io.Dir, dep_file_sub_path: []const u8) !void {
-        assert(self.manifest_file != null);
-        return self.addDepFileMaybePost(dir, dep_file_sub_path);
-    }
-
-    fn addDepFileMaybePost(self: *Manifest, dir: Io.Dir, dep_file_sub_path: []const u8) !void {
-        const gpa = self.cache.gpa;
-        const io = self.cache.io;
-        const dep_file_contents = try dir.readFileAlloc(io, dep_file_sub_path, gpa, .limited(manifest_file_size_max));
-        defer gpa.free(dep_file_contents);
-
-        var error_buf: std.ArrayList(u8) = .empty;
-        defer error_buf.deinit(gpa);
-
-        var resolve_buf: std.ArrayList(u8) = .empty;
-        defer resolve_buf.deinit(gpa);
-
-        var it: DepTokenizer = .{ .bytes = dep_file_contents };
-        while (it.next()) |token| {
-            switch (token) {
-                // We don't care about targets, we only want the prereqs
-                // Clang is invoked in single-source mode but other programs may not
-                .target, .target_must_resolve =&gt; {},
-                .prereq =&gt; |file_path| if (self.manifest_file == null) {
-                    _ = try self.addFile(file_path, null);
-                } else try self.addFilePost(file_path),
-                .prereq_must_resolve =&gt; {
-                    resolve_buf.clearRetainingCapacity();
-                    try token.resolve(gpa, &amp;resolve_buf);
-                    if (self.manifest_file == null) {
-                        _ = try self.addFile(resolve_buf.items, null);
-                    } else try self.addFilePost(resolve_buf.items);
-                },
-                else =&gt; |err| {
-                    try err.printError(gpa, &amp;error_buf);
-                    log.err("failed parsing {s}: {s}", .{ dep_file_sub_path, error_buf.items });
-                    return error.InvalidDepFile;
-                },
-            }
-        }
-    }
-
-    /// Returns a binary hash of the inputs.
-    pub fn finalBin(self: *Manifest) BinDigest {
-        assert(self.manifest_file != null);
-
-        // We don't close the manifest file yet, because we want to
-        // keep it locked until the API user is done using it.
-        // We also don't write out the manifest yet, because until
-        // cache_release is called we still might be working on creating
-        // the artifacts to cache.
-
-        var bin_digest: BinDigest = undefined;
-        self.hash.hasher.final(&amp;bin_digest);
-        return bin_digest;
-    }
-
-    /// Returns a hex encoded hash of the inputs.
-    pub fn final(self: *Manifest) HexDigest {
-        const bin_digest = self.finalBin();
-        return binToHex(bin_digest);
-    }
-
-    /// If `want_shared_lock` is true, this function automatically downgrades the
-    /// lock from exclusive to shared.
-    pub fn writeManifest(self: *Manifest) !void {
-        assert(self.have_exclusive_lock);
-        const io = self.cache.io;
-        const manifest_file = self.manifest_file.?;
-        if (self.manifest_dirty) {
-            self.manifest_dirty = false;
-
-            var buffer: [4000]u8 = undefined;
-            var fw = manifest_file.writer(io, &amp;buffer);
-            writeDirtyManifestToStream(self, &amp;fw) catch |err| switch (err) {
-                error.WriteFailed =&gt; return fw.err.?,
-                else =&gt; |e| return e,
-            };
-        }
-
-        if (self.want_shared_lock) {
-            try self.downgradeToSharedLock();
-        }
-    }
-
-    fn writeDirtyManifestToStream(self: *Manifest, fw: *Io.File.Writer) !void {
-        try fw.interface.writeAll(manifest_header ++ "\n");
-        for (self.files.keys()) |file| {
-            try fw.interface.print("{d} {d} {d} {x} {d} {s}\n", .{
-                file.stat.size,
-                file.stat.inode,
-                file.stat.mtime,
-                &amp;file.bin_digest,
-                file.prefixed_path.prefix,
-                file.prefixed_path.sub_path,
-            });
-        }
-        try fw.end();
-    }
-
-    fn downgradeToSharedLock(self: *Manifest) !void {
-        if (!self.have_exclusive_lock) return;
-        const io = self.cache.io;
-
-        if (std.process.can_spawn or !builtin.single_threaded) {
-            const manifest_file = self.manifest_file.?;
-            try manifest_file.downgradeLock(io);
-        }
-
-        self.have_exclusive_lock = false;
-    }
-
-    fn upgradeToExclusiveLock(self: *Manifest) error{CacheCheckFailed}!bool {
-        if (self.have_exclusive_lock) return false;
-        assert(self.manifest_file != null);
-        const io = self.cache.io;
-
-        if (std.process.can_spawn or !builtin.single_threaded) {
-            const manifest_file = self.manifest_file.?;
-            // Here we intentionally have a period where the lock is released, in case there are
-            // other processes holding a shared lock.
-            manifest_file.unlock(io);
-            manifest_file.lock(io, .exclusive) catch |err| {
-                self.diagnostic = .{ .manifest_lock = err };
-                return error.CacheCheckFailed;
-            };
-        }
-        self.have_exclusive_lock = true;
-        return true;
-    }
-
-    /// Obtain only the data needed to maintain a lock on the manifest file.
-    /// The `Manifest` remains safe to deinit.
-    /// Don't forget to call `writeManifest` before this!
-    pub fn toOwnedLock(self: *Manifest) Lock {
-        defer self.manifest_file = null;
-        return .{ .manifest_file = self.manifest_file.? };
-    }
-
-    /// Releases the manifest file and frees any memory the Manifest was using.
-    /// `Manifest.hit` must be called first.
-    /// Don't forget to call `writeManifest` before this!
-    pub fn deinit(self: *Manifest) void {
-        const io = self.cache.io;
-
-        if (self.manifest_file) |file| {
-            if (builtin.os.tag == .windows) {
-                // See Lock.release for why this is required on Windows
-                file.unlock(io);
-            }
-
-            file.close(io);
-        }
-        for (self.files.keys()) |*file| {
-            file.deinit(self.cache.gpa);
-        }
-        self.files.deinit(self.cache.gpa);
-    }
-
-    pub fn populateFileSystemInputs(man: *Manifest, buf: *std.ArrayList(u8)) Allocator.Error!void {
-        assert(@typeInfo(std.zig.Server.Message.PathPrefix).@"enum".fields.len == man.cache.prefixes_len);
-        buf.clearRetainingCapacity();
-        const gpa = man.cache.gpa;
-        const files = man.files.keys();
-        if (files.len &gt; 0) {
-            for (files) |file| {
-                try buf.ensureUnusedCapacity(gpa, file.prefixed_path.sub_path.len + 2);
-                buf.appendAssumeCapacity(file.prefixed_path.prefix + 1);
-                buf.appendSliceAssumeCapacity(file.prefixed_path.sub_path);
-                buf.appendAssumeCapacity(0);
-            }
-            // The null byte is a separator, not a terminator.
-            buf.items.len -= 1;
-        }
-    }
-
-    pub fn populateOtherManifest(man: *Manifest, other: *Manifest, prefix_map: [4]u8) Allocator.Error!void {
-        const gpa = other.cache.gpa;
-        assert(@typeInfo(std.zig.Server.Message.PathPrefix).@"enum".fields.len == man.cache.prefixes_len);
-        assert(man.cache.prefixes_len == 4);
-        for (man.files.keys()) |file| {
-            const prefixed_path: PrefixedPath = .{
-                .prefix = prefix_map[file.prefixed_path.prefix],
-                .sub_path = try gpa.dupe(u8, file.prefixed_path.sub_path),
-            };
-            errdefer gpa.free(prefixed_path.sub_path);
-
-            const gop = try other.files.getOrPutAdapted(gpa, prefixed_path, FilesAdapter{});
-            errdefer _ = other.files.pop();
-
-            if (gop.found_existing) {
-                gpa.free(prefixed_path.sub_path);
-                continue;
-            }
-
-            gop.key_ptr.* = .{
-                .prefixed_path = prefixed_path,
-                .max_file_size = file.max_file_size,
-                .handle = file.handle,
-                .stat = file.stat,
-                .bin_digest = file.bin_digest,
-                .contents = null,
-            };
-
-            other.hash.hasher.update(&amp;gop.key_ptr.bin_digest);
-        }
-    }
-};
-
-fn hashFile(io: Io, file: Io.File, bin_digest: *[Hasher.mac_length]u8) Io.File.ReadPositionalError!void {
-    var buffer: [2048]u8 = undefined;
-    var hasher = hasher_init;
-    var offset: u64 = 0;
-    while (true) {
-        const n = try file.readPositional(io, &amp;.{&amp;buffer}, offset);
-        if (n == 0) break;
-        hasher.update(buffer[0..n]);
-        offset += n;
-    }
-    hasher.final(bin_digest);
-}
-
-// Create/Write a file, close it, then grab its stat.mtime timestamp.
-fn testGetCurrentFileTimestamp(io: Io, dir: Io.Dir) !Io.Timestamp {
-    const test_out_file = "test-filetimestamp.tmp";
-
-    var file = try dir.createFile(io, test_out_file, .{
-        .read = true,
-        .truncate = true,
-    });
-    defer {
-        file.close(io);
-        dir.deleteFile(io, test_out_file) catch {};
-    }
-
-    return (try file.stat(io)).mtime;
-}
-
-test "cache file and then recall it" {
-    const io = testing.io;
-
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const cwd = try std.process.currentPathAlloc(io, testing.allocator);
-    defer testing.allocator.free(cwd);
-
-    const temp_file = "test.txt";
-    const temp_manifest_dir = "temp_manifest_dir";
-
-    try tmp.dir.writeFile(io, .{ .sub_path = temp_file, .data = "Hello, world!\n" });
-
-    // Wait for file timestamps to tick
-    const initial_time = try testGetCurrentFileTimestamp(io, tmp.dir);
-    while ((try testGetCurrentFileTimestamp(io, tmp.dir)).nanoseconds == initial_time.nanoseconds) {
-        try std.Io.Clock.Duration.sleep(.{ .clock = .boot, .raw = .fromNanoseconds(1) }, io);
-    }
-
-    var digest1: HexDigest = undefined;
-    var digest2: HexDigest = undefined;
-
-    {
-        var cache: Cache = .{
-            .io = io,
-            .gpa = testing.allocator,
-            .manifest_dir = try tmp.dir.createDirPathOpen(io, temp_manifest_dir, .{}),
-            .cwd = cwd,
-        };
-        cache.addPrefix(.{ .path = null, .handle = tmp.dir });
-        defer cache.manifest_dir.close(io);
-
-        {
-            var ch = cache.obtain();
-            defer ch.deinit();
-
-            ch.hash.add(true);
-            ch.hash.add(@as(u16, 1234));
-            ch.hash.addBytes("1234");
-            _ = try ch.addFile(temp_file, null);
-
-            // There should be nothing in the cache
-            try testing.expectEqual(false, try ch.hit());
-
-            digest1 = ch.final();
-            try ch.writeManifest();
-        }
-        {
-            var ch = cache.obtain();
-            defer ch.deinit();
-
-            ch.hash.add(true);
-            ch.hash.add(@as(u16, 1234));
-            ch.hash.addBytes("1234");
-            _ = try ch.addFile(temp_file, null);
-
-            // Cache hit! We just "built" the same file
-            try testing.expect(try ch.hit());
-            digest2 = ch.final();
-
-            try testing.expectEqual(false, ch.have_exclusive_lock);
-        }
-
-        try testing.expectEqual(digest1, digest2);
-    }
-}
-
-test "check that changing a file makes cache fail" {
-    const io = testing.io;
-
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const cwd = try std.process.currentPathAlloc(io, testing.allocator);
-    defer testing.allocator.free(cwd);
-
-    const temp_file = "cache_hash_change_file_test.txt";
-    const temp_manifest_dir = "cache_hash_change_file_manifest_dir";
-    const original_temp_file_contents = "Hello, world!\n";
-    const updated_temp_file_contents = "Hello, world; but updated!\n";
-
-    try tmp.dir.writeFile(io, .{ .sub_path = temp_file, .data = original_temp_file_contents });
-
-    // Wait for file timestamps to tick
-    const initial_time = try testGetCurrentFileTimestamp(io, tmp.dir);
-    while ((try testGetCurrentFileTimestamp(io, tmp.dir)).nanoseconds == initial_time.nanoseconds) {
-        try std.Io.Clock.Duration.sleep(.{ .clock = .boot, .raw = .fromNanoseconds(1) }, io);
-    }
-
-    var digest1: HexDigest = undefined;
-    var digest2: HexDigest = undefined;
-
-    {
-        var cache: Cache = .{
-            .io = io,
-            .gpa = testing.allocator,
-            .manifest_dir = try tmp.dir.createDirPathOpen(io, temp_manifest_dir, .{}),
-            .cwd = cwd,
-        };
-        cache.addPrefix(.{ .path = null, .handle = tmp.dir });
-        defer cache.manifest_dir.close(io);
-
-        {
-            var ch = cache.obtain();
-            defer ch.deinit();
-
-            ch.hash.addBytes("1234");
-            const temp_file_idx = try ch.addFile(temp_file, 100);
-
-            // There should be nothing in the cache
-            try testing.expectEqual(false, try ch.hit());
-
-            try testing.expect(mem.eql(u8, original_temp_file_contents, ch.files.keys()[temp_file_idx].contents.?));
-
-            digest1 = ch.final();
-
-            try ch.writeManifest();
-        }
-
-        try tmp.dir.writeFile(io, .{ .sub_path = temp_file, .data = updated_temp_file_contents });
-
-        {
-            var ch = cache.obtain();
-            defer ch.deinit();
-
-            ch.hash.addBytes("1234");
-            const temp_file_idx = try ch.addFile(temp_file, 100);
-
-            // A file that we depend on has been updated, so the cache should not contain an entry for it
-            try testing.expectEqual(false, try ch.hit());
-
-            // The cache system does not keep the contents of re-hashed input files.
-            try testing.expect(ch.files.keys()[temp_file_idx].contents == null);
-
-            digest2 = ch.final();
-
-            try ch.writeManifest();
-        }
-
-        try testing.expect(!mem.eql(u8, digest1[0..], digest2[0..]));
-    }
-}
-
-test "no file inputs" {
-    const io = testing.io;
-
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const cwd = try std.process.currentPathAlloc(io, testing.allocator);
-    defer testing.allocator.free(cwd);
-
-    const temp_manifest_dir = "no_file_inputs_manifest_dir";
-
-    var digest1: HexDigest = undefined;
-    var digest2: HexDigest = undefined;
-
-    var cache: Cache = .{
-        .io = io,
-        .gpa = testing.allocator,
-        .manifest_dir = try tmp.dir.createDirPathOpen(io, temp_manifest_dir, .{}),
-        .cwd = cwd,
-    };
-    cache.addPrefix(.{ .path = null, .handle = tmp.dir });
-    defer cache.manifest_dir.close(io);
-
-    {
-        var man = cache.obtain();
-        defer man.deinit();
-
-        man.hash.addBytes("1234");
-
-        // There should be nothing in the cache
-        try testing.expectEqual(false, try man.hit());
-
-        digest1 = man.final();
-
-        try man.writeManifest();
-    }
-    {
-        var man = cache.obtain();
-        defer man.deinit();
-
-        man.hash.addBytes("1234");
-
-        try testing.expect(try man.hit());
-        digest2 = man.final();
-        try testing.expectEqual(false, man.have_exclusive_lock);
-    }
-
-    try testing.expectEqual(digest1, digest2);
-}
-
-test "Manifest with files added after initial hash work" {
-    const io = testing.io;
-
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const cwd = try std.process.currentPathAlloc(io, testing.allocator);
-    defer testing.allocator.free(cwd);
-
-    const temp_file1 = "cache_hash_post_file_test1.txt";
-    const temp_file2 = "cache_hash_post_file_test2.txt";
-    const temp_manifest_dir = "cache_hash_post_file_manifest_dir";
-
-    try tmp.dir.writeFile(io, .{ .sub_path = temp_file1, .data = "Hello, world!\n" });
-    try tmp.dir.writeFile(io, .{ .sub_path = temp_file2, .data = "Hello world the second!\n" });
-
-    // Wait for file timestamps to tick
-    const initial_time = try testGetCurrentFileTimestamp(io, tmp.dir);
-    while ((try testGetCurrentFileTimestamp(io, tmp.dir)).nanoseconds == initial_time.nanoseconds) {
-        try std.Io.Clock.Duration.sleep(.{ .clock = .boot, .raw = .fromNanoseconds(1) }, io);
-    }
-
-    var digest1: HexDigest = undefined;
-    var digest2: HexDigest = undefined;
-    var digest3: HexDigest = undefined;
-
-    {
-        var cache: Cache = .{
-            .io = io,
-            .gpa = testing.allocator,
-            .manifest_dir = try tmp.dir.createDirPathOpen(io, temp_manifest_dir, .{}),
-            .cwd = cwd,
-        };
-        cache.addPrefix(.{ .path = null, .handle = tmp.dir });
-        defer cache.manifest_dir.close(io);
-
-        {
-            var ch = cache.obtain();
-            defer ch.deinit();
-
-            ch.hash.addBytes("1234");
-            _ = try ch.addFile(temp_file1, null);
-
-            // There should be nothing in the cache
-            try testing.expectEqual(false, try ch.hit());
-
-            _ = try ch.addFilePost(temp_file2);
-
-            digest1 = ch.final();
-            try ch.writeManifest();
-        }
-        {
-            var ch = cache.obtain();
-            defer ch.deinit();
-
-            ch.hash.addBytes("1234");
-            _ = try ch.addFile(temp_file1, null);
-
-            try testing.expect(try ch.hit());
-            digest2 = ch.final();
-
-            try testing.expectEqual(false, ch.have_exclusive_lock);
-        }
-        try testing.expect(mem.eql(u8, &amp;digest1, &amp;digest2));
-
-        // Modify the file added after initial hash
-        try tmp.dir.writeFile(io, .{ .sub_path = temp_file2, .data = "Hello world the second, updated\n" });
-
-        // Wait for file timestamps to tick
-        const initial_time2 = try testGetCurrentFileTimestamp(io, tmp.dir);
-        while ((try testGetCurrentFileTimestamp(io, tmp.dir)).nanoseconds == initial_time2.nanoseconds) {
-            try std.Io.Clock.Duration.sleep(.{ .clock = .boot, .raw = .fromNanoseconds(1) }, io);
-        }
-
-        {
-            var ch = cache.obtain();
-            defer ch.deinit();
-
-            ch.hash.addBytes("1234");
-            _ = try ch.addFile(temp_file1, null);
-
-            // A file that we depend on has been updated, so the cache should not contain an entry for it
-            try testing.expectEqual(false, try ch.hit());
-
-            _ = try ch.addFilePost(temp_file2);
-
-            digest3 = ch.final();
-
-            try ch.writeManifest();
-        }
-
-        try testing.expect(!mem.eql(u8, &amp;digest1, &amp;digest3));
-    }
-}</pre>
+    <pre><a id="L1"></a>//! Manages `zig-cache` directories.
+<a id="L2"></a>//! This is not a general-purpose cache. It is designed to be fast and simple,
+<a id="L3"></a>//! not to withstand attacks using specially-crafted input.
+<a id="L4"></a>
+<a id="L5"></a>const Cache = @This();
+<a id="L6"></a>const builtin = @import("builtin");
+<a id="L7"></a>
+<a id="L8"></a>const std = @import("std");
+<a id="L9"></a>const Io = std.Io;
+<a id="L10"></a>const crypto = std.crypto;
+<a id="L11"></a>const assert = std.debug.assert;
+<a id="L12"></a>const testing = std.testing;
+<a id="L13"></a>const mem = std.mem;
+<a id="L14"></a>const fmt = std.fmt;
+<a id="L15"></a>const Allocator = std.mem.Allocator;
+<a id="L16"></a>const log = std.log.scoped(.cache);
+<a id="L17"></a>
+<a id="L18"></a>gpa: Allocator,
+<a id="L19"></a>io: Io,
+<a id="L20"></a>manifest_dir: Io.Dir,
+<a id="L21"></a>hash: HashHelper = .{},
+<a id="L22"></a>/// This value is accessed from multiple threads, protected by mutex.
+<a id="L23"></a>recent_problematic_timestamp: Io.Timestamp = .zero,
+<a id="L24"></a>mutex: Io.Mutex = .init,
+<a id="L25"></a>
+<a id="L26"></a>/// A set of strings such as the zig library directory or project source root, which
+<a id="L27"></a>/// are stripped from the file paths before putting into the cache. They
+<a id="L28"></a>/// are replaced with single-character indicators. This is not to save
+<a id="L29"></a>/// space but to eliminate absolute file paths. This improves portability
+<a id="L30"></a>/// and usefulness of the cache for advanced use cases.
+<a id="L31"></a>prefixes_buffer: [4]Directory = undefined,
+<a id="L32"></a>prefixes_len: usize = 0,
+<a id="L33"></a>/// Used to identify prefixes. References external memory.
+<a id="L34"></a>cwd: []const u8,
+<a id="L35"></a>
+<a id="L36"></a>pub const Path = @import("Cache/Path.zig");
+<a id="L37"></a>pub const Directory = @import("Cache/Directory.zig");
+<a id="L38"></a>pub const DepTokenizer = @import("Cache/DepTokenizer.zig");
+<a id="L39"></a>
+<a id="L40"></a>pub fn addPrefix(cache: *Cache, directory: Directory) void {
+<a id="L41"></a>    cache.prefixes_buffer[cache.prefixes_len] = directory;
+<a id="L42"></a>    cache.prefixes_len += 1;
+<a id="L43"></a>}
+<a id="L44"></a>
+<a id="L45"></a>/// Be sure to call `Manifest.deinit` after successful initialization.
+<a id="L46"></a>pub fn obtain(cache: *Cache) Manifest {
+<a id="L47"></a>    return .{
+<a id="L48"></a>        .cache = cache,
+<a id="L49"></a>        .hash = cache.hash,
+<a id="L50"></a>        .manifest_file = null,
+<a id="L51"></a>        .manifest_dirty = false,
+<a id="L52"></a>        .hex_digest = undefined,
+<a id="L53"></a>    };
+<a id="L54"></a>}
+<a id="L55"></a>
+<a id="L56"></a>pub fn prefixes(cache: *const Cache) []const Directory {
+<a id="L57"></a>    return cache.prefixes_buffer[0..cache.prefixes_len];
+<a id="L58"></a>}
+<a id="L59"></a>
+<a id="L60"></a>const PrefixedPath = struct {
+<a id="L61"></a>    prefix: u8,
+<a id="L62"></a>    sub_path: []const u8,
+<a id="L63"></a>
+<a id="L64"></a>    fn eql(a: PrefixedPath, b: PrefixedPath) bool {
+<a id="L65"></a>        return a.prefix == b.prefix and std.mem.eql(u8, a.sub_path, b.sub_path);
+<a id="L66"></a>    }
+<a id="L67"></a>
+<a id="L68"></a>    fn hash(pp: PrefixedPath) u32 {
+<a id="L69"></a>        return @truncate(std.hash.Wyhash.hash(pp.prefix, pp.sub_path));
+<a id="L70"></a>    }
+<a id="L71"></a>};
+<a id="L72"></a>
+<a id="L73"></a>fn findPrefix(cache: *const Cache, file_path: []const u8) !PrefixedPath {
+<a id="L74"></a>    const gpa = cache.gpa;
+<a id="L75"></a>    const resolved_path = try std.fs.path.resolve(gpa, &amp;.{file_path});
+<a id="L76"></a>    errdefer gpa.free(resolved_path);
+<a id="L77"></a>    return findPrefixResolved(cache, resolved_path);
+<a id="L78"></a>}
+<a id="L79"></a>
+<a id="L80"></a>/// Takes ownership of `resolved_path` on success.
+<a id="L81"></a>fn findPrefixResolved(cache: *const Cache, resolved_path: []u8) !PrefixedPath {
+<a id="L82"></a>    const gpa = cache.gpa;
+<a id="L83"></a>    const cwd = cache.cwd;
+<a id="L84"></a>    const prefixes_slice = cache.prefixes();
+<a id="L85"></a>    var i: u8 = 1; // Start at 1 to skip over checking the null prefix.
+<a id="L86"></a>    while (i &lt; prefixes_slice.len) : (i += 1) {
+<a id="L87"></a>        const p = prefixes_slice[i].path.?;
+<a id="L88"></a>        const sub_path = getPrefixSubpath(gpa, cwd, p, resolved_path) catch |err| switch (err) {
+<a id="L89"></a>            error.NotASubPath =&gt; continue,
+<a id="L90"></a>            else =&gt; |e| return e,
+<a id="L91"></a>        };
+<a id="L92"></a>        // Free the resolved path since we're not going to return it
+<a id="L93"></a>        gpa.free(resolved_path);
+<a id="L94"></a>        return PrefixedPath{
+<a id="L95"></a>            .prefix = i,
+<a id="L96"></a>            .sub_path = sub_path,
+<a id="L97"></a>        };
+<a id="L98"></a>    }
+<a id="L99"></a>
+<a id="L100"></a>    return PrefixedPath{
+<a id="L101"></a>        .prefix = 0,
+<a id="L102"></a>        .sub_path = resolved_path,
+<a id="L103"></a>    };
+<a id="L104"></a>}
+<a id="L105"></a>
+<a id="L106"></a>fn getPrefixSubpath(gpa: Allocator, cwd: []const u8, prefix: []const u8, path: []u8) ![]u8 {
+<a id="L107"></a>    const relative = try std.fs.path.relative(gpa, cwd, null, prefix, path);
+<a id="L108"></a>    errdefer gpa.free(relative);
+<a id="L109"></a>    var component_iterator: std.fs.path.NativeComponentIterator = .init(relative);
+<a id="L110"></a>    if (component_iterator.root() != null) {
+<a id="L111"></a>        return error.NotASubPath;
+<a id="L112"></a>    }
+<a id="L113"></a>    const first_component = component_iterator.first();
+<a id="L114"></a>    if (first_component != null and std.mem.eql(u8, first_component.?.name, "..")) {
+<a id="L115"></a>        return error.NotASubPath;
+<a id="L116"></a>    }
+<a id="L117"></a>    return relative;
+<a id="L118"></a>}
+<a id="L119"></a>
+<a id="L120"></a>/// This is 128 bits - Even with 2^54 cache entries, the probably of a collision would be under 10^-6
+<a id="L121"></a>pub const bin_digest_len = 16;
+<a id="L122"></a>pub const hex_digest_len = bin_digest_len * 2;
+<a id="L123"></a>pub const BinDigest = [bin_digest_len]u8;
+<a id="L124"></a>pub const HexDigest = [hex_digest_len]u8;
+<a id="L125"></a>
+<a id="L126"></a>/// This is currently just an arbitrary non-empty string that can't match another manifest line.
+<a id="L127"></a>const manifest_header = "0";
+<a id="L128"></a>pub const manifest_file_size_max = 100 * 1024 * 1024;
+<a id="L129"></a>
+<a id="L130"></a>/// The type used for hashing file contents. Currently, this is SipHash128(1, 3), because it
+<a id="L131"></a>/// provides enough collision resistance for the Manifest use cases, while being one of our
+<a id="L132"></a>/// fastest options right now.
+<a id="L133"></a>pub const Hasher = crypto.auth.siphash.SipHash128(1, 3);
+<a id="L134"></a>
+<a id="L135"></a>/// Initial state with random bytes, that can be copied.
+<a id="L136"></a>/// Refresh this with new random bytes when the manifest
+<a id="L137"></a>/// format is modified in a non-backwards-compatible way.
+<a id="L138"></a>pub const hasher_init: Hasher = Hasher.init(&amp;.{
+<a id="L139"></a>    0x33, 0x52, 0xa2, 0x84,
+<a id="L140"></a>    0xcf, 0x17, 0x56, 0x57,
+<a id="L141"></a>    0x01, 0xbb, 0xcd, 0xe4,
+<a id="L142"></a>    0x77, 0xd6, 0xf0, 0x60,
+<a id="L143"></a>});
+<a id="L144"></a>
+<a id="L145"></a>pub const File = struct {
+<a id="L146"></a>    prefixed_path: PrefixedPath,
+<a id="L147"></a>    max_file_size: ?usize,
+<a id="L148"></a>    /// Populated if the user calls `addOpenedFile`.
+<a id="L149"></a>    /// The handle is not owned here.
+<a id="L150"></a>    handle: ?Io.File,
+<a id="L151"></a>    stat: Stat,
+<a id="L152"></a>    bin_digest: BinDigest,
+<a id="L153"></a>    contents: ?[]const u8,
+<a id="L154"></a>
+<a id="L155"></a>    pub const Stat = struct {
+<a id="L156"></a>        inode: Io.File.INode,
+<a id="L157"></a>        size: u64,
+<a id="L158"></a>        mtime: Io.Timestamp,
+<a id="L159"></a>
+<a id="L160"></a>        pub fn fromFs(fs_stat: Io.File.Stat) Stat {
+<a id="L161"></a>            return .{
+<a id="L162"></a>                .inode = fs_stat.inode,
+<a id="L163"></a>                .size = fs_stat.size,
+<a id="L164"></a>                .mtime = fs_stat.mtime,
+<a id="L165"></a>            };
+<a id="L166"></a>        }
+<a id="L167"></a>    };
+<a id="L168"></a>
+<a id="L169"></a>    pub fn deinit(self: *File, gpa: Allocator) void {
+<a id="L170"></a>        gpa.free(self.prefixed_path.sub_path);
+<a id="L171"></a>        if (self.contents) |contents| {
+<a id="L172"></a>            gpa.free(contents);
+<a id="L173"></a>            self.contents = null;
+<a id="L174"></a>        }
+<a id="L175"></a>        self.* = undefined;
+<a id="L176"></a>    }
+<a id="L177"></a>
+<a id="L178"></a>    pub fn updateMaxSize(file: *File, new_max_size: ?usize) void {
+<a id="L179"></a>        const new = new_max_size orelse return;
+<a id="L180"></a>        file.max_file_size = if (file.max_file_size) |old| @max(old, new) else new;
+<a id="L181"></a>    }
+<a id="L182"></a>
+<a id="L183"></a>    pub fn updateHandle(file: *File, new_handle: ?Io.File) void {
+<a id="L184"></a>        const handle = new_handle orelse return;
+<a id="L185"></a>        file.handle = handle;
+<a id="L186"></a>    }
+<a id="L187"></a>};
+<a id="L188"></a>
+<a id="L189"></a>pub const HashHelper = struct {
+<a id="L190"></a>    hasher: Hasher = hasher_init,
+<a id="L191"></a>
+<a id="L192"></a>    /// Record a slice of bytes as a dependency of the process being cached.
+<a id="L193"></a>    pub fn addBytes(hh: *HashHelper, bytes: []const u8) void {
+<a id="L194"></a>        hh.hasher.update(mem.asBytes(&amp;bytes.len));
+<a id="L195"></a>        hh.hasher.update(bytes);
+<a id="L196"></a>    }
+<a id="L197"></a>
+<a id="L198"></a>    pub fn addOptionalBytes(hh: *HashHelper, optional_bytes: ?[]const u8) void {
+<a id="L199"></a>        hh.add(optional_bytes != null);
+<a id="L200"></a>        hh.addBytes(optional_bytes orelse return);
+<a id="L201"></a>    }
+<a id="L202"></a>
+<a id="L203"></a>    pub fn addListOfBytes(hh: *HashHelper, list_of_bytes: []const []const u8) void {
+<a id="L204"></a>        hh.add(list_of_bytes.len);
+<a id="L205"></a>        for (list_of_bytes) |bytes| hh.addBytes(bytes);
+<a id="L206"></a>    }
+<a id="L207"></a>
+<a id="L208"></a>    pub fn addOptionalListOfBytes(hh: *HashHelper, optional_list_of_bytes: ?[]const []const u8) void {
+<a id="L209"></a>        hh.add(optional_list_of_bytes != null);
+<a id="L210"></a>        hh.addListOfBytes(optional_list_of_bytes orelse return);
+<a id="L211"></a>    }
+<a id="L212"></a>
+<a id="L213"></a>    /// Convert the input value into bytes and record it as a dependency of the process being cached.
+<a id="L214"></a>    pub fn add(hh: *HashHelper, x: anytype) void {
+<a id="L215"></a>        switch (@TypeOf(x)) {
+<a id="L216"></a>            std.SemanticVersion =&gt; {
+<a id="L217"></a>                hh.add(x.major);
+<a id="L218"></a>                hh.add(x.minor);
+<a id="L219"></a>                hh.add(x.patch);
+<a id="L220"></a>            },
+<a id="L221"></a>            std.Target.Os.TaggedVersionRange =&gt; {
+<a id="L222"></a>                switch (x) {
+<a id="L223"></a>                    .hurd =&gt; |hurd| {
+<a id="L224"></a>                        hh.add(hurd.range.min);
+<a id="L225"></a>                        hh.add(hurd.range.max);
+<a id="L226"></a>                        hh.add(hurd.glibc);
+<a id="L227"></a>                    },
+<a id="L228"></a>                    .linux =&gt; |linux| {
+<a id="L229"></a>                        hh.add(linux.range.min);
+<a id="L230"></a>                        hh.add(linux.range.max);
+<a id="L231"></a>                        hh.add(linux.glibc);
+<a id="L232"></a>                        hh.add(linux.android);
+<a id="L233"></a>                    },
+<a id="L234"></a>                    .windows =&gt; |windows| {
+<a id="L235"></a>                        hh.add(windows.min);
+<a id="L236"></a>                        hh.add(windows.max);
+<a id="L237"></a>                    },
+<a id="L238"></a>                    .semver =&gt; |semver| {
+<a id="L239"></a>                        hh.add(semver.min);
+<a id="L240"></a>                        hh.add(semver.max);
+<a id="L241"></a>                    },
+<a id="L242"></a>                    .none =&gt; {},
+<a id="L243"></a>                }
+<a id="L244"></a>            },
+<a id="L245"></a>            std.zig.BuildId =&gt; switch (x) {
+<a id="L246"></a>                .none, .fast, .uuid, .sha1, .md5 =&gt; hh.add(std.meta.activeTag(x)),
+<a id="L247"></a>                .hexstring =&gt; |hex_string| hh.addBytes(hex_string.toSlice()),
+<a id="L248"></a>            },
+<a id="L249"></a>            else =&gt; switch (@typeInfo(@TypeOf(x))) {
+<a id="L250"></a>                .bool, .int, .@"enum", .array =&gt; hh.addBytes(mem.asBytes(&amp;x)),
+<a id="L251"></a>                else =&gt; @compileError("unable to hash type " ++ @typeName(@TypeOf(x))),
+<a id="L252"></a>            },
+<a id="L253"></a>        }
+<a id="L254"></a>    }
+<a id="L255"></a>
+<a id="L256"></a>    pub fn addOptional(hh: *HashHelper, optional: anytype) void {
+<a id="L257"></a>        hh.add(optional != null);
+<a id="L258"></a>        hh.add(optional orelse return);
+<a id="L259"></a>    }
+<a id="L260"></a>
+<a id="L261"></a>    /// Returns a hex encoded hash of the inputs, without modifying state.
+<a id="L262"></a>    pub fn peek(hh: HashHelper) [hex_digest_len]u8 {
+<a id="L263"></a>        var copy = hh;
+<a id="L264"></a>        return copy.final();
+<a id="L265"></a>    }
+<a id="L266"></a>
+<a id="L267"></a>    pub fn peekBin(hh: HashHelper) BinDigest {
+<a id="L268"></a>        var copy = hh;
+<a id="L269"></a>        var bin_digest: BinDigest = undefined;
+<a id="L270"></a>        copy.hasher.final(&amp;bin_digest);
+<a id="L271"></a>        return bin_digest;
+<a id="L272"></a>    }
+<a id="L273"></a>
+<a id="L274"></a>    /// Returns a hex encoded hash of the inputs, mutating the state of the hasher.
+<a id="L275"></a>    pub fn final(hh: *HashHelper) HexDigest {
+<a id="L276"></a>        var bin_digest: BinDigest = undefined;
+<a id="L277"></a>        hh.hasher.final(&amp;bin_digest);
+<a id="L278"></a>        return binToHex(bin_digest);
+<a id="L279"></a>    }
+<a id="L280"></a>
+<a id="L281"></a>    pub fn oneShot(bytes: []const u8) [hex_digest_len]u8 {
+<a id="L282"></a>        var hasher: Hasher = hasher_init;
+<a id="L283"></a>        hasher.update(bytes);
+<a id="L284"></a>        var bin_digest: BinDigest = undefined;
+<a id="L285"></a>        hasher.final(&amp;bin_digest);
+<a id="L286"></a>        return binToHex(bin_digest);
+<a id="L287"></a>    }
+<a id="L288"></a>};
+<a id="L289"></a>
+<a id="L290"></a>pub fn binToHex(bin_digest: BinDigest) HexDigest {
+<a id="L291"></a>    var out_digest: HexDigest = undefined;
+<a id="L292"></a>    var w: std.Io.Writer = .fixed(&amp;out_digest);
+<a id="L293"></a>    w.printHex(&amp;bin_digest, .lower) catch unreachable;
+<a id="L294"></a>    return out_digest;
+<a id="L295"></a>}
+<a id="L296"></a>
+<a id="L297"></a>pub const Lock = struct {
+<a id="L298"></a>    manifest_file: Io.File,
+<a id="L299"></a>
+<a id="L300"></a>    pub fn release(lock: *Lock, io: Io) void {
+<a id="L301"></a>        if (builtin.os.tag == .windows) {
+<a id="L302"></a>            // Windows does not guarantee that locks are immediately unlocked when
+<a id="L303"></a>            // the file handle is closed. See LockFileEx documentation.
+<a id="L304"></a>            lock.manifest_file.unlock(io);
+<a id="L305"></a>        }
+<a id="L306"></a>
+<a id="L307"></a>        lock.manifest_file.close(io);
+<a id="L308"></a>        lock.* = undefined;
+<a id="L309"></a>    }
+<a id="L310"></a>};
+<a id="L311"></a>
+<a id="L312"></a>pub const Manifest = struct {
+<a id="L313"></a>    cache: *Cache,
+<a id="L314"></a>    /// Current state for incremental hashing.
+<a id="L315"></a>    hash: HashHelper,
+<a id="L316"></a>    manifest_file: ?Io.File,
+<a id="L317"></a>    manifest_dirty: bool,
+<a id="L318"></a>    /// Set this flag to true before calling hit() in order to indicate that
+<a id="L319"></a>    /// upon a cache hit, the code using the cache will not modify the files
+<a id="L320"></a>    /// within the cache directory. This allows multiple processes to utilize
+<a id="L321"></a>    /// the same cache directory at the same time.
+<a id="L322"></a>    want_shared_lock: bool = true,
+<a id="L323"></a>    have_exclusive_lock: bool = false,
+<a id="L324"></a>    // Indicate that we want isProblematicTimestamp to perform a filesystem write in
+<a id="L325"></a>    // order to obtain a problematic timestamp for the next call. Calls after that
+<a id="L326"></a>    // will then use the same timestamp, to avoid unnecessary filesystem writes.
+<a id="L327"></a>    want_refresh_timestamp: bool = true,
+<a id="L328"></a>    files: Files = .{},
+<a id="L329"></a>    hex_digest: HexDigest,
+<a id="L330"></a>    diagnostic: Diagnostic = .none,
+<a id="L331"></a>    /// Keeps track of the last time we performed a file system write to observe
+<a id="L332"></a>    /// what time the file system thinks it is, according to its own granularity.
+<a id="L333"></a>    recent_problematic_timestamp: Io.Timestamp = .zero,
+<a id="L334"></a>
+<a id="L335"></a>    pub const Diagnostic = union(enum) {
+<a id="L336"></a>        none,
+<a id="L337"></a>        manifest_create: Io.File.OpenError,
+<a id="L338"></a>        manifest_read: Io.File.Reader.Error,
+<a id="L339"></a>        manifest_lock: Io.File.LockError,
+<a id="L340"></a>        file_open: FileOp,
+<a id="L341"></a>        file_stat: FileOp,
+<a id="L342"></a>        file_read: FileOp,
+<a id="L343"></a>        file_hash: FileOp,
+<a id="L344"></a>
+<a id="L345"></a>        pub const FileOp = struct {
+<a id="L346"></a>            file_index: usize,
+<a id="L347"></a>            err: anyerror,
+<a id="L348"></a>        };
+<a id="L349"></a>    };
+<a id="L350"></a>
+<a id="L351"></a>    pub const Files = std.ArrayHashMapUnmanaged(File, void, FilesContext, false);
+<a id="L352"></a>
+<a id="L353"></a>    pub const FilesContext = struct {
+<a id="L354"></a>        pub fn hash(fc: FilesContext, file: File) u32 {
+<a id="L355"></a>            _ = fc;
+<a id="L356"></a>            return file.prefixed_path.hash();
+<a id="L357"></a>        }
+<a id="L358"></a>
+<a id="L359"></a>        pub fn eql(fc: FilesContext, a: File, b: File, b_index: usize) bool {
+<a id="L360"></a>            _ = fc;
+<a id="L361"></a>            _ = b_index;
+<a id="L362"></a>            return a.prefixed_path.eql(b.prefixed_path);
+<a id="L363"></a>        }
+<a id="L364"></a>    };
+<a id="L365"></a>
+<a id="L366"></a>    const FilesAdapter = struct {
+<a id="L367"></a>        pub fn eql(context: @This(), a: PrefixedPath, b: File, b_index: usize) bool {
+<a id="L368"></a>            _ = context;
+<a id="L369"></a>            _ = b_index;
+<a id="L370"></a>            return a.eql(b.prefixed_path);
+<a id="L371"></a>        }
+<a id="L372"></a>
+<a id="L373"></a>        pub fn hash(context: @This(), key: PrefixedPath) u32 {
+<a id="L374"></a>            _ = context;
+<a id="L375"></a>            return key.hash();
+<a id="L376"></a>        }
+<a id="L377"></a>    };
+<a id="L378"></a>
+<a id="L379"></a>    /// Add a file as a dependency of process being cached. When `hit` is
+<a id="L380"></a>    /// called, the file's contents will be checked to ensure that it matches
+<a id="L381"></a>    /// the contents from previous times.
+<a id="L382"></a>    ///
+<a id="L383"></a>    /// Max file size will be used to determine the amount of space the file contents
+<a id="L384"></a>    /// are allowed to take up in memory. If max_file_size is null, then the contents
+<a id="L385"></a>    /// will not be loaded into memory.
+<a id="L386"></a>    ///
+<a id="L387"></a>    /// Returns the index of the entry in the `files` array list. You can use it
+<a id="L388"></a>    /// to access the contents of the file after calling `hit()` like so:
+<a id="L389"></a>    ///
+<a id="L390"></a>    /// ```
+<a id="L391"></a>    /// var file_contents = cache_hash.files.keys()[file_index].contents.?;
+<a id="L392"></a>    /// ```
+<a id="L393"></a>    pub fn addFilePath(m: *Manifest, file_path: Path, max_file_size: ?usize) !usize {
+<a id="L394"></a>        return addOpenedFile(m, file_path, null, max_file_size);
+<a id="L395"></a>    }
+<a id="L396"></a>
+<a id="L397"></a>    /// Same as `addFilePath` except the file has already been opened.
+<a id="L398"></a>    pub fn addOpenedFile(m: *Manifest, path: Path, handle: ?Io.File, max_file_size: ?usize) !usize {
+<a id="L399"></a>        const gpa = m.cache.gpa;
+<a id="L400"></a>        try m.files.ensureUnusedCapacity(gpa, 1);
+<a id="L401"></a>        const resolved_path = try std.fs.path.resolve(gpa, &amp;.{
+<a id="L402"></a>            path.root_dir.path orelse ".",
+<a id="L403"></a>            path.subPathOrDot(),
+<a id="L404"></a>        });
+<a id="L405"></a>        errdefer gpa.free(resolved_path);
+<a id="L406"></a>        const prefixed_path = try m.cache.findPrefixResolved(resolved_path);
+<a id="L407"></a>        return addFileInner(m, prefixed_path, handle, max_file_size);
+<a id="L408"></a>    }
+<a id="L409"></a>
+<a id="L410"></a>    /// Deprecated; use `addFilePath`.
+<a id="L411"></a>    pub fn addFile(self: *Manifest, file_path: []const u8, max_file_size: ?usize) !usize {
+<a id="L412"></a>        assert(self.manifest_file == null);
+<a id="L413"></a>
+<a id="L414"></a>        const gpa = self.cache.gpa;
+<a id="L415"></a>        try self.files.ensureUnusedCapacity(gpa, 1);
+<a id="L416"></a>        const prefixed_path = try self.cache.findPrefix(file_path);
+<a id="L417"></a>        errdefer gpa.free(prefixed_path.sub_path);
+<a id="L418"></a>
+<a id="L419"></a>        return addFileInner(self, prefixed_path, null, max_file_size);
+<a id="L420"></a>    }
+<a id="L421"></a>
+<a id="L422"></a>    fn addFileInner(self: *Manifest, prefixed_path: PrefixedPath, handle: ?Io.File, max_file_size: ?usize) usize {
+<a id="L423"></a>        const gop = self.files.getOrPutAssumeCapacityAdapted(prefixed_path, FilesAdapter{});
+<a id="L424"></a>        if (gop.found_existing) {
+<a id="L425"></a>            self.cache.gpa.free(prefixed_path.sub_path);
+<a id="L426"></a>            gop.key_ptr.updateMaxSize(max_file_size);
+<a id="L427"></a>            gop.key_ptr.updateHandle(handle);
+<a id="L428"></a>            return gop.index;
+<a id="L429"></a>        }
+<a id="L430"></a>        gop.key_ptr.* = .{
+<a id="L431"></a>            .prefixed_path = prefixed_path,
+<a id="L432"></a>            .contents = null,
+<a id="L433"></a>            .max_file_size = max_file_size,
+<a id="L434"></a>            .stat = undefined,
+<a id="L435"></a>            .bin_digest = undefined,
+<a id="L436"></a>            .handle = handle,
+<a id="L437"></a>        };
+<a id="L438"></a>
+<a id="L439"></a>        self.hash.add(prefixed_path.prefix);
+<a id="L440"></a>        self.hash.addBytes(prefixed_path.sub_path);
+<a id="L441"></a>
+<a id="L442"></a>        return gop.index;
+<a id="L443"></a>    }
+<a id="L444"></a>
+<a id="L445"></a>    /// Deprecated, use `addOptionalFilePath`.
+<a id="L446"></a>    pub fn addOptionalFile(self: *Manifest, optional_file_path: ?[]const u8) !void {
+<a id="L447"></a>        self.hash.add(optional_file_path != null);
+<a id="L448"></a>        const file_path = optional_file_path orelse return;
+<a id="L449"></a>        _ = try self.addFile(file_path, null);
+<a id="L450"></a>    }
+<a id="L451"></a>
+<a id="L452"></a>    pub fn addOptionalFilePath(self: *Manifest, optional_file_path: ?Path) !void {
+<a id="L453"></a>        self.hash.add(optional_file_path != null);
+<a id="L454"></a>        const file_path = optional_file_path orelse return;
+<a id="L455"></a>        _ = try self.addFilePath(file_path, null);
+<a id="L456"></a>    }
+<a id="L457"></a>
+<a id="L458"></a>    pub fn addListOfFiles(self: *Manifest, list_of_files: []const []const u8) !void {
+<a id="L459"></a>        self.hash.add(list_of_files.len);
+<a id="L460"></a>        for (list_of_files) |file_path| {
+<a id="L461"></a>            _ = try self.addFile(file_path, null);
+<a id="L462"></a>        }
+<a id="L463"></a>    }
+<a id="L464"></a>
+<a id="L465"></a>    pub fn addDepFile(self: *Manifest, dir: Io.Dir, dep_file_sub_path: []const u8) !void {
+<a id="L466"></a>        assert(self.manifest_file == null);
+<a id="L467"></a>        return self.addDepFileMaybePost(dir, dep_file_sub_path);
+<a id="L468"></a>    }
+<a id="L469"></a>
+<a id="L470"></a>    pub const HitError = error{
+<a id="L471"></a>        /// Unable to check the cache for a reason that has been recorded into
+<a id="L472"></a>        /// the `diagnostic` field.
+<a id="L473"></a>        CacheCheckFailed,
+<a id="L474"></a>        /// A cache manifest file exists however it could not be parsed.
+<a id="L475"></a>        InvalidFormat,
+<a id="L476"></a>        OutOfMemory,
+<a id="L477"></a>        Canceled,
+<a id="L478"></a>    };
+<a id="L479"></a>
+<a id="L480"></a>    /// Check the cache to see if the input exists in it. If it exists, returns `true`.
+<a id="L481"></a>    /// A hex encoding of its hash is available by calling `final`.
+<a id="L482"></a>    ///
+<a id="L483"></a>    /// This function will also acquire an exclusive lock to the manifest file. This means
+<a id="L484"></a>    /// that a process holding a Manifest will block any other process attempting to
+<a id="L485"></a>    /// acquire the lock. If `want_shared_lock` is `true`, a cache hit guarantees the
+<a id="L486"></a>    /// manifest file to be locked in shared mode, and a cache miss guarantees the manifest
+<a id="L487"></a>    /// file to be locked in exclusive mode.
+<a id="L488"></a>    ///
+<a id="L489"></a>    /// The lock on the manifest file is released when `deinit` is called. As another
+<a id="L490"></a>    /// option, one may call `toOwnedLock` to obtain a smaller object which can represent
+<a id="L491"></a>    /// the lock. `deinit` is safe to call whether or not `toOwnedLock` has been called.
+<a id="L492"></a>    pub fn hit(self: *Manifest) HitError!bool {
+<a id="L493"></a>        assert(self.manifest_file == null);
+<a id="L494"></a>
+<a id="L495"></a>        self.diagnostic = .none;
+<a id="L496"></a>
+<a id="L497"></a>        const ext = ".txt";
+<a id="L498"></a>        var manifest_file_path: [hex_digest_len + ext.len]u8 = undefined;
+<a id="L499"></a>
+<a id="L500"></a>        var bin_digest: BinDigest = undefined;
+<a id="L501"></a>        self.hash.hasher.final(&amp;bin_digest);
+<a id="L502"></a>
+<a id="L503"></a>        self.hex_digest = binToHex(bin_digest);
+<a id="L504"></a>
+<a id="L505"></a>        @memcpy(manifest_file_path[0..self.hex_digest.len], &amp;self.hex_digest);
+<a id="L506"></a>        manifest_file_path[hex_digest_len..][0..ext.len].* = ext.*;
+<a id="L507"></a>
+<a id="L508"></a>        const io = self.cache.io;
+<a id="L509"></a>
+<a id="L510"></a>        // We'll try to open the cache with an exclusive lock, but if that would block
+<a id="L511"></a>        // and `want_shared_lock` is set, a shared lock might be sufficient, so we'll
+<a id="L512"></a>        // open with a shared lock instead.
+<a id="L513"></a>        while (true) {
+<a id="L514"></a>            if (self.cache.manifest_dir.createFile(io, &amp;manifest_file_path, .{
+<a id="L515"></a>                .read = true,
+<a id="L516"></a>                .truncate = false,
+<a id="L517"></a>                .lock = .exclusive,
+<a id="L518"></a>                .lock_nonblocking = self.want_shared_lock,
+<a id="L519"></a>            })) |manifest_file| {
+<a id="L520"></a>                self.manifest_file = manifest_file;
+<a id="L521"></a>                self.have_exclusive_lock = true;
+<a id="L522"></a>                break;
+<a id="L523"></a>            } else |err| switch (err) {
+<a id="L524"></a>                error.WouldBlock =&gt; {
+<a id="L525"></a>                    self.manifest_file = self.cache.manifest_dir.openFile(io, &amp;manifest_file_path, .{
+<a id="L526"></a>                        .mode = .read_write,
+<a id="L527"></a>                        .lock = .shared,
+<a id="L528"></a>                    }) catch |e| {
+<a id="L529"></a>                        self.diagnostic = .{ .manifest_create = e };
+<a id="L530"></a>                        return error.CacheCheckFailed;
+<a id="L531"></a>                    };
+<a id="L532"></a>                    break;
+<a id="L533"></a>                },
+<a id="L534"></a>                error.FileNotFound =&gt; {
+<a id="L535"></a>                    // There are no dir components, so the only possibility
+<a id="L536"></a>                    // should be that the directory behind the handle has been
+<a id="L537"></a>                    // deleted, however we have observed on macOS two processes
+<a id="L538"></a>                    // racing to do openat() with O_CREAT manifest in ENOENT.
+<a id="L539"></a>                    //
+<a id="L540"></a>                    // As a workaround, we retry with exclusive=true which
+<a id="L541"></a>                    // disambiguates by returning EEXIST, indicating original
+<a id="L542"></a>                    // failure was a race, or ENOENT, indicating deletion of
+<a id="L543"></a>                    // the directory of our open handle.
+<a id="L544"></a>                    if (!builtin.os.tag.isDarwin()) {
+<a id="L545"></a>                        self.diagnostic = .{ .manifest_create = error.FileNotFound };
+<a id="L546"></a>                        return error.CacheCheckFailed;
+<a id="L547"></a>                    }
+<a id="L548"></a>
+<a id="L549"></a>                    if (self.cache.manifest_dir.createFile(io, &amp;manifest_file_path, .{
+<a id="L550"></a>                        .read = true,
+<a id="L551"></a>                        .truncate = false,
+<a id="L552"></a>                        .lock = .exclusive,
+<a id="L553"></a>                        .lock_nonblocking = self.want_shared_lock,
+<a id="L554"></a>                        .exclusive = true,
+<a id="L555"></a>                    })) |manifest_file| {
+<a id="L556"></a>                        self.manifest_file = manifest_file;
+<a id="L557"></a>                        self.have_exclusive_lock = true;
+<a id="L558"></a>                        break;
+<a id="L559"></a>                    } else |excl_err| switch (excl_err) {
+<a id="L560"></a>                        error.WouldBlock, error.PathAlreadyExists =&gt; continue,
+<a id="L561"></a>                        error.FileNotFound =&gt; {
+<a id="L562"></a>                            self.diagnostic = .{ .manifest_create = error.FileNotFound };
+<a id="L563"></a>                            return error.CacheCheckFailed;
+<a id="L564"></a>                        },
+<a id="L565"></a>                        error.Canceled =&gt; return error.Canceled,
+<a id="L566"></a>                        else =&gt; |e| {
+<a id="L567"></a>                            self.diagnostic = .{ .manifest_create = e };
+<a id="L568"></a>                            return error.CacheCheckFailed;
+<a id="L569"></a>                        },
+<a id="L570"></a>                    }
+<a id="L571"></a>                },
+<a id="L572"></a>                error.Canceled =&gt; return error.Canceled,
+<a id="L573"></a>                else =&gt; |e| {
+<a id="L574"></a>                    self.diagnostic = .{ .manifest_create = e };
+<a id="L575"></a>                    return error.CacheCheckFailed;
+<a id="L576"></a>                },
+<a id="L577"></a>            }
+<a id="L578"></a>        }
+<a id="L579"></a>
+<a id="L580"></a>        self.want_refresh_timestamp = true;
+<a id="L581"></a>
+<a id="L582"></a>        const input_file_count = self.files.entries.len;
+<a id="L583"></a>
+<a id="L584"></a>        // We're going to construct a second hash. Its input will begin with the digest we've
+<a id="L585"></a>        // already computed (`bin_digest`), and then it'll have the digests of each input file,
+<a id="L586"></a>        // including "post" files (see `addFilePost`). If this is a hit, we learn the set of "post"
+<a id="L587"></a>        // files from the manifest on disk. If this is a miss, we'll learn those from future calls
+<a id="L588"></a>        // to `addFilePost` etc. As such, the state of `self.hash.hasher` after this function
+<a id="L589"></a>        // depends on whether this is a hit or a miss.
+<a id="L590"></a>        //
+<a id="L591"></a>        // If we return `true` indicating a cache hit, then `self.hash.hasher` must already include
+<a id="L592"></a>        // the digests of the "post" files, so the caller can call `final`. Otherwise, on a cache
+<a id="L593"></a>        // miss, `self.hash.hasher` will include the digests of all non-"post" files -- that is,
+<a id="L594"></a>        // the ones we've already been told about. The rest will be discovered through calls to
+<a id="L595"></a>        // `addFilePost` etc, which will update the hasher. After all files are added, the user can
+<a id="L596"></a>        // use `final`, and will at some point `writeManifest` the file list to disk.
+<a id="L597"></a>
+<a id="L598"></a>        self.hash.hasher = hasher_init;
+<a id="L599"></a>        self.hash.hasher.update(&amp;bin_digest);
+<a id="L600"></a>
+<a id="L601"></a>        hit: {
+<a id="L602"></a>            const file_digests_populated: usize = digests: {
+<a id="L603"></a>                switch (try self.hitWithCurrentLock()) {
+<a id="L604"></a>                    .hit =&gt; break :hit,
+<a id="L605"></a>                    .miss =&gt; |m| if (!try self.upgradeToExclusiveLock()) {
+<a id="L606"></a>                        break :digests m.file_digests_populated;
+<a id="L607"></a>                    },
+<a id="L608"></a>                }
+<a id="L609"></a>                // We've just had a miss with the shared lock, and upgraded to an exclusive lock. Someone
+<a id="L610"></a>                // else might have modified the digest, so we need to check again before deciding to miss.
+<a id="L611"></a>                // Before trying again, we must reset `self.hash.hasher` and `self.files`.
+<a id="L612"></a>                // This is basically just the first half of `unhit`.
+<a id="L613"></a>                self.hash.hasher = hasher_init;
+<a id="L614"></a>                self.hash.hasher.update(&amp;bin_digest);
+<a id="L615"></a>                while (self.files.count() != input_file_count) {
+<a id="L616"></a>                    var file = self.files.pop().?;
+<a id="L617"></a>                    file.key.deinit(self.cache.gpa);
+<a id="L618"></a>                }
+<a id="L619"></a>                switch (try self.hitWithCurrentLock()) {
+<a id="L620"></a>                    .hit =&gt; break :hit,
+<a id="L621"></a>                    .miss =&gt; |m| break :digests m.file_digests_populated,
+<a id="L622"></a>                }
+<a id="L623"></a>            };
+<a id="L624"></a>
+<a id="L625"></a>            // This is a guaranteed cache miss. We're almost ready to return `false`, but there's a
+<a id="L626"></a>            // little bookkeeping to do first. The first `file_digests_populated` entries in `files`
+<a id="L627"></a>            // have their `bin_digest` populated; there may be some left in `input_file_count` which
+<a id="L628"></a>            // we'll need to populate ourselves. Other than that, this is basically `unhit`.
+<a id="L629"></a>            self.manifest_dirty = true;
+<a id="L630"></a>            self.hash.hasher = hasher_init;
+<a id="L631"></a>            self.hash.hasher.update(&amp;bin_digest);
+<a id="L632"></a>            while (self.files.count() != input_file_count) {
+<a id="L633"></a>                var file = self.files.pop().?;
+<a id="L634"></a>                file.key.deinit(self.cache.gpa);
+<a id="L635"></a>            }
+<a id="L636"></a>            for (self.files.keys(), 0..) |*file, idx| {
+<a id="L637"></a>                if (idx &lt; file_digests_populated) {
+<a id="L638"></a>                    // `bin_digest` is already populated by `hitWithCurrentLock`, so we can use it directly.
+<a id="L639"></a>                    self.hash.hasher.update(&amp;file.bin_digest);
+<a id="L640"></a>                } else {
+<a id="L641"></a>                    self.populateFileHash(file) catch |err| {
+<a id="L642"></a>                        self.diagnostic = .{ .file_hash = .{
+<a id="L643"></a>                            .file_index = idx,
+<a id="L644"></a>                            .err = err,
+<a id="L645"></a>                        } };
+<a id="L646"></a>                        return error.CacheCheckFailed;
+<a id="L647"></a>                    };
+<a id="L648"></a>                }
+<a id="L649"></a>            }
+<a id="L650"></a>            return false;
+<a id="L651"></a>        }
+<a id="L652"></a>
+<a id="L653"></a>        if (self.want_shared_lock) {
+<a id="L654"></a>            self.downgradeToSharedLock() catch |err| {
+<a id="L655"></a>                self.diagnostic = .{ .manifest_lock = err };
+<a id="L656"></a>                return error.CacheCheckFailed;
+<a id="L657"></a>            };
+<a id="L658"></a>        }
+<a id="L659"></a>
+<a id="L660"></a>        return true;
+<a id="L661"></a>    }
+<a id="L662"></a>
+<a id="L663"></a>    /// Assumes that `self.hash.hasher` has been updated only with the original digest and that
+<a id="L664"></a>    /// `self.files` contains only the original input files.
+<a id="L665"></a>    fn hitWithCurrentLock(self: *Manifest) HitError!union(enum) {
+<a id="L666"></a>        hit,
+<a id="L667"></a>        miss: struct {
+<a id="L668"></a>            file_digests_populated: usize,
+<a id="L669"></a>        },
+<a id="L670"></a>    } {
+<a id="L671"></a>        const gpa = self.cache.gpa;
+<a id="L672"></a>        const io = self.cache.io;
+<a id="L673"></a>        const input_file_count = self.files.entries.len;
+<a id="L674"></a>        var tiny_buffer: [1]u8 = undefined; // allows allocRemaining to detect limit exceeded
+<a id="L675"></a>        var manifest_reader = self.manifest_file.?.reader(io, &amp;tiny_buffer); // Reads positionally from zero.
+<a id="L676"></a>        const limit: std.Io.Limit = .limited(manifest_file_size_max);
+<a id="L677"></a>        const file_contents = manifest_reader.interface.allocRemaining(gpa, limit) catch |err| switch (err) {
+<a id="L678"></a>            error.OutOfMemory =&gt; return error.OutOfMemory,
+<a id="L679"></a>            error.StreamTooLong =&gt; return error.OutOfMemory,
+<a id="L680"></a>            error.ReadFailed =&gt; {
+<a id="L681"></a>                self.diagnostic = .{ .manifest_read = manifest_reader.err.? };
+<a id="L682"></a>                return error.CacheCheckFailed;
+<a id="L683"></a>            },
+<a id="L684"></a>        };
+<a id="L685"></a>        defer gpa.free(file_contents);
+<a id="L686"></a>
+<a id="L687"></a>        var any_file_changed = false;
+<a id="L688"></a>        var line_iter = mem.tokenizeScalar(u8, file_contents, '\n');
+<a id="L689"></a>        var idx: usize = 0;
+<a id="L690"></a>        const header_valid = valid: {
+<a id="L691"></a>            const line = line_iter.next() orelse break :valid false;
+<a id="L692"></a>            break :valid std.mem.eql(u8, line, manifest_header);
+<a id="L693"></a>        };
+<a id="L694"></a>        if (!header_valid) {
+<a id="L695"></a>            return .{ .miss = .{ .file_digests_populated = 0 } };
+<a id="L696"></a>        }
+<a id="L697"></a>        while (line_iter.next()) |line| {
+<a id="L698"></a>            defer idx += 1;
+<a id="L699"></a>
+<a id="L700"></a>            var iter = mem.tokenizeScalar(u8, line, ' ');
+<a id="L701"></a>            const size = iter.next() orelse return error.InvalidFormat;
+<a id="L702"></a>            const inode = iter.next() orelse return error.InvalidFormat;
+<a id="L703"></a>            const mtime_nsec_str = iter.next() orelse return error.InvalidFormat;
+<a id="L704"></a>            const digest_str = iter.next() orelse return error.InvalidFormat;
+<a id="L705"></a>            const prefix_str = iter.next() orelse return error.InvalidFormat;
+<a id="L706"></a>            const file_path = iter.rest();
+<a id="L707"></a>
+<a id="L708"></a>            const stat_size = fmt.parseInt(u64, size, 10) catch return error.InvalidFormat;
+<a id="L709"></a>            const stat_inode = fmt.parseInt(Io.File.INode, inode, 10) catch return error.InvalidFormat;
+<a id="L710"></a>            const stat_mtime = fmt.parseInt(i64, mtime_nsec_str, 10) catch return error.InvalidFormat;
+<a id="L711"></a>            const file_bin_digest = b: {
+<a id="L712"></a>                if (digest_str.len != hex_digest_len) return error.InvalidFormat;
+<a id="L713"></a>                var bd: BinDigest = undefined;
+<a id="L714"></a>                _ = fmt.hexToBytes(&amp;bd, digest_str) catch return error.InvalidFormat;
+<a id="L715"></a>                break :b bd;
+<a id="L716"></a>            };
+<a id="L717"></a>
+<a id="L718"></a>            const prefix = fmt.parseInt(u8, prefix_str, 10) catch return error.InvalidFormat;
+<a id="L719"></a>            if (prefix &gt;= self.cache.prefixes_len) return error.InvalidFormat;
+<a id="L720"></a>
+<a id="L721"></a>            if (file_path.len == 0) return error.InvalidFormat;
+<a id="L722"></a>
+<a id="L723"></a>            const cache_hash_file = f: {
+<a id="L724"></a>                const prefixed_path: PrefixedPath = .{
+<a id="L725"></a>                    .prefix = prefix,
+<a id="L726"></a>                    .sub_path = file_path, // expires with file_contents
+<a id="L727"></a>                };
+<a id="L728"></a>                if (idx &lt; input_file_count) {
+<a id="L729"></a>                    const file = &amp;self.files.keys()[idx];
+<a id="L730"></a>                    if (!file.prefixed_path.eql(prefixed_path))
+<a id="L731"></a>                        return error.InvalidFormat;
+<a id="L732"></a>
+<a id="L733"></a>                    file.stat = .{
+<a id="L734"></a>                        .size = stat_size,
+<a id="L735"></a>                        .inode = stat_inode,
+<a id="L736"></a>                        .mtime = .{ .nanoseconds = stat_mtime },
+<a id="L737"></a>                    };
+<a id="L738"></a>                    file.bin_digest = file_bin_digest;
+<a id="L739"></a>                    break :f file;
+<a id="L740"></a>                }
+<a id="L741"></a>                const gop = try self.files.getOrPutAdapted(gpa, prefixed_path, FilesAdapter{});
+<a id="L742"></a>                errdefer _ = self.files.pop();
+<a id="L743"></a>                if (!gop.found_existing) {
+<a id="L744"></a>                    gop.key_ptr.* = .{
+<a id="L745"></a>                        .prefixed_path = .{
+<a id="L746"></a>                            .prefix = prefix,
+<a id="L747"></a>                            .sub_path = try gpa.dupe(u8, file_path),
+<a id="L748"></a>                        },
+<a id="L749"></a>                        .contents = null,
+<a id="L750"></a>                        .max_file_size = null,
+<a id="L751"></a>                        .handle = null,
+<a id="L752"></a>                        .stat = .{
+<a id="L753"></a>                            .size = stat_size,
+<a id="L754"></a>                            .inode = stat_inode,
+<a id="L755"></a>                            .mtime = .{ .nanoseconds = stat_mtime },
+<a id="L756"></a>                        },
+<a id="L757"></a>                        .bin_digest = file_bin_digest,
+<a id="L758"></a>                    };
+<a id="L759"></a>                }
+<a id="L760"></a>                break :f gop.key_ptr;
+<a id="L761"></a>            };
+<a id="L762"></a>
+<a id="L763"></a>            const pp = cache_hash_file.prefixed_path;
+<a id="L764"></a>            const dir = self.cache.prefixes()[pp.prefix].handle;
+<a id="L765"></a>            const this_file = dir.openFile(io, pp.sub_path, .{ .mode = .read_only }) catch |err| switch (err) {
+<a id="L766"></a>                error.FileNotFound =&gt; {
+<a id="L767"></a>                    // Every digest before this one has been populated successfully.
+<a id="L768"></a>                    return .{ .miss = .{ .file_digests_populated = idx } };
+<a id="L769"></a>                },
+<a id="L770"></a>                error.Canceled =&gt; return error.Canceled,
+<a id="L771"></a>                else =&gt; |e| {
+<a id="L772"></a>                    self.diagnostic = .{ .file_open = .{
+<a id="L773"></a>                        .file_index = idx,
+<a id="L774"></a>                        .err = e,
+<a id="L775"></a>                    } };
+<a id="L776"></a>                    return error.CacheCheckFailed;
+<a id="L777"></a>                },
+<a id="L778"></a>            };
+<a id="L779"></a>            defer this_file.close(io);
+<a id="L780"></a>
+<a id="L781"></a>            const actual_stat = this_file.stat(io) catch |err| {
+<a id="L782"></a>                self.diagnostic = .{ .file_stat = .{
+<a id="L783"></a>                    .file_index = idx,
+<a id="L784"></a>                    .err = err,
+<a id="L785"></a>                } };
+<a id="L786"></a>                return error.CacheCheckFailed;
+<a id="L787"></a>            };
+<a id="L788"></a>            const size_match = actual_stat.size == cache_hash_file.stat.size;
+<a id="L789"></a>            const mtime_match = actual_stat.mtime.nanoseconds == cache_hash_file.stat.mtime.nanoseconds;
+<a id="L790"></a>            const inode_match = actual_stat.inode == cache_hash_file.stat.inode;
+<a id="L791"></a>
+<a id="L792"></a>            if (!size_match or !mtime_match or !inode_match) {
+<a id="L793"></a>                cache_hash_file.stat = .{
+<a id="L794"></a>                    .size = actual_stat.size,
+<a id="L795"></a>                    .mtime = actual_stat.mtime,
+<a id="L796"></a>                    .inode = actual_stat.inode,
+<a id="L797"></a>                };
+<a id="L798"></a>
+<a id="L799"></a>                if (try self.isProblematicTimestamp(cache_hash_file.stat.mtime)) {
+<a id="L800"></a>                    // The actual file has an unreliable timestamp, force it to be hashed
+<a id="L801"></a>                    cache_hash_file.stat.mtime = .zero;
+<a id="L802"></a>                    cache_hash_file.stat.inode = 0;
+<a id="L803"></a>                }
+<a id="L804"></a>
+<a id="L805"></a>                var actual_digest: BinDigest = undefined;
+<a id="L806"></a>                hashFile(io, this_file, &amp;actual_digest) catch |err| {
+<a id="L807"></a>                    self.diagnostic = .{ .file_read = .{
+<a id="L808"></a>                        .file_index = idx,
+<a id="L809"></a>                        .err = err,
+<a id="L810"></a>                    } };
+<a id="L811"></a>                    return error.CacheCheckFailed;
+<a id="L812"></a>                };
+<a id="L813"></a>
+<a id="L814"></a>                if (!mem.eql(u8, &amp;cache_hash_file.bin_digest, &amp;actual_digest)) {
+<a id="L815"></a>                    cache_hash_file.bin_digest = actual_digest;
+<a id="L816"></a>                    // keep going until we have the input file digests
+<a id="L817"></a>                    any_file_changed = true;
+<a id="L818"></a>                }
+<a id="L819"></a>            }
+<a id="L820"></a>
+<a id="L821"></a>            if (!any_file_changed) {
+<a id="L822"></a>                self.hash.hasher.update(&amp;cache_hash_file.bin_digest);
+<a id="L823"></a>            }
+<a id="L824"></a>        }
+<a id="L825"></a>
+<a id="L826"></a>        // If the manifest was somehow missing one of our input files, or if any file hash has changed,
+<a id="L827"></a>        // then this is a cache miss. However, we have successfully populated some or all of the file
+<a id="L828"></a>        // digests.
+<a id="L829"></a>        if (any_file_changed or idx &lt; input_file_count) {
+<a id="L830"></a>            return .{ .miss = .{ .file_digests_populated = idx } };
+<a id="L831"></a>        }
+<a id="L832"></a>
+<a id="L833"></a>        return .hit;
+<a id="L834"></a>    }
+<a id="L835"></a>
+<a id="L836"></a>    /// Reset `self.hash.hasher` to the state it should be in after `hit` returns `false`.
+<a id="L837"></a>    /// The hasher contains the original input digest, and all original input file digests (i.e.
+<a id="L838"></a>    /// not including post files).
+<a id="L839"></a>    /// Assumes that `bin_digest` is populated for all files up to `input_file_count`. As such,
+<a id="L840"></a>    /// this is not necessarily safe to call within `hit`.
+<a id="L841"></a>    pub fn unhit(self: *Manifest, bin_digest: BinDigest, input_file_count: usize) void {
+<a id="L842"></a>        // Reset the hash.
+<a id="L843"></a>        self.hash.hasher = hasher_init;
+<a id="L844"></a>        self.hash.hasher.update(&amp;bin_digest);
+<a id="L845"></a>
+<a id="L846"></a>        // Remove files not in the initial hash.
+<a id="L847"></a>        while (self.files.count() != input_file_count) {
+<a id="L848"></a>            var file = self.files.pop().?;
+<a id="L849"></a>            file.key.deinit(self.cache.gpa);
+<a id="L850"></a>        }
+<a id="L851"></a>
+<a id="L852"></a>        for (self.files.keys()) |file| {
+<a id="L853"></a>            self.hash.hasher.update(&amp;file.bin_digest);
+<a id="L854"></a>        }
+<a id="L855"></a>    }
+<a id="L856"></a>
+<a id="L857"></a>    fn isProblematicTimestamp(man: *Manifest, timestamp: Io.Timestamp) error{Canceled}!bool {
+<a id="L858"></a>        const io = man.cache.io;
+<a id="L859"></a>
+<a id="L860"></a>        // If the file_time is prior to the most recent problematic timestamp
+<a id="L861"></a>        // then we don't need to access the filesystem.
+<a id="L862"></a>        if (timestamp.nanoseconds &lt; man.recent_problematic_timestamp.nanoseconds)
+<a id="L863"></a>            return false;
+<a id="L864"></a>
+<a id="L865"></a>        // Next we will check the globally shared Cache timestamp, which is accessed
+<a id="L866"></a>        // from multiple threads.
+<a id="L867"></a>        try man.cache.mutex.lock(io);
+<a id="L868"></a>        defer man.cache.mutex.unlock(io);
+<a id="L869"></a>
+<a id="L870"></a>        // Save the global one to our local one to avoid locking next time.
+<a id="L871"></a>        man.recent_problematic_timestamp = man.cache.recent_problematic_timestamp;
+<a id="L872"></a>        if (timestamp.nanoseconds &lt; man.recent_problematic_timestamp.nanoseconds)
+<a id="L873"></a>            return false;
+<a id="L874"></a>
+<a id="L875"></a>        // This flag prevents multiple filesystem writes for the same hit() call.
+<a id="L876"></a>        if (man.want_refresh_timestamp) {
+<a id="L877"></a>            man.want_refresh_timestamp = false;
+<a id="L878"></a>
+<a id="L879"></a>            var file = man.cache.manifest_dir.createFile(io, "timestamp", .{
+<a id="L880"></a>                .read = true,
+<a id="L881"></a>                .truncate = true,
+<a id="L882"></a>            }) catch |err| switch (err) {
+<a id="L883"></a>                error.Canceled =&gt; return error.Canceled,
+<a id="L884"></a>                else =&gt; return true,
+<a id="L885"></a>            };
+<a id="L886"></a>            defer file.close(io);
+<a id="L887"></a>
+<a id="L888"></a>            // Save locally and also save globally (we still hold the global lock).
+<a id="L889"></a>            const stat = file.stat(io) catch |err| switch (err) {
+<a id="L890"></a>                error.Canceled =&gt; return error.Canceled,
+<a id="L891"></a>                else =&gt; return true,
+<a id="L892"></a>            };
+<a id="L893"></a>            man.recent_problematic_timestamp = stat.mtime;
+<a id="L894"></a>            man.cache.recent_problematic_timestamp = man.recent_problematic_timestamp;
+<a id="L895"></a>        }
+<a id="L896"></a>
+<a id="L897"></a>        return timestamp.nanoseconds &gt;= man.recent_problematic_timestamp.nanoseconds;
+<a id="L898"></a>    }
+<a id="L899"></a>
+<a id="L900"></a>    fn populateFileHash(self: *Manifest, ch_file: *File) !void {
+<a id="L901"></a>        const io = self.cache.io;
+<a id="L902"></a>
+<a id="L903"></a>        if (ch_file.handle) |handle| {
+<a id="L904"></a>            return populateFileHashHandle(self, ch_file, handle);
+<a id="L905"></a>        } else {
+<a id="L906"></a>            const pp = ch_file.prefixed_path;
+<a id="L907"></a>            const dir = self.cache.prefixes()[pp.prefix].handle;
+<a id="L908"></a>            const handle = try dir.openFile(io, pp.sub_path, .{});
+<a id="L909"></a>            defer handle.close(io);
+<a id="L910"></a>            return populateFileHashHandle(self, ch_file, handle);
+<a id="L911"></a>        }
+<a id="L912"></a>    }
+<a id="L913"></a>
+<a id="L914"></a>    fn populateFileHashHandle(self: *Manifest, ch_file: *File, io_file: Io.File) !void {
+<a id="L915"></a>        const io = self.cache.io;
+<a id="L916"></a>        const gpa = self.cache.gpa;
+<a id="L917"></a>
+<a id="L918"></a>        const actual_stat = try io_file.stat(io);
+<a id="L919"></a>        ch_file.stat = .{
+<a id="L920"></a>            .size = actual_stat.size,
+<a id="L921"></a>            .mtime = actual_stat.mtime,
+<a id="L922"></a>            .inode = actual_stat.inode,
+<a id="L923"></a>        };
+<a id="L924"></a>
+<a id="L925"></a>        if (try self.isProblematicTimestamp(ch_file.stat.mtime)) {
+<a id="L926"></a>            // The actual file has an unreliable timestamp, force it to be hashed
+<a id="L927"></a>            ch_file.stat.mtime = .zero;
+<a id="L928"></a>            ch_file.stat.inode = 0;
+<a id="L929"></a>        }
+<a id="L930"></a>
+<a id="L931"></a>        if (ch_file.max_file_size) |max_file_size| {
+<a id="L932"></a>            if (ch_file.stat.size &gt; max_file_size) return error.FileTooBig;
+<a id="L933"></a>
+<a id="L934"></a>            // Hash while reading from disk, to keep the contents in the cpu
+<a id="L935"></a>            // cache while doing hashing.
+<a id="L936"></a>            const contents = try gpa.alloc(u8, @intCast(ch_file.stat.size));
+<a id="L937"></a>            errdefer gpa.free(contents);
+<a id="L938"></a>
+<a id="L939"></a>            var hasher = hasher_init;
+<a id="L940"></a>            var off: usize = 0;
+<a id="L941"></a>            while (true) {
+<a id="L942"></a>                const bytes_read = try io_file.readPositional(io, &amp;.{contents[off..]}, off);
+<a id="L943"></a>                if (bytes_read == 0) break;
+<a id="L944"></a>                hasher.update(contents[off..][0..bytes_read]);
+<a id="L945"></a>                off += bytes_read;
+<a id="L946"></a>            }
+<a id="L947"></a>            hasher.final(&amp;ch_file.bin_digest);
+<a id="L948"></a>
+<a id="L949"></a>            ch_file.contents = contents;
+<a id="L950"></a>        } else {
+<a id="L951"></a>            try hashFile(io, io_file, &amp;ch_file.bin_digest);
+<a id="L952"></a>        }
+<a id="L953"></a>
+<a id="L954"></a>        self.hash.hasher.update(&amp;ch_file.bin_digest);
+<a id="L955"></a>    }
+<a id="L956"></a>
+<a id="L957"></a>    /// Add a file as a dependency of process being cached, after the initial hash has been
+<a id="L958"></a>    /// calculated. This is useful for processes that don't know all the files that
+<a id="L959"></a>    /// are depended on ahead of time. For example, a source file that can import other files
+<a id="L960"></a>    /// will need to be recompiled if the imported file is changed.
+<a id="L961"></a>    pub fn addFilePostFetch(self: *Manifest, file_path: []const u8, max_file_size: usize) ![]const u8 {
+<a id="L962"></a>        assert(self.manifest_file != null);
+<a id="L963"></a>
+<a id="L964"></a>        const gpa = self.cache.gpa;
+<a id="L965"></a>        const prefixed_path = try self.cache.findPrefix(file_path);
+<a id="L966"></a>        errdefer gpa.free(prefixed_path.sub_path);
+<a id="L967"></a>
+<a id="L968"></a>        const gop = try self.files.getOrPutAdapted(gpa, prefixed_path, FilesAdapter{});
+<a id="L969"></a>        errdefer _ = self.files.pop();
+<a id="L970"></a>
+<a id="L971"></a>        if (gop.found_existing) {
+<a id="L972"></a>            gpa.free(prefixed_path.sub_path);
+<a id="L973"></a>            return gop.key_ptr.contents.?;
+<a id="L974"></a>        }
+<a id="L975"></a>
+<a id="L976"></a>        gop.key_ptr.* = .{
+<a id="L977"></a>            .prefixed_path = prefixed_path,
+<a id="L978"></a>            .max_file_size = max_file_size,
+<a id="L979"></a>            .stat = undefined,
+<a id="L980"></a>            .bin_digest = undefined,
+<a id="L981"></a>            .contents = null,
+<a id="L982"></a>        };
+<a id="L983"></a>
+<a id="L984"></a>        self.files.lockPointers();
+<a id="L985"></a>        defer self.files.unlockPointers();
+<a id="L986"></a>
+<a id="L987"></a>        try self.populateFileHash(gop.key_ptr);
+<a id="L988"></a>        return gop.key_ptr.contents.?;
+<a id="L989"></a>    }
+<a id="L990"></a>
+<a id="L991"></a>    /// Add a file as a dependency of process being cached, after the initial hash has been
+<a id="L992"></a>    /// calculated.
+<a id="L993"></a>    ///
+<a id="L994"></a>    /// This is useful for processes that don't know the all the files that are
+<a id="L995"></a>    /// depended on ahead of time. For example, a source file that can import
+<a id="L996"></a>    /// other files will need to be recompiled if the imported file is changed.
+<a id="L997"></a>    pub fn addFilePost(self: *Manifest, file_path: []const u8) !void {
+<a id="L998"></a>        assert(self.manifest_file != null);
+<a id="L999"></a>
+<a id="L1000"></a>        const gpa = self.cache.gpa;
+<a id="L1001"></a>        const prefixed_path = try self.cache.findPrefix(file_path);
+<a id="L1002"></a>        errdefer gpa.free(prefixed_path.sub_path);
+<a id="L1003"></a>
+<a id="L1004"></a>        const gop = try self.files.getOrPutAdapted(gpa, prefixed_path, FilesAdapter{});
+<a id="L1005"></a>        errdefer _ = self.files.pop();
+<a id="L1006"></a>
+<a id="L1007"></a>        if (gop.found_existing) {
+<a id="L1008"></a>            gpa.free(prefixed_path.sub_path);
+<a id="L1009"></a>            return;
+<a id="L1010"></a>        }
+<a id="L1011"></a>
+<a id="L1012"></a>        gop.key_ptr.* = .{
+<a id="L1013"></a>            .prefixed_path = prefixed_path,
+<a id="L1014"></a>            .max_file_size = null,
+<a id="L1015"></a>            .handle = null,
+<a id="L1016"></a>            .stat = undefined,
+<a id="L1017"></a>            .bin_digest = undefined,
+<a id="L1018"></a>            .contents = null,
+<a id="L1019"></a>        };
+<a id="L1020"></a>
+<a id="L1021"></a>        self.files.lockPointers();
+<a id="L1022"></a>        defer self.files.unlockPointers();
+<a id="L1023"></a>
+<a id="L1024"></a>        try self.populateFileHash(gop.key_ptr);
+<a id="L1025"></a>    }
+<a id="L1026"></a>
+<a id="L1027"></a>    /// Like `addFilePost` but when the file contents have already been loaded from disk.
+<a id="L1028"></a>    pub fn addFilePostContents(
+<a id="L1029"></a>        self: *Manifest,
+<a id="L1030"></a>        file_path: []const u8,
+<a id="L1031"></a>        bytes: []const u8,
+<a id="L1032"></a>        stat: File.Stat,
+<a id="L1033"></a>    ) !void {
+<a id="L1034"></a>        assert(self.manifest_file != null);
+<a id="L1035"></a>        const gpa = self.cache.gpa;
+<a id="L1036"></a>
+<a id="L1037"></a>        const prefixed_path = try self.cache.findPrefix(file_path);
+<a id="L1038"></a>        errdefer gpa.free(prefixed_path.sub_path);
+<a id="L1039"></a>
+<a id="L1040"></a>        const gop = try self.files.getOrPutAdapted(gpa, prefixed_path, FilesAdapter{});
+<a id="L1041"></a>        errdefer _ = self.files.pop();
+<a id="L1042"></a>
+<a id="L1043"></a>        if (gop.found_existing) {
+<a id="L1044"></a>            gpa.free(prefixed_path.sub_path);
+<a id="L1045"></a>            return;
+<a id="L1046"></a>        }
+<a id="L1047"></a>
+<a id="L1048"></a>        const new_file = gop.key_ptr;
+<a id="L1049"></a>
+<a id="L1050"></a>        new_file.* = .{
+<a id="L1051"></a>            .prefixed_path = prefixed_path,
+<a id="L1052"></a>            .max_file_size = null,
+<a id="L1053"></a>            .handle = null,
+<a id="L1054"></a>            .stat = stat,
+<a id="L1055"></a>            .bin_digest = undefined,
+<a id="L1056"></a>            .contents = null,
+<a id="L1057"></a>        };
+<a id="L1058"></a>
+<a id="L1059"></a>        if (try self.isProblematicTimestamp(new_file.stat.mtime)) {
+<a id="L1060"></a>            // The actual file has an unreliable timestamp, force it to be hashed
+<a id="L1061"></a>            new_file.stat.mtime = .zero;
+<a id="L1062"></a>            new_file.stat.inode = 0;
+<a id="L1063"></a>        }
+<a id="L1064"></a>
+<a id="L1065"></a>        {
+<a id="L1066"></a>            var hasher = hasher_init;
+<a id="L1067"></a>            hasher.update(bytes);
+<a id="L1068"></a>            hasher.final(&amp;new_file.bin_digest);
+<a id="L1069"></a>        }
+<a id="L1070"></a>
+<a id="L1071"></a>        self.hash.hasher.update(&amp;new_file.bin_digest);
+<a id="L1072"></a>    }
+<a id="L1073"></a>
+<a id="L1074"></a>    pub fn addDepFilePost(self: *Manifest, dir: Io.Dir, dep_file_sub_path: []const u8) !void {
+<a id="L1075"></a>        assert(self.manifest_file != null);
+<a id="L1076"></a>        return self.addDepFileMaybePost(dir, dep_file_sub_path);
+<a id="L1077"></a>    }
+<a id="L1078"></a>
+<a id="L1079"></a>    fn addDepFileMaybePost(self: *Manifest, dir: Io.Dir, dep_file_sub_path: []const u8) !void {
+<a id="L1080"></a>        const gpa = self.cache.gpa;
+<a id="L1081"></a>        const io = self.cache.io;
+<a id="L1082"></a>        const dep_file_contents = try dir.readFileAlloc(io, dep_file_sub_path, gpa, .limited(manifest_file_size_max));
+<a id="L1083"></a>        defer gpa.free(dep_file_contents);
+<a id="L1084"></a>
+<a id="L1085"></a>        var error_buf: std.ArrayList(u8) = .empty;
+<a id="L1086"></a>        defer error_buf.deinit(gpa);
+<a id="L1087"></a>
+<a id="L1088"></a>        var resolve_buf: std.ArrayList(u8) = .empty;
+<a id="L1089"></a>        defer resolve_buf.deinit(gpa);
+<a id="L1090"></a>
+<a id="L1091"></a>        var it: DepTokenizer = .{ .bytes = dep_file_contents };
+<a id="L1092"></a>        while (it.next()) |token| {
+<a id="L1093"></a>            switch (token) {
+<a id="L1094"></a>                // We don't care about targets, we only want the prereqs
+<a id="L1095"></a>                // Clang is invoked in single-source mode but other programs may not
+<a id="L1096"></a>                .target, .target_must_resolve =&gt; {},
+<a id="L1097"></a>                .prereq =&gt; |file_path| if (self.manifest_file == null) {
+<a id="L1098"></a>                    _ = try self.addFile(file_path, null);
+<a id="L1099"></a>                } else try self.addFilePost(file_path),
+<a id="L1100"></a>                .prereq_must_resolve =&gt; {
+<a id="L1101"></a>                    resolve_buf.clearRetainingCapacity();
+<a id="L1102"></a>                    try token.resolve(gpa, &amp;resolve_buf);
+<a id="L1103"></a>                    if (self.manifest_file == null) {
+<a id="L1104"></a>                        _ = try self.addFile(resolve_buf.items, null);
+<a id="L1105"></a>                    } else try self.addFilePost(resolve_buf.items);
+<a id="L1106"></a>                },
+<a id="L1107"></a>                else =&gt; |err| {
+<a id="L1108"></a>                    try err.printError(gpa, &amp;error_buf);
+<a id="L1109"></a>                    log.err("failed parsing {s}: {s}", .{ dep_file_sub_path, error_buf.items });
+<a id="L1110"></a>                    return error.InvalidDepFile;
+<a id="L1111"></a>                },
+<a id="L1112"></a>            }
+<a id="L1113"></a>        }
+<a id="L1114"></a>    }
+<a id="L1115"></a>
+<a id="L1116"></a>    /// Returns a binary hash of the inputs.
+<a id="L1117"></a>    pub fn finalBin(self: *Manifest) BinDigest {
+<a id="L1118"></a>        assert(self.manifest_file != null);
+<a id="L1119"></a>
+<a id="L1120"></a>        // We don't close the manifest file yet, because we want to
+<a id="L1121"></a>        // keep it locked until the API user is done using it.
+<a id="L1122"></a>        // We also don't write out the manifest yet, because until
+<a id="L1123"></a>        // cache_release is called we still might be working on creating
+<a id="L1124"></a>        // the artifacts to cache.
+<a id="L1125"></a>
+<a id="L1126"></a>        var bin_digest: BinDigest = undefined;
+<a id="L1127"></a>        self.hash.hasher.final(&amp;bin_digest);
+<a id="L1128"></a>        return bin_digest;
+<a id="L1129"></a>    }
+<a id="L1130"></a>
+<a id="L1131"></a>    /// Returns a hex encoded hash of the inputs.
+<a id="L1132"></a>    pub fn final(self: *Manifest) HexDigest {
+<a id="L1133"></a>        const bin_digest = self.finalBin();
+<a id="L1134"></a>        return binToHex(bin_digest);
+<a id="L1135"></a>    }
+<a id="L1136"></a>
+<a id="L1137"></a>    /// If `want_shared_lock` is true, this function automatically downgrades the
+<a id="L1138"></a>    /// lock from exclusive to shared.
+<a id="L1139"></a>    pub fn writeManifest(self: *Manifest) !void {
+<a id="L1140"></a>        assert(self.have_exclusive_lock);
+<a id="L1141"></a>        const io = self.cache.io;
+<a id="L1142"></a>        const manifest_file = self.manifest_file.?;
+<a id="L1143"></a>        if (self.manifest_dirty) {
+<a id="L1144"></a>            self.manifest_dirty = false;
+<a id="L1145"></a>
+<a id="L1146"></a>            var buffer: [4000]u8 = undefined;
+<a id="L1147"></a>            var fw = manifest_file.writer(io, &amp;buffer);
+<a id="L1148"></a>            writeDirtyManifestToStream(self, &amp;fw) catch |err| switch (err) {
+<a id="L1149"></a>                error.WriteFailed =&gt; return fw.err.?,
+<a id="L1150"></a>                else =&gt; |e| return e,
+<a id="L1151"></a>            };
+<a id="L1152"></a>        }
+<a id="L1153"></a>
+<a id="L1154"></a>        if (self.want_shared_lock) {
+<a id="L1155"></a>            try self.downgradeToSharedLock();
+<a id="L1156"></a>        }
+<a id="L1157"></a>    }
+<a id="L1158"></a>
+<a id="L1159"></a>    fn writeDirtyManifestToStream(self: *Manifest, fw: *Io.File.Writer) !void {
+<a id="L1160"></a>        try fw.interface.writeAll(manifest_header ++ "\n");
+<a id="L1161"></a>        for (self.files.keys()) |file| {
+<a id="L1162"></a>            try fw.interface.print("{d} {d} {d} {x} {d} {s}\n", .{
+<a id="L1163"></a>                file.stat.size,
+<a id="L1164"></a>                file.stat.inode,
+<a id="L1165"></a>                file.stat.mtime,
+<a id="L1166"></a>                &amp;file.bin_digest,
+<a id="L1167"></a>                file.prefixed_path.prefix,
+<a id="L1168"></a>                file.prefixed_path.sub_path,
+<a id="L1169"></a>            });
+<a id="L1170"></a>        }
+<a id="L1171"></a>        try fw.end();
+<a id="L1172"></a>    }
+<a id="L1173"></a>
+<a id="L1174"></a>    fn downgradeToSharedLock(self: *Manifest) !void {
+<a id="L1175"></a>        if (!self.have_exclusive_lock) return;
+<a id="L1176"></a>        const io = self.cache.io;
+<a id="L1177"></a>
+<a id="L1178"></a>        if (std.process.can_spawn or !builtin.single_threaded) {
+<a id="L1179"></a>            const manifest_file = self.manifest_file.?;
+<a id="L1180"></a>            try manifest_file.downgradeLock(io);
+<a id="L1181"></a>        }
+<a id="L1182"></a>
+<a id="L1183"></a>        self.have_exclusive_lock = false;
+<a id="L1184"></a>    }
+<a id="L1185"></a>
+<a id="L1186"></a>    fn upgradeToExclusiveLock(self: *Manifest) error{CacheCheckFailed}!bool {
+<a id="L1187"></a>        if (self.have_exclusive_lock) return false;
+<a id="L1188"></a>        assert(self.manifest_file != null);
+<a id="L1189"></a>        const io = self.cache.io;
+<a id="L1190"></a>
+<a id="L1191"></a>        if (std.process.can_spawn or !builtin.single_threaded) {
+<a id="L1192"></a>            const manifest_file = self.manifest_file.?;
+<a id="L1193"></a>            // Here we intentionally have a period where the lock is released, in case there are
+<a id="L1194"></a>            // other processes holding a shared lock.
+<a id="L1195"></a>            manifest_file.unlock(io);
+<a id="L1196"></a>            manifest_file.lock(io, .exclusive) catch |err| {
+<a id="L1197"></a>                self.diagnostic = .{ .manifest_lock = err };
+<a id="L1198"></a>                return error.CacheCheckFailed;
+<a id="L1199"></a>            };
+<a id="L1200"></a>        }
+<a id="L1201"></a>        self.have_exclusive_lock = true;
+<a id="L1202"></a>        return true;
+<a id="L1203"></a>    }
+<a id="L1204"></a>
+<a id="L1205"></a>    /// Obtain only the data needed to maintain a lock on the manifest file.
+<a id="L1206"></a>    /// The `Manifest` remains safe to deinit.
+<a id="L1207"></a>    /// Don't forget to call `writeManifest` before this!
+<a id="L1208"></a>    pub fn toOwnedLock(self: *Manifest) Lock {
+<a id="L1209"></a>        defer self.manifest_file = null;
+<a id="L1210"></a>        return .{ .manifest_file = self.manifest_file.? };
+<a id="L1211"></a>    }
+<a id="L1212"></a>
+<a id="L1213"></a>    /// Releases the manifest file and frees any memory the Manifest was using.
+<a id="L1214"></a>    /// `Manifest.hit` must be called first.
+<a id="L1215"></a>    /// Don't forget to call `writeManifest` before this!
+<a id="L1216"></a>    pub fn deinit(self: *Manifest) void {
+<a id="L1217"></a>        const io = self.cache.io;
+<a id="L1218"></a>
+<a id="L1219"></a>        if (self.manifest_file) |file| {
+<a id="L1220"></a>            if (builtin.os.tag == .windows) {
+<a id="L1221"></a>                // See Lock.release for why this is required on Windows
+<a id="L1222"></a>                file.unlock(io);
+<a id="L1223"></a>            }
+<a id="L1224"></a>
+<a id="L1225"></a>            file.close(io);
+<a id="L1226"></a>        }
+<a id="L1227"></a>        for (self.files.keys()) |*file| {
+<a id="L1228"></a>            file.deinit(self.cache.gpa);
+<a id="L1229"></a>        }
+<a id="L1230"></a>        self.files.deinit(self.cache.gpa);
+<a id="L1231"></a>    }
+<a id="L1232"></a>
+<a id="L1233"></a>    pub fn populateFileSystemInputs(man: *Manifest, buf: *std.ArrayList(u8)) Allocator.Error!void {
+<a id="L1234"></a>        assert(@typeInfo(std.zig.Server.Message.PathPrefix).@"enum".fields.len == man.cache.prefixes_len);
+<a id="L1235"></a>        buf.clearRetainingCapacity();
+<a id="L1236"></a>        const gpa = man.cache.gpa;
+<a id="L1237"></a>        const files = man.files.keys();
+<a id="L1238"></a>        if (files.len &gt; 0) {
+<a id="L1239"></a>            for (files) |file| {
+<a id="L1240"></a>                try buf.ensureUnusedCapacity(gpa, file.prefixed_path.sub_path.len + 2);
+<a id="L1241"></a>                buf.appendAssumeCapacity(file.prefixed_path.prefix + 1);
+<a id="L1242"></a>                buf.appendSliceAssumeCapacity(file.prefixed_path.sub_path);
+<a id="L1243"></a>                buf.appendAssumeCapacity(0);
+<a id="L1244"></a>            }
+<a id="L1245"></a>            // The null byte is a separator, not a terminator.
+<a id="L1246"></a>            buf.items.len -= 1;
+<a id="L1247"></a>        }
+<a id="L1248"></a>    }
+<a id="L1249"></a>
+<a id="L1250"></a>    pub fn populateOtherManifest(man: *Manifest, other: *Manifest, prefix_map: [4]u8) Allocator.Error!void {
+<a id="L1251"></a>        const gpa = other.cache.gpa;
+<a id="L1252"></a>        assert(@typeInfo(std.zig.Server.Message.PathPrefix).@"enum".fields.len == man.cache.prefixes_len);
+<a id="L1253"></a>        assert(man.cache.prefixes_len == 4);
+<a id="L1254"></a>        for (man.files.keys()) |file| {
+<a id="L1255"></a>            const prefixed_path: PrefixedPath = .{
+<a id="L1256"></a>                .prefix = prefix_map[file.prefixed_path.prefix],
+<a id="L1257"></a>                .sub_path = try gpa.dupe(u8, file.prefixed_path.sub_path),
+<a id="L1258"></a>            };
+<a id="L1259"></a>            errdefer gpa.free(prefixed_path.sub_path);
+<a id="L1260"></a>
+<a id="L1261"></a>            const gop = try other.files.getOrPutAdapted(gpa, prefixed_path, FilesAdapter{});
+<a id="L1262"></a>            errdefer _ = other.files.pop();
+<a id="L1263"></a>
+<a id="L1264"></a>            if (gop.found_existing) {
+<a id="L1265"></a>                gpa.free(prefixed_path.sub_path);
+<a id="L1266"></a>                continue;
+<a id="L1267"></a>            }
+<a id="L1268"></a>
+<a id="L1269"></a>            gop.key_ptr.* = .{
+<a id="L1270"></a>                .prefixed_path = prefixed_path,
+<a id="L1271"></a>                .max_file_size = file.max_file_size,
+<a id="L1272"></a>                .handle = file.handle,
+<a id="L1273"></a>                .stat = file.stat,
+<a id="L1274"></a>                .bin_digest = file.bin_digest,
+<a id="L1275"></a>                .contents = null,
+<a id="L1276"></a>            };
+<a id="L1277"></a>
+<a id="L1278"></a>            other.hash.hasher.update(&amp;gop.key_ptr.bin_digest);
+<a id="L1279"></a>        }
+<a id="L1280"></a>    }
+<a id="L1281"></a>};
+<a id="L1282"></a>
+<a id="L1283"></a>fn hashFile(io: Io, file: Io.File, bin_digest: *[Hasher.mac_length]u8) Io.File.ReadPositionalError!void {
+<a id="L1284"></a>    var buffer: [2048]u8 = undefined;
+<a id="L1285"></a>    var hasher = hasher_init;
+<a id="L1286"></a>    var offset: u64 = 0;
+<a id="L1287"></a>    while (true) {
+<a id="L1288"></a>        const n = try file.readPositional(io, &amp;.{&amp;buffer}, offset);
+<a id="L1289"></a>        if (n == 0) break;
+<a id="L1290"></a>        hasher.update(buffer[0..n]);
+<a id="L1291"></a>        offset += n;
+<a id="L1292"></a>    }
+<a id="L1293"></a>    hasher.final(bin_digest);
+<a id="L1294"></a>}
+<a id="L1295"></a>
+<a id="L1296"></a>// Create/Write a file, close it, then grab its stat.mtime timestamp.
+<a id="L1297"></a>fn testGetCurrentFileTimestamp(io: Io, dir: Io.Dir) !Io.Timestamp {
+<a id="L1298"></a>    const test_out_file = "test-filetimestamp.tmp";
+<a id="L1299"></a>
+<a id="L1300"></a>    var file = try dir.createFile(io, test_out_file, .{
+<a id="L1301"></a>        .read = true,
+<a id="L1302"></a>        .truncate = true,
+<a id="L1303"></a>    });
+<a id="L1304"></a>    defer {
+<a id="L1305"></a>        file.close(io);
+<a id="L1306"></a>        dir.deleteFile(io, test_out_file) catch {};
+<a id="L1307"></a>    }
+<a id="L1308"></a>
+<a id="L1309"></a>    return (try file.stat(io)).mtime;
+<a id="L1310"></a>}
+<a id="L1311"></a>
+<a id="L1312"></a>test "cache file and then recall it" {
+<a id="L1313"></a>    const io = testing.io;
+<a id="L1314"></a>
+<a id="L1315"></a>    var tmp = testing.tmpDir(.{});
+<a id="L1316"></a>    defer tmp.cleanup();
+<a id="L1317"></a>
+<a id="L1318"></a>    const cwd = try std.process.currentPathAlloc(io, testing.allocator);
+<a id="L1319"></a>    defer testing.allocator.free(cwd);
+<a id="L1320"></a>
+<a id="L1321"></a>    const temp_file = "test.txt";
+<a id="L1322"></a>    const temp_manifest_dir = "temp_manifest_dir";
+<a id="L1323"></a>
+<a id="L1324"></a>    try tmp.dir.writeFile(io, .{ .sub_path = temp_file, .data = "Hello, world!\n" });
+<a id="L1325"></a>
+<a id="L1326"></a>    // Wait for file timestamps to tick
+<a id="L1327"></a>    const initial_time = try testGetCurrentFileTimestamp(io, tmp.dir);
+<a id="L1328"></a>    while ((try testGetCurrentFileTimestamp(io, tmp.dir)).nanoseconds == initial_time.nanoseconds) {
+<a id="L1329"></a>        try std.Io.Clock.Duration.sleep(.{ .clock = .boot, .raw = .fromNanoseconds(1) }, io);
+<a id="L1330"></a>    }
+<a id="L1331"></a>
+<a id="L1332"></a>    var digest1: HexDigest = undefined;
+<a id="L1333"></a>    var digest2: HexDigest = undefined;
+<a id="L1334"></a>
+<a id="L1335"></a>    {
+<a id="L1336"></a>        var cache: Cache = .{
+<a id="L1337"></a>            .io = io,
+<a id="L1338"></a>            .gpa = testing.allocator,
+<a id="L1339"></a>            .manifest_dir = try tmp.dir.createDirPathOpen(io, temp_manifest_dir, .{}),
+<a id="L1340"></a>            .cwd = cwd,
+<a id="L1341"></a>        };
+<a id="L1342"></a>        cache.addPrefix(.{ .path = null, .handle = tmp.dir });
+<a id="L1343"></a>        defer cache.manifest_dir.close(io);
+<a id="L1344"></a>
+<a id="L1345"></a>        {
+<a id="L1346"></a>            var ch = cache.obtain();
+<a id="L1347"></a>            defer ch.deinit();
+<a id="L1348"></a>
+<a id="L1349"></a>            ch.hash.add(true);
+<a id="L1350"></a>            ch.hash.add(@as(u16, 1234));
+<a id="L1351"></a>            ch.hash.addBytes("1234");
+<a id="L1352"></a>            _ = try ch.addFile(temp_file, null);
+<a id="L1353"></a>
+<a id="L1354"></a>            // There should be nothing in the cache
+<a id="L1355"></a>            try testing.expectEqual(false, try ch.hit());
+<a id="L1356"></a>
+<a id="L1357"></a>            digest1 = ch.final();
+<a id="L1358"></a>            try ch.writeManifest();
+<a id="L1359"></a>        }
+<a id="L1360"></a>        {
+<a id="L1361"></a>            var ch = cache.obtain();
+<a id="L1362"></a>            defer ch.deinit();
+<a id="L1363"></a>
+<a id="L1364"></a>            ch.hash.add(true);
+<a id="L1365"></a>            ch.hash.add(@as(u16, 1234));
+<a id="L1366"></a>            ch.hash.addBytes("1234");
+<a id="L1367"></a>            _ = try ch.addFile(temp_file, null);
+<a id="L1368"></a>
+<a id="L1369"></a>            // Cache hit! We just "built" the same file
+<a id="L1370"></a>            try testing.expect(try ch.hit());
+<a id="L1371"></a>            digest2 = ch.final();
+<a id="L1372"></a>
+<a id="L1373"></a>            try testing.expectEqual(false, ch.have_exclusive_lock);
+<a id="L1374"></a>        }
+<a id="L1375"></a>
+<a id="L1376"></a>        try testing.expectEqual(digest1, digest2);
+<a id="L1377"></a>    }
+<a id="L1378"></a>}
+<a id="L1379"></a>
+<a id="L1380"></a>test "check that changing a file makes cache fail" {
+<a id="L1381"></a>    const io = testing.io;
+<a id="L1382"></a>
+<a id="L1383"></a>    var tmp = testing.tmpDir(.{});
+<a id="L1384"></a>    defer tmp.cleanup();
+<a id="L1385"></a>
+<a id="L1386"></a>    const cwd = try std.process.currentPathAlloc(io, testing.allocator);
+<a id="L1387"></a>    defer testing.allocator.free(cwd);
+<a id="L1388"></a>
+<a id="L1389"></a>    const temp_file = "cache_hash_change_file_test.txt";
+<a id="L1390"></a>    const temp_manifest_dir = "cache_hash_change_file_manifest_dir";
+<a id="L1391"></a>    const original_temp_file_contents = "Hello, world!\n";
+<a id="L1392"></a>    const updated_temp_file_contents = "Hello, world; but updated!\n";
+<a id="L1393"></a>
+<a id="L1394"></a>    try tmp.dir.writeFile(io, .{ .sub_path = temp_file, .data = original_temp_file_contents });
+<a id="L1395"></a>
+<a id="L1396"></a>    // Wait for file timestamps to tick
+<a id="L1397"></a>    const initial_time = try testGetCurrentFileTimestamp(io, tmp.dir);
+<a id="L1398"></a>    while ((try testGetCurrentFileTimestamp(io, tmp.dir)).nanoseconds == initial_time.nanoseconds) {
+<a id="L1399"></a>        try std.Io.Clock.Duration.sleep(.{ .clock = .boot, .raw = .fromNanoseconds(1) }, io);
+<a id="L1400"></a>    }
+<a id="L1401"></a>
+<a id="L1402"></a>    var digest1: HexDigest = undefined;
+<a id="L1403"></a>    var digest2: HexDigest = undefined;
+<a id="L1404"></a>
+<a id="L1405"></a>    {
+<a id="L1406"></a>        var cache: Cache = .{
+<a id="L1407"></a>            .io = io,
+<a id="L1408"></a>            .gpa = testing.allocator,
+<a id="L1409"></a>            .manifest_dir = try tmp.dir.createDirPathOpen(io, temp_manifest_dir, .{}),
+<a id="L1410"></a>            .cwd = cwd,
+<a id="L1411"></a>        };
+<a id="L1412"></a>        cache.addPrefix(.{ .path = null, .handle = tmp.dir });
+<a id="L1413"></a>        defer cache.manifest_dir.close(io);
+<a id="L1414"></a>
+<a id="L1415"></a>        {
+<a id="L1416"></a>            var ch = cache.obtain();
+<a id="L1417"></a>            defer ch.deinit();
+<a id="L1418"></a>
+<a id="L1419"></a>            ch.hash.addBytes("1234");
+<a id="L1420"></a>            const temp_file_idx = try ch.addFile(temp_file, 100);
+<a id="L1421"></a>
+<a id="L1422"></a>            // There should be nothing in the cache
+<a id="L1423"></a>            try testing.expectEqual(false, try ch.hit());
+<a id="L1424"></a>
+<a id="L1425"></a>            try testing.expect(mem.eql(u8, original_temp_file_contents, ch.files.keys()[temp_file_idx].contents.?));
+<a id="L1426"></a>
+<a id="L1427"></a>            digest1 = ch.final();
+<a id="L1428"></a>
+<a id="L1429"></a>            try ch.writeManifest();
+<a id="L1430"></a>        }
+<a id="L1431"></a>
+<a id="L1432"></a>        try tmp.dir.writeFile(io, .{ .sub_path = temp_file, .data = updated_temp_file_contents });
+<a id="L1433"></a>
+<a id="L1434"></a>        {
+<a id="L1435"></a>            var ch = cache.obtain();
+<a id="L1436"></a>            defer ch.deinit();
+<a id="L1437"></a>
+<a id="L1438"></a>            ch.hash.addBytes("1234");
+<a id="L1439"></a>            const temp_file_idx = try ch.addFile(temp_file, 100);
+<a id="L1440"></a>
+<a id="L1441"></a>            // A file that we depend on has been updated, so the cache should not contain an entry for it
+<a id="L1442"></a>            try testing.expectEqual(false, try ch.hit());
+<a id="L1443"></a>
+<a id="L1444"></a>            // The cache system does not keep the contents of re-hashed input files.
+<a id="L1445"></a>            try testing.expect(ch.files.keys()[temp_file_idx].contents == null);
+<a id="L1446"></a>
+<a id="L1447"></a>            digest2 = ch.final();
+<a id="L1448"></a>
+<a id="L1449"></a>            try ch.writeManifest();
+<a id="L1450"></a>        }
+<a id="L1451"></a>
+<a id="L1452"></a>        try testing.expect(!mem.eql(u8, digest1[0..], digest2[0..]));
+<a id="L1453"></a>    }
+<a id="L1454"></a>}
+<a id="L1455"></a>
+<a id="L1456"></a>test "no file inputs" {
+<a id="L1457"></a>    const io = testing.io;
+<a id="L1458"></a>
+<a id="L1459"></a>    var tmp = testing.tmpDir(.{});
+<a id="L1460"></a>    defer tmp.cleanup();
+<a id="L1461"></a>
+<a id="L1462"></a>    const cwd = try std.process.currentPathAlloc(io, testing.allocator);
+<a id="L1463"></a>    defer testing.allocator.free(cwd);
+<a id="L1464"></a>
+<a id="L1465"></a>    const temp_manifest_dir = "no_file_inputs_manifest_dir";
+<a id="L1466"></a>
+<a id="L1467"></a>    var digest1: HexDigest = undefined;
+<a id="L1468"></a>    var digest2: HexDigest = undefined;
+<a id="L1469"></a>
+<a id="L1470"></a>    var cache: Cache = .{
+<a id="L1471"></a>        .io = io,
+<a id="L1472"></a>        .gpa = testing.allocator,
+<a id="L1473"></a>        .manifest_dir = try tmp.dir.createDirPathOpen(io, temp_manifest_dir, .{}),
+<a id="L1474"></a>        .cwd = cwd,
+<a id="L1475"></a>    };
+<a id="L1476"></a>    cache.addPrefix(.{ .path = null, .handle = tmp.dir });
+<a id="L1477"></a>    defer cache.manifest_dir.close(io);
+<a id="L1478"></a>
+<a id="L1479"></a>    {
+<a id="L1480"></a>        var man = cache.obtain();
+<a id="L1481"></a>        defer man.deinit();
+<a id="L1482"></a>
+<a id="L1483"></a>        man.hash.addBytes("1234");
+<a id="L1484"></a>
+<a id="L1485"></a>        // There should be nothing in the cache
+<a id="L1486"></a>        try testing.expectEqual(false, try man.hit());
+<a id="L1487"></a>
+<a id="L1488"></a>        digest1 = man.final();
+<a id="L1489"></a>
+<a id="L1490"></a>        try man.writeManifest();
+<a id="L1491"></a>    }
+<a id="L1492"></a>    {
+<a id="L1493"></a>        var man = cache.obtain();
+<a id="L1494"></a>        defer man.deinit();
+<a id="L1495"></a>
+<a id="L1496"></a>        man.hash.addBytes("1234");
+<a id="L1497"></a>
+<a id="L1498"></a>        try testing.expect(try man.hit());
+<a id="L1499"></a>        digest2 = man.final();
+<a id="L1500"></a>        try testing.expectEqual(false, man.have_exclusive_lock);
+<a id="L1501"></a>    }
+<a id="L1502"></a>
+<a id="L1503"></a>    try testing.expectEqual(digest1, digest2);
+<a id="L1504"></a>}
+<a id="L1505"></a>
+<a id="L1506"></a>test "Manifest with files added after initial hash work" {
+<a id="L1507"></a>    const io = testing.io;
+<a id="L1508"></a>
+<a id="L1509"></a>    var tmp = testing.tmpDir(.{});
+<a id="L1510"></a>    defer tmp.cleanup();
+<a id="L1511"></a>
+<a id="L1512"></a>    const cwd = try std.process.currentPathAlloc(io, testing.allocator);
+<a id="L1513"></a>    defer testing.allocator.free(cwd);
+<a id="L1514"></a>
+<a id="L1515"></a>    const temp_file1 = "cache_hash_post_file_test1.txt";
+<a id="L1516"></a>    const temp_file2 = "cache_hash_post_file_test2.txt";
+<a id="L1517"></a>    const temp_manifest_dir = "cache_hash_post_file_manifest_dir";
+<a id="L1518"></a>
+<a id="L1519"></a>    try tmp.dir.writeFile(io, .{ .sub_path = temp_file1, .data = "Hello, world!\n" });
+<a id="L1520"></a>    try tmp.dir.writeFile(io, .{ .sub_path = temp_file2, .data = "Hello world the second!\n" });
+<a id="L1521"></a>
+<a id="L1522"></a>    // Wait for file timestamps to tick
+<a id="L1523"></a>    const initial_time = try testGetCurrentFileTimestamp(io, tmp.dir);
+<a id="L1524"></a>    while ((try testGetCurrentFileTimestamp(io, tmp.dir)).nanoseconds == initial_time.nanoseconds) {
+<a id="L1525"></a>        try std.Io.Clock.Duration.sleep(.{ .clock = .boot, .raw = .fromNanoseconds(1) }, io);
+<a id="L1526"></a>    }
+<a id="L1527"></a>
+<a id="L1528"></a>    var digest1: HexDigest = undefined;
+<a id="L1529"></a>    var digest2: HexDigest = undefined;
+<a id="L1530"></a>    var digest3: HexDigest = undefined;
+<a id="L1531"></a>
+<a id="L1532"></a>    {
+<a id="L1533"></a>        var cache: Cache = .{
+<a id="L1534"></a>            .io = io,
+<a id="L1535"></a>            .gpa = testing.allocator,
+<a id="L1536"></a>            .manifest_dir = try tmp.dir.createDirPathOpen(io, temp_manifest_dir, .{}),
+<a id="L1537"></a>            .cwd = cwd,
+<a id="L1538"></a>        };
+<a id="L1539"></a>        cache.addPrefix(.{ .path = null, .handle = tmp.dir });
+<a id="L1540"></a>        defer cache.manifest_dir.close(io);
+<a id="L1541"></a>
+<a id="L1542"></a>        {
+<a id="L1543"></a>            var ch = cache.obtain();
+<a id="L1544"></a>            defer ch.deinit();
+<a id="L1545"></a>
+<a id="L1546"></a>            ch.hash.addBytes("1234");
+<a id="L1547"></a>            _ = try ch.addFile(temp_file1, null);
+<a id="L1548"></a>
+<a id="L1549"></a>            // There should be nothing in the cache
+<a id="L1550"></a>            try testing.expectEqual(false, try ch.hit());
+<a id="L1551"></a>
+<a id="L1552"></a>            _ = try ch.addFilePost(temp_file2);
+<a id="L1553"></a>
+<a id="L1554"></a>            digest1 = ch.final();
+<a id="L1555"></a>            try ch.writeManifest();
+<a id="L1556"></a>        }
+<a id="L1557"></a>        {
+<a id="L1558"></a>            var ch = cache.obtain();
+<a id="L1559"></a>            defer ch.deinit();
+<a id="L1560"></a>
+<a id="L1561"></a>            ch.hash.addBytes("1234");
+<a id="L1562"></a>            _ = try ch.addFile(temp_file1, null);
+<a id="L1563"></a>
+<a id="L1564"></a>            try testing.expect(try ch.hit());
+<a id="L1565"></a>            digest2 = ch.final();
+<a id="L1566"></a>
+<a id="L1567"></a>            try testing.expectEqual(false, ch.have_exclusive_lock);
+<a id="L1568"></a>        }
+<a id="L1569"></a>        try testing.expect(mem.eql(u8, &amp;digest1, &amp;digest2));
+<a id="L1570"></a>
+<a id="L1571"></a>        // Modify the file added after initial hash
+<a id="L1572"></a>        try tmp.dir.writeFile(io, .{ .sub_path = temp_file2, .data = "Hello world the second, updated\n" });
+<a id="L1573"></a>
+<a id="L1574"></a>        // Wait for file timestamps to tick
+<a id="L1575"></a>        const initial_time2 = try testGetCurrentFileTimestamp(io, tmp.dir);
+<a id="L1576"></a>        while ((try testGetCurrentFileTimestamp(io, tmp.dir)).nanoseconds == initial_time2.nanoseconds) {
+<a id="L1577"></a>            try std.Io.Clock.Duration.sleep(.{ .clock = .boot, .raw = .fromNanoseconds(1) }, io);
+<a id="L1578"></a>        }
+<a id="L1579"></a>
+<a id="L1580"></a>        {
+<a id="L1581"></a>            var ch = cache.obtain();
+<a id="L1582"></a>            defer ch.deinit();
+<a id="L1583"></a>
+<a id="L1584"></a>            ch.hash.addBytes("1234");
+<a id="L1585"></a>            _ = try ch.addFile(temp_file1, null);
+<a id="L1586"></a>
+<a id="L1587"></a>            // A file that we depend on has been updated, so the cache should not contain an entry for it
+<a id="L1588"></a>            try testing.expectEqual(false, try ch.hit());
+<a id="L1589"></a>
+<a id="L1590"></a>            _ = try ch.addFilePost(temp_file2);
+<a id="L1591"></a>
+<a id="L1592"></a>            digest3 = ch.final();
+<a id="L1593"></a>
+<a id="L1594"></a>            try ch.writeManifest();
+<a id="L1595"></a>        }
+<a id="L1596"></a>
+<a id="L1597"></a>        try testing.expect(!mem.eql(u8, &amp;digest1, &amp;digest3));
+<a id="L1598"></a>    }
+<a id="L1599"></a>}
+</pre>
 </body>
 </html>

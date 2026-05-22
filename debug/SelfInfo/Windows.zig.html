@@ -2,759 +2,762 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Source: zig-0.16.0-std/debug/SelfInfo/Windows.zig</title>
+    <title>Source: debug/SelfInfo/Windows.zig</title>
     <style>
         body { background: #1e1e1e; color: #d4d4d4; font-family: monospace; padding: 20px; }
         pre { white-space: pre-wrap; word-wrap: break-word; }
         .header { border-bottom: 1px solid #444; padding-bottom: 10px; margin-bottom: 20px; }
         a { color: #569cd6; }
+        a[id] { color: inherit; text-decoration: none; }
+        :target { background: #3a3a00; }
     </style>
 </head>
 <body>
     <div class="header">
-        <a href="/">Index</a> | <strong>File: zig-0.16.0-std/debug/SelfInfo/Windows.zig</strong>
+        <a href="/">Index</a> | <strong>File: debug/SelfInfo/Windows.zig</strong>
     </div>
-    <pre>lock: Io.RwLock,
-ntdll_handle: ?if (load_dll_notification_procs) *anyopaque else noreturn,
-notification_cookie: ?LDR.DLL_NOTIFICATION.COOKIE,
-modules: std.ArrayList(Module),
-
-pub const init: SelfInfo = .{
-    .lock = .init,
-    .ntdll_handle = null,
-    .notification_cookie = null,
-    .modules = .empty,
-};
-pub fn deinit(si: *SelfInfo, io: Io) void {
-    const gpa = std.debug.getDebugInfoAllocator();
-    if (si.notification_cookie) |cookie| unregister: {
-        switch ((si.getNtdllProc(.LdrUnregisterDllNotification) catch break :unregister)(cookie)) {
-            .SUCCESS =&gt; {},
-            else =&gt; |status| windows.unexpectedStatus(status) catch break :unregister,
-        }
-    }
-    if (si.ntdll_handle) |handle| switch (windows.ntdll.LdrUnloadDll(handle)) {
-        .SUCCESS =&gt; {},
-        else =&gt; |status| windows.unexpectedStatus(status) catch {},
-    };
-    for (si.modules.items) |*module| module.deinit(gpa, io);
-    si.modules.deinit(gpa);
-}
-
-pub fn getSymbols(
-    si: *SelfInfo,
-    io: Io,
-    symbol_allocator: Allocator,
-    text_arena: Allocator,
-    address: usize,
-    resolve_inline_callers: bool,
-    symbols: *std.ArrayList(std.debug.Symbol),
-) Error!void {
-    const gpa = std.debug.getDebugInfoAllocator();
-    try si.lock.lockShared(io);
-    defer si.lock.unlockShared(io);
-    const module = try si.findModule(gpa, address);
-    const di = try module.getDebugInfo(gpa, io);
-    return di.getSymbols(
-        symbol_allocator,
-        text_arena,
-        address - @intFromPtr(module.entry.DllBase),
-        resolve_inline_callers,
-        symbols,
-    );
-}
-
-pub fn getModuleName(si: *SelfInfo, io: Io, address: usize) Error![]const u8 {
-    const gpa = std.debug.getDebugInfoAllocator();
-    try si.lock.lockShared(io);
-    defer si.lock.unlockShared(io);
-    const module = try si.findModule(gpa, address);
-    return module.name orelse {
-        const name = try std.unicode.wtf16LeToWtf8Alloc(gpa, module.entry.BaseDllName.slice());
-        module.name = name;
-        return name;
-    };
-}
-pub fn getModuleSlide(si: *SelfInfo, io: Io, address: usize) Error!usize {
-    const gpa = std.debug.getDebugInfoAllocator();
-    try si.lock.lockShared(io);
-    defer si.lock.unlockShared(io);
-    const module = try si.findModule(gpa, address);
-    return module.base_address;
-}
-
-pub const can_unwind: bool = switch (builtin.cpu.arch) {
-    else =&gt; true,
-    // On x86, `RtlVirtualUnwind` does not exist. We could in theory use `RtlCaptureStackBackTrace`
-    // instead, but on x86, it turns out that function is just... doing FP unwinding with esp! It's
-    // hard to find implementation details to confirm that, but the most authoritative source I have
-    // is an entry in the LLVM mailing list from 2020/08/16 which contains this quote:
-    //
-    // &gt; x86 doesn't have what most architectures would consider an "unwinder" in the sense of
-    // &gt; restoring registers; there is simply a linked list of frames that participate in SEH and
-    // &gt; that desire to be called for a dynamic unwind operation, so RtlCaptureStackBackTrace
-    // &gt; assumes that EBP-based frames are in use and walks an EBP-based frame chain on x86 - not
-    // &gt; all x86 code is written with EBP-based frames so while even though we generally build the
-    // &gt; OS that way, you might always run the risk of encountering external code that uses EBP as a
-    // &gt; general purpose register for which such an unwind attempt for a stack trace would fail.
-    //
-    // Regardless, it's easy to effectively confirm this hypothesis just by compiling some code with
-    // `-fomit-frame-pointer -OReleaseFast` and observing that `RtlCaptureStackBackTrace` returns an
-    // empty trace when it's called in such an application. Note that without `-OReleaseFast` or
-    // similar, LLVM seems reluctant to ever clobber ebp, so you'll get a trace returned which just
-    // contains all of the kernel32/ntdll frames but none of your own. Don't be deceived---this is
-    // just coincidental!
-    //
-    // Anyway, the point is, the only stack walking primitive on x86-windows is FP unwinding. We
-    // *could* ask Microsoft to do that for us with `RtlCaptureStackBackTrace`... but better to just
-    // use our existing FP unwinder in `std.debug`!
-    .x86 =&gt; false,
-};
-pub const UnwindContext = struct {
-    pc: usize,
-    cur: windows.CONTEXT,
-    history_table: windows.UNWIND_HISTORY_TABLE,
-    pub fn init(ctx: *const std.debug.cpu_context.Native) UnwindContext {
-        return .{
-            .pc = @returnAddress(),
-            .cur = switch (builtin.cpu.arch) {
-                .x86_64 =&gt; std.mem.zeroInit(windows.CONTEXT, .{
-                    .Rax = ctx.gprs.get(.rax),
-                    .Rcx = ctx.gprs.get(.rcx),
-                    .Rdx = ctx.gprs.get(.rdx),
-                    .Rbx = ctx.gprs.get(.rbx),
-                    .Rsp = ctx.gprs.get(.rsp),
-                    .Rbp = ctx.gprs.get(.rbp),
-                    .Rsi = ctx.gprs.get(.rsi),
-                    .Rdi = ctx.gprs.get(.rdi),
-                    .R8 = ctx.gprs.get(.r8),
-                    .R9 = ctx.gprs.get(.r9),
-                    .R10 = ctx.gprs.get(.r10),
-                    .R11 = ctx.gprs.get(.r11),
-                    .R12 = ctx.gprs.get(.r12),
-                    .R13 = ctx.gprs.get(.r13),
-                    .R14 = ctx.gprs.get(.r14),
-                    .R15 = ctx.gprs.get(.r15),
-                    .Rip = ctx.gprs.get(.rip),
-                }),
-                .aarch64 =&gt; .{
-                    .ContextFlags = 0,
-                    .Cpsr = 0,
-                    .DUMMYUNIONNAME = .{ .X = ctx.x },
-                    .Sp = ctx.sp,
-                    .Pc = ctx.pc,
-                    .V = @splat(.{ .B = @splat(0) }),
-                    .Fpcr = 0,
-                    .Fpsr = 0,
-                    .Bcr = @splat(0),
-                    .Bvr = @splat(0),
-                    .Wcr = @splat(0),
-                    .Wvr = @splat(0),
-                },
-                .thumb =&gt; .{
-                    .ContextFlags = 0,
-                    .R0 = ctx.r[0],
-                    .R1 = ctx.r[1],
-                    .R2 = ctx.r[2],
-                    .R3 = ctx.r[3],
-                    .R4 = ctx.r[4],
-                    .R5 = ctx.r[5],
-                    .R6 = ctx.r[6],
-                    .R7 = ctx.r[7],
-                    .R8 = ctx.r[8],
-                    .R9 = ctx.r[9],
-                    .R10 = ctx.r[10],
-                    .R11 = ctx.r[11],
-                    .R12 = ctx.r[12],
-                    .Sp = ctx.r[13],
-                    .Lr = ctx.r[14],
-                    .Pc = ctx.r[15],
-                    .Cpsr = 0,
-                    .Fpcsr = 0,
-                    .Padding = 0,
-                    .DUMMYUNIONNAME = .{ .S = @splat(0) },
-                    .Bvr = @splat(0),
-                    .Bcr = @splat(0),
-                    .Wvr = @splat(0),
-                    .Wcr = @splat(0),
-                    .Padding2 = @splat(0),
-                },
-                else =&gt; comptime unreachable,
-            },
-            .history_table = std.mem.zeroes(windows.UNWIND_HISTORY_TABLE),
-        };
-    }
-    pub fn deinit(ctx: *UnwindContext) void {
-        _ = ctx;
-    }
-    pub fn getFp(ctx: *UnwindContext) usize {
-        return ctx.cur.getRegs().bp;
-    }
-};
-pub fn unwindFrame(si: *SelfInfo, io: Io, context: *UnwindContext) Error!usize {
-    _ = si;
-    _ = io;
-
-    const current_regs = context.cur.getRegs();
-    var image_base: usize = undefined;
-    if (windows.ntdll.RtlLookupFunctionEntry(current_regs.ip, &amp;image_base, &amp;context.history_table)) |runtime_function| {
-        var handler_data: ?*anyopaque = null;
-        var establisher_frame: usize = undefined;
-        _ = windows.ntdll.RtlVirtualUnwind(
-            windows.UNW_FLAG_NHANDLER,
-            image_base,
-            current_regs.ip,
-            runtime_function,
-            &amp;context.cur,
-            &amp;handler_data,
-            &amp;establisher_frame,
-            null,
-        );
-    } else {
-        // leaf function
-        context.cur.setIp(@as(*const usize, @ptrFromInt(current_regs.sp)).*);
-        context.cur.setSp(current_regs.sp + @sizeOf(usize));
-    }
-
-    const next_regs = context.cur.getRegs();
-    const tib = &amp;windows.teb().NtTib;
-    if (next_regs.sp &lt; @intFromPtr(tib.StackLimit) or next_regs.sp &gt; @intFromPtr(tib.StackBase)) {
-        context.pc = 0;
-        return 0;
-    }
-    // Like `DwarfUnwindContext.unwindFrame`, adjust our next lookup pc in case the `call` was this
-    // function's last instruction making `next_regs.ip` one byte past its end.
-    context.pc = next_regs.ip -| 1;
-    return next_regs.ip;
-}
-
-const Module = struct {
-    entry: *const LDR.DATA_TABLE_ENTRY,
-    name: ?[]const u8,
-    di: ?(Error!DebugInfo),
-
-    const DebugInfo = struct {
-        arena: std.heap.ArenaAllocator.State,
-        coff_image_base: u64,
-        mapped_file: ?MappedFile,
-        dwarf: ?Dwarf,
-        pdb: ?Pdb,
-        coff_section_headers: []coff.SectionHeader,
-
-        const MappedFile = struct {
-            file: Io.File,
-            section_handle: windows.HANDLE,
-            section_view: []const u8,
-            fn deinit(mf: *const MappedFile, io: Io) void {
-                const process_handle = windows.GetCurrentProcess();
-                switch (windows.ntdll.NtUnmapViewOfSection(
-                    process_handle,
-                    @constCast(mf.section_view.ptr),
-                )) {
-                    .SUCCESS =&gt; {},
-                    else =&gt; |status| windows.unexpectedStatus(status) catch {},
-                }
-                windows.CloseHandle(mf.section_handle);
-                mf.file.close(io);
-            }
-        };
-
-        fn deinit(di: *DebugInfo, gpa: Allocator, io: Io) void {
-            if (di.dwarf) |*dwarf| dwarf.deinit(gpa);
-            if (di.pdb) |*pdb| {
-                pdb.file_reader.file.close(io);
-                pdb.deinit();
-            }
-            if (di.mapped_file) |*mf| mf.deinit(io);
-
-            var arena = di.arena.promote(gpa);
-            arena.deinit();
-        }
-
-        fn getSymbols(
-            di: *DebugInfo,
-            symbol_allocator: Allocator,
-            text_arena: Allocator,
-            vaddr: usize,
-            resolve_inline_callers: bool,
-            symbols: *std.ArrayList(std.debug.Symbol),
-        ) Error!void {
-            pdb: {
-                const pdb = &amp;(di.pdb orelse break :pdb);
-                var coff_section: *align(1) const coff.SectionHeader = undefined;
-                const mod_index = for (pdb.sect_contribs) |sect_contrib| {
-                    if (sect_contrib.section &gt; di.coff_section_headers.len) continue;
-                    // Remember that SectionContribEntry.Section is 1-based.
-                    coff_section = &amp;di.coff_section_headers[sect_contrib.section - 1];
-
-                    const vaddr_start = coff_section.virtual_address + sect_contrib.offset;
-                    const vaddr_end = vaddr_start + sect_contrib.size;
-                    if (vaddr &gt;= vaddr_start and vaddr &lt; vaddr_end) {
-                        break sect_contrib.module_index;
-                    }
-                } else {
-                    // we have no information to add to the address
-                    break :pdb;
-                };
-                const module = pdb.getModule(mod_index) catch |err| switch (err) {
-                    error.InvalidDebugInfo,
-                    error.MissingDebugInfo,
-                    error.OutOfMemory,
-                    =&gt; |e| return e,
-
-                    error.ReadFailed,
-                    error.EndOfStream,
-                    =&gt; return error.InvalidDebugInfo,
-                } orelse {
-                    return error.InvalidDebugInfo; // bad module index
-                };
-
-                const addr = vaddr - coff_section.virtual_address;
-                const maybe_proc = pdb.getProcSym(module, addr);
-                const compile_unit_name = fs.path.basename(module.obj_file_name);
-                const symbols_top = symbols.items.len;
-                if (maybe_proc) |proc| {
-                    const offset_in_func = addr - proc.code_offset;
-                    var last_inlinee: ?u32 = null;
-                    var iter = pdb.getInlinees(module, proc);
-                    while (iter.next(module)) |inline_site| {
-                        // Filter out duplicate inline sites. Tools like llvm-addr2line output
-                        // duplicate sites in the same cases as us if we elide this check,
-                        // implying that they exist in the underlying data and are not indicative
-                        // of a parser bug. No useful information is lost here since an inline site
-                        // can't actually reference itself.
-                        if (inline_site.inlinee == last_inlinee) continue;
-
-                        // If our address points into this site, get the source location(s) it
-                        // points at
-                        for (pdb.getInlineeSourceLines(
-                            module,
-                            inline_site.inlinee,
-                        )) |inlinee_src_line| {
-                            const maybe_loc = pdb.getInlineSiteSourceLocation(
-                                text_arena,
-                                module,
-                                inline_site,
-                                inlinee_src_line.info,
-                                offset_in_func,
-                            ) catch continue;
-                            const loc = maybe_loc orelse continue;
-
-                            // If we aren't trying to resolve inline callers, and we've matched a
-                            // new inline site, we want to overwrite the previously appended
-                            // results.
-                            if (!resolve_inline_callers and inline_site.inlinee != last_inlinee) {
-                                symbols.items.len = symbols_top;
-                            }
-
-                            // Only resolve the name if we're resolving inline callers, otherwise
-                            // wait until we're done to avoid duplicated work.
-                            const name = if (resolve_inline_callers)
-                                pdb.findInlineeName(inline_site.inlinee)
-                            else
-                                null;
-
-                            try symbols.append(symbol_allocator, .{
-                                .name = name,
-                                .compile_unit_name = compile_unit_name,
-                                .source_location = loc,
-                            });
-
-                            last_inlinee = inline_site.inlinee;
-                        }
-                    }
-
-                    if (resolve_inline_callers) {
-                        // Inline sites are stored in the pdb in reverse order, so we reverse the
-                        // matching sites here. We could alternatively use the parent fields to
-                        // determine the order, but this would introduce seemingly unecessary
-                        // complexity.
-                        std.mem.reverse(std.debug.Symbol, symbols.items);
-                    } else if (last_inlinee) |inlinee| {
-                        // If we aren't resolving inline callers, then all results will have the
-                        // same inline site, and we resolve its name once at the end.
-                        const name = pdb.findInlineeName(inlinee);
-                        for (symbols.items) |*symbol| symbol.name = name;
-                    }
-                }
-
-                // If there's room for another symbol, add the actual proc
-                if (resolve_inline_callers or symbols.items.len == 0) {
-                    try symbols.append(symbol_allocator, .{
-                        .name = if (maybe_proc) |proc| pdb.getSymbolName(proc) else null,
-                        .compile_unit_name = compile_unit_name,
-                        .source_location = pdb.getLineNumberInfo(text_arena, module, addr) catch null,
-                    });
-                }
-
-                return;
-            }
-
-            dwarf: {
-                const dwarf = &amp;(di.dwarf orelse break :dwarf);
-                const addr = vaddr + di.coff_image_base;
-                return dwarf.getSymbols(
-                    symbol_allocator,
-                    text_arena,
-                    native_endian,
-                    addr,
-                    resolve_inline_callers,
-                    symbols,
-                );
-            }
-
-            return error.MissingDebugInfo;
-        }
-    };
-
-    fn deinit(module: *Module, gpa: Allocator, io: Io) void {
-        if (module.name) |name| gpa.free(name);
-        if (module.di) |*di_or_err| if (di_or_err.*) |*di| di.deinit(gpa, io) else |_| {};
-        module.* = undefined;
-    }
-
-    fn getDebugInfo(module: *Module, gpa: Allocator, io: Io) Error!*DebugInfo {
-        if (module.di == null) module.di = loadDebugInfo(module, gpa, io);
-        return if (module.di.?) |*di| di else |err| err;
-    }
-    fn loadDebugInfo(module: *const Module, gpa: Allocator, io: Io) Error!DebugInfo {
-        const mapped_ptr: [*]const u8 = @ptrCast(module.entry.DllBase);
-        const mapped = mapped_ptr[0..module.entry.SizeOfImage];
-        var coff_obj = coff.Coff.init(mapped, true) catch return error.InvalidDebugInfo;
-
-        var arena_instance: std.heap.ArenaAllocator = .init(gpa);
-        errdefer arena_instance.deinit();
-        const arena = arena_instance.allocator();
-
-        // The string table is not mapped into memory by the loader, so if a section name is in the
-        // string table then we have to map the full image file from disk. This can happen when
-        // a binary is produced with -gdwarf, since the section names are longer than 8 bytes.
-        const mapped_file: ?DebugInfo.MappedFile = mapped: {
-            if (!coff_obj.strtabRequired()) break :mapped null;
-            var path_buffer: [4 + windows.PATH_MAX_WIDE]u16 = undefined;
-            path_buffer[0..4].* = .{ '\\', '?', '?', '\\' }; // openFileAbsoluteW requires the prefix to be present
-            const path_slice = module.entry.FullDllName.slice();
-            @memcpy(path_buffer[4..][0..path_slice.len], path_slice);
-            const coff_file = Io.Threaded.dirOpenFileWtf16(
-                null,
-                path_buffer[0 .. 4 + path_slice.len],
-                .{},
-            ) catch |err| switch (err) {
-                error.Canceled =&gt; |e| return e,
-                error.Unexpected =&gt; |e| return e,
-                error.FileNotFound =&gt; return error.MissingDebugInfo,
-
-                error.FileTooBig,
-                error.IsDir,
-                error.NotDir,
-                error.SymLinkLoop,
-                error.NameTooLong,
-                error.BadPathName,
-                =&gt; return error.InvalidDebugInfo,
-
-                error.SystemResources,
-                error.WouldBlock,
-                error.AccessDenied,
-                error.PermissionDenied,
-                error.NoSpaceLeft,
-                error.DeviceBusy,
-                error.NoDevice,
-                error.PathAlreadyExists,
-                error.PipeBusy,
-                error.NetworkNotFound,
-                error.AntivirusInterference,
-                error.ProcessFdQuotaExceeded,
-                error.SystemFdQuotaExceeded,
-                error.FileLocksUnsupported,
-                error.FileBusy,
-                error.ReadOnlyFileSystem,
-                =&gt; return error.ReadFailed,
-            };
-            errdefer coff_file.close(io);
-            var section_handle: windows.HANDLE = undefined;
-            const create_section_rc = windows.ntdll.NtCreateSection(
-                &amp;section_handle,
-                .{
-                    .SPECIFIC = .{ .SECTION = .{
-                        .QUERY = true,
-                        .MAP_READ = true,
-                    } },
-                    .STANDARD = .{ .RIGHTS = .REQUIRED },
-                },
-                null,
-                null,
-                .{ .READONLY = true },
-                // The documentation states that if no AllocationAttribute is specified,
-                // then SEC_COMMIT is the default.
-                // In practice, this isn't the case and specifying 0 will result in INVALID_PARAMETER_6.
-                .{ .COMMIT = true },
-                coff_file.handle,
-            );
-            if (create_section_rc != .SUCCESS) return error.MissingDebugInfo;
-            errdefer windows.CloseHandle(section_handle);
-            var coff_len: usize = 0;
-            var section_view_ptr: ?[*]const u8 = null;
-            const process_handle = windows.GetCurrentProcess();
-            const map_section_rc = windows.ntdll.NtMapViewOfSection(
-                section_handle,
-                process_handle,
-                @ptrCast(&amp;section_view_ptr),
-                null,
-                0,
-                null,
-                &amp;coff_len,
-                .Unmap,
-                .{},
-                .{ .READONLY = true },
-            );
-            if (map_section_rc != .SUCCESS) return error.MissingDebugInfo;
-            errdefer switch (windows.ntdll.NtUnmapViewOfSection(
-                process_handle,
-                @constCast(section_view_ptr.?),
-            )) {
-                .SUCCESS =&gt; {},
-                else =&gt; |status| windows.unexpectedStatus(status) catch {},
-            };
-            const section_view = section_view_ptr.?[0..coff_len];
-            coff_obj = coff.Coff.init(section_view, false) catch return error.InvalidDebugInfo;
-            break :mapped .{
-                .file = coff_file,
-                .section_handle = section_handle,
-                .section_view = section_view,
-            };
-        };
-        errdefer if (mapped_file) |*mf| mf.deinit(io);
-
-        const coff_image_base = coff_obj.getImageBase();
-
-        var opt_dwarf: ?Dwarf = dwarf: {
-            if (coff_obj.getSectionByName(".debug_info") == null) break :dwarf null;
-
-            var sections: Dwarf.SectionArray = undefined;
-            inline for (@typeInfo(Dwarf.Section.Id).@"enum".fields, 0..) |section, i| {
-                sections[i] = if (coff_obj.getSectionByName("." ++ section.name)) |section_header| .{
-                    .data = try coff_obj.getSectionDataAlloc(section_header, arena),
-                    .owned = false,
-                } else null;
-            }
-            break :dwarf .{ .sections = sections };
-        };
-        errdefer if (opt_dwarf) |*dwarf| dwarf.deinit(gpa);
-
-        if (opt_dwarf) |*dwarf| {
-            dwarf.open(gpa, native_endian) catch |err| switch (err) {
-                error.Overflow,
-                error.EndOfStream,
-                error.StreamTooLong,
-                error.ReadFailed,
-                =&gt; return error.InvalidDebugInfo,
-
-                error.InvalidDebugInfo,
-                error.MissingDebugInfo,
-                error.OutOfMemory,
-                =&gt; |e| return e,
-            };
-        }
-
-        var opt_pdb: ?Pdb = pdb: {
-            const path = coff_obj.getPdbPath() catch {
-                return error.InvalidDebugInfo;
-            } orelse {
-                break :pdb null;
-            };
-            const pdb_file_open_result = if (fs.path.isAbsolute(path)) res: {
-                break :res Io.Dir.cwd().openFile(io, path, .{});
-            } else res: {
-                const self_dir = std.process.executableDirPathAlloc(io, gpa) catch |err| switch (err) {
-                    error.OutOfMemory, error.Unexpected =&gt; |e| return e,
-                    else =&gt; return error.ReadFailed,
-                };
-                defer gpa.free(self_dir);
-                const abs_path = try fs.path.join(gpa, &amp;.{ self_dir, path });
-                defer gpa.free(abs_path);
-                break :res Io.Dir.cwd().openFile(io, abs_path, .{});
-            };
-            const pdb_file = pdb_file_open_result catch |err| switch (err) {
-                error.FileNotFound, error.IsDir =&gt; break :pdb null,
-                else =&gt; return error.ReadFailed,
-            };
-            errdefer pdb_file.close(io);
-
-            const pdb_reader = try arena.create(Io.File.Reader);
-            pdb_reader.* = pdb_file.reader(io, try arena.alloc(u8, 4096));
-
-            var pdb = Pdb.init(gpa, pdb_reader) catch |err| switch (err) {
-                error.OutOfMemory, error.ReadFailed, error.Unexpected =&gt; |e| return e,
-                else =&gt; return error.InvalidDebugInfo,
-            };
-            errdefer pdb.deinit();
-            pdb.parseInfoStream() catch |err| switch (err) {
-                error.UnknownPDBVersion =&gt; return error.UnsupportedDebugInfo,
-                error.EndOfStream =&gt; return error.InvalidDebugInfo,
-
-                error.InvalidDebugInfo,
-                error.MissingDebugInfo,
-                error.OutOfMemory,
-                error.ReadFailed,
-                =&gt; |e| return e,
-            };
-            pdb.parseDbiStream() catch |err| switch (err) {
-                error.UnknownPDBVersion =&gt; return error.UnsupportedDebugInfo,
-
-                error.EndOfStream,
-                error.EOF,
-                error.StreamTooLong,
-                error.WriteFailed,
-                =&gt; return error.InvalidDebugInfo,
-
-                error.InvalidDebugInfo,
-                error.OutOfMemory,
-                error.ReadFailed,
-                =&gt; |e| return e,
-            };
-            pdb.parseIpiStream() catch |err| switch (err) {
-                error.UnknownPDBVersion =&gt; return error.UnsupportedDebugInfo,
-
-                error.EndOfStream,
-                =&gt; return error.InvalidDebugInfo,
-
-                error.OutOfMemory,
-                error.ReadFailed,
-                =&gt; |e| return e,
-            };
-
-            if (!std.mem.eql(u8, &amp;coff_obj.guid, &amp;pdb.guid) or coff_obj.age != pdb.age)
-                return error.InvalidDebugInfo;
-
-            break :pdb pdb;
-        };
-        errdefer if (opt_pdb) |*pdb| {
-            pdb.file_reader.file.close(io);
-            pdb.deinit();
-        };
-
-        const coff_section_headers: []coff.SectionHeader = if (opt_pdb != null) csh: {
-            break :csh try coff_obj.getSectionHeadersAlloc(arena);
-        } else &amp;.{};
-
-        return .{
-            .arena = arena_instance.state,
-            .coff_image_base = coff_image_base,
-            .mapped_file = mapped_file,
-            .dwarf = opt_dwarf,
-            .pdb = opt_pdb,
-            .coff_section_headers = coff_section_headers,
-        };
-    }
-};
-
-/// Assumes we already hold `si.lock`.
-fn findModule(si: *SelfInfo, gpa: Allocator, address: usize) error{ MissingDebugInfo, OutOfMemory, Unexpected }!*Module {
-    for (si.modules.items) |*mod| {
-        const base = @intFromPtr(mod.entry.DllBase);
-        if (address &gt;= base and address &lt; base + mod.entry.SizeOfImage) return mod;
-    }
-    try si.modules.ensureUnusedCapacity(gpa, 1);
-    var entry: *LDR.DATA_TABLE_ENTRY = undefined;
-    switch (windows.ntdll.LdrFindEntryForAddress(@ptrFromInt(address), &amp;entry)) {
-        .SUCCESS =&gt; {},
-        .DLL_NOT_FOUND =&gt; return error.MissingDebugInfo,
-        else =&gt; |status| return windows.unexpectedStatus(status),
-    }
-    if (si.notification_cookie == null) {
-        var notification_cookie: LDR.DLL_NOTIFICATION.COOKIE = undefined;
-        switch ((try si.getNtdllProc(.LdrRegisterDllNotification))(
-            .{},
-            &amp;dllNotification,
-            si,
-            &amp;notification_cookie,
-        )) {
-            .SUCCESS =&gt; si.notification_cookie = notification_cookie,
-            else =&gt; |status| return windows.unexpectedStatus(status),
-        }
-    }
-    const mod = si.modules.addOneAssumeCapacity();
-    mod.* = .{ .entry = entry, .name = null, .di = null };
-    return mod;
-}
-
-inline fn getNtdllProc(
-    si: *SelfInfo,
-    comptime proc: std.meta.DeclEnum(windows.ntdll),
-) !@TypeOf(&amp;@field(windows.ntdll, @tagName(proc))) {
-    return if (load_dll_notification_procs)
-        @ptrCast(try si.loadNtdllProc(@tagName(proc)))
-    else
-        &amp;@field(windows.ntdll, @tagName(proc));
-}
-fn loadNtdllProc(si: *SelfInfo, name: []const u8) Io.UnexpectedError!*anyopaque {
-    const ntdll_handle = si.ntdll_handle orelse ntdll_handle: {
-        var ntdll_handle: *anyopaque = undefined;
-        switch (windows.ntdll.LdrLoadDll(null, null, &amp;.init(
-            &amp;.{ 'n', 't', 'd', 'l', 'l', '.', 'd', 'l', 'l' },
-        ), &amp;ntdll_handle)) {
-            .SUCCESS =&gt; {},
-            .DLL_NOT_FOUND =&gt; return error.Unexpected,
-            else =&gt; |status| return windows.unexpectedStatus(status),
-        }
-        si.ntdll_handle = ntdll_handle;
-        break :ntdll_handle ntdll_handle;
-    };
-    var proc_addr: *anyopaque = undefined;
-    switch (windows.ntdll.LdrGetProcedureAddress(ntdll_handle, &amp;.init(name), 0, &amp;proc_addr)) {
-        .SUCCESS =&gt; {},
-        else =&gt; |status| return windows.unexpectedStatus(status),
-    }
-    return proc_addr;
-}
-
-fn dllNotification(
-    reason: LDR.DLL_NOTIFICATION.REASON,
-    data: *const LDR.DLL_NOTIFICATION.DATA,
-    context: ?*anyopaque,
-) callconv(.winapi) void {
-    const si: *SelfInfo = @ptrCast(@alignCast(context));
-    switch (reason) {
-        .LOADED =&gt; {},
-        .UNLOADED =&gt; {
-            const io = std.Options.debug_io;
-            si.lock.lockUncancelable(io);
-            defer si.lock.unlock(io);
-            for (si.modules.items, 0..) |*mod, mod_index| {
-                if (mod.entry.DllBase != data.Unloaded.DllBase) continue;
-                mod.deinit(std.debug.getDebugInfoAllocator(), io);
-                _ = si.modules.swapRemove(mod_index);
-                break;
-            }
-        },
-    }
-}
-
-const std = @import("std");
-const Io = std.Io;
-const Allocator = std.mem.Allocator;
-const Dwarf = std.debug.Dwarf;
-const Pdb = std.debug.Pdb;
-const Error = std.debug.SelfInfoError;
-const coff = std.coff;
-const fs = std.fs;
-const windows = std.os.windows;
-const LDR = windows.LDR;
-
-const builtin = @import("builtin");
-const native_endian = builtin.target.cpu.arch.endian();
-const load_dll_notification_procs = builtin.abi == .msvc and switch (builtin.zig_backend) {
-    .stage2_c =&gt; true,
-    else =&gt; switch (builtin.output_mode) {
-        .Exe =&gt; false,
-        .Lib =&gt; switch (builtin.link_mode) {
-            .static =&gt; true,
-            .dynamic =&gt; false,
-        },
-        .Obj =&gt; true,
-    },
-};
-
-const SelfInfo = @This();</pre>
+    <pre><a id="L1"></a>lock: Io.RwLock,
+<a id="L2"></a>ntdll_handle: ?if (load_dll_notification_procs) *anyopaque else noreturn,
+<a id="L3"></a>notification_cookie: ?LDR.DLL_NOTIFICATION.COOKIE,
+<a id="L4"></a>modules: std.ArrayList(Module),
+<a id="L5"></a>
+<a id="L6"></a>pub const init: SelfInfo = .{
+<a id="L7"></a>    .lock = .init,
+<a id="L8"></a>    .ntdll_handle = null,
+<a id="L9"></a>    .notification_cookie = null,
+<a id="L10"></a>    .modules = .empty,
+<a id="L11"></a>};
+<a id="L12"></a>pub fn deinit(si: *SelfInfo, io: Io) void {
+<a id="L13"></a>    const gpa = std.debug.getDebugInfoAllocator();
+<a id="L14"></a>    if (si.notification_cookie) |cookie| unregister: {
+<a id="L15"></a>        switch ((si.getNtdllProc(.LdrUnregisterDllNotification) catch break :unregister)(cookie)) {
+<a id="L16"></a>            .SUCCESS =&gt; {},
+<a id="L17"></a>            else =&gt; |status| windows.unexpectedStatus(status) catch break :unregister,
+<a id="L18"></a>        }
+<a id="L19"></a>    }
+<a id="L20"></a>    if (si.ntdll_handle) |handle| switch (windows.ntdll.LdrUnloadDll(handle)) {
+<a id="L21"></a>        .SUCCESS =&gt; {},
+<a id="L22"></a>        else =&gt; |status| windows.unexpectedStatus(status) catch {},
+<a id="L23"></a>    };
+<a id="L24"></a>    for (si.modules.items) |*module| module.deinit(gpa, io);
+<a id="L25"></a>    si.modules.deinit(gpa);
+<a id="L26"></a>}
+<a id="L27"></a>
+<a id="L28"></a>pub fn getSymbols(
+<a id="L29"></a>    si: *SelfInfo,
+<a id="L30"></a>    io: Io,
+<a id="L31"></a>    symbol_allocator: Allocator,
+<a id="L32"></a>    text_arena: Allocator,
+<a id="L33"></a>    address: usize,
+<a id="L34"></a>    resolve_inline_callers: bool,
+<a id="L35"></a>    symbols: *std.ArrayList(std.debug.Symbol),
+<a id="L36"></a>) Error!void {
+<a id="L37"></a>    const gpa = std.debug.getDebugInfoAllocator();
+<a id="L38"></a>    try si.lock.lockShared(io);
+<a id="L39"></a>    defer si.lock.unlockShared(io);
+<a id="L40"></a>    const module = try si.findModule(gpa, address);
+<a id="L41"></a>    const di = try module.getDebugInfo(gpa, io);
+<a id="L42"></a>    return di.getSymbols(
+<a id="L43"></a>        symbol_allocator,
+<a id="L44"></a>        text_arena,
+<a id="L45"></a>        address - @intFromPtr(module.entry.DllBase),
+<a id="L46"></a>        resolve_inline_callers,
+<a id="L47"></a>        symbols,
+<a id="L48"></a>    );
+<a id="L49"></a>}
+<a id="L50"></a>
+<a id="L51"></a>pub fn getModuleName(si: *SelfInfo, io: Io, address: usize) Error![]const u8 {
+<a id="L52"></a>    const gpa = std.debug.getDebugInfoAllocator();
+<a id="L53"></a>    try si.lock.lockShared(io);
+<a id="L54"></a>    defer si.lock.unlockShared(io);
+<a id="L55"></a>    const module = try si.findModule(gpa, address);
+<a id="L56"></a>    return module.name orelse {
+<a id="L57"></a>        const name = try std.unicode.wtf16LeToWtf8Alloc(gpa, module.entry.BaseDllName.slice());
+<a id="L58"></a>        module.name = name;
+<a id="L59"></a>        return name;
+<a id="L60"></a>    };
+<a id="L61"></a>}
+<a id="L62"></a>pub fn getModuleSlide(si: *SelfInfo, io: Io, address: usize) Error!usize {
+<a id="L63"></a>    const gpa = std.debug.getDebugInfoAllocator();
+<a id="L64"></a>    try si.lock.lockShared(io);
+<a id="L65"></a>    defer si.lock.unlockShared(io);
+<a id="L66"></a>    const module = try si.findModule(gpa, address);
+<a id="L67"></a>    return module.base_address;
+<a id="L68"></a>}
+<a id="L69"></a>
+<a id="L70"></a>pub const can_unwind: bool = switch (builtin.cpu.arch) {
+<a id="L71"></a>    else =&gt; true,
+<a id="L72"></a>    // On x86, `RtlVirtualUnwind` does not exist. We could in theory use `RtlCaptureStackBackTrace`
+<a id="L73"></a>    // instead, but on x86, it turns out that function is just... doing FP unwinding with esp! It's
+<a id="L74"></a>    // hard to find implementation details to confirm that, but the most authoritative source I have
+<a id="L75"></a>    // is an entry in the LLVM mailing list from 2020/08/16 which contains this quote:
+<a id="L76"></a>    //
+<a id="L77"></a>    // &gt; x86 doesn't have what most architectures would consider an "unwinder" in the sense of
+<a id="L78"></a>    // &gt; restoring registers; there is simply a linked list of frames that participate in SEH and
+<a id="L79"></a>    // &gt; that desire to be called for a dynamic unwind operation, so RtlCaptureStackBackTrace
+<a id="L80"></a>    // &gt; assumes that EBP-based frames are in use and walks an EBP-based frame chain on x86 - not
+<a id="L81"></a>    // &gt; all x86 code is written with EBP-based frames so while even though we generally build the
+<a id="L82"></a>    // &gt; OS that way, you might always run the risk of encountering external code that uses EBP as a
+<a id="L83"></a>    // &gt; general purpose register for which such an unwind attempt for a stack trace would fail.
+<a id="L84"></a>    //
+<a id="L85"></a>    // Regardless, it's easy to effectively confirm this hypothesis just by compiling some code with
+<a id="L86"></a>    // `-fomit-frame-pointer -OReleaseFast` and observing that `RtlCaptureStackBackTrace` returns an
+<a id="L87"></a>    // empty trace when it's called in such an application. Note that without `-OReleaseFast` or
+<a id="L88"></a>    // similar, LLVM seems reluctant to ever clobber ebp, so you'll get a trace returned which just
+<a id="L89"></a>    // contains all of the kernel32/ntdll frames but none of your own. Don't be deceived---this is
+<a id="L90"></a>    // just coincidental!
+<a id="L91"></a>    //
+<a id="L92"></a>    // Anyway, the point is, the only stack walking primitive on x86-windows is FP unwinding. We
+<a id="L93"></a>    // *could* ask Microsoft to do that for us with `RtlCaptureStackBackTrace`... but better to just
+<a id="L94"></a>    // use our existing FP unwinder in `std.debug`!
+<a id="L95"></a>    .x86 =&gt; false,
+<a id="L96"></a>};
+<a id="L97"></a>pub const UnwindContext = struct {
+<a id="L98"></a>    pc: usize,
+<a id="L99"></a>    cur: windows.CONTEXT,
+<a id="L100"></a>    history_table: windows.UNWIND_HISTORY_TABLE,
+<a id="L101"></a>    pub fn init(ctx: *const std.debug.cpu_context.Native) UnwindContext {
+<a id="L102"></a>        return .{
+<a id="L103"></a>            .pc = @returnAddress(),
+<a id="L104"></a>            .cur = switch (builtin.cpu.arch) {
+<a id="L105"></a>                .x86_64 =&gt; std.mem.zeroInit(windows.CONTEXT, .{
+<a id="L106"></a>                    .Rax = ctx.gprs.get(.rax),
+<a id="L107"></a>                    .Rcx = ctx.gprs.get(.rcx),
+<a id="L108"></a>                    .Rdx = ctx.gprs.get(.rdx),
+<a id="L109"></a>                    .Rbx = ctx.gprs.get(.rbx),
+<a id="L110"></a>                    .Rsp = ctx.gprs.get(.rsp),
+<a id="L111"></a>                    .Rbp = ctx.gprs.get(.rbp),
+<a id="L112"></a>                    .Rsi = ctx.gprs.get(.rsi),
+<a id="L113"></a>                    .Rdi = ctx.gprs.get(.rdi),
+<a id="L114"></a>                    .R8 = ctx.gprs.get(.r8),
+<a id="L115"></a>                    .R9 = ctx.gprs.get(.r9),
+<a id="L116"></a>                    .R10 = ctx.gprs.get(.r10),
+<a id="L117"></a>                    .R11 = ctx.gprs.get(.r11),
+<a id="L118"></a>                    .R12 = ctx.gprs.get(.r12),
+<a id="L119"></a>                    .R13 = ctx.gprs.get(.r13),
+<a id="L120"></a>                    .R14 = ctx.gprs.get(.r14),
+<a id="L121"></a>                    .R15 = ctx.gprs.get(.r15),
+<a id="L122"></a>                    .Rip = ctx.gprs.get(.rip),
+<a id="L123"></a>                }),
+<a id="L124"></a>                .aarch64 =&gt; .{
+<a id="L125"></a>                    .ContextFlags = 0,
+<a id="L126"></a>                    .Cpsr = 0,
+<a id="L127"></a>                    .DUMMYUNIONNAME = .{ .X = ctx.x },
+<a id="L128"></a>                    .Sp = ctx.sp,
+<a id="L129"></a>                    .Pc = ctx.pc,
+<a id="L130"></a>                    .V = @splat(.{ .B = @splat(0) }),
+<a id="L131"></a>                    .Fpcr = 0,
+<a id="L132"></a>                    .Fpsr = 0,
+<a id="L133"></a>                    .Bcr = @splat(0),
+<a id="L134"></a>                    .Bvr = @splat(0),
+<a id="L135"></a>                    .Wcr = @splat(0),
+<a id="L136"></a>                    .Wvr = @splat(0),
+<a id="L137"></a>                },
+<a id="L138"></a>                .thumb =&gt; .{
+<a id="L139"></a>                    .ContextFlags = 0,
+<a id="L140"></a>                    .R0 = ctx.r[0],
+<a id="L141"></a>                    .R1 = ctx.r[1],
+<a id="L142"></a>                    .R2 = ctx.r[2],
+<a id="L143"></a>                    .R3 = ctx.r[3],
+<a id="L144"></a>                    .R4 = ctx.r[4],
+<a id="L145"></a>                    .R5 = ctx.r[5],
+<a id="L146"></a>                    .R6 = ctx.r[6],
+<a id="L147"></a>                    .R7 = ctx.r[7],
+<a id="L148"></a>                    .R8 = ctx.r[8],
+<a id="L149"></a>                    .R9 = ctx.r[9],
+<a id="L150"></a>                    .R10 = ctx.r[10],
+<a id="L151"></a>                    .R11 = ctx.r[11],
+<a id="L152"></a>                    .R12 = ctx.r[12],
+<a id="L153"></a>                    .Sp = ctx.r[13],
+<a id="L154"></a>                    .Lr = ctx.r[14],
+<a id="L155"></a>                    .Pc = ctx.r[15],
+<a id="L156"></a>                    .Cpsr = 0,
+<a id="L157"></a>                    .Fpcsr = 0,
+<a id="L158"></a>                    .Padding = 0,
+<a id="L159"></a>                    .DUMMYUNIONNAME = .{ .S = @splat(0) },
+<a id="L160"></a>                    .Bvr = @splat(0),
+<a id="L161"></a>                    .Bcr = @splat(0),
+<a id="L162"></a>                    .Wvr = @splat(0),
+<a id="L163"></a>                    .Wcr = @splat(0),
+<a id="L164"></a>                    .Padding2 = @splat(0),
+<a id="L165"></a>                },
+<a id="L166"></a>                else =&gt; comptime unreachable,
+<a id="L167"></a>            },
+<a id="L168"></a>            .history_table = std.mem.zeroes(windows.UNWIND_HISTORY_TABLE),
+<a id="L169"></a>        };
+<a id="L170"></a>    }
+<a id="L171"></a>    pub fn deinit(ctx: *UnwindContext) void {
+<a id="L172"></a>        _ = ctx;
+<a id="L173"></a>    }
+<a id="L174"></a>    pub fn getFp(ctx: *UnwindContext) usize {
+<a id="L175"></a>        return ctx.cur.getRegs().bp;
+<a id="L176"></a>    }
+<a id="L177"></a>};
+<a id="L178"></a>pub fn unwindFrame(si: *SelfInfo, io: Io, context: *UnwindContext) Error!usize {
+<a id="L179"></a>    _ = si;
+<a id="L180"></a>    _ = io;
+<a id="L181"></a>
+<a id="L182"></a>    const current_regs = context.cur.getRegs();
+<a id="L183"></a>    var image_base: usize = undefined;
+<a id="L184"></a>    if (windows.ntdll.RtlLookupFunctionEntry(current_regs.ip, &amp;image_base, &amp;context.history_table)) |runtime_function| {
+<a id="L185"></a>        var handler_data: ?*anyopaque = null;
+<a id="L186"></a>        var establisher_frame: usize = undefined;
+<a id="L187"></a>        _ = windows.ntdll.RtlVirtualUnwind(
+<a id="L188"></a>            windows.UNW_FLAG_NHANDLER,
+<a id="L189"></a>            image_base,
+<a id="L190"></a>            current_regs.ip,
+<a id="L191"></a>            runtime_function,
+<a id="L192"></a>            &amp;context.cur,
+<a id="L193"></a>            &amp;handler_data,
+<a id="L194"></a>            &amp;establisher_frame,
+<a id="L195"></a>            null,
+<a id="L196"></a>        );
+<a id="L197"></a>    } else {
+<a id="L198"></a>        // leaf function
+<a id="L199"></a>        context.cur.setIp(@as(*const usize, @ptrFromInt(current_regs.sp)).*);
+<a id="L200"></a>        context.cur.setSp(current_regs.sp + @sizeOf(usize));
+<a id="L201"></a>    }
+<a id="L202"></a>
+<a id="L203"></a>    const next_regs = context.cur.getRegs();
+<a id="L204"></a>    const tib = &amp;windows.teb().NtTib;
+<a id="L205"></a>    if (next_regs.sp &lt; @intFromPtr(tib.StackLimit) or next_regs.sp &gt; @intFromPtr(tib.StackBase)) {
+<a id="L206"></a>        context.pc = 0;
+<a id="L207"></a>        return 0;
+<a id="L208"></a>    }
+<a id="L209"></a>    // Like `DwarfUnwindContext.unwindFrame`, adjust our next lookup pc in case the `call` was this
+<a id="L210"></a>    // function's last instruction making `next_regs.ip` one byte past its end.
+<a id="L211"></a>    context.pc = next_regs.ip -| 1;
+<a id="L212"></a>    return next_regs.ip;
+<a id="L213"></a>}
+<a id="L214"></a>
+<a id="L215"></a>const Module = struct {
+<a id="L216"></a>    entry: *const LDR.DATA_TABLE_ENTRY,
+<a id="L217"></a>    name: ?[]const u8,
+<a id="L218"></a>    di: ?(Error!DebugInfo),
+<a id="L219"></a>
+<a id="L220"></a>    const DebugInfo = struct {
+<a id="L221"></a>        arena: std.heap.ArenaAllocator.State,
+<a id="L222"></a>        coff_image_base: u64,
+<a id="L223"></a>        mapped_file: ?MappedFile,
+<a id="L224"></a>        dwarf: ?Dwarf,
+<a id="L225"></a>        pdb: ?Pdb,
+<a id="L226"></a>        coff_section_headers: []coff.SectionHeader,
+<a id="L227"></a>
+<a id="L228"></a>        const MappedFile = struct {
+<a id="L229"></a>            file: Io.File,
+<a id="L230"></a>            section_handle: windows.HANDLE,
+<a id="L231"></a>            section_view: []const u8,
+<a id="L232"></a>            fn deinit(mf: *const MappedFile, io: Io) void {
+<a id="L233"></a>                const process_handle = windows.GetCurrentProcess();
+<a id="L234"></a>                switch (windows.ntdll.NtUnmapViewOfSection(
+<a id="L235"></a>                    process_handle,
+<a id="L236"></a>                    @constCast(mf.section_view.ptr),
+<a id="L237"></a>                )) {
+<a id="L238"></a>                    .SUCCESS =&gt; {},
+<a id="L239"></a>                    else =&gt; |status| windows.unexpectedStatus(status) catch {},
+<a id="L240"></a>                }
+<a id="L241"></a>                windows.CloseHandle(mf.section_handle);
+<a id="L242"></a>                mf.file.close(io);
+<a id="L243"></a>            }
+<a id="L244"></a>        };
+<a id="L245"></a>
+<a id="L246"></a>        fn deinit(di: *DebugInfo, gpa: Allocator, io: Io) void {
+<a id="L247"></a>            if (di.dwarf) |*dwarf| dwarf.deinit(gpa);
+<a id="L248"></a>            if (di.pdb) |*pdb| {
+<a id="L249"></a>                pdb.file_reader.file.close(io);
+<a id="L250"></a>                pdb.deinit();
+<a id="L251"></a>            }
+<a id="L252"></a>            if (di.mapped_file) |*mf| mf.deinit(io);
+<a id="L253"></a>
+<a id="L254"></a>            var arena = di.arena.promote(gpa);
+<a id="L255"></a>            arena.deinit();
+<a id="L256"></a>        }
+<a id="L257"></a>
+<a id="L258"></a>        fn getSymbols(
+<a id="L259"></a>            di: *DebugInfo,
+<a id="L260"></a>            symbol_allocator: Allocator,
+<a id="L261"></a>            text_arena: Allocator,
+<a id="L262"></a>            vaddr: usize,
+<a id="L263"></a>            resolve_inline_callers: bool,
+<a id="L264"></a>            symbols: *std.ArrayList(std.debug.Symbol),
+<a id="L265"></a>        ) Error!void {
+<a id="L266"></a>            pdb: {
+<a id="L267"></a>                const pdb = &amp;(di.pdb orelse break :pdb);
+<a id="L268"></a>                var coff_section: *align(1) const coff.SectionHeader = undefined;
+<a id="L269"></a>                const mod_index = for (pdb.sect_contribs) |sect_contrib| {
+<a id="L270"></a>                    if (sect_contrib.section &gt; di.coff_section_headers.len) continue;
+<a id="L271"></a>                    // Remember that SectionContribEntry.Section is 1-based.
+<a id="L272"></a>                    coff_section = &amp;di.coff_section_headers[sect_contrib.section - 1];
+<a id="L273"></a>
+<a id="L274"></a>                    const vaddr_start = coff_section.virtual_address + sect_contrib.offset;
+<a id="L275"></a>                    const vaddr_end = vaddr_start + sect_contrib.size;
+<a id="L276"></a>                    if (vaddr &gt;= vaddr_start and vaddr &lt; vaddr_end) {
+<a id="L277"></a>                        break sect_contrib.module_index;
+<a id="L278"></a>                    }
+<a id="L279"></a>                } else {
+<a id="L280"></a>                    // we have no information to add to the address
+<a id="L281"></a>                    break :pdb;
+<a id="L282"></a>                };
+<a id="L283"></a>                const module = pdb.getModule(mod_index) catch |err| switch (err) {
+<a id="L284"></a>                    error.InvalidDebugInfo,
+<a id="L285"></a>                    error.MissingDebugInfo,
+<a id="L286"></a>                    error.OutOfMemory,
+<a id="L287"></a>                    =&gt; |e| return e,
+<a id="L288"></a>
+<a id="L289"></a>                    error.ReadFailed,
+<a id="L290"></a>                    error.EndOfStream,
+<a id="L291"></a>                    =&gt; return error.InvalidDebugInfo,
+<a id="L292"></a>                } orelse {
+<a id="L293"></a>                    return error.InvalidDebugInfo; // bad module index
+<a id="L294"></a>                };
+<a id="L295"></a>
+<a id="L296"></a>                const addr = vaddr - coff_section.virtual_address;
+<a id="L297"></a>                const maybe_proc = pdb.getProcSym(module, addr);
+<a id="L298"></a>                const compile_unit_name = fs.path.basename(module.obj_file_name);
+<a id="L299"></a>                const symbols_top = symbols.items.len;
+<a id="L300"></a>                if (maybe_proc) |proc| {
+<a id="L301"></a>                    const offset_in_func = addr - proc.code_offset;
+<a id="L302"></a>                    var last_inlinee: ?u32 = null;
+<a id="L303"></a>                    var iter = pdb.getInlinees(module, proc);
+<a id="L304"></a>                    while (iter.next(module)) |inline_site| {
+<a id="L305"></a>                        // Filter out duplicate inline sites. Tools like llvm-addr2line output
+<a id="L306"></a>                        // duplicate sites in the same cases as us if we elide this check,
+<a id="L307"></a>                        // implying that they exist in the underlying data and are not indicative
+<a id="L308"></a>                        // of a parser bug. No useful information is lost here since an inline site
+<a id="L309"></a>                        // can't actually reference itself.
+<a id="L310"></a>                        if (inline_site.inlinee == last_inlinee) continue;
+<a id="L311"></a>
+<a id="L312"></a>                        // If our address points into this site, get the source location(s) it
+<a id="L313"></a>                        // points at
+<a id="L314"></a>                        for (pdb.getInlineeSourceLines(
+<a id="L315"></a>                            module,
+<a id="L316"></a>                            inline_site.inlinee,
+<a id="L317"></a>                        )) |inlinee_src_line| {
+<a id="L318"></a>                            const maybe_loc = pdb.getInlineSiteSourceLocation(
+<a id="L319"></a>                                text_arena,
+<a id="L320"></a>                                module,
+<a id="L321"></a>                                inline_site,
+<a id="L322"></a>                                inlinee_src_line.info,
+<a id="L323"></a>                                offset_in_func,
+<a id="L324"></a>                            ) catch continue;
+<a id="L325"></a>                            const loc = maybe_loc orelse continue;
+<a id="L326"></a>
+<a id="L327"></a>                            // If we aren't trying to resolve inline callers, and we've matched a
+<a id="L328"></a>                            // new inline site, we want to overwrite the previously appended
+<a id="L329"></a>                            // results.
+<a id="L330"></a>                            if (!resolve_inline_callers and inline_site.inlinee != last_inlinee) {
+<a id="L331"></a>                                symbols.items.len = symbols_top;
+<a id="L332"></a>                            }
+<a id="L333"></a>
+<a id="L334"></a>                            // Only resolve the name if we're resolving inline callers, otherwise
+<a id="L335"></a>                            // wait until we're done to avoid duplicated work.
+<a id="L336"></a>                            const name = if (resolve_inline_callers)
+<a id="L337"></a>                                pdb.findInlineeName(inline_site.inlinee)
+<a id="L338"></a>                            else
+<a id="L339"></a>                                null;
+<a id="L340"></a>
+<a id="L341"></a>                            try symbols.append(symbol_allocator, .{
+<a id="L342"></a>                                .name = name,
+<a id="L343"></a>                                .compile_unit_name = compile_unit_name,
+<a id="L344"></a>                                .source_location = loc,
+<a id="L345"></a>                            });
+<a id="L346"></a>
+<a id="L347"></a>                            last_inlinee = inline_site.inlinee;
+<a id="L348"></a>                        }
+<a id="L349"></a>                    }
+<a id="L350"></a>
+<a id="L351"></a>                    if (resolve_inline_callers) {
+<a id="L352"></a>                        // Inline sites are stored in the pdb in reverse order, so we reverse the
+<a id="L353"></a>                        // matching sites here. We could alternatively use the parent fields to
+<a id="L354"></a>                        // determine the order, but this would introduce seemingly unecessary
+<a id="L355"></a>                        // complexity.
+<a id="L356"></a>                        std.mem.reverse(std.debug.Symbol, symbols.items);
+<a id="L357"></a>                    } else if (last_inlinee) |inlinee| {
+<a id="L358"></a>                        // If we aren't resolving inline callers, then all results will have the
+<a id="L359"></a>                        // same inline site, and we resolve its name once at the end.
+<a id="L360"></a>                        const name = pdb.findInlineeName(inlinee);
+<a id="L361"></a>                        for (symbols.items) |*symbol| symbol.name = name;
+<a id="L362"></a>                    }
+<a id="L363"></a>                }
+<a id="L364"></a>
+<a id="L365"></a>                // If there's room for another symbol, add the actual proc
+<a id="L366"></a>                if (resolve_inline_callers or symbols.items.len == 0) {
+<a id="L367"></a>                    try symbols.append(symbol_allocator, .{
+<a id="L368"></a>                        .name = if (maybe_proc) |proc| pdb.getSymbolName(proc) else null,
+<a id="L369"></a>                        .compile_unit_name = compile_unit_name,
+<a id="L370"></a>                        .source_location = pdb.getLineNumberInfo(text_arena, module, addr) catch null,
+<a id="L371"></a>                    });
+<a id="L372"></a>                }
+<a id="L373"></a>
+<a id="L374"></a>                return;
+<a id="L375"></a>            }
+<a id="L376"></a>
+<a id="L377"></a>            dwarf: {
+<a id="L378"></a>                const dwarf = &amp;(di.dwarf orelse break :dwarf);
+<a id="L379"></a>                const addr = vaddr + di.coff_image_base;
+<a id="L380"></a>                return dwarf.getSymbols(
+<a id="L381"></a>                    symbol_allocator,
+<a id="L382"></a>                    text_arena,
+<a id="L383"></a>                    native_endian,
+<a id="L384"></a>                    addr,
+<a id="L385"></a>                    resolve_inline_callers,
+<a id="L386"></a>                    symbols,
+<a id="L387"></a>                );
+<a id="L388"></a>            }
+<a id="L389"></a>
+<a id="L390"></a>            return error.MissingDebugInfo;
+<a id="L391"></a>        }
+<a id="L392"></a>    };
+<a id="L393"></a>
+<a id="L394"></a>    fn deinit(module: *Module, gpa: Allocator, io: Io) void {
+<a id="L395"></a>        if (module.name) |name| gpa.free(name);
+<a id="L396"></a>        if (module.di) |*di_or_err| if (di_or_err.*) |*di| di.deinit(gpa, io) else |_| {};
+<a id="L397"></a>        module.* = undefined;
+<a id="L398"></a>    }
+<a id="L399"></a>
+<a id="L400"></a>    fn getDebugInfo(module: *Module, gpa: Allocator, io: Io) Error!*DebugInfo {
+<a id="L401"></a>        if (module.di == null) module.di = loadDebugInfo(module, gpa, io);
+<a id="L402"></a>        return if (module.di.?) |*di| di else |err| err;
+<a id="L403"></a>    }
+<a id="L404"></a>    fn loadDebugInfo(module: *const Module, gpa: Allocator, io: Io) Error!DebugInfo {
+<a id="L405"></a>        const mapped_ptr: [*]const u8 = @ptrCast(module.entry.DllBase);
+<a id="L406"></a>        const mapped = mapped_ptr[0..module.entry.SizeOfImage];
+<a id="L407"></a>        var coff_obj = coff.Coff.init(mapped, true) catch return error.InvalidDebugInfo;
+<a id="L408"></a>
+<a id="L409"></a>        var arena_instance: std.heap.ArenaAllocator = .init(gpa);
+<a id="L410"></a>        errdefer arena_instance.deinit();
+<a id="L411"></a>        const arena = arena_instance.allocator();
+<a id="L412"></a>
+<a id="L413"></a>        // The string table is not mapped into memory by the loader, so if a section name is in the
+<a id="L414"></a>        // string table then we have to map the full image file from disk. This can happen when
+<a id="L415"></a>        // a binary is produced with -gdwarf, since the section names are longer than 8 bytes.
+<a id="L416"></a>        const mapped_file: ?DebugInfo.MappedFile = mapped: {
+<a id="L417"></a>            if (!coff_obj.strtabRequired()) break :mapped null;
+<a id="L418"></a>            var path_buffer: [4 + windows.PATH_MAX_WIDE]u16 = undefined;
+<a id="L419"></a>            path_buffer[0..4].* = .{ '\\', '?', '?', '\\' }; // openFileAbsoluteW requires the prefix to be present
+<a id="L420"></a>            const path_slice = module.entry.FullDllName.slice();
+<a id="L421"></a>            @memcpy(path_buffer[4..][0..path_slice.len], path_slice);
+<a id="L422"></a>            const coff_file = Io.Threaded.dirOpenFileWtf16(
+<a id="L423"></a>                null,
+<a id="L424"></a>                path_buffer[0 .. 4 + path_slice.len],
+<a id="L425"></a>                .{},
+<a id="L426"></a>            ) catch |err| switch (err) {
+<a id="L427"></a>                error.Canceled =&gt; |e| return e,
+<a id="L428"></a>                error.Unexpected =&gt; |e| return e,
+<a id="L429"></a>                error.FileNotFound =&gt; return error.MissingDebugInfo,
+<a id="L430"></a>
+<a id="L431"></a>                error.FileTooBig,
+<a id="L432"></a>                error.IsDir,
+<a id="L433"></a>                error.NotDir,
+<a id="L434"></a>                error.SymLinkLoop,
+<a id="L435"></a>                error.NameTooLong,
+<a id="L436"></a>                error.BadPathName,
+<a id="L437"></a>                =&gt; return error.InvalidDebugInfo,
+<a id="L438"></a>
+<a id="L439"></a>                error.SystemResources,
+<a id="L440"></a>                error.WouldBlock,
+<a id="L441"></a>                error.AccessDenied,
+<a id="L442"></a>                error.PermissionDenied,
+<a id="L443"></a>                error.NoSpaceLeft,
+<a id="L444"></a>                error.DeviceBusy,
+<a id="L445"></a>                error.NoDevice,
+<a id="L446"></a>                error.PathAlreadyExists,
+<a id="L447"></a>                error.PipeBusy,
+<a id="L448"></a>                error.NetworkNotFound,
+<a id="L449"></a>                error.AntivirusInterference,
+<a id="L450"></a>                error.ProcessFdQuotaExceeded,
+<a id="L451"></a>                error.SystemFdQuotaExceeded,
+<a id="L452"></a>                error.FileLocksUnsupported,
+<a id="L453"></a>                error.FileBusy,
+<a id="L454"></a>                error.ReadOnlyFileSystem,
+<a id="L455"></a>                =&gt; return error.ReadFailed,
+<a id="L456"></a>            };
+<a id="L457"></a>            errdefer coff_file.close(io);
+<a id="L458"></a>            var section_handle: windows.HANDLE = undefined;
+<a id="L459"></a>            const create_section_rc = windows.ntdll.NtCreateSection(
+<a id="L460"></a>                &amp;section_handle,
+<a id="L461"></a>                .{
+<a id="L462"></a>                    .SPECIFIC = .{ .SECTION = .{
+<a id="L463"></a>                        .QUERY = true,
+<a id="L464"></a>                        .MAP_READ = true,
+<a id="L465"></a>                    } },
+<a id="L466"></a>                    .STANDARD = .{ .RIGHTS = .REQUIRED },
+<a id="L467"></a>                },
+<a id="L468"></a>                null,
+<a id="L469"></a>                null,
+<a id="L470"></a>                .{ .READONLY = true },
+<a id="L471"></a>                // The documentation states that if no AllocationAttribute is specified,
+<a id="L472"></a>                // then SEC_COMMIT is the default.
+<a id="L473"></a>                // In practice, this isn't the case and specifying 0 will result in INVALID_PARAMETER_6.
+<a id="L474"></a>                .{ .COMMIT = true },
+<a id="L475"></a>                coff_file.handle,
+<a id="L476"></a>            );
+<a id="L477"></a>            if (create_section_rc != .SUCCESS) return error.MissingDebugInfo;
+<a id="L478"></a>            errdefer windows.CloseHandle(section_handle);
+<a id="L479"></a>            var coff_len: usize = 0;
+<a id="L480"></a>            var section_view_ptr: ?[*]const u8 = null;
+<a id="L481"></a>            const process_handle = windows.GetCurrentProcess();
+<a id="L482"></a>            const map_section_rc = windows.ntdll.NtMapViewOfSection(
+<a id="L483"></a>                section_handle,
+<a id="L484"></a>                process_handle,
+<a id="L485"></a>                @ptrCast(&amp;section_view_ptr),
+<a id="L486"></a>                null,
+<a id="L487"></a>                0,
+<a id="L488"></a>                null,
+<a id="L489"></a>                &amp;coff_len,
+<a id="L490"></a>                .Unmap,
+<a id="L491"></a>                .{},
+<a id="L492"></a>                .{ .READONLY = true },
+<a id="L493"></a>            );
+<a id="L494"></a>            if (map_section_rc != .SUCCESS) return error.MissingDebugInfo;
+<a id="L495"></a>            errdefer switch (windows.ntdll.NtUnmapViewOfSection(
+<a id="L496"></a>                process_handle,
+<a id="L497"></a>                @constCast(section_view_ptr.?),
+<a id="L498"></a>            )) {
+<a id="L499"></a>                .SUCCESS =&gt; {},
+<a id="L500"></a>                else =&gt; |status| windows.unexpectedStatus(status) catch {},
+<a id="L501"></a>            };
+<a id="L502"></a>            const section_view = section_view_ptr.?[0..coff_len];
+<a id="L503"></a>            coff_obj = coff.Coff.init(section_view, false) catch return error.InvalidDebugInfo;
+<a id="L504"></a>            break :mapped .{
+<a id="L505"></a>                .file = coff_file,
+<a id="L506"></a>                .section_handle = section_handle,
+<a id="L507"></a>                .section_view = section_view,
+<a id="L508"></a>            };
+<a id="L509"></a>        };
+<a id="L510"></a>        errdefer if (mapped_file) |*mf| mf.deinit(io);
+<a id="L511"></a>
+<a id="L512"></a>        const coff_image_base = coff_obj.getImageBase();
+<a id="L513"></a>
+<a id="L514"></a>        var opt_dwarf: ?Dwarf = dwarf: {
+<a id="L515"></a>            if (coff_obj.getSectionByName(".debug_info") == null) break :dwarf null;
+<a id="L516"></a>
+<a id="L517"></a>            var sections: Dwarf.SectionArray = undefined;
+<a id="L518"></a>            inline for (@typeInfo(Dwarf.Section.Id).@"enum".fields, 0..) |section, i| {
+<a id="L519"></a>                sections[i] = if (coff_obj.getSectionByName("." ++ section.name)) |section_header| .{
+<a id="L520"></a>                    .data = try coff_obj.getSectionDataAlloc(section_header, arena),
+<a id="L521"></a>                    .owned = false,
+<a id="L522"></a>                } else null;
+<a id="L523"></a>            }
+<a id="L524"></a>            break :dwarf .{ .sections = sections };
+<a id="L525"></a>        };
+<a id="L526"></a>        errdefer if (opt_dwarf) |*dwarf| dwarf.deinit(gpa);
+<a id="L527"></a>
+<a id="L528"></a>        if (opt_dwarf) |*dwarf| {
+<a id="L529"></a>            dwarf.open(gpa, native_endian) catch |err| switch (err) {
+<a id="L530"></a>                error.Overflow,
+<a id="L531"></a>                error.EndOfStream,
+<a id="L532"></a>                error.StreamTooLong,
+<a id="L533"></a>                error.ReadFailed,
+<a id="L534"></a>                =&gt; return error.InvalidDebugInfo,
+<a id="L535"></a>
+<a id="L536"></a>                error.InvalidDebugInfo,
+<a id="L537"></a>                error.MissingDebugInfo,
+<a id="L538"></a>                error.OutOfMemory,
+<a id="L539"></a>                =&gt; |e| return e,
+<a id="L540"></a>            };
+<a id="L541"></a>        }
+<a id="L542"></a>
+<a id="L543"></a>        var opt_pdb: ?Pdb = pdb: {
+<a id="L544"></a>            const path = coff_obj.getPdbPath() catch {
+<a id="L545"></a>                return error.InvalidDebugInfo;
+<a id="L546"></a>            } orelse {
+<a id="L547"></a>                break :pdb null;
+<a id="L548"></a>            };
+<a id="L549"></a>            const pdb_file_open_result = if (fs.path.isAbsolute(path)) res: {
+<a id="L550"></a>                break :res Io.Dir.cwd().openFile(io, path, .{});
+<a id="L551"></a>            } else res: {
+<a id="L552"></a>                const self_dir = std.process.executableDirPathAlloc(io, gpa) catch |err| switch (err) {
+<a id="L553"></a>                    error.OutOfMemory, error.Unexpected =&gt; |e| return e,
+<a id="L554"></a>                    else =&gt; return error.ReadFailed,
+<a id="L555"></a>                };
+<a id="L556"></a>                defer gpa.free(self_dir);
+<a id="L557"></a>                const abs_path = try fs.path.join(gpa, &amp;.{ self_dir, path });
+<a id="L558"></a>                defer gpa.free(abs_path);
+<a id="L559"></a>                break :res Io.Dir.cwd().openFile(io, abs_path, .{});
+<a id="L560"></a>            };
+<a id="L561"></a>            const pdb_file = pdb_file_open_result catch |err| switch (err) {
+<a id="L562"></a>                error.FileNotFound, error.IsDir =&gt; break :pdb null,
+<a id="L563"></a>                else =&gt; return error.ReadFailed,
+<a id="L564"></a>            };
+<a id="L565"></a>            errdefer pdb_file.close(io);
+<a id="L566"></a>
+<a id="L567"></a>            const pdb_reader = try arena.create(Io.File.Reader);
+<a id="L568"></a>            pdb_reader.* = pdb_file.reader(io, try arena.alloc(u8, 4096));
+<a id="L569"></a>
+<a id="L570"></a>            var pdb = Pdb.init(gpa, pdb_reader) catch |err| switch (err) {
+<a id="L571"></a>                error.OutOfMemory, error.ReadFailed, error.Unexpected =&gt; |e| return e,
+<a id="L572"></a>                else =&gt; return error.InvalidDebugInfo,
+<a id="L573"></a>            };
+<a id="L574"></a>            errdefer pdb.deinit();
+<a id="L575"></a>            pdb.parseInfoStream() catch |err| switch (err) {
+<a id="L576"></a>                error.UnknownPDBVersion =&gt; return error.UnsupportedDebugInfo,
+<a id="L577"></a>                error.EndOfStream =&gt; return error.InvalidDebugInfo,
+<a id="L578"></a>
+<a id="L579"></a>                error.InvalidDebugInfo,
+<a id="L580"></a>                error.MissingDebugInfo,
+<a id="L581"></a>                error.OutOfMemory,
+<a id="L582"></a>                error.ReadFailed,
+<a id="L583"></a>                =&gt; |e| return e,
+<a id="L584"></a>            };
+<a id="L585"></a>            pdb.parseDbiStream() catch |err| switch (err) {
+<a id="L586"></a>                error.UnknownPDBVersion =&gt; return error.UnsupportedDebugInfo,
+<a id="L587"></a>
+<a id="L588"></a>                error.EndOfStream,
+<a id="L589"></a>                error.EOF,
+<a id="L590"></a>                error.StreamTooLong,
+<a id="L591"></a>                error.WriteFailed,
+<a id="L592"></a>                =&gt; return error.InvalidDebugInfo,
+<a id="L593"></a>
+<a id="L594"></a>                error.InvalidDebugInfo,
+<a id="L595"></a>                error.OutOfMemory,
+<a id="L596"></a>                error.ReadFailed,
+<a id="L597"></a>                =&gt; |e| return e,
+<a id="L598"></a>            };
+<a id="L599"></a>            pdb.parseIpiStream() catch |err| switch (err) {
+<a id="L600"></a>                error.UnknownPDBVersion =&gt; return error.UnsupportedDebugInfo,
+<a id="L601"></a>
+<a id="L602"></a>                error.EndOfStream,
+<a id="L603"></a>                =&gt; return error.InvalidDebugInfo,
+<a id="L604"></a>
+<a id="L605"></a>                error.OutOfMemory,
+<a id="L606"></a>                error.ReadFailed,
+<a id="L607"></a>                =&gt; |e| return e,
+<a id="L608"></a>            };
+<a id="L609"></a>
+<a id="L610"></a>            if (!std.mem.eql(u8, &amp;coff_obj.guid, &amp;pdb.guid) or coff_obj.age != pdb.age)
+<a id="L611"></a>                return error.InvalidDebugInfo;
+<a id="L612"></a>
+<a id="L613"></a>            break :pdb pdb;
+<a id="L614"></a>        };
+<a id="L615"></a>        errdefer if (opt_pdb) |*pdb| {
+<a id="L616"></a>            pdb.file_reader.file.close(io);
+<a id="L617"></a>            pdb.deinit();
+<a id="L618"></a>        };
+<a id="L619"></a>
+<a id="L620"></a>        const coff_section_headers: []coff.SectionHeader = if (opt_pdb != null) csh: {
+<a id="L621"></a>            break :csh try coff_obj.getSectionHeadersAlloc(arena);
+<a id="L622"></a>        } else &amp;.{};
+<a id="L623"></a>
+<a id="L624"></a>        return .{
+<a id="L625"></a>            .arena = arena_instance.state,
+<a id="L626"></a>            .coff_image_base = coff_image_base,
+<a id="L627"></a>            .mapped_file = mapped_file,
+<a id="L628"></a>            .dwarf = opt_dwarf,
+<a id="L629"></a>            .pdb = opt_pdb,
+<a id="L630"></a>            .coff_section_headers = coff_section_headers,
+<a id="L631"></a>        };
+<a id="L632"></a>    }
+<a id="L633"></a>};
+<a id="L634"></a>
+<a id="L635"></a>/// Assumes we already hold `si.lock`.
+<a id="L636"></a>fn findModule(si: *SelfInfo, gpa: Allocator, address: usize) error{ MissingDebugInfo, OutOfMemory, Unexpected }!*Module {
+<a id="L637"></a>    for (si.modules.items) |*mod| {
+<a id="L638"></a>        const base = @intFromPtr(mod.entry.DllBase);
+<a id="L639"></a>        if (address &gt;= base and address &lt; base + mod.entry.SizeOfImage) return mod;
+<a id="L640"></a>    }
+<a id="L641"></a>    try si.modules.ensureUnusedCapacity(gpa, 1);
+<a id="L642"></a>    var entry: *LDR.DATA_TABLE_ENTRY = undefined;
+<a id="L643"></a>    switch (windows.ntdll.LdrFindEntryForAddress(@ptrFromInt(address), &amp;entry)) {
+<a id="L644"></a>        .SUCCESS =&gt; {},
+<a id="L645"></a>        .DLL_NOT_FOUND =&gt; return error.MissingDebugInfo,
+<a id="L646"></a>        else =&gt; |status| return windows.unexpectedStatus(status),
+<a id="L647"></a>    }
+<a id="L648"></a>    if (si.notification_cookie == null) {
+<a id="L649"></a>        var notification_cookie: LDR.DLL_NOTIFICATION.COOKIE = undefined;
+<a id="L650"></a>        switch ((try si.getNtdllProc(.LdrRegisterDllNotification))(
+<a id="L651"></a>            .{},
+<a id="L652"></a>            &amp;dllNotification,
+<a id="L653"></a>            si,
+<a id="L654"></a>            &amp;notification_cookie,
+<a id="L655"></a>        )) {
+<a id="L656"></a>            .SUCCESS =&gt; si.notification_cookie = notification_cookie,
+<a id="L657"></a>            else =&gt; |status| return windows.unexpectedStatus(status),
+<a id="L658"></a>        }
+<a id="L659"></a>    }
+<a id="L660"></a>    const mod = si.modules.addOneAssumeCapacity();
+<a id="L661"></a>    mod.* = .{ .entry = entry, .name = null, .di = null };
+<a id="L662"></a>    return mod;
+<a id="L663"></a>}
+<a id="L664"></a>
+<a id="L665"></a>inline fn getNtdllProc(
+<a id="L666"></a>    si: *SelfInfo,
+<a id="L667"></a>    comptime proc: std.meta.DeclEnum(windows.ntdll),
+<a id="L668"></a>) !@TypeOf(&amp;@field(windows.ntdll, @tagName(proc))) {
+<a id="L669"></a>    return if (load_dll_notification_procs)
+<a id="L670"></a>        @ptrCast(try si.loadNtdllProc(@tagName(proc)))
+<a id="L671"></a>    else
+<a id="L672"></a>        &amp;@field(windows.ntdll, @tagName(proc));
+<a id="L673"></a>}
+<a id="L674"></a>fn loadNtdllProc(si: *SelfInfo, name: []const u8) Io.UnexpectedError!*anyopaque {
+<a id="L675"></a>    const ntdll_handle = si.ntdll_handle orelse ntdll_handle: {
+<a id="L676"></a>        var ntdll_handle: *anyopaque = undefined;
+<a id="L677"></a>        switch (windows.ntdll.LdrLoadDll(null, null, &amp;.init(
+<a id="L678"></a>            &amp;.{ 'n', 't', 'd', 'l', 'l', '.', 'd', 'l', 'l' },
+<a id="L679"></a>        ), &amp;ntdll_handle)) {
+<a id="L680"></a>            .SUCCESS =&gt; {},
+<a id="L681"></a>            .DLL_NOT_FOUND =&gt; return error.Unexpected,
+<a id="L682"></a>            else =&gt; |status| return windows.unexpectedStatus(status),
+<a id="L683"></a>        }
+<a id="L684"></a>        si.ntdll_handle = ntdll_handle;
+<a id="L685"></a>        break :ntdll_handle ntdll_handle;
+<a id="L686"></a>    };
+<a id="L687"></a>    var proc_addr: *anyopaque = undefined;
+<a id="L688"></a>    switch (windows.ntdll.LdrGetProcedureAddress(ntdll_handle, &amp;.init(name), 0, &amp;proc_addr)) {
+<a id="L689"></a>        .SUCCESS =&gt; {},
+<a id="L690"></a>        else =&gt; |status| return windows.unexpectedStatus(status),
+<a id="L691"></a>    }
+<a id="L692"></a>    return proc_addr;
+<a id="L693"></a>}
+<a id="L694"></a>
+<a id="L695"></a>fn dllNotification(
+<a id="L696"></a>    reason: LDR.DLL_NOTIFICATION.REASON,
+<a id="L697"></a>    data: *const LDR.DLL_NOTIFICATION.DATA,
+<a id="L698"></a>    context: ?*anyopaque,
+<a id="L699"></a>) callconv(.winapi) void {
+<a id="L700"></a>    const si: *SelfInfo = @ptrCast(@alignCast(context));
+<a id="L701"></a>    switch (reason) {
+<a id="L702"></a>        .LOADED =&gt; {},
+<a id="L703"></a>        .UNLOADED =&gt; {
+<a id="L704"></a>            const io = std.Options.debug_io;
+<a id="L705"></a>            si.lock.lockUncancelable(io);
+<a id="L706"></a>            defer si.lock.unlock(io);
+<a id="L707"></a>            for (si.modules.items, 0..) |*mod, mod_index| {
+<a id="L708"></a>                if (mod.entry.DllBase != data.Unloaded.DllBase) continue;
+<a id="L709"></a>                mod.deinit(std.debug.getDebugInfoAllocator(), io);
+<a id="L710"></a>                _ = si.modules.swapRemove(mod_index);
+<a id="L711"></a>                break;
+<a id="L712"></a>            }
+<a id="L713"></a>        },
+<a id="L714"></a>    }
+<a id="L715"></a>}
+<a id="L716"></a>
+<a id="L717"></a>const std = @import("std");
+<a id="L718"></a>const Io = std.Io;
+<a id="L719"></a>const Allocator = std.mem.Allocator;
+<a id="L720"></a>const Dwarf = std.debug.Dwarf;
+<a id="L721"></a>const Pdb = std.debug.Pdb;
+<a id="L722"></a>const Error = std.debug.SelfInfoError;
+<a id="L723"></a>const coff = std.coff;
+<a id="L724"></a>const fs = std.fs;
+<a id="L725"></a>const windows = std.os.windows;
+<a id="L726"></a>const LDR = windows.LDR;
+<a id="L727"></a>
+<a id="L728"></a>const builtin = @import("builtin");
+<a id="L729"></a>const native_endian = builtin.target.cpu.arch.endian();
+<a id="L730"></a>const load_dll_notification_procs = builtin.abi == .msvc and switch (builtin.zig_backend) {
+<a id="L731"></a>    .stage2_c =&gt; true,
+<a id="L732"></a>    else =&gt; switch (builtin.output_mode) {
+<a id="L733"></a>        .Exe =&gt; false,
+<a id="L734"></a>        .Lib =&gt; switch (builtin.link_mode) {
+<a id="L735"></a>            .static =&gt; true,
+<a id="L736"></a>            .dynamic =&gt; false,
+<a id="L737"></a>        },
+<a id="L738"></a>        .Obj =&gt; true,
+<a id="L739"></a>    },
+<a id="L740"></a>};
+<a id="L741"></a>
+<a id="L742"></a>const SelfInfo = @This();
+</pre>
 </body>
 </html>

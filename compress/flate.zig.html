@@ -2,186 +2,189 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Source: zig-0.16.0-std/compress/flate.zig</title>
+    <title>Source: compress/flate.zig</title>
     <style>
         body { background: #1e1e1e; color: #d4d4d4; font-family: monospace; padding: 20px; }
         pre { white-space: pre-wrap; word-wrap: break-word; }
         .header { border-bottom: 1px solid #444; padding-bottom: 10px; margin-bottom: 20px; }
         a { color: #569cd6; }
+        a[id] { color: inherit; text-decoration: none; }
+        :target { background: #3a3a00; }
     </style>
 </head>
 <body>
     <div class="header">
-        <a href="/">Index</a> | <strong>File: zig-0.16.0-std/compress/flate.zig</strong>
+        <a href="/">Index</a> | <strong>File: compress/flate.zig</strong>
     </div>
-    <pre>const std = @import("../std.zig");
-
-/// When compressing and decompressing, the provided buffer is used as the
-/// history window, so it must be at least this size.
-pub const max_window_len = history_len * 2;
-
-pub const history_len = 32768;
-
-/// Deflate is a lossless data compression file format that uses a combination
-/// of LZ77 and Huffman coding.
-pub const Compress = @import("flate/Compress.zig");
-
-/// Inflate is the decoding process that consumes a Deflate bitstream and
-/// produces the original full-size data.
-pub const Decompress = @import("flate/Decompress.zig");
-
-/// Container of the deflate bit stream body. Container adds header before
-/// deflate bit stream and footer after. It can bi gzip, zlib or raw (no header,
-/// no footer, raw bit stream).
-///
-/// Zlib format is defined in rfc 1950. Header has 2 bytes and footer 4 bytes
-/// addler 32 checksum.
-///
-/// Gzip format is defined in rfc 1952. Header has 10+ bytes and footer 4 bytes
-/// crc32 checksum and 4 bytes of uncompressed data length.
-///
-/// rfc 1950: https://datatracker.ietf.org/doc/html/rfc1950#page-4
-/// rfc 1952: https://datatracker.ietf.org/doc/html/rfc1952#page-5
-pub const Container = enum {
-    raw, // no header or footer
-    gzip, // gzip header and footer
-    zlib, // zlib header and footer
-
-    pub fn size(w: Container) usize {
-        return headerSize(w) + footerSize(w);
-    }
-
-    pub fn headerSize(w: Container) usize {
-        return header(w).len;
-    }
-
-    pub fn footerSize(w: Container) usize {
-        return switch (w) {
-            .gzip =&gt; 8,
-            .zlib =&gt; 4,
-            .raw =&gt; 0,
-        };
-    }
-
-    pub const list = [_]Container{ .raw, .gzip, .zlib };
-
-    pub const Error = error{
-        BadGzipHeader,
-        BadZlibHeader,
-        WrongGzipChecksum,
-        WrongGzipSize,
-        WrongZlibChecksum,
-    };
-
-    pub fn header(container: Container) []const u8 {
-        return switch (container) {
-            // GZIP 10 byte header (https://datatracker.ietf.org/doc/html/rfc1952#page-5):
-            //  - ID1 (IDentification 1), always 0x1f
-            //  - ID2 (IDentification 2), always 0x8b
-            //  - CM (Compression Method), always 8 = deflate
-            //  - FLG (Flags), all set to 0
-            //  - 4 bytes, MTIME (Modification time), not used, all set to zero
-            //  - XFL (eXtra FLags), all set to zero
-            //  - OS (Operating System), 03 = Unix
-            .gzip =&gt; &amp;[_]u8{ 0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03 },
-            // ZLIB has a two-byte header (https://datatracker.ietf.org/doc/html/rfc1950#page-4):
-            // 1st byte:
-            //  - First four bits is the CINFO (compression info), which is 7 for the default deflate window size.
-            //  - The next four bits is the CM (compression method), which is 8 for deflate.
-            // 2nd byte:
-            //  - Two bits is the FLEVEL (compression level). Values are: 0=fastest, 1=fast, 2=default, 3=best.
-            //  - The next bit, FDICT, is set if a dictionary is given.
-            //  - The final five FCHECK bits form a mod-31 checksum.
-            //
-            // CINFO = 7, CM = 8, FLEVEL = 0b10, FDICT = 0, FCHECK = 0b11100
-            .zlib =&gt; &amp;[_]u8{ 0x78, 0b10_0_11100 },
-            .raw =&gt; &amp;.{},
-        };
-    }
-
-    pub const Hasher = union(Container) {
-        raw: void,
-        gzip: struct {
-            crc: std.hash.Crc32 = .init(),
-            count: u32 = 0,
-        },
-        zlib: std.hash.Adler32,
-
-        pub fn init(containter: Container) Hasher {
-            return switch (containter) {
-                .gzip =&gt; .{ .gzip = .{} },
-                .zlib =&gt; .{ .zlib = .{} },
-                .raw =&gt; .raw,
-            };
-        }
-
-        pub fn container(h: Hasher) Container {
-            return h;
-        }
-
-        pub fn update(h: *Hasher, buf: []const u8) void {
-            switch (h.*) {
-                .raw =&gt; {},
-                .gzip =&gt; |*gzip| {
-                    gzip.crc.update(buf);
-                    gzip.count +%= @truncate(buf.len);
-                },
-                .zlib =&gt; |*zlib| {
-                    zlib.update(buf);
-                },
-            }
-        }
-
-        pub fn writeFooter(hasher: *Hasher, writer: *std.Io.Writer) std.Io.Writer.Error!void {
-            switch (hasher.*) {
-                .gzip =&gt; |*gzip| {
-                    // GZIP 8 bytes footer
-                    //  - 4 bytes, CRC32 (CRC-32)
-                    //  - 4 bytes, ISIZE (Input SIZE) - size of the original
-                    //  (uncompressed) input data modulo 2^32
-                    try writer.writeInt(u32, gzip.crc.final(), .little);
-                    try writer.writeInt(u32, gzip.count, .little);
-                },
-                .zlib =&gt; |*zlib| {
-                    // ZLIB (RFC 1950) is big-endian, unlike GZIP (RFC 1952).
-                    // 4 bytes of ADLER32 (Adler-32 checksum)
-                    // Checksum value of the uncompressed data (excluding any
-                    // dictionary data) computed according to Adler-32
-                    // algorithm.
-                    try writer.writeInt(u32, zlib.adler, .big);
-                },
-                .raw =&gt; {},
-            }
-        }
-    };
-
-    pub const Metadata = union(Container) {
-        raw: void,
-        gzip: struct {
-            crc: u32 = 0,
-            count: u32 = 0,
-        },
-        zlib: struct {
-            adler: u32 = 0,
-        },
-
-        pub fn init(containter: Container) Metadata {
-            return switch (containter) {
-                .gzip =&gt; .{ .gzip = .{} },
-                .zlib =&gt; .{ .zlib = .{} },
-                .raw =&gt; .raw,
-            };
-        }
-
-        pub fn container(m: Metadata) Container {
-            return m;
-        }
-    };
-};
-
-test {
-    _ = Compress;
-    _ = Decompress;
-}</pre>
+    <pre><a id="L1"></a>const std = @import("../std.zig");
+<a id="L2"></a>
+<a id="L3"></a>/// When compressing and decompressing, the provided buffer is used as the
+<a id="L4"></a>/// history window, so it must be at least this size.
+<a id="L5"></a>pub const max_window_len = history_len * 2;
+<a id="L6"></a>
+<a id="L7"></a>pub const history_len = 32768;
+<a id="L8"></a>
+<a id="L9"></a>/// Deflate is a lossless data compression file format that uses a combination
+<a id="L10"></a>/// of LZ77 and Huffman coding.
+<a id="L11"></a>pub const Compress = @import("flate/Compress.zig");
+<a id="L12"></a>
+<a id="L13"></a>/// Inflate is the decoding process that consumes a Deflate bitstream and
+<a id="L14"></a>/// produces the original full-size data.
+<a id="L15"></a>pub const Decompress = @import("flate/Decompress.zig");
+<a id="L16"></a>
+<a id="L17"></a>/// Container of the deflate bit stream body. Container adds header before
+<a id="L18"></a>/// deflate bit stream and footer after. It can bi gzip, zlib or raw (no header,
+<a id="L19"></a>/// no footer, raw bit stream).
+<a id="L20"></a>///
+<a id="L21"></a>/// Zlib format is defined in rfc 1950. Header has 2 bytes and footer 4 bytes
+<a id="L22"></a>/// addler 32 checksum.
+<a id="L23"></a>///
+<a id="L24"></a>/// Gzip format is defined in rfc 1952. Header has 10+ bytes and footer 4 bytes
+<a id="L25"></a>/// crc32 checksum and 4 bytes of uncompressed data length.
+<a id="L26"></a>///
+<a id="L27"></a>/// rfc 1950: https://datatracker.ietf.org/doc/html/rfc1950#page-4
+<a id="L28"></a>/// rfc 1952: https://datatracker.ietf.org/doc/html/rfc1952#page-5
+<a id="L29"></a>pub const Container = enum {
+<a id="L30"></a>    raw, // no header or footer
+<a id="L31"></a>    gzip, // gzip header and footer
+<a id="L32"></a>    zlib, // zlib header and footer
+<a id="L33"></a>
+<a id="L34"></a>    pub fn size(w: Container) usize {
+<a id="L35"></a>        return headerSize(w) + footerSize(w);
+<a id="L36"></a>    }
+<a id="L37"></a>
+<a id="L38"></a>    pub fn headerSize(w: Container) usize {
+<a id="L39"></a>        return header(w).len;
+<a id="L40"></a>    }
+<a id="L41"></a>
+<a id="L42"></a>    pub fn footerSize(w: Container) usize {
+<a id="L43"></a>        return switch (w) {
+<a id="L44"></a>            .gzip =&gt; 8,
+<a id="L45"></a>            .zlib =&gt; 4,
+<a id="L46"></a>            .raw =&gt; 0,
+<a id="L47"></a>        };
+<a id="L48"></a>    }
+<a id="L49"></a>
+<a id="L50"></a>    pub const list = [_]Container{ .raw, .gzip, .zlib };
+<a id="L51"></a>
+<a id="L52"></a>    pub const Error = error{
+<a id="L53"></a>        BadGzipHeader,
+<a id="L54"></a>        BadZlibHeader,
+<a id="L55"></a>        WrongGzipChecksum,
+<a id="L56"></a>        WrongGzipSize,
+<a id="L57"></a>        WrongZlibChecksum,
+<a id="L58"></a>    };
+<a id="L59"></a>
+<a id="L60"></a>    pub fn header(container: Container) []const u8 {
+<a id="L61"></a>        return switch (container) {
+<a id="L62"></a>            // GZIP 10 byte header (https://datatracker.ietf.org/doc/html/rfc1952#page-5):
+<a id="L63"></a>            //  - ID1 (IDentification 1), always 0x1f
+<a id="L64"></a>            //  - ID2 (IDentification 2), always 0x8b
+<a id="L65"></a>            //  - CM (Compression Method), always 8 = deflate
+<a id="L66"></a>            //  - FLG (Flags), all set to 0
+<a id="L67"></a>            //  - 4 bytes, MTIME (Modification time), not used, all set to zero
+<a id="L68"></a>            //  - XFL (eXtra FLags), all set to zero
+<a id="L69"></a>            //  - OS (Operating System), 03 = Unix
+<a id="L70"></a>            .gzip =&gt; &amp;[_]u8{ 0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03 },
+<a id="L71"></a>            // ZLIB has a two-byte header (https://datatracker.ietf.org/doc/html/rfc1950#page-4):
+<a id="L72"></a>            // 1st byte:
+<a id="L73"></a>            //  - First four bits is the CINFO (compression info), which is 7 for the default deflate window size.
+<a id="L74"></a>            //  - The next four bits is the CM (compression method), which is 8 for deflate.
+<a id="L75"></a>            // 2nd byte:
+<a id="L76"></a>            //  - Two bits is the FLEVEL (compression level). Values are: 0=fastest, 1=fast, 2=default, 3=best.
+<a id="L77"></a>            //  - The next bit, FDICT, is set if a dictionary is given.
+<a id="L78"></a>            //  - The final five FCHECK bits form a mod-31 checksum.
+<a id="L79"></a>            //
+<a id="L80"></a>            // CINFO = 7, CM = 8, FLEVEL = 0b10, FDICT = 0, FCHECK = 0b11100
+<a id="L81"></a>            .zlib =&gt; &amp;[_]u8{ 0x78, 0b10_0_11100 },
+<a id="L82"></a>            .raw =&gt; &amp;.{},
+<a id="L83"></a>        };
+<a id="L84"></a>    }
+<a id="L85"></a>
+<a id="L86"></a>    pub const Hasher = union(Container) {
+<a id="L87"></a>        raw: void,
+<a id="L88"></a>        gzip: struct {
+<a id="L89"></a>            crc: std.hash.Crc32 = .init(),
+<a id="L90"></a>            count: u32 = 0,
+<a id="L91"></a>        },
+<a id="L92"></a>        zlib: std.hash.Adler32,
+<a id="L93"></a>
+<a id="L94"></a>        pub fn init(containter: Container) Hasher {
+<a id="L95"></a>            return switch (containter) {
+<a id="L96"></a>                .gzip =&gt; .{ .gzip = .{} },
+<a id="L97"></a>                .zlib =&gt; .{ .zlib = .{} },
+<a id="L98"></a>                .raw =&gt; .raw,
+<a id="L99"></a>            };
+<a id="L100"></a>        }
+<a id="L101"></a>
+<a id="L102"></a>        pub fn container(h: Hasher) Container {
+<a id="L103"></a>            return h;
+<a id="L104"></a>        }
+<a id="L105"></a>
+<a id="L106"></a>        pub fn update(h: *Hasher, buf: []const u8) void {
+<a id="L107"></a>            switch (h.*) {
+<a id="L108"></a>                .raw =&gt; {},
+<a id="L109"></a>                .gzip =&gt; |*gzip| {
+<a id="L110"></a>                    gzip.crc.update(buf);
+<a id="L111"></a>                    gzip.count +%= @truncate(buf.len);
+<a id="L112"></a>                },
+<a id="L113"></a>                .zlib =&gt; |*zlib| {
+<a id="L114"></a>                    zlib.update(buf);
+<a id="L115"></a>                },
+<a id="L116"></a>            }
+<a id="L117"></a>        }
+<a id="L118"></a>
+<a id="L119"></a>        pub fn writeFooter(hasher: *Hasher, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+<a id="L120"></a>            switch (hasher.*) {
+<a id="L121"></a>                .gzip =&gt; |*gzip| {
+<a id="L122"></a>                    // GZIP 8 bytes footer
+<a id="L123"></a>                    //  - 4 bytes, CRC32 (CRC-32)
+<a id="L124"></a>                    //  - 4 bytes, ISIZE (Input SIZE) - size of the original
+<a id="L125"></a>                    //  (uncompressed) input data modulo 2^32
+<a id="L126"></a>                    try writer.writeInt(u32, gzip.crc.final(), .little);
+<a id="L127"></a>                    try writer.writeInt(u32, gzip.count, .little);
+<a id="L128"></a>                },
+<a id="L129"></a>                .zlib =&gt; |*zlib| {
+<a id="L130"></a>                    // ZLIB (RFC 1950) is big-endian, unlike GZIP (RFC 1952).
+<a id="L131"></a>                    // 4 bytes of ADLER32 (Adler-32 checksum)
+<a id="L132"></a>                    // Checksum value of the uncompressed data (excluding any
+<a id="L133"></a>                    // dictionary data) computed according to Adler-32
+<a id="L134"></a>                    // algorithm.
+<a id="L135"></a>                    try writer.writeInt(u32, zlib.adler, .big);
+<a id="L136"></a>                },
+<a id="L137"></a>                .raw =&gt; {},
+<a id="L138"></a>            }
+<a id="L139"></a>        }
+<a id="L140"></a>    };
+<a id="L141"></a>
+<a id="L142"></a>    pub const Metadata = union(Container) {
+<a id="L143"></a>        raw: void,
+<a id="L144"></a>        gzip: struct {
+<a id="L145"></a>            crc: u32 = 0,
+<a id="L146"></a>            count: u32 = 0,
+<a id="L147"></a>        },
+<a id="L148"></a>        zlib: struct {
+<a id="L149"></a>            adler: u32 = 0,
+<a id="L150"></a>        },
+<a id="L151"></a>
+<a id="L152"></a>        pub fn init(containter: Container) Metadata {
+<a id="L153"></a>            return switch (containter) {
+<a id="L154"></a>                .gzip =&gt; .{ .gzip = .{} },
+<a id="L155"></a>                .zlib =&gt; .{ .zlib = .{} },
+<a id="L156"></a>                .raw =&gt; .raw,
+<a id="L157"></a>            };
+<a id="L158"></a>        }
+<a id="L159"></a>
+<a id="L160"></a>        pub fn container(m: Metadata) Container {
+<a id="L161"></a>            return m;
+<a id="L162"></a>        }
+<a id="L163"></a>    };
+<a id="L164"></a>};
+<a id="L165"></a>
+<a id="L166"></a>test {
+<a id="L167"></a>    _ = Compress;
+<a id="L168"></a>    _ = Decompress;
+<a id="L169"></a>}
+</pre>
 </body>
 </html>

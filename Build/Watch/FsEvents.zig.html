@@ -2,496 +2,499 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Source: zig-0.16.0-std/Build/Watch/FsEvents.zig</title>
+    <title>Source: Build/Watch/FsEvents.zig</title>
     <style>
         body { background: #1e1e1e; color: #d4d4d4; font-family: monospace; padding: 20px; }
         pre { white-space: pre-wrap; word-wrap: break-word; }
         .header { border-bottom: 1px solid #444; padding-bottom: 10px; margin-bottom: 20px; }
         a { color: #569cd6; }
+        a[id] { color: inherit; text-decoration: none; }
+        :target { background: #3a3a00; }
     </style>
 </head>
 <body>
     <div class="header">
-        <a href="/">Index</a> | <strong>File: zig-0.16.0-std/Build/Watch/FsEvents.zig</strong>
+        <a href="/">Index</a> | <strong>File: Build/Watch/FsEvents.zig</strong>
     </div>
-    <pre>//! An implementation of file-system watching based on the `FSEventStream` API in macOS.
-//! While macOS supports kqueue, it does not allow detecting changes to files without
-//! placing watches on each individual file, meaning FD limits are reached incredibly
-//! quickly. The File System Events API works differently: it implements *recursive*
-//! directory watches, managed by a system service. Rather than being in libc, the API is
-//! exposed by the CoreServices framework. To avoid a compile dependency on the framework
-//! bundle, we dynamically load CoreServices with `std.DynLib`.
-//!
-//! While the logic in this file *is* specialized to `std.Build.Watch`, efforts have been
-//! made to keep that specialization to a minimum. Other use cases could be served with
-//! relatively minimal modifications to the `watch_paths` field and its usages (in
-//! particular the `setPaths` function). We avoid using the global GCD dispatch queue in
-//! favour of creating our own and synchronizing with an explicit semaphore, meaning this
-//! logic is thread-safe and does not affect process-global state.
-//!
-//! In theory, this API is quite good at avoiding filesystem race conditions. In practice,
-//! the logic that would avoid them is currently disabled, because the build system kind
-//! of relies on them at the time of writing to avoid redundant work -- see the comment at
-//! the top of `wait` for details.
-
-const enable_debug_logs = false;
-
-core_services: std.DynLib,
-resolved_symbols: ResolvedSymbols,
-
-paths_arena: std.heap.ArenaAllocator.State,
-/// The roots of the recursive watches. FSEvents has relatively small limits on the number
-/// of watched paths, so this slice must not be too long. The paths themselves are allocated
-/// into `paths_arena`, but this slice is allocated into the GPA.
-watch_roots: [][:0]const u8,
-/// All of the paths being watched. Value is the set of steps which depend on the file/directory.
-/// Keys and values are in `paths_arena`, but this map is allocated into the GPA.
-watch_paths: std.StringArrayHashMapUnmanaged([]const *std.Build.Step),
-
-/// The semaphore we use to block the thread calling `wait` until the callback determines a relevant
-/// event has occurred. This is retained across `wait` calls for simplicity and efficiency.
-waiting_semaphore: dispatch.semaphore_t,
-/// This dispatch queue is created by us and executes serially. It exists exclusively to trigger the
-/// callbacks of the FSEventStream we create. This is not in use outside of `wait`, but is retained
-/// across `wait` calls for simplicity and efficiency.
-dispatch_queue: dispatch.queue_t,
-/// In theory, this field avoids race conditions. In practice, it is essentially unused at the time
-/// of writing. See the comment at the start of `wait` for details.
-since_event: FSEventStreamEventId,
-
-cwd_path: []const u8,
-
-/// All of the symbols we pull from the `dlopen`ed CoreServices framework. If any of these symbols
-/// is not present, `init` will close the framework and return an error.
-const ResolvedSymbols = struct {
-    FSEventStreamCreate: *const fn (
-        allocator: CFAllocatorRef,
-        callback: FSEventStreamCallback,
-        ctx: ?*const FSEventStreamContext,
-        paths_to_watch: CFArrayRef,
-        since_when: FSEventStreamEventId,
-        latency: CFTimeInterval,
-        flags: FSEventStreamCreateFlags,
-    ) callconv(.c) FSEventStreamRef,
-    FSEventStreamSetDispatchQueue: *const fn (stream: FSEventStreamRef, queue: dispatch.queue_t) callconv(.c) void,
-    FSEventStreamStart: *const fn (stream: FSEventStreamRef) callconv(.c) bool,
-    FSEventStreamStop: *const fn (stream: FSEventStreamRef) callconv(.c) void,
-    FSEventStreamInvalidate: *const fn (stream: FSEventStreamRef) callconv(.c) void,
-    FSEventStreamRelease: *const fn (stream: FSEventStreamRef) callconv(.c) void,
-    FSEventStreamGetLatestEventId: *const fn (stream: ConstFSEventStreamRef) callconv(.c) FSEventStreamEventId,
-    FSEventsGetCurrentEventId: *const fn () callconv(.c) FSEventStreamEventId,
-    CFRelease: *const fn (cf: *const anyopaque) callconv(.c) void,
-    CFArrayCreate: *const fn (
-        allocator: CFAllocatorRef,
-        values: [*]const usize,
-        num_values: CFIndex,
-        call_backs: ?*const CFArrayCallBacks,
-    ) callconv(.c) CFArrayRef,
-    CFStringCreateWithCString: *const fn (
-        alloc: CFAllocatorRef,
-        c_str: [*:0]const u8,
-        encoding: CFStringEncoding,
-    ) callconv(.c) CFStringRef,
-    CFAllocatorCreate: *const fn (allocator: CFAllocatorRef, context: *const CFAllocatorContext) callconv(.c) CFAllocatorRef,
-    kCFAllocatorUseContext: *const CFAllocatorRef,
-};
-
-pub fn init(cwd_path: []const u8) error{ OpenFrameworkFailed, MissingCoreServicesSymbol, SystemResources }!FsEvents {
-    var core_services = std.DynLib.open("/System/Library/Frameworks/CoreServices.framework/CoreServices") catch
-        return error.OpenFrameworkFailed;
-    errdefer core_services.close();
-
-    var resolved_symbols: ResolvedSymbols = undefined;
-    inline for (@typeInfo(ResolvedSymbols).@"struct".fields) |f| {
-        @field(resolved_symbols, f.name) = core_services.lookup(f.type, f.name) orelse return error.MissingCoreServicesSymbol;
-    }
-
-    return .{
-        .core_services = core_services,
-        .resolved_symbols = resolved_symbols,
-        .paths_arena = .{},
-        .watch_roots = &amp;.{},
-        .watch_paths = .empty,
-        .waiting_semaphore = dispatch.semaphore_create(0) orelse return error.SystemResources,
-        .dispatch_queue = dispatch.queue_create("zig-watch", .SERIAL()) orelse return error.SystemResources,
-        // Not `.since_now`, because this means we can init `FsEvents` *before* we do work in order
-        // to notice any changes which happened during said work.
-        .since_event = resolved_symbols.FSEventsGetCurrentEventId(),
-        .cwd_path = cwd_path,
-    };
-}
-
-pub fn deinit(fse: *FsEvents, gpa: Allocator, io: Io) void {
-    fse.waiting_semaphore.as_object().release();
-    fse.dispatch_queue.as_object().release();
-    fse.core_services.close(io);
-
-    gpa.free(fse.watch_roots);
-    fse.watch_paths.deinit(gpa);
-    {
-        var paths_arena = fse.paths_arena.promote(gpa);
-        paths_arena.deinit();
-    }
-}
-
-pub fn setPaths(fse: *FsEvents, gpa: Allocator, steps: []const *std.Build.Step) !void {
-    var paths_arena_instance = fse.paths_arena.promote(gpa);
-    defer fse.paths_arena = paths_arena_instance.state;
-    const paths_arena = paths_arena_instance.allocator();
-
-    var need_dirs: std.StringArrayHashMapUnmanaged(void) = .empty;
-    defer need_dirs.deinit(gpa);
-
-    fse.watch_paths.clearRetainingCapacity();
-
-    // We take `step` by pointer for a slight memory optimization in a moment.
-    for (steps) |*step| {
-        for (step.*.inputs.table.keys(), step.*.inputs.table.values()) |path, *files| {
-            const resolved_dir = try std.fs.path.resolvePosix(paths_arena, &amp;.{
-                fse.cwd_path, path.root_dir.path orelse ".", path.sub_path,
-            });
-            try need_dirs.put(gpa, resolved_dir, {});
-            for (files.items) |file_name| {
-                const watch_path = if (std.mem.eql(u8, file_name, "."))
-                    resolved_dir
-                else
-                    try std.fs.path.join(paths_arena, &amp;.{ resolved_dir, file_name });
-                const gop = try fse.watch_paths.getOrPut(gpa, watch_path);
-                if (gop.found_existing) {
-                    const old_steps = gop.value_ptr.*;
-                    const new_steps = try paths_arena.alloc(*std.Build.Step, old_steps.len + 1);
-                    @memcpy(new_steps[0..old_steps.len], old_steps);
-                    new_steps[old_steps.len] = step.*;
-                    gop.value_ptr.* = new_steps;
-                } else {
-                    // This is why we captured `step` by pointer! We can avoid allocating a slice of one
-                    // step in the arena in the common case where a file is referenced by only one step.
-                    gop.value_ptr.* = step[0..1];
-                }
-            }
-        }
-    }
-
-    {
-        // There's no point looking at directories inside other ones (e.g. "/foo" and "/foo/bar").
-        // To eliminate these, we'll re-add directories in order of path length with a redundancy check.
-        const old_dirs = try gpa.dupe([]const u8, need_dirs.keys());
-        defer gpa.free(old_dirs);
-        std.mem.sort([]const u8, old_dirs, {}, struct {
-            fn lessThan(ctx: void, a: []const u8, b: []const u8) bool {
-                ctx;
-                return std.mem.lessThan(u8, a, b);
-            }
-        }.lessThan);
-        need_dirs.clearRetainingCapacity();
-        for (old_dirs) |dir_path| {
-            var it: std.fs.path.ComponentIterator(.posix, u8) = .init(dir_path);
-            while (it.next()) |component| {
-                if (need_dirs.contains(component.path)) {
-                    // this path is '/foo/bar/qux', but '/foo' or '/foo/bar' was already added
-                    break;
-                }
-            } else {
-                need_dirs.putAssumeCapacityNoClobber(dir_path, {});
-            }
-        }
-    }
-
-    // `need_dirs` is now a set of directories to watch with no redundancy. In practice, this is very
-    // likely to have reduced it to a quite small set (e.g. it'll typically coalesce a full `src/`
-    // directory into one entry). However, the FSEventStream API has a fairly low undocumented limit
-    // on total watches (supposedly 4096), so we should handle the case where we exceed it. To be
-    // safe, because this API can be a little unpredictable, we'll cap ourselves a little *below*
-    // that known limit.
-    if (need_dirs.count() &gt; 2048) {
-        // Fallback: watch the whole filesystem. This is excessive, but... it *works* :P
-        if (enable_debug_logs) watch_log.debug("too many dirs; recursively watching root", .{});
-        fse.watch_roots = try gpa.realloc(fse.watch_roots, 1);
-        fse.watch_roots[0] = "/";
-    } else {
-        fse.watch_roots = try gpa.realloc(fse.watch_roots, need_dirs.count());
-        for (fse.watch_roots, need_dirs.keys()) |*out, in| {
-            out.* = try paths_arena.dupeZ(u8, in);
-        }
-    }
-    if (enable_debug_logs) {
-        watch_log.debug("watching {d} paths using {d} recursive watches:", .{ fse.watch_paths.count(), fse.watch_roots.len });
-        for (fse.watch_roots) |dir_path| {
-            watch_log.debug("- '{s}'", .{dir_path});
-        }
-    }
-}
-
-pub fn wait(fse: *FsEvents, gpa: Allocator, timeout_ns: ?u64) error{ OutOfMemory, StartFailed }!std.Build.Watch.WaitResult {
-    if (fse.watch_roots.len == 0) @panic("nothing to watch");
-
-    const rs = fse.resolved_symbols;
-
-    // At the time of writing, using `since_event` in the obvious way causes redundant rebuilds
-    // to occur, because one step modifies a file which is an input to another step. The solution
-    // to this problem will probably be either:
-    //
-    // a) Don't include the output of one step as a watch input of another; only mark external
-    //    files as watch inputs. Or...
-    //
-    // b) Note the current event ID when a step begins, and disregard events preceding that ID
-    //    when considering whether to dirty that step in `eventCallback`.
-    //
-    // For now, to avoid the redundant rebuilds, we bypass this `since_event` mechanism. This does
-    // introduce race conditions, but the other `std.Build.Watch` implementations suffer from those
-    // too at the time of writing, so this is kind of expected.
-    fse.since_event = .since_now;
-
-    const cf_allocator = rs.CFAllocatorCreate(rs.kCFAllocatorUseContext.*, &amp;.{
-        .version = 0,
-        .info = @constCast(&amp;gpa),
-        .retain = null,
-        .release = null,
-        .copy_description = null,
-        .allocate = &amp;cf_alloc_callbacks.allocate,
-        .reallocate = &amp;cf_alloc_callbacks.reallocate,
-        .deallocate = &amp;cf_alloc_callbacks.deallocate,
-        .preferred_size = null,
-    }) orelse return error.OutOfMemory;
-    defer rs.CFRelease(cf_allocator);
-
-    const cf_paths = try gpa.alloc(?CFStringRef, fse.watch_roots.len);
-    @memset(cf_paths, null);
-    defer {
-        for (cf_paths) |o| if (o) |p| rs.CFRelease(p);
-        gpa.free(cf_paths);
-    }
-    for (fse.watch_roots, cf_paths) |raw_path, *cf_path| {
-        cf_path.* = rs.CFStringCreateWithCString(cf_allocator, raw_path, .utf8);
-    }
-    const cf_paths_array = rs.CFArrayCreate(cf_allocator, @ptrCast(cf_paths), @intCast(cf_paths.len), null);
-    defer rs.CFRelease(cf_paths_array);
-
-    const callback_ctx: EventCallbackCtx = .{
-        .fse = fse,
-        .gpa = gpa,
-    };
-    const event_stream = rs.FSEventStreamCreate(
-        null,
-        &amp;eventCallback,
-        &amp;.{
-            .version = 0,
-            .info = @constCast(&amp;callback_ctx),
-            .retain = null,
-            .release = null,
-            .copy_description = null,
-        },
-        cf_paths_array,
-        fse.since_event,
-        0.05, // 0.05s latency; higher values increase efficiency by coalescing more events
-        .{ .watch_root = true, .file_events = true },
-    );
-    defer rs.FSEventStreamRelease(event_stream);
-    rs.FSEventStreamSetDispatchQueue(event_stream, fse.dispatch_queue);
-    defer rs.FSEventStreamInvalidate(event_stream);
-    if (!rs.FSEventStreamStart(event_stream)) return error.StartFailed;
-    defer rs.FSEventStreamStop(event_stream);
-    const result = fse.waiting_semaphore.wait(timeout: {
-        const ns = timeout_ns orelse break :timeout .FOREVER;
-        break :timeout .time(.NOW, @intCast(ns));
-    });
-    return switch (result) {
-        0 =&gt; .dirty,
-        else =&gt; .timeout,
-    };
-}
-
-const cf_alloc_callbacks = struct {
-    const log = std.log.scoped(.cf_alloc);
-    fn allocate(size: CFIndex, hint: CFOptionFlags, info: ?*const anyopaque) callconv(.c) ?*const anyopaque {
-        if (enable_debug_logs) log.debug("allocate {d}", .{size});
-        _ = hint;
-        const gpa: *const Allocator = @ptrCast(@alignCast(info));
-        const mem = gpa.alignedAlloc(u8, .of(usize), @intCast(size + @sizeOf(usize))) catch return null;
-        const metadata: *usize = @ptrCast(mem);
-        metadata.* = @intCast(size);
-        return mem[@sizeOf(usize)..].ptr;
-    }
-    fn reallocate(ptr: ?*anyopaque, new_size: CFIndex, hint: CFOptionFlags, info: ?*const anyopaque) callconv(.c) ?*const anyopaque {
-        if (enable_debug_logs) log.debug("reallocate @{*} {d}", .{ ptr, new_size });
-        _ = hint;
-        if (ptr == null or new_size == 0) return null; // not a bug: documentation explicitly states that realloc on NULL should return NULL
-        const gpa: *const Allocator = @ptrCast(@alignCast(info));
-        const old_base: [*]align(@alignOf(usize)) u8 = @alignCast(@as([*]u8, @ptrCast(ptr)) - @sizeOf(usize));
-        const old_size = @as(*const usize, @ptrCast(old_base)).*;
-        const old_mem = old_base[0 .. old_size + @sizeOf(usize)];
-        const new_mem = gpa.realloc(old_mem, @intCast(new_size + @sizeOf(usize))) catch return null;
-        const metadata: *usize = @ptrCast(new_mem);
-        metadata.* = @intCast(new_size);
-        return new_mem[@sizeOf(usize)..].ptr;
-    }
-    fn deallocate(ptr: *anyopaque, info: ?*const anyopaque) callconv(.c) void {
-        if (enable_debug_logs) log.debug("deallocate @{*}", .{ptr});
-        const gpa: *const Allocator = @ptrCast(@alignCast(info));
-        const old_base: [*]align(@alignOf(usize)) u8 = @alignCast(@as([*]u8, @ptrCast(ptr)) - @sizeOf(usize));
-        const old_size = @as(*const usize, @ptrCast(old_base)).*;
-        const old_mem = old_base[0 .. old_size + @sizeOf(usize)];
-        gpa.free(old_mem);
-    }
-};
-
-const EventCallbackCtx = struct {
-    fse: *FsEvents,
-    gpa: Allocator,
-};
-
-fn eventCallback(
-    stream: ConstFSEventStreamRef,
-    client_callback_info: ?*anyopaque,
-    num_events: usize,
-    events_paths_ptr: *anyopaque,
-    events_flags_ptr: [*]const FSEventStreamEventFlags,
-    events_ids_ptr: [*]const FSEventStreamEventId,
-) callconv(.c) void {
-    const ctx: *const EventCallbackCtx = @ptrCast(@alignCast(client_callback_info));
-    const fse = ctx.fse;
-    const gpa = ctx.gpa;
-    const rs = fse.resolved_symbols;
-    const events_paths_ptr_casted: [*]const [*:0]const u8 = @ptrCast(@alignCast(events_paths_ptr));
-    const events_paths = events_paths_ptr_casted[0..num_events];
-    const events_ids = events_ids_ptr[0..num_events];
-    const events_flags = events_flags_ptr[0..num_events];
-    var any_dirty = false;
-    for (events_paths, events_ids, events_flags) |event_path_nts, event_id, event_flags| {
-        _ = event_id;
-        if (event_flags.history_done) continue; // sentinel
-        const event_path = std.mem.span(event_path_nts);
-        switch (event_flags.must_scan_sub_dirs) {
-            false =&gt; {
-                if (fse.watch_paths.get(event_path)) |steps| {
-                    assert(steps.len &gt; 0);
-                    for (steps) |s| {
-                        if (s.invalidateResult(gpa)) any_dirty = true;
-                    }
-                }
-                if (std.fs.path.dirname(event_path)) |event_dirname| {
-                    // Modifying '/foo/bar' triggers the watch on '/foo'.
-                    if (fse.watch_paths.get(event_dirname)) |steps| {
-                        assert(steps.len &gt; 0);
-                        for (steps) |s| {
-                            if (s.invalidateResult(gpa)) any_dirty = true;
-                        }
-                    }
-                }
-            },
-            true =&gt; {
-                // This is unlikely, but can occasionally happen when bottlenecked: events have been
-                // coalesced into one. We want to see if any of these events are actually relevant
-                // to us. The only way we can reasonably do that in this rare edge case is iterate
-                // the watch paths and see if any is under this directory. That's acceptable because
-                // we would otherwise kick off a rebuild which would be clearing those paths anyway.
-                const changed_path = std.fs.path.dirname(event_path) orelse event_path;
-                for (fse.watch_paths.keys(), fse.watch_paths.values()) |watching_path, steps| {
-                    if (dirStartsWith(watching_path, changed_path)) {
-                        for (steps) |s| {
-                            if (s.invalidateResult(gpa)) any_dirty = true;
-                        }
-                    }
-                }
-            },
-        }
-    }
-    if (any_dirty) {
-        fse.since_event = rs.FSEventStreamGetLatestEventId(stream);
-        _ = fse.waiting_semaphore.signal();
-    }
-}
-fn dirStartsWith(path: []const u8, prefix: []const u8) bool {
-    if (std.mem.eql(u8, path, prefix)) return true;
-    if (!std.mem.startsWith(u8, path, prefix)) return false;
-    if (path[prefix.len] != '/') return false; // `path` is `/foo/barx`, `prefix` is `/foo/bar`
-    return true; // `path` is `/foo/bar/...`, `prefix` is `/foo/bar`
-}
-
-const CFAllocatorRef = ?*const opaque {};
-const CFArrayRef = *const opaque {};
-const CFStringRef = *const opaque {};
-const CFTimeInterval = f64;
-const CFIndex = i32;
-const CFOptionFlags = enum(u32) { _ };
-const CFAllocatorRetainCallBack = *const fn (info: ?*const anyopaque) callconv(.c) *const anyopaque;
-const CFAllocatorReleaseCallBack = *const fn (info: ?*const anyopaque) callconv(.c) void;
-const CFAllocatorCopyDescriptionCallBack = *const fn (info: ?*const anyopaque) callconv(.c) CFStringRef;
-const CFAllocatorAllocateCallBack = *const fn (alloc_size: CFIndex, hint: CFOptionFlags, info: ?*const anyopaque) callconv(.c) ?*const anyopaque;
-const CFAllocatorReallocateCallBack = *const fn (ptr: ?*anyopaque, new_size: CFIndex, hint: CFOptionFlags, info: ?*const anyopaque) callconv(.c) ?*const anyopaque;
-const CFAllocatorDeallocateCallBack = *const fn (ptr: *anyopaque, info: ?*const anyopaque) callconv(.c) void;
-const CFAllocatorPreferredSizeCallBack = *const fn (size: CFIndex, hint: CFOptionFlags, info: ?*const anyopaque) callconv(.c) CFIndex;
-const CFAllocatorContext = extern struct {
-    version: CFIndex,
-    info: ?*anyopaque,
-    retain: ?CFAllocatorRetainCallBack,
-    release: ?CFAllocatorReleaseCallBack,
-    copy_description: ?CFAllocatorCopyDescriptionCallBack,
-    allocate: CFAllocatorAllocateCallBack,
-    reallocate: ?CFAllocatorReallocateCallBack,
-    deallocate: ?CFAllocatorDeallocateCallBack,
-    preferred_size: ?CFAllocatorPreferredSizeCallBack,
-};
-const CFArrayCallBacks = opaque {};
-const CFStringEncoding = enum(u32) {
-    invalid_id = std.math.maxInt(u32),
-    mac_roman = 0,
-    windows_latin_1 = 0x500,
-    iso_latin_1 = 0x201,
-    next_step_latin = 0xB01,
-    ascii = 0x600,
-    unicode = 0x100,
-    utf8 = 0x8000100,
-    non_lossy_ascii = 0xBFF,
-};
-
-const FSEventStreamRef = *opaque {};
-const ConstFSEventStreamRef = *const @typeInfo(FSEventStreamRef).pointer.child;
-const FSEventStreamCallback = *const fn (
-    stream: ConstFSEventStreamRef,
-    client_callback_info: ?*anyopaque,
-    num_events: usize,
-    event_paths: *anyopaque,
-    event_flags: [*]const FSEventStreamEventFlags,
-    event_ids: [*]const FSEventStreamEventId,
-) callconv(.c) void;
-const FSEventStreamContext = extern struct {
-    version: CFIndex,
-    info: ?*anyopaque,
-    retain: ?CFAllocatorRetainCallBack,
-    release: ?CFAllocatorReleaseCallBack,
-    copy_description: ?CFAllocatorCopyDescriptionCallBack,
-};
-const FSEventStreamEventId = enum(u64) {
-    since_now = std.math.maxInt(u64),
-    _,
-};
-const FSEventStreamCreateFlags = packed struct(u32) {
-    use_cf_types: bool = false,
-    no_defer: bool = false,
-    watch_root: bool = false,
-    ignore_self: bool = false,
-    file_events: bool = false,
-    _: u27 = 0,
-};
-const FSEventStreamEventFlags = packed struct(u32) {
-    must_scan_sub_dirs: bool,
-    user_dropped: bool,
-    kernel_dropped: bool,
-    event_ids_wrapped: bool,
-    history_done: bool,
-    root_changed: bool,
-    mount: bool,
-    unmount: bool,
-    _: u24 = 0,
-};
-
-const dispatch = std.c.dispatch;
-const std = @import("std");
-const Io = std.Io;
-const assert = std.debug.assert;
-const Allocator = std.mem.Allocator;
-const watch_log = std.log.scoped(.watch);
-const FsEvents = @This();</pre>
+    <pre><a id="L1"></a>//! An implementation of file-system watching based on the `FSEventStream` API in macOS.
+<a id="L2"></a>//! While macOS supports kqueue, it does not allow detecting changes to files without
+<a id="L3"></a>//! placing watches on each individual file, meaning FD limits are reached incredibly
+<a id="L4"></a>//! quickly. The File System Events API works differently: it implements *recursive*
+<a id="L5"></a>//! directory watches, managed by a system service. Rather than being in libc, the API is
+<a id="L6"></a>//! exposed by the CoreServices framework. To avoid a compile dependency on the framework
+<a id="L7"></a>//! bundle, we dynamically load CoreServices with `std.DynLib`.
+<a id="L8"></a>//!
+<a id="L9"></a>//! While the logic in this file *is* specialized to `std.Build.Watch`, efforts have been
+<a id="L10"></a>//! made to keep that specialization to a minimum. Other use cases could be served with
+<a id="L11"></a>//! relatively minimal modifications to the `watch_paths` field and its usages (in
+<a id="L12"></a>//! particular the `setPaths` function). We avoid using the global GCD dispatch queue in
+<a id="L13"></a>//! favour of creating our own and synchronizing with an explicit semaphore, meaning this
+<a id="L14"></a>//! logic is thread-safe and does not affect process-global state.
+<a id="L15"></a>//!
+<a id="L16"></a>//! In theory, this API is quite good at avoiding filesystem race conditions. In practice,
+<a id="L17"></a>//! the logic that would avoid them is currently disabled, because the build system kind
+<a id="L18"></a>//! of relies on them at the time of writing to avoid redundant work -- see the comment at
+<a id="L19"></a>//! the top of `wait` for details.
+<a id="L20"></a>
+<a id="L21"></a>const enable_debug_logs = false;
+<a id="L22"></a>
+<a id="L23"></a>core_services: std.DynLib,
+<a id="L24"></a>resolved_symbols: ResolvedSymbols,
+<a id="L25"></a>
+<a id="L26"></a>paths_arena: std.heap.ArenaAllocator.State,
+<a id="L27"></a>/// The roots of the recursive watches. FSEvents has relatively small limits on the number
+<a id="L28"></a>/// of watched paths, so this slice must not be too long. The paths themselves are allocated
+<a id="L29"></a>/// into `paths_arena`, but this slice is allocated into the GPA.
+<a id="L30"></a>watch_roots: [][:0]const u8,
+<a id="L31"></a>/// All of the paths being watched. Value is the set of steps which depend on the file/directory.
+<a id="L32"></a>/// Keys and values are in `paths_arena`, but this map is allocated into the GPA.
+<a id="L33"></a>watch_paths: std.StringArrayHashMapUnmanaged([]const *std.Build.Step),
+<a id="L34"></a>
+<a id="L35"></a>/// The semaphore we use to block the thread calling `wait` until the callback determines a relevant
+<a id="L36"></a>/// event has occurred. This is retained across `wait` calls for simplicity and efficiency.
+<a id="L37"></a>waiting_semaphore: dispatch.semaphore_t,
+<a id="L38"></a>/// This dispatch queue is created by us and executes serially. It exists exclusively to trigger the
+<a id="L39"></a>/// callbacks of the FSEventStream we create. This is not in use outside of `wait`, but is retained
+<a id="L40"></a>/// across `wait` calls for simplicity and efficiency.
+<a id="L41"></a>dispatch_queue: dispatch.queue_t,
+<a id="L42"></a>/// In theory, this field avoids race conditions. In practice, it is essentially unused at the time
+<a id="L43"></a>/// of writing. See the comment at the start of `wait` for details.
+<a id="L44"></a>since_event: FSEventStreamEventId,
+<a id="L45"></a>
+<a id="L46"></a>cwd_path: []const u8,
+<a id="L47"></a>
+<a id="L48"></a>/// All of the symbols we pull from the `dlopen`ed CoreServices framework. If any of these symbols
+<a id="L49"></a>/// is not present, `init` will close the framework and return an error.
+<a id="L50"></a>const ResolvedSymbols = struct {
+<a id="L51"></a>    FSEventStreamCreate: *const fn (
+<a id="L52"></a>        allocator: CFAllocatorRef,
+<a id="L53"></a>        callback: FSEventStreamCallback,
+<a id="L54"></a>        ctx: ?*const FSEventStreamContext,
+<a id="L55"></a>        paths_to_watch: CFArrayRef,
+<a id="L56"></a>        since_when: FSEventStreamEventId,
+<a id="L57"></a>        latency: CFTimeInterval,
+<a id="L58"></a>        flags: FSEventStreamCreateFlags,
+<a id="L59"></a>    ) callconv(.c) FSEventStreamRef,
+<a id="L60"></a>    FSEventStreamSetDispatchQueue: *const fn (stream: FSEventStreamRef, queue: dispatch.queue_t) callconv(.c) void,
+<a id="L61"></a>    FSEventStreamStart: *const fn (stream: FSEventStreamRef) callconv(.c) bool,
+<a id="L62"></a>    FSEventStreamStop: *const fn (stream: FSEventStreamRef) callconv(.c) void,
+<a id="L63"></a>    FSEventStreamInvalidate: *const fn (stream: FSEventStreamRef) callconv(.c) void,
+<a id="L64"></a>    FSEventStreamRelease: *const fn (stream: FSEventStreamRef) callconv(.c) void,
+<a id="L65"></a>    FSEventStreamGetLatestEventId: *const fn (stream: ConstFSEventStreamRef) callconv(.c) FSEventStreamEventId,
+<a id="L66"></a>    FSEventsGetCurrentEventId: *const fn () callconv(.c) FSEventStreamEventId,
+<a id="L67"></a>    CFRelease: *const fn (cf: *const anyopaque) callconv(.c) void,
+<a id="L68"></a>    CFArrayCreate: *const fn (
+<a id="L69"></a>        allocator: CFAllocatorRef,
+<a id="L70"></a>        values: [*]const usize,
+<a id="L71"></a>        num_values: CFIndex,
+<a id="L72"></a>        call_backs: ?*const CFArrayCallBacks,
+<a id="L73"></a>    ) callconv(.c) CFArrayRef,
+<a id="L74"></a>    CFStringCreateWithCString: *const fn (
+<a id="L75"></a>        alloc: CFAllocatorRef,
+<a id="L76"></a>        c_str: [*:0]const u8,
+<a id="L77"></a>        encoding: CFStringEncoding,
+<a id="L78"></a>    ) callconv(.c) CFStringRef,
+<a id="L79"></a>    CFAllocatorCreate: *const fn (allocator: CFAllocatorRef, context: *const CFAllocatorContext) callconv(.c) CFAllocatorRef,
+<a id="L80"></a>    kCFAllocatorUseContext: *const CFAllocatorRef,
+<a id="L81"></a>};
+<a id="L82"></a>
+<a id="L83"></a>pub fn init(cwd_path: []const u8) error{ OpenFrameworkFailed, MissingCoreServicesSymbol, SystemResources }!FsEvents {
+<a id="L84"></a>    var core_services = std.DynLib.open("/System/Library/Frameworks/CoreServices.framework/CoreServices") catch
+<a id="L85"></a>        return error.OpenFrameworkFailed;
+<a id="L86"></a>    errdefer core_services.close();
+<a id="L87"></a>
+<a id="L88"></a>    var resolved_symbols: ResolvedSymbols = undefined;
+<a id="L89"></a>    inline for (@typeInfo(ResolvedSymbols).@"struct".fields) |f| {
+<a id="L90"></a>        @field(resolved_symbols, f.name) = core_services.lookup(f.type, f.name) orelse return error.MissingCoreServicesSymbol;
+<a id="L91"></a>    }
+<a id="L92"></a>
+<a id="L93"></a>    return .{
+<a id="L94"></a>        .core_services = core_services,
+<a id="L95"></a>        .resolved_symbols = resolved_symbols,
+<a id="L96"></a>        .paths_arena = .{},
+<a id="L97"></a>        .watch_roots = &amp;.{},
+<a id="L98"></a>        .watch_paths = .empty,
+<a id="L99"></a>        .waiting_semaphore = dispatch.semaphore_create(0) orelse return error.SystemResources,
+<a id="L100"></a>        .dispatch_queue = dispatch.queue_create("zig-watch", .SERIAL()) orelse return error.SystemResources,
+<a id="L101"></a>        // Not `.since_now`, because this means we can init `FsEvents` *before* we do work in order
+<a id="L102"></a>        // to notice any changes which happened during said work.
+<a id="L103"></a>        .since_event = resolved_symbols.FSEventsGetCurrentEventId(),
+<a id="L104"></a>        .cwd_path = cwd_path,
+<a id="L105"></a>    };
+<a id="L106"></a>}
+<a id="L107"></a>
+<a id="L108"></a>pub fn deinit(fse: *FsEvents, gpa: Allocator, io: Io) void {
+<a id="L109"></a>    fse.waiting_semaphore.as_object().release();
+<a id="L110"></a>    fse.dispatch_queue.as_object().release();
+<a id="L111"></a>    fse.core_services.close(io);
+<a id="L112"></a>
+<a id="L113"></a>    gpa.free(fse.watch_roots);
+<a id="L114"></a>    fse.watch_paths.deinit(gpa);
+<a id="L115"></a>    {
+<a id="L116"></a>        var paths_arena = fse.paths_arena.promote(gpa);
+<a id="L117"></a>        paths_arena.deinit();
+<a id="L118"></a>    }
+<a id="L119"></a>}
+<a id="L120"></a>
+<a id="L121"></a>pub fn setPaths(fse: *FsEvents, gpa: Allocator, steps: []const *std.Build.Step) !void {
+<a id="L122"></a>    var paths_arena_instance = fse.paths_arena.promote(gpa);
+<a id="L123"></a>    defer fse.paths_arena = paths_arena_instance.state;
+<a id="L124"></a>    const paths_arena = paths_arena_instance.allocator();
+<a id="L125"></a>
+<a id="L126"></a>    var need_dirs: std.StringArrayHashMapUnmanaged(void) = .empty;
+<a id="L127"></a>    defer need_dirs.deinit(gpa);
+<a id="L128"></a>
+<a id="L129"></a>    fse.watch_paths.clearRetainingCapacity();
+<a id="L130"></a>
+<a id="L131"></a>    // We take `step` by pointer for a slight memory optimization in a moment.
+<a id="L132"></a>    for (steps) |*step| {
+<a id="L133"></a>        for (step.*.inputs.table.keys(), step.*.inputs.table.values()) |path, *files| {
+<a id="L134"></a>            const resolved_dir = try std.fs.path.resolvePosix(paths_arena, &amp;.{
+<a id="L135"></a>                fse.cwd_path, path.root_dir.path orelse ".", path.sub_path,
+<a id="L136"></a>            });
+<a id="L137"></a>            try need_dirs.put(gpa, resolved_dir, {});
+<a id="L138"></a>            for (files.items) |file_name| {
+<a id="L139"></a>                const watch_path = if (std.mem.eql(u8, file_name, "."))
+<a id="L140"></a>                    resolved_dir
+<a id="L141"></a>                else
+<a id="L142"></a>                    try std.fs.path.join(paths_arena, &amp;.{ resolved_dir, file_name });
+<a id="L143"></a>                const gop = try fse.watch_paths.getOrPut(gpa, watch_path);
+<a id="L144"></a>                if (gop.found_existing) {
+<a id="L145"></a>                    const old_steps = gop.value_ptr.*;
+<a id="L146"></a>                    const new_steps = try paths_arena.alloc(*std.Build.Step, old_steps.len + 1);
+<a id="L147"></a>                    @memcpy(new_steps[0..old_steps.len], old_steps);
+<a id="L148"></a>                    new_steps[old_steps.len] = step.*;
+<a id="L149"></a>                    gop.value_ptr.* = new_steps;
+<a id="L150"></a>                } else {
+<a id="L151"></a>                    // This is why we captured `step` by pointer! We can avoid allocating a slice of one
+<a id="L152"></a>                    // step in the arena in the common case where a file is referenced by only one step.
+<a id="L153"></a>                    gop.value_ptr.* = step[0..1];
+<a id="L154"></a>                }
+<a id="L155"></a>            }
+<a id="L156"></a>        }
+<a id="L157"></a>    }
+<a id="L158"></a>
+<a id="L159"></a>    {
+<a id="L160"></a>        // There's no point looking at directories inside other ones (e.g. "/foo" and "/foo/bar").
+<a id="L161"></a>        // To eliminate these, we'll re-add directories in order of path length with a redundancy check.
+<a id="L162"></a>        const old_dirs = try gpa.dupe([]const u8, need_dirs.keys());
+<a id="L163"></a>        defer gpa.free(old_dirs);
+<a id="L164"></a>        std.mem.sort([]const u8, old_dirs, {}, struct {
+<a id="L165"></a>            fn lessThan(ctx: void, a: []const u8, b: []const u8) bool {
+<a id="L166"></a>                ctx;
+<a id="L167"></a>                return std.mem.lessThan(u8, a, b);
+<a id="L168"></a>            }
+<a id="L169"></a>        }.lessThan);
+<a id="L170"></a>        need_dirs.clearRetainingCapacity();
+<a id="L171"></a>        for (old_dirs) |dir_path| {
+<a id="L172"></a>            var it: std.fs.path.ComponentIterator(.posix, u8) = .init(dir_path);
+<a id="L173"></a>            while (it.next()) |component| {
+<a id="L174"></a>                if (need_dirs.contains(component.path)) {
+<a id="L175"></a>                    // this path is '/foo/bar/qux', but '/foo' or '/foo/bar' was already added
+<a id="L176"></a>                    break;
+<a id="L177"></a>                }
+<a id="L178"></a>            } else {
+<a id="L179"></a>                need_dirs.putAssumeCapacityNoClobber(dir_path, {});
+<a id="L180"></a>            }
+<a id="L181"></a>        }
+<a id="L182"></a>    }
+<a id="L183"></a>
+<a id="L184"></a>    // `need_dirs` is now a set of directories to watch with no redundancy. In practice, this is very
+<a id="L185"></a>    // likely to have reduced it to a quite small set (e.g. it'll typically coalesce a full `src/`
+<a id="L186"></a>    // directory into one entry). However, the FSEventStream API has a fairly low undocumented limit
+<a id="L187"></a>    // on total watches (supposedly 4096), so we should handle the case where we exceed it. To be
+<a id="L188"></a>    // safe, because this API can be a little unpredictable, we'll cap ourselves a little *below*
+<a id="L189"></a>    // that known limit.
+<a id="L190"></a>    if (need_dirs.count() &gt; 2048) {
+<a id="L191"></a>        // Fallback: watch the whole filesystem. This is excessive, but... it *works* :P
+<a id="L192"></a>        if (enable_debug_logs) watch_log.debug("too many dirs; recursively watching root", .{});
+<a id="L193"></a>        fse.watch_roots = try gpa.realloc(fse.watch_roots, 1);
+<a id="L194"></a>        fse.watch_roots[0] = "/";
+<a id="L195"></a>    } else {
+<a id="L196"></a>        fse.watch_roots = try gpa.realloc(fse.watch_roots, need_dirs.count());
+<a id="L197"></a>        for (fse.watch_roots, need_dirs.keys()) |*out, in| {
+<a id="L198"></a>            out.* = try paths_arena.dupeZ(u8, in);
+<a id="L199"></a>        }
+<a id="L200"></a>    }
+<a id="L201"></a>    if (enable_debug_logs) {
+<a id="L202"></a>        watch_log.debug("watching {d} paths using {d} recursive watches:", .{ fse.watch_paths.count(), fse.watch_roots.len });
+<a id="L203"></a>        for (fse.watch_roots) |dir_path| {
+<a id="L204"></a>            watch_log.debug("- '{s}'", .{dir_path});
+<a id="L205"></a>        }
+<a id="L206"></a>    }
+<a id="L207"></a>}
+<a id="L208"></a>
+<a id="L209"></a>pub fn wait(fse: *FsEvents, gpa: Allocator, timeout_ns: ?u64) error{ OutOfMemory, StartFailed }!std.Build.Watch.WaitResult {
+<a id="L210"></a>    if (fse.watch_roots.len == 0) @panic("nothing to watch");
+<a id="L211"></a>
+<a id="L212"></a>    const rs = fse.resolved_symbols;
+<a id="L213"></a>
+<a id="L214"></a>    // At the time of writing, using `since_event` in the obvious way causes redundant rebuilds
+<a id="L215"></a>    // to occur, because one step modifies a file which is an input to another step. The solution
+<a id="L216"></a>    // to this problem will probably be either:
+<a id="L217"></a>    //
+<a id="L218"></a>    // a) Don't include the output of one step as a watch input of another; only mark external
+<a id="L219"></a>    //    files as watch inputs. Or...
+<a id="L220"></a>    //
+<a id="L221"></a>    // b) Note the current event ID when a step begins, and disregard events preceding that ID
+<a id="L222"></a>    //    when considering whether to dirty that step in `eventCallback`.
+<a id="L223"></a>    //
+<a id="L224"></a>    // For now, to avoid the redundant rebuilds, we bypass this `since_event` mechanism. This does
+<a id="L225"></a>    // introduce race conditions, but the other `std.Build.Watch` implementations suffer from those
+<a id="L226"></a>    // too at the time of writing, so this is kind of expected.
+<a id="L227"></a>    fse.since_event = .since_now;
+<a id="L228"></a>
+<a id="L229"></a>    const cf_allocator = rs.CFAllocatorCreate(rs.kCFAllocatorUseContext.*, &amp;.{
+<a id="L230"></a>        .version = 0,
+<a id="L231"></a>        .info = @constCast(&amp;gpa),
+<a id="L232"></a>        .retain = null,
+<a id="L233"></a>        .release = null,
+<a id="L234"></a>        .copy_description = null,
+<a id="L235"></a>        .allocate = &amp;cf_alloc_callbacks.allocate,
+<a id="L236"></a>        .reallocate = &amp;cf_alloc_callbacks.reallocate,
+<a id="L237"></a>        .deallocate = &amp;cf_alloc_callbacks.deallocate,
+<a id="L238"></a>        .preferred_size = null,
+<a id="L239"></a>    }) orelse return error.OutOfMemory;
+<a id="L240"></a>    defer rs.CFRelease(cf_allocator);
+<a id="L241"></a>
+<a id="L242"></a>    const cf_paths = try gpa.alloc(?CFStringRef, fse.watch_roots.len);
+<a id="L243"></a>    @memset(cf_paths, null);
+<a id="L244"></a>    defer {
+<a id="L245"></a>        for (cf_paths) |o| if (o) |p| rs.CFRelease(p);
+<a id="L246"></a>        gpa.free(cf_paths);
+<a id="L247"></a>    }
+<a id="L248"></a>    for (fse.watch_roots, cf_paths) |raw_path, *cf_path| {
+<a id="L249"></a>        cf_path.* = rs.CFStringCreateWithCString(cf_allocator, raw_path, .utf8);
+<a id="L250"></a>    }
+<a id="L251"></a>    const cf_paths_array = rs.CFArrayCreate(cf_allocator, @ptrCast(cf_paths), @intCast(cf_paths.len), null);
+<a id="L252"></a>    defer rs.CFRelease(cf_paths_array);
+<a id="L253"></a>
+<a id="L254"></a>    const callback_ctx: EventCallbackCtx = .{
+<a id="L255"></a>        .fse = fse,
+<a id="L256"></a>        .gpa = gpa,
+<a id="L257"></a>    };
+<a id="L258"></a>    const event_stream = rs.FSEventStreamCreate(
+<a id="L259"></a>        null,
+<a id="L260"></a>        &amp;eventCallback,
+<a id="L261"></a>        &amp;.{
+<a id="L262"></a>            .version = 0,
+<a id="L263"></a>            .info = @constCast(&amp;callback_ctx),
+<a id="L264"></a>            .retain = null,
+<a id="L265"></a>            .release = null,
+<a id="L266"></a>            .copy_description = null,
+<a id="L267"></a>        },
+<a id="L268"></a>        cf_paths_array,
+<a id="L269"></a>        fse.since_event,
+<a id="L270"></a>        0.05, // 0.05s latency; higher values increase efficiency by coalescing more events
+<a id="L271"></a>        .{ .watch_root = true, .file_events = true },
+<a id="L272"></a>    );
+<a id="L273"></a>    defer rs.FSEventStreamRelease(event_stream);
+<a id="L274"></a>    rs.FSEventStreamSetDispatchQueue(event_stream, fse.dispatch_queue);
+<a id="L275"></a>    defer rs.FSEventStreamInvalidate(event_stream);
+<a id="L276"></a>    if (!rs.FSEventStreamStart(event_stream)) return error.StartFailed;
+<a id="L277"></a>    defer rs.FSEventStreamStop(event_stream);
+<a id="L278"></a>    const result = fse.waiting_semaphore.wait(timeout: {
+<a id="L279"></a>        const ns = timeout_ns orelse break :timeout .FOREVER;
+<a id="L280"></a>        break :timeout .time(.NOW, @intCast(ns));
+<a id="L281"></a>    });
+<a id="L282"></a>    return switch (result) {
+<a id="L283"></a>        0 =&gt; .dirty,
+<a id="L284"></a>        else =&gt; .timeout,
+<a id="L285"></a>    };
+<a id="L286"></a>}
+<a id="L287"></a>
+<a id="L288"></a>const cf_alloc_callbacks = struct {
+<a id="L289"></a>    const log = std.log.scoped(.cf_alloc);
+<a id="L290"></a>    fn allocate(size: CFIndex, hint: CFOptionFlags, info: ?*const anyopaque) callconv(.c) ?*const anyopaque {
+<a id="L291"></a>        if (enable_debug_logs) log.debug("allocate {d}", .{size});
+<a id="L292"></a>        _ = hint;
+<a id="L293"></a>        const gpa: *const Allocator = @ptrCast(@alignCast(info));
+<a id="L294"></a>        const mem = gpa.alignedAlloc(u8, .of(usize), @intCast(size + @sizeOf(usize))) catch return null;
+<a id="L295"></a>        const metadata: *usize = @ptrCast(mem);
+<a id="L296"></a>        metadata.* = @intCast(size);
+<a id="L297"></a>        return mem[@sizeOf(usize)..].ptr;
+<a id="L298"></a>    }
+<a id="L299"></a>    fn reallocate(ptr: ?*anyopaque, new_size: CFIndex, hint: CFOptionFlags, info: ?*const anyopaque) callconv(.c) ?*const anyopaque {
+<a id="L300"></a>        if (enable_debug_logs) log.debug("reallocate @{*} {d}", .{ ptr, new_size });
+<a id="L301"></a>        _ = hint;
+<a id="L302"></a>        if (ptr == null or new_size == 0) return null; // not a bug: documentation explicitly states that realloc on NULL should return NULL
+<a id="L303"></a>        const gpa: *const Allocator = @ptrCast(@alignCast(info));
+<a id="L304"></a>        const old_base: [*]align(@alignOf(usize)) u8 = @alignCast(@as([*]u8, @ptrCast(ptr)) - @sizeOf(usize));
+<a id="L305"></a>        const old_size = @as(*const usize, @ptrCast(old_base)).*;
+<a id="L306"></a>        const old_mem = old_base[0 .. old_size + @sizeOf(usize)];
+<a id="L307"></a>        const new_mem = gpa.realloc(old_mem, @intCast(new_size + @sizeOf(usize))) catch return null;
+<a id="L308"></a>        const metadata: *usize = @ptrCast(new_mem);
+<a id="L309"></a>        metadata.* = @intCast(new_size);
+<a id="L310"></a>        return new_mem[@sizeOf(usize)..].ptr;
+<a id="L311"></a>    }
+<a id="L312"></a>    fn deallocate(ptr: *anyopaque, info: ?*const anyopaque) callconv(.c) void {
+<a id="L313"></a>        if (enable_debug_logs) log.debug("deallocate @{*}", .{ptr});
+<a id="L314"></a>        const gpa: *const Allocator = @ptrCast(@alignCast(info));
+<a id="L315"></a>        const old_base: [*]align(@alignOf(usize)) u8 = @alignCast(@as([*]u8, @ptrCast(ptr)) - @sizeOf(usize));
+<a id="L316"></a>        const old_size = @as(*const usize, @ptrCast(old_base)).*;
+<a id="L317"></a>        const old_mem = old_base[0 .. old_size + @sizeOf(usize)];
+<a id="L318"></a>        gpa.free(old_mem);
+<a id="L319"></a>    }
+<a id="L320"></a>};
+<a id="L321"></a>
+<a id="L322"></a>const EventCallbackCtx = struct {
+<a id="L323"></a>    fse: *FsEvents,
+<a id="L324"></a>    gpa: Allocator,
+<a id="L325"></a>};
+<a id="L326"></a>
+<a id="L327"></a>fn eventCallback(
+<a id="L328"></a>    stream: ConstFSEventStreamRef,
+<a id="L329"></a>    client_callback_info: ?*anyopaque,
+<a id="L330"></a>    num_events: usize,
+<a id="L331"></a>    events_paths_ptr: *anyopaque,
+<a id="L332"></a>    events_flags_ptr: [*]const FSEventStreamEventFlags,
+<a id="L333"></a>    events_ids_ptr: [*]const FSEventStreamEventId,
+<a id="L334"></a>) callconv(.c) void {
+<a id="L335"></a>    const ctx: *const EventCallbackCtx = @ptrCast(@alignCast(client_callback_info));
+<a id="L336"></a>    const fse = ctx.fse;
+<a id="L337"></a>    const gpa = ctx.gpa;
+<a id="L338"></a>    const rs = fse.resolved_symbols;
+<a id="L339"></a>    const events_paths_ptr_casted: [*]const [*:0]const u8 = @ptrCast(@alignCast(events_paths_ptr));
+<a id="L340"></a>    const events_paths = events_paths_ptr_casted[0..num_events];
+<a id="L341"></a>    const events_ids = events_ids_ptr[0..num_events];
+<a id="L342"></a>    const events_flags = events_flags_ptr[0..num_events];
+<a id="L343"></a>    var any_dirty = false;
+<a id="L344"></a>    for (events_paths, events_ids, events_flags) |event_path_nts, event_id, event_flags| {
+<a id="L345"></a>        _ = event_id;
+<a id="L346"></a>        if (event_flags.history_done) continue; // sentinel
+<a id="L347"></a>        const event_path = std.mem.span(event_path_nts);
+<a id="L348"></a>        switch (event_flags.must_scan_sub_dirs) {
+<a id="L349"></a>            false =&gt; {
+<a id="L350"></a>                if (fse.watch_paths.get(event_path)) |steps| {
+<a id="L351"></a>                    assert(steps.len &gt; 0);
+<a id="L352"></a>                    for (steps) |s| {
+<a id="L353"></a>                        if (s.invalidateResult(gpa)) any_dirty = true;
+<a id="L354"></a>                    }
+<a id="L355"></a>                }
+<a id="L356"></a>                if (std.fs.path.dirname(event_path)) |event_dirname| {
+<a id="L357"></a>                    // Modifying '/foo/bar' triggers the watch on '/foo'.
+<a id="L358"></a>                    if (fse.watch_paths.get(event_dirname)) |steps| {
+<a id="L359"></a>                        assert(steps.len &gt; 0);
+<a id="L360"></a>                        for (steps) |s| {
+<a id="L361"></a>                            if (s.invalidateResult(gpa)) any_dirty = true;
+<a id="L362"></a>                        }
+<a id="L363"></a>                    }
+<a id="L364"></a>                }
+<a id="L365"></a>            },
+<a id="L366"></a>            true =&gt; {
+<a id="L367"></a>                // This is unlikely, but can occasionally happen when bottlenecked: events have been
+<a id="L368"></a>                // coalesced into one. We want to see if any of these events are actually relevant
+<a id="L369"></a>                // to us. The only way we can reasonably do that in this rare edge case is iterate
+<a id="L370"></a>                // the watch paths and see if any is under this directory. That's acceptable because
+<a id="L371"></a>                // we would otherwise kick off a rebuild which would be clearing those paths anyway.
+<a id="L372"></a>                const changed_path = std.fs.path.dirname(event_path) orelse event_path;
+<a id="L373"></a>                for (fse.watch_paths.keys(), fse.watch_paths.values()) |watching_path, steps| {
+<a id="L374"></a>                    if (dirStartsWith(watching_path, changed_path)) {
+<a id="L375"></a>                        for (steps) |s| {
+<a id="L376"></a>                            if (s.invalidateResult(gpa)) any_dirty = true;
+<a id="L377"></a>                        }
+<a id="L378"></a>                    }
+<a id="L379"></a>                }
+<a id="L380"></a>            },
+<a id="L381"></a>        }
+<a id="L382"></a>    }
+<a id="L383"></a>    if (any_dirty) {
+<a id="L384"></a>        fse.since_event = rs.FSEventStreamGetLatestEventId(stream);
+<a id="L385"></a>        _ = fse.waiting_semaphore.signal();
+<a id="L386"></a>    }
+<a id="L387"></a>}
+<a id="L388"></a>fn dirStartsWith(path: []const u8, prefix: []const u8) bool {
+<a id="L389"></a>    if (std.mem.eql(u8, path, prefix)) return true;
+<a id="L390"></a>    if (!std.mem.startsWith(u8, path, prefix)) return false;
+<a id="L391"></a>    if (path[prefix.len] != '/') return false; // `path` is `/foo/barx`, `prefix` is `/foo/bar`
+<a id="L392"></a>    return true; // `path` is `/foo/bar/...`, `prefix` is `/foo/bar`
+<a id="L393"></a>}
+<a id="L394"></a>
+<a id="L395"></a>const CFAllocatorRef = ?*const opaque {};
+<a id="L396"></a>const CFArrayRef = *const opaque {};
+<a id="L397"></a>const CFStringRef = *const opaque {};
+<a id="L398"></a>const CFTimeInterval = f64;
+<a id="L399"></a>const CFIndex = i32;
+<a id="L400"></a>const CFOptionFlags = enum(u32) { _ };
+<a id="L401"></a>const CFAllocatorRetainCallBack = *const fn (info: ?*const anyopaque) callconv(.c) *const anyopaque;
+<a id="L402"></a>const CFAllocatorReleaseCallBack = *const fn (info: ?*const anyopaque) callconv(.c) void;
+<a id="L403"></a>const CFAllocatorCopyDescriptionCallBack = *const fn (info: ?*const anyopaque) callconv(.c) CFStringRef;
+<a id="L404"></a>const CFAllocatorAllocateCallBack = *const fn (alloc_size: CFIndex, hint: CFOptionFlags, info: ?*const anyopaque) callconv(.c) ?*const anyopaque;
+<a id="L405"></a>const CFAllocatorReallocateCallBack = *const fn (ptr: ?*anyopaque, new_size: CFIndex, hint: CFOptionFlags, info: ?*const anyopaque) callconv(.c) ?*const anyopaque;
+<a id="L406"></a>const CFAllocatorDeallocateCallBack = *const fn (ptr: *anyopaque, info: ?*const anyopaque) callconv(.c) void;
+<a id="L407"></a>const CFAllocatorPreferredSizeCallBack = *const fn (size: CFIndex, hint: CFOptionFlags, info: ?*const anyopaque) callconv(.c) CFIndex;
+<a id="L408"></a>const CFAllocatorContext = extern struct {
+<a id="L409"></a>    version: CFIndex,
+<a id="L410"></a>    info: ?*anyopaque,
+<a id="L411"></a>    retain: ?CFAllocatorRetainCallBack,
+<a id="L412"></a>    release: ?CFAllocatorReleaseCallBack,
+<a id="L413"></a>    copy_description: ?CFAllocatorCopyDescriptionCallBack,
+<a id="L414"></a>    allocate: CFAllocatorAllocateCallBack,
+<a id="L415"></a>    reallocate: ?CFAllocatorReallocateCallBack,
+<a id="L416"></a>    deallocate: ?CFAllocatorDeallocateCallBack,
+<a id="L417"></a>    preferred_size: ?CFAllocatorPreferredSizeCallBack,
+<a id="L418"></a>};
+<a id="L419"></a>const CFArrayCallBacks = opaque {};
+<a id="L420"></a>const CFStringEncoding = enum(u32) {
+<a id="L421"></a>    invalid_id = std.math.maxInt(u32),
+<a id="L422"></a>    mac_roman = 0,
+<a id="L423"></a>    windows_latin_1 = 0x500,
+<a id="L424"></a>    iso_latin_1 = 0x201,
+<a id="L425"></a>    next_step_latin = 0xB01,
+<a id="L426"></a>    ascii = 0x600,
+<a id="L427"></a>    unicode = 0x100,
+<a id="L428"></a>    utf8 = 0x8000100,
+<a id="L429"></a>    non_lossy_ascii = 0xBFF,
+<a id="L430"></a>};
+<a id="L431"></a>
+<a id="L432"></a>const FSEventStreamRef = *opaque {};
+<a id="L433"></a>const ConstFSEventStreamRef = *const @typeInfo(FSEventStreamRef).pointer.child;
+<a id="L434"></a>const FSEventStreamCallback = *const fn (
+<a id="L435"></a>    stream: ConstFSEventStreamRef,
+<a id="L436"></a>    client_callback_info: ?*anyopaque,
+<a id="L437"></a>    num_events: usize,
+<a id="L438"></a>    event_paths: *anyopaque,
+<a id="L439"></a>    event_flags: [*]const FSEventStreamEventFlags,
+<a id="L440"></a>    event_ids: [*]const FSEventStreamEventId,
+<a id="L441"></a>) callconv(.c) void;
+<a id="L442"></a>const FSEventStreamContext = extern struct {
+<a id="L443"></a>    version: CFIndex,
+<a id="L444"></a>    info: ?*anyopaque,
+<a id="L445"></a>    retain: ?CFAllocatorRetainCallBack,
+<a id="L446"></a>    release: ?CFAllocatorReleaseCallBack,
+<a id="L447"></a>    copy_description: ?CFAllocatorCopyDescriptionCallBack,
+<a id="L448"></a>};
+<a id="L449"></a>const FSEventStreamEventId = enum(u64) {
+<a id="L450"></a>    since_now = std.math.maxInt(u64),
+<a id="L451"></a>    _,
+<a id="L452"></a>};
+<a id="L453"></a>const FSEventStreamCreateFlags = packed struct(u32) {
+<a id="L454"></a>    use_cf_types: bool = false,
+<a id="L455"></a>    no_defer: bool = false,
+<a id="L456"></a>    watch_root: bool = false,
+<a id="L457"></a>    ignore_self: bool = false,
+<a id="L458"></a>    file_events: bool = false,
+<a id="L459"></a>    _: u27 = 0,
+<a id="L460"></a>};
+<a id="L461"></a>const FSEventStreamEventFlags = packed struct(u32) {
+<a id="L462"></a>    must_scan_sub_dirs: bool,
+<a id="L463"></a>    user_dropped: bool,
+<a id="L464"></a>    kernel_dropped: bool,
+<a id="L465"></a>    event_ids_wrapped: bool,
+<a id="L466"></a>    history_done: bool,
+<a id="L467"></a>    root_changed: bool,
+<a id="L468"></a>    mount: bool,
+<a id="L469"></a>    unmount: bool,
+<a id="L470"></a>    _: u24 = 0,
+<a id="L471"></a>};
+<a id="L472"></a>
+<a id="L473"></a>const dispatch = std.c.dispatch;
+<a id="L474"></a>const std = @import("std");
+<a id="L475"></a>const Io = std.Io;
+<a id="L476"></a>const assert = std.debug.assert;
+<a id="L477"></a>const Allocator = std.mem.Allocator;
+<a id="L478"></a>const watch_log = std.log.scoped(.watch);
+<a id="L479"></a>const FsEvents = @This();
+</pre>
 </body>
 </html>

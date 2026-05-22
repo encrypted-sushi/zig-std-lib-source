@@ -2,825 +2,828 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Source: zig-0.16.0-std/json/static.zig</title>
+    <title>Source: json/static.zig</title>
     <style>
         body { background: #1e1e1e; color: #d4d4d4; font-family: monospace; padding: 20px; }
         pre { white-space: pre-wrap; word-wrap: break-word; }
         .header { border-bottom: 1px solid #444; padding-bottom: 10px; margin-bottom: 20px; }
         a { color: #569cd6; }
+        a[id] { color: inherit; text-decoration: none; }
+        :target { background: #3a3a00; }
     </style>
 </head>
 <body>
     <div class="header">
-        <a href="/">Index</a> | <strong>File: zig-0.16.0-std/json/static.zig</strong>
+        <a href="/">Index</a> | <strong>File: json/static.zig</strong>
     </div>
-    <pre>const std = @import("std");
-const assert = std.debug.assert;
-const Allocator = std.mem.Allocator;
-const ArenaAllocator = std.heap.ArenaAllocator;
-const ArrayList = std.array_list.Managed;
-
-const Scanner = @import("Scanner.zig");
-const Token = Scanner.Token;
-const AllocWhen = Scanner.AllocWhen;
-const default_max_value_len = Scanner.default_max_value_len;
-const isNumberFormattedLikeAnInteger = Scanner.isNumberFormattedLikeAnInteger;
-
-const Value = @import("./dynamic.zig").Value;
-const Array = @import("./dynamic.zig").Array;
-
-/// Controls how to deal with various inconsistencies between the JSON document and the Zig struct type passed in.
-/// For duplicate fields or unknown fields, set options in this struct.
-/// For missing fields, give the Zig struct fields default values.
-pub const ParseOptions = struct {
-    /// Behaviour when a duplicate field is encountered.
-    /// The default is to return `error.DuplicateField`.
-    duplicate_field_behavior: enum {
-        use_first,
-        @"error",
-        use_last,
-    } = .@"error",
-
-    /// If false, finding an unknown field returns `error.UnknownField`.
-    ignore_unknown_fields: bool = false,
-
-    /// Passed to `std.json.Scanner.nextAllocMax` or `std.json.Reader.nextAllocMax`.
-    /// The default for `parseFromSlice` or `parseFromTokenSource` with a `*std.json.Scanner` input
-    /// is the length of the input slice, which means `error.ValueTooLong` will never be returned.
-    /// The default for `parseFromTokenSource` with a `*std.json.Reader` is `std.json.default_max_value_len`.
-    /// Ignored for `parseFromValue` and `parseFromValueLeaky`.
-    max_value_len: ?usize = null,
-
-    /// This determines whether strings should always be copied,
-    /// or if a reference to the given buffer should be preferred if possible.
-    /// The default for `parseFromSlice` or `parseFromTokenSource` with a `*std.json.Scanner` input
-    /// is `.alloc_if_needed`.
-    /// The default with a `*std.json.Reader` input is `.alloc_always`.
-    /// Ignored for `parseFromValue` and `parseFromValueLeaky`.
-    allocate: ?AllocWhen = null,
-
-    /// When parsing to a `std.json.Value`, set this option to false to always emit
-    /// JSON numbers as unparsed `std.json.Value.number_string`.
-    /// Otherwise, JSON numbers are parsed as either `std.json.Value.integer`,
-    /// `std.json.Value.float` or left as unparsed `std.json.Value.number_string`
-    /// depending on the format and value of the JSON number.
-    /// When this option is true, JSON numbers encoded as floats (see `std.json.isNumberFormattedLikeAnInteger`)
-    /// may lose precision when being parsed into `std.json.Value.float`.
-    parse_numbers: bool = true,
-};
-
-pub fn Parsed(comptime T: type) type {
-    return struct {
-        arena: *ArenaAllocator,
-        value: T,
-
-        pub fn deinit(self: @This()) void {
-            const allocator = self.arena.child_allocator;
-            self.arena.deinit();
-            allocator.destroy(self.arena);
-        }
-    };
-}
-
-/// Parses the json document from `s` and returns the result packaged in a `std.json.Parsed`.
-/// You must call `deinit()` of the returned object to clean up allocated resources.
-/// If you are using a `std.heap.ArenaAllocator` or similar, consider calling `parseFromSliceLeaky` instead.
-/// Note that `error.BufferUnderrun` is not actually possible to return from this function.
-pub fn parseFromSlice(
-    comptime T: type,
-    allocator: Allocator,
-    s: []const u8,
-    options: ParseOptions,
-) ParseError(Scanner)!Parsed(T) {
-    var scanner = Scanner.initCompleteInput(allocator, s);
-    defer scanner.deinit();
-
-    return parseFromTokenSource(T, allocator, &amp;scanner, options);
-}
-
-/// Parses the json document from `s` and returns the result.
-/// Allocations made during this operation are not carefully tracked and may not be possible to individually clean up.
-/// It is recommended to use a `std.heap.ArenaAllocator` or similar.
-pub fn parseFromSliceLeaky(
-    comptime T: type,
-    allocator: Allocator,
-    s: []const u8,
-    options: ParseOptions,
-) ParseError(Scanner)!T {
-    var scanner = Scanner.initCompleteInput(allocator, s);
-    defer scanner.deinit();
-
-    return parseFromTokenSourceLeaky(T, allocator, &amp;scanner, options);
-}
-
-/// `scanner_or_reader` must be either a `*std.json.Scanner` with complete input or a `*std.json.Reader`.
-/// Note that `error.BufferUnderrun` is not actually possible to return from this function.
-pub fn parseFromTokenSource(
-    comptime T: type,
-    allocator: Allocator,
-    scanner_or_reader: anytype,
-    options: ParseOptions,
-) ParseError(@TypeOf(scanner_or_reader.*))!Parsed(T) {
-    var parsed = Parsed(T){
-        .arena = try allocator.create(ArenaAllocator),
-        .value = undefined,
-    };
-    errdefer allocator.destroy(parsed.arena);
-    parsed.arena.* = ArenaAllocator.init(allocator);
-    errdefer parsed.arena.deinit();
-
-    parsed.value = try parseFromTokenSourceLeaky(T, parsed.arena.allocator(), scanner_or_reader, options);
-
-    return parsed;
-}
-
-/// `scanner_or_reader` must be either a `*std.json.Scanner` with complete input or a `*std.json.Reader`.
-/// Allocations made during this operation are not carefully tracked and may not be possible to individually clean up.
-/// It is recommended to use a `std.heap.ArenaAllocator` or similar.
-pub fn parseFromTokenSourceLeaky(
-    comptime T: type,
-    allocator: Allocator,
-    scanner_or_reader: anytype,
-    options: ParseOptions,
-) ParseError(@TypeOf(scanner_or_reader.*))!T {
-    if (@TypeOf(scanner_or_reader.*) == Scanner) {
-        assert(scanner_or_reader.is_end_of_input);
-    }
-    var resolved_options = options;
-    if (resolved_options.max_value_len == null) {
-        if (@TypeOf(scanner_or_reader.*) == Scanner) {
-            resolved_options.max_value_len = scanner_or_reader.input.len;
-        } else {
-            resolved_options.max_value_len = default_max_value_len;
-        }
-    }
-    if (resolved_options.allocate == null) {
-        if (@TypeOf(scanner_or_reader.*) == Scanner) {
-            resolved_options.allocate = .alloc_if_needed;
-        } else {
-            resolved_options.allocate = .alloc_always;
-        }
-    }
-
-    const value = try innerParse(T, allocator, scanner_or_reader, resolved_options);
-
-    assert(.end_of_document == try scanner_or_reader.next());
-
-    return value;
-}
-
-/// Like `parseFromSlice`, but the input is an already-parsed `std.json.Value` object.
-/// Only `options.ignore_unknown_fields` is used from `options`.
-pub fn parseFromValue(
-    comptime T: type,
-    allocator: Allocator,
-    source: Value,
-    options: ParseOptions,
-) ParseFromValueError!Parsed(T) {
-    var parsed = Parsed(T){
-        .arena = try allocator.create(ArenaAllocator),
-        .value = undefined,
-    };
-    errdefer allocator.destroy(parsed.arena);
-    parsed.arena.* = ArenaAllocator.init(allocator);
-    errdefer parsed.arena.deinit();
-
-    parsed.value = try parseFromValueLeaky(T, parsed.arena.allocator(), source, options);
-
-    return parsed;
-}
-
-pub fn parseFromValueLeaky(
-    comptime T: type,
-    allocator: Allocator,
-    source: Value,
-    options: ParseOptions,
-) ParseFromValueError!T {
-    // I guess this function doesn't need to exist,
-    // but the flow of the sourcecode is easy to follow and grouped nicely with
-    // this pub redirect function near the top and the implementation near the bottom.
-    return innerParseFromValue(T, allocator, source, options);
-}
-
-/// The error set that will be returned when parsing from `*Source`.
-/// Note that this may contain `error.BufferUnderrun`, but that error will never actually be returned.
-pub fn ParseError(comptime Source: type) type {
-    // A few of these will either always be present or present enough of the time that
-    // omitting them is more confusing than always including them.
-    return ParseFromValueError || Source.NextError || Source.PeekError || Source.AllocError;
-}
-
-pub const ParseFromValueError = std.fmt.ParseIntError || std.fmt.ParseFloatError || Allocator.Error || error{
-    UnexpectedToken,
-    InvalidNumber,
-    Overflow,
-    InvalidEnumTag,
-    DuplicateField,
-    UnknownField,
-    MissingField,
-    LengthMismatch,
-};
-
-/// This is an internal function called recursively
-/// during the implementation of `parseFromTokenSourceLeaky` and similar.
-/// It is exposed primarily to enable custom `jsonParse()` methods to call back into the `parseFrom*` system,
-/// such as if you're implementing a custom container of type `T`;
-/// you can call `innerParse(T, ...)` for each of the container's items.
-/// Note that `null` fields are not allowed on the `options` when calling this function.
-/// (The `options` you get in your `jsonParse` method has no `null` fields.)
-pub fn innerParse(
-    comptime T: type,
-    allocator: Allocator,
-    source: anytype,
-    options: ParseOptions,
-) ParseError(@TypeOf(source.*))!T {
-    switch (@typeInfo(T)) {
-        .bool =&gt; {
-            return switch (try source.next()) {
-                .true =&gt; true,
-                .false =&gt; false,
-                else =&gt; error.UnexpectedToken,
-            };
-        },
-        .float, .comptime_float =&gt; {
-            const token = try source.nextAllocMax(allocator, .alloc_if_needed, options.max_value_len.?);
-            defer freeAllocated(allocator, token);
-            const slice = switch (token) {
-                inline .number, .allocated_number, .string, .allocated_string =&gt; |slice| slice,
-                else =&gt; return error.UnexpectedToken,
-            };
-            return try std.fmt.parseFloat(T, slice);
-        },
-        .int, .comptime_int =&gt; {
-            const token = try source.nextAllocMax(allocator, .alloc_if_needed, options.max_value_len.?);
-            defer freeAllocated(allocator, token);
-            const slice = switch (token) {
-                inline .number, .allocated_number, .string, .allocated_string =&gt; |slice| slice,
-                else =&gt; return error.UnexpectedToken,
-            };
-            return sliceToInt(T, slice);
-        },
-        .optional =&gt; |optionalInfo| {
-            switch (try source.peekNextTokenType()) {
-                .null =&gt; {
-                    _ = try source.next();
-                    return null;
-                },
-                else =&gt; {
-                    return try innerParse(optionalInfo.child, allocator, source, options);
-                },
-            }
-        },
-        .@"enum" =&gt; {
-            if (std.meta.hasFn(T, "jsonParse")) {
-                return T.jsonParse(allocator, source, options);
-            }
-
-            const token = try source.nextAllocMax(allocator, .alloc_if_needed, options.max_value_len.?);
-            defer freeAllocated(allocator, token);
-            const slice = switch (token) {
-                inline .number, .allocated_number, .string, .allocated_string =&gt; |slice| slice,
-                else =&gt; return error.UnexpectedToken,
-            };
-            return sliceToEnum(T, slice);
-        },
-        .@"union" =&gt; |unionInfo| {
-            if (std.meta.hasFn(T, "jsonParse")) {
-                return T.jsonParse(allocator, source, options);
-            }
-
-            if (unionInfo.tag_type == null) @compileError("Unable to parse into untagged union '" ++ @typeName(T) ++ "'");
-
-            if (.object_begin != try source.next()) return error.UnexpectedToken;
-
-            var result: ?T = null;
-            var name_token: ?Token = try source.nextAllocMax(allocator, .alloc_if_needed, options.max_value_len.?);
-            const field_name = switch (name_token.?) {
-                inline .string, .allocated_string =&gt; |slice| slice,
-                else =&gt; {
-                    return error.UnexpectedToken;
-                },
-            };
-
-            inline for (unionInfo.fields) |u_field| {
-                if (std.mem.eql(u8, u_field.name, field_name)) {
-                    // Free the name token now in case we're using an allocator that optimizes freeing the last allocated object.
-                    // (Recursing into innerParse() might trigger more allocations.)
-                    freeAllocated(allocator, name_token.?);
-                    name_token = null;
-                    if (u_field.type == void) {
-                        // void isn't really a json type, but we can support void payload union tags with {} as a value.
-                        if (.object_begin != try source.next()) return error.UnexpectedToken;
-                        if (.object_end != try source.next()) return error.UnexpectedToken;
-                        result = @unionInit(T, u_field.name, {});
-                    } else {
-                        // Recurse.
-                        result = @unionInit(T, u_field.name, try innerParse(u_field.type, allocator, source, options));
-                    }
-                    break;
-                }
-            } else {
-                // Didn't match anything.
-                return error.UnknownField;
-            }
-
-            if (.object_end != try source.next()) return error.UnexpectedToken;
-
-            return result.?;
-        },
-
-        .@"struct" =&gt; |structInfo| {
-            if (structInfo.is_tuple) {
-                if (.array_begin != try source.next()) return error.UnexpectedToken;
-
-                var r: T = undefined;
-                inline for (0..structInfo.fields.len) |i| {
-                    r[i] = try innerParse(structInfo.fields[i].type, allocator, source, options);
-                }
-
-                if (.array_end != try source.next()) return error.UnexpectedToken;
-
-                return r;
-            }
-
-            if (std.meta.hasFn(T, "jsonParse")) {
-                return T.jsonParse(allocator, source, options);
-            }
-
-            if (.object_begin != try source.next()) return error.UnexpectedToken;
-
-            var r: T = undefined;
-            var fields_seen = [_]bool{false} ** structInfo.fields.len;
-
-            while (true) {
-                var name_token: ?Token = try source.nextAllocMax(allocator, .alloc_if_needed, options.max_value_len.?);
-                const field_name = switch (name_token.?) {
-                    inline .string, .allocated_string =&gt; |slice| slice,
-                    .object_end =&gt; { // No more fields.
-                        break;
-                    },
-                    else =&gt; {
-                        return error.UnexpectedToken;
-                    },
-                };
-
-                inline for (structInfo.fields, 0..) |field, i| {
-                    if (field.is_comptime) @compileError("comptime fields are not supported: " ++ @typeName(T) ++ "." ++ field.name);
-                    if (std.mem.eql(u8, field.name, field_name)) {
-                        // Free the name token now in case we're using an allocator that optimizes freeing the last allocated object.
-                        // (Recursing into innerParse() might trigger more allocations.)
-                        freeAllocated(allocator, name_token.?);
-                        name_token = null;
-                        if (fields_seen[i]) {
-                            switch (options.duplicate_field_behavior) {
-                                .use_first =&gt; {
-                                    // Parse and ignore the redundant value.
-                                    // We don't want to skip the value, because we want type checking.
-                                    _ = try innerParse(field.type, allocator, source, options);
-                                    break;
-                                },
-                                .@"error" =&gt; return error.DuplicateField,
-                                .use_last =&gt; {},
-                            }
-                        }
-                        @field(r, field.name) = try innerParse(field.type, allocator, source, options);
-                        fields_seen[i] = true;
-                        break;
-                    }
-                } else {
-                    // Didn't match anything.
-                    freeAllocated(allocator, name_token.?);
-                    if (options.ignore_unknown_fields) {
-                        try source.skipValue();
-                    } else {
-                        return error.UnknownField;
-                    }
-                }
-            }
-            try fillDefaultStructValues(T, &amp;r, &amp;fields_seen);
-            return r;
-        },
-
-        .array =&gt; |arrayInfo| {
-            switch (try source.peekNextTokenType()) {
-                .array_begin =&gt; {
-                    // Typical array.
-                    return internalParseArray(T, arrayInfo.child, allocator, source, options);
-                },
-                .string =&gt; {
-                    if (arrayInfo.child != u8) return error.UnexpectedToken;
-                    // Fixed-length string.
-
-                    var r: T = undefined;
-                    var i: usize = 0;
-                    while (true) {
-                        switch (try source.next()) {
-                            .string =&gt; |slice| {
-                                if (i + slice.len != r.len) return error.LengthMismatch;
-                                @memcpy(r[i..][0..slice.len], slice);
-                                break;
-                            },
-                            .partial_string =&gt; |slice| {
-                                if (i + slice.len &gt; r.len) return error.LengthMismatch;
-                                @memcpy(r[i..][0..slice.len], slice);
-                                i += slice.len;
-                            },
-                            .partial_string_escaped_1 =&gt; |arr| {
-                                if (i + arr.len &gt; r.len) return error.LengthMismatch;
-                                @memcpy(r[i..][0..arr.len], arr[0..]);
-                                i += arr.len;
-                            },
-                            .partial_string_escaped_2 =&gt; |arr| {
-                                if (i + arr.len &gt; r.len) return error.LengthMismatch;
-                                @memcpy(r[i..][0..arr.len], arr[0..]);
-                                i += arr.len;
-                            },
-                            .partial_string_escaped_3 =&gt; |arr| {
-                                if (i + arr.len &gt; r.len) return error.LengthMismatch;
-                                @memcpy(r[i..][0..arr.len], arr[0..]);
-                                i += arr.len;
-                            },
-                            .partial_string_escaped_4 =&gt; |arr| {
-                                if (i + arr.len &gt; r.len) return error.LengthMismatch;
-                                @memcpy(r[i..][0..arr.len], arr[0..]);
-                                i += arr.len;
-                            },
-                            else =&gt; unreachable,
-                        }
-                    }
-
-                    return r;
-                },
-
-                else =&gt; return error.UnexpectedToken,
-            }
-        },
-
-        .vector =&gt; |vector_info| {
-            switch (try source.peekNextTokenType()) {
-                .array_begin =&gt; {
-                    const A = [vector_info.len]vector_info.child;
-                    return try internalParseArray(A, vector_info.child, allocator, source, options);
-                },
-                else =&gt; return error.UnexpectedToken,
-            }
-        },
-
-        .pointer =&gt; |ptrInfo| {
-            switch (ptrInfo.size) {
-                .one =&gt; {
-                    const r: *ptrInfo.child = try allocator.create(ptrInfo.child);
-                    r.* = try innerParse(ptrInfo.child, allocator, source, options);
-                    return r;
-                },
-                .slice =&gt; {
-                    switch (try source.peekNextTokenType()) {
-                        .array_begin =&gt; {
-                            _ = try source.next();
-
-                            // Typical array.
-                            var arraylist = ArrayList(ptrInfo.child).init(allocator);
-                            while (true) {
-                                switch (try source.peekNextTokenType()) {
-                                    .array_end =&gt; {
-                                        _ = try source.next();
-                                        break;
-                                    },
-                                    else =&gt; {},
-                                }
-
-                                try arraylist.ensureUnusedCapacity(1);
-                                arraylist.appendAssumeCapacity(try innerParse(ptrInfo.child, allocator, source, options));
-                            }
-
-                            if (ptrInfo.sentinel()) |s| {
-                                return try arraylist.toOwnedSliceSentinel(s);
-                            }
-
-                            return try arraylist.toOwnedSlice();
-                        },
-                        .string =&gt; {
-                            if (ptrInfo.child != u8) return error.UnexpectedToken;
-
-                            // Dynamic length string.
-                            if (ptrInfo.sentinel()) |s| {
-                                // Use our own array list so we can append the sentinel.
-                                var value_list = ArrayList(u8).init(allocator);
-                                _ = try source.allocNextIntoArrayList(&amp;value_list, .alloc_always);
-                                return try value_list.toOwnedSliceSentinel(s);
-                            }
-                            if (ptrInfo.is_const) {
-                                switch (try source.nextAllocMax(allocator, options.allocate.?, options.max_value_len.?)) {
-                                    inline .string, .allocated_string =&gt; |slice| return slice,
-                                    else =&gt; unreachable,
-                                }
-                            } else {
-                                // Have to allocate to get a mutable copy.
-                                switch (try source.nextAllocMax(allocator, .alloc_always, options.max_value_len.?)) {
-                                    .allocated_string =&gt; |slice| return slice,
-                                    else =&gt; unreachable,
-                                }
-                            }
-                        },
-                        else =&gt; return error.UnexpectedToken,
-                    }
-                },
-                else =&gt; @compileError("Unable to parse into type '" ++ @typeName(T) ++ "'"),
-            }
-        },
-        else =&gt; @compileError("Unable to parse into type '" ++ @typeName(T) ++ "'"),
-    }
-    unreachable;
-}
-
-fn internalParseArray(
-    comptime T: type,
-    comptime Child: type,
-    allocator: Allocator,
-    source: anytype,
-    options: ParseOptions,
-) !T {
-    assert(.array_begin == try source.next());
-
-    var r: T = undefined;
-    for (&amp;r) |*elem| {
-        elem.* = try innerParse(Child, allocator, source, options);
-    }
-
-    if (.array_end != try source.next()) return error.UnexpectedToken;
-
-    return r;
-}
-
-/// This is an internal function called recursively
-/// during the implementation of `parseFromValueLeaky`.
-/// It is exposed primarily to enable custom `jsonParseFromValue()` methods to call back into the `parseFromValue*` system,
-/// such as if you're implementing a custom container of type `T`;
-/// you can call `innerParseFromValue(T, ...)` for each of the container's items.
-pub fn innerParseFromValue(
-    comptime T: type,
-    allocator: Allocator,
-    source: Value,
-    options: ParseOptions,
-) ParseFromValueError!T {
-    switch (@typeInfo(T)) {
-        .bool =&gt; {
-            switch (source) {
-                .bool =&gt; |b| return b,
-                else =&gt; return error.UnexpectedToken,
-            }
-        },
-        .float, .comptime_float =&gt; {
-            switch (source) {
-                .float =&gt; |f| return @as(T, @floatCast(f)),
-                .integer =&gt; |i| return @as(T, @floatFromInt(i)),
-                .number_string, .string =&gt; |s| return std.fmt.parseFloat(T, s),
-                else =&gt; return error.UnexpectedToken,
-            }
-        },
-        .int, .comptime_int =&gt; {
-            switch (source) {
-                .float =&gt; |f| {
-                    if (@round(f) != f) return error.InvalidNumber;
-                    if (f &gt; @as(@TypeOf(f), @floatFromInt(std.math.maxInt(T)))) return error.Overflow;
-                    if (f &lt; @as(@TypeOf(f), @floatFromInt(std.math.minInt(T)))) return error.Overflow;
-                    return @intFromFloat(f);
-                },
-                .integer =&gt; |i| {
-                    if (i &gt; std.math.maxInt(T)) return error.Overflow;
-                    if (i &lt; std.math.minInt(T)) return error.Overflow;
-                    return @intCast(i);
-                },
-                .number_string, .string =&gt; |s| {
-                    return sliceToInt(T, s);
-                },
-                else =&gt; return error.UnexpectedToken,
-            }
-        },
-        .optional =&gt; |optionalInfo| {
-            switch (source) {
-                .null =&gt; return null,
-                else =&gt; return try innerParseFromValue(optionalInfo.child, allocator, source, options),
-            }
-        },
-        .@"enum" =&gt; {
-            if (std.meta.hasFn(T, "jsonParseFromValue")) {
-                return T.jsonParseFromValue(allocator, source, options);
-            }
-
-            switch (source) {
-                .float =&gt; return error.InvalidEnumTag,
-                .integer =&gt; |i| return std.enums.fromInt(T, i) orelse return error.InvalidEnumTag,
-                .number_string, .string =&gt; |s| return sliceToEnum(T, s),
-                else =&gt; return error.UnexpectedToken,
-            }
-        },
-        .@"union" =&gt; |unionInfo| {
-            if (std.meta.hasFn(T, "jsonParseFromValue")) {
-                return T.jsonParseFromValue(allocator, source, options);
-            }
-
-            if (unionInfo.tag_type == null) @compileError("Unable to parse into untagged union '" ++ @typeName(T) ++ "'");
-
-            if (source != .object) return error.UnexpectedToken;
-            if (source.object.count() != 1) return error.UnexpectedToken;
-
-            var it = source.object.iterator();
-            const kv = it.next().?;
-            const field_name = kv.key_ptr.*;
-
-            inline for (unionInfo.fields) |u_field| {
-                if (std.mem.eql(u8, u_field.name, field_name)) {
-                    if (u_field.type == void) {
-                        // void isn't really a json type, but we can support void payload union tags with {} as a value.
-                        if (kv.value_ptr.* != .object) return error.UnexpectedToken;
-                        if (kv.value_ptr.*.object.count() != 0) return error.UnexpectedToken;
-                        return @unionInit(T, u_field.name, {});
-                    }
-                    // Recurse.
-                    return @unionInit(T, u_field.name, try innerParseFromValue(u_field.type, allocator, kv.value_ptr.*, options));
-                }
-            }
-            // Didn't match anything.
-            return error.UnknownField;
-        },
-
-        .@"struct" =&gt; |structInfo| {
-            if (structInfo.is_tuple) {
-                if (source != .array) return error.UnexpectedToken;
-                if (source.array.items.len != structInfo.fields.len) return error.UnexpectedToken;
-
-                var r: T = undefined;
-                inline for (0..structInfo.fields.len, source.array.items) |i, item| {
-                    r[i] = try innerParseFromValue(structInfo.fields[i].type, allocator, item, options);
-                }
-
-                return r;
-            }
-
-            if (std.meta.hasFn(T, "jsonParseFromValue")) {
-                return T.jsonParseFromValue(allocator, source, options);
-            }
-
-            if (source != .object) return error.UnexpectedToken;
-
-            var r: T = undefined;
-            var fields_seen = [_]bool{false} ** structInfo.fields.len;
-
-            var it = source.object.iterator();
-            while (it.next()) |kv| {
-                const field_name = kv.key_ptr.*;
-
-                inline for (structInfo.fields, 0..) |field, i| {
-                    if (field.is_comptime) @compileError("comptime fields are not supported: " ++ @typeName(T) ++ "." ++ field.name);
-                    if (std.mem.eql(u8, field.name, field_name)) {
-                        assert(!fields_seen[i]); // Can't have duplicate keys in a Value.object.
-                        @field(r, field.name) = try innerParseFromValue(field.type, allocator, kv.value_ptr.*, options);
-                        fields_seen[i] = true;
-                        break;
-                    }
-                } else {
-                    // Didn't match anything.
-                    if (!options.ignore_unknown_fields) return error.UnknownField;
-                }
-            }
-            try fillDefaultStructValues(T, &amp;r, &amp;fields_seen);
-            return r;
-        },
-
-        .array =&gt; |arrayInfo| {
-            switch (source) {
-                .array =&gt; |array| {
-                    // Typical array.
-                    return innerParseArrayFromArrayValue(T, arrayInfo.child, arrayInfo.len, allocator, array, options);
-                },
-                .string =&gt; |s| {
-                    if (arrayInfo.child != u8) return error.UnexpectedToken;
-                    // Fixed-length string.
-
-                    if (s.len != arrayInfo.len) return error.LengthMismatch;
-
-                    var r: T = undefined;
-                    @memcpy(r[0..], s);
-                    return r;
-                },
-
-                else =&gt; return error.UnexpectedToken,
-            }
-        },
-
-        .vector =&gt; |vecInfo| {
-            switch (source) {
-                .array =&gt; |array| {
-                    return innerParseArrayFromArrayValue(T, vecInfo.child, vecInfo.len, allocator, array, options);
-                },
-                else =&gt; return error.UnexpectedToken,
-            }
-        },
-
-        .pointer =&gt; |ptrInfo| {
-            switch (ptrInfo.size) {
-                .one =&gt; {
-                    const r: *ptrInfo.child = try allocator.create(ptrInfo.child);
-                    r.* = try innerParseFromValue(ptrInfo.child, allocator, source, options);
-                    return r;
-                },
-                .slice =&gt; {
-                    switch (source) {
-                        .array =&gt; |array| {
-                            const r = if (ptrInfo.sentinel()) |sentinel|
-                                try allocator.allocSentinel(ptrInfo.child, array.items.len, sentinel)
-                            else
-                                try allocator.alloc(ptrInfo.child, array.items.len);
-
-                            for (array.items, r) |item, *dest| {
-                                dest.* = try innerParseFromValue(ptrInfo.child, allocator, item, options);
-                            }
-
-                            return r;
-                        },
-                        .string =&gt; |s| {
-                            if (ptrInfo.child != u8) return error.UnexpectedToken;
-                            // Dynamic length string.
-
-                            const r = if (ptrInfo.sentinel()) |sentinel|
-                                try allocator.allocSentinel(ptrInfo.child, s.len, sentinel)
-                            else
-                                try allocator.alloc(ptrInfo.child, s.len);
-                            @memcpy(r[0..], s);
-
-                            return r;
-                        },
-                        else =&gt; return error.UnexpectedToken,
-                    }
-                },
-                else =&gt; @compileError("Unable to parse into type '" ++ @typeName(T) ++ "'"),
-            }
-        },
-        else =&gt; @compileError("Unable to parse into type '" ++ @typeName(T) ++ "'"),
-    }
-}
-
-fn innerParseArrayFromArrayValue(
-    comptime T: type,
-    comptime Child: type,
-    comptime len: comptime_int,
-    allocator: Allocator,
-    array: Array,
-    options: ParseOptions,
-) !T {
-    if (array.items.len != len) return error.LengthMismatch;
-
-    var r: T = undefined;
-    for (array.items, 0..) |item, i| {
-        r[i] = try innerParseFromValue(Child, allocator, item, options);
-    }
-
-    return r;
-}
-
-fn sliceToInt(comptime T: type, slice: []const u8) !T {
-    if (isNumberFormattedLikeAnInteger(slice))
-        return std.fmt.parseInt(T, slice, 10);
-    // Try to coerce a float to an integer.
-    const float = try std.fmt.parseFloat(f128, slice);
-    if (@round(float) != float) return error.InvalidNumber;
-    if (float &gt; @as(f128, @floatFromInt(std.math.maxInt(T))) or float &lt; @as(f128, @floatFromInt(std.math.minInt(T)))) return error.Overflow;
-    return @as(T, @intCast(@as(i128, @intFromFloat(float))));
-}
-
-fn sliceToEnum(comptime T: type, slice: []const u8) !T {
-    // Check for a named value.
-    if (std.meta.stringToEnum(T, slice)) |value| return value;
-    // Check for a numeric value.
-    if (!isNumberFormattedLikeAnInteger(slice)) return error.InvalidEnumTag;
-    const n = std.fmt.parseInt(@typeInfo(T).@"enum".tag_type, slice, 10) catch return error.InvalidEnumTag;
-    return std.enums.fromInt(T, n) orelse return error.InvalidEnumTag;
-}
-
-fn fillDefaultStructValues(comptime T: type, r: *T, fields_seen: *[@typeInfo(T).@"struct".fields.len]bool) !void {
-    inline for (@typeInfo(T).@"struct".fields, 0..) |field, i| {
-        if (!fields_seen[i]) {
-            if (field.defaultValue()) |default| {
-                @field(r, field.name) = default;
-            } else {
-                return error.MissingField;
-            }
-        }
-    }
-}
-
-fn freeAllocated(allocator: Allocator, token: Token) void {
-    switch (token) {
-        .allocated_number, .allocated_string =&gt; |slice| {
-            allocator.free(slice);
-        },
-        else =&gt; {},
-    }
-}
-
-test {
-    _ = @import("./static_test.zig");
-}</pre>
+    <pre><a id="L1"></a>const std = @import("std");
+<a id="L2"></a>const assert = std.debug.assert;
+<a id="L3"></a>const Allocator = std.mem.Allocator;
+<a id="L4"></a>const ArenaAllocator = std.heap.ArenaAllocator;
+<a id="L5"></a>const ArrayList = std.array_list.Managed;
+<a id="L6"></a>
+<a id="L7"></a>const Scanner = @import("Scanner.zig");
+<a id="L8"></a>const Token = Scanner.Token;
+<a id="L9"></a>const AllocWhen = Scanner.AllocWhen;
+<a id="L10"></a>const default_max_value_len = Scanner.default_max_value_len;
+<a id="L11"></a>const isNumberFormattedLikeAnInteger = Scanner.isNumberFormattedLikeAnInteger;
+<a id="L12"></a>
+<a id="L13"></a>const Value = @import("./dynamic.zig").Value;
+<a id="L14"></a>const Array = @import("./dynamic.zig").Array;
+<a id="L15"></a>
+<a id="L16"></a>/// Controls how to deal with various inconsistencies between the JSON document and the Zig struct type passed in.
+<a id="L17"></a>/// For duplicate fields or unknown fields, set options in this struct.
+<a id="L18"></a>/// For missing fields, give the Zig struct fields default values.
+<a id="L19"></a>pub const ParseOptions = struct {
+<a id="L20"></a>    /// Behaviour when a duplicate field is encountered.
+<a id="L21"></a>    /// The default is to return `error.DuplicateField`.
+<a id="L22"></a>    duplicate_field_behavior: enum {
+<a id="L23"></a>        use_first,
+<a id="L24"></a>        @"error",
+<a id="L25"></a>        use_last,
+<a id="L26"></a>    } = .@"error",
+<a id="L27"></a>
+<a id="L28"></a>    /// If false, finding an unknown field returns `error.UnknownField`.
+<a id="L29"></a>    ignore_unknown_fields: bool = false,
+<a id="L30"></a>
+<a id="L31"></a>    /// Passed to `std.json.Scanner.nextAllocMax` or `std.json.Reader.nextAllocMax`.
+<a id="L32"></a>    /// The default for `parseFromSlice` or `parseFromTokenSource` with a `*std.json.Scanner` input
+<a id="L33"></a>    /// is the length of the input slice, which means `error.ValueTooLong` will never be returned.
+<a id="L34"></a>    /// The default for `parseFromTokenSource` with a `*std.json.Reader` is `std.json.default_max_value_len`.
+<a id="L35"></a>    /// Ignored for `parseFromValue` and `parseFromValueLeaky`.
+<a id="L36"></a>    max_value_len: ?usize = null,
+<a id="L37"></a>
+<a id="L38"></a>    /// This determines whether strings should always be copied,
+<a id="L39"></a>    /// or if a reference to the given buffer should be preferred if possible.
+<a id="L40"></a>    /// The default for `parseFromSlice` or `parseFromTokenSource` with a `*std.json.Scanner` input
+<a id="L41"></a>    /// is `.alloc_if_needed`.
+<a id="L42"></a>    /// The default with a `*std.json.Reader` input is `.alloc_always`.
+<a id="L43"></a>    /// Ignored for `parseFromValue` and `parseFromValueLeaky`.
+<a id="L44"></a>    allocate: ?AllocWhen = null,
+<a id="L45"></a>
+<a id="L46"></a>    /// When parsing to a `std.json.Value`, set this option to false to always emit
+<a id="L47"></a>    /// JSON numbers as unparsed `std.json.Value.number_string`.
+<a id="L48"></a>    /// Otherwise, JSON numbers are parsed as either `std.json.Value.integer`,
+<a id="L49"></a>    /// `std.json.Value.float` or left as unparsed `std.json.Value.number_string`
+<a id="L50"></a>    /// depending on the format and value of the JSON number.
+<a id="L51"></a>    /// When this option is true, JSON numbers encoded as floats (see `std.json.isNumberFormattedLikeAnInteger`)
+<a id="L52"></a>    /// may lose precision when being parsed into `std.json.Value.float`.
+<a id="L53"></a>    parse_numbers: bool = true,
+<a id="L54"></a>};
+<a id="L55"></a>
+<a id="L56"></a>pub fn Parsed(comptime T: type) type {
+<a id="L57"></a>    return struct {
+<a id="L58"></a>        arena: *ArenaAllocator,
+<a id="L59"></a>        value: T,
+<a id="L60"></a>
+<a id="L61"></a>        pub fn deinit(self: @This()) void {
+<a id="L62"></a>            const allocator = self.arena.child_allocator;
+<a id="L63"></a>            self.arena.deinit();
+<a id="L64"></a>            allocator.destroy(self.arena);
+<a id="L65"></a>        }
+<a id="L66"></a>    };
+<a id="L67"></a>}
+<a id="L68"></a>
+<a id="L69"></a>/// Parses the json document from `s` and returns the result packaged in a `std.json.Parsed`.
+<a id="L70"></a>/// You must call `deinit()` of the returned object to clean up allocated resources.
+<a id="L71"></a>/// If you are using a `std.heap.ArenaAllocator` or similar, consider calling `parseFromSliceLeaky` instead.
+<a id="L72"></a>/// Note that `error.BufferUnderrun` is not actually possible to return from this function.
+<a id="L73"></a>pub fn parseFromSlice(
+<a id="L74"></a>    comptime T: type,
+<a id="L75"></a>    allocator: Allocator,
+<a id="L76"></a>    s: []const u8,
+<a id="L77"></a>    options: ParseOptions,
+<a id="L78"></a>) ParseError(Scanner)!Parsed(T) {
+<a id="L79"></a>    var scanner = Scanner.initCompleteInput(allocator, s);
+<a id="L80"></a>    defer scanner.deinit();
+<a id="L81"></a>
+<a id="L82"></a>    return parseFromTokenSource(T, allocator, &amp;scanner, options);
+<a id="L83"></a>}
+<a id="L84"></a>
+<a id="L85"></a>/// Parses the json document from `s` and returns the result.
+<a id="L86"></a>/// Allocations made during this operation are not carefully tracked and may not be possible to individually clean up.
+<a id="L87"></a>/// It is recommended to use a `std.heap.ArenaAllocator` or similar.
+<a id="L88"></a>pub fn parseFromSliceLeaky(
+<a id="L89"></a>    comptime T: type,
+<a id="L90"></a>    allocator: Allocator,
+<a id="L91"></a>    s: []const u8,
+<a id="L92"></a>    options: ParseOptions,
+<a id="L93"></a>) ParseError(Scanner)!T {
+<a id="L94"></a>    var scanner = Scanner.initCompleteInput(allocator, s);
+<a id="L95"></a>    defer scanner.deinit();
+<a id="L96"></a>
+<a id="L97"></a>    return parseFromTokenSourceLeaky(T, allocator, &amp;scanner, options);
+<a id="L98"></a>}
+<a id="L99"></a>
+<a id="L100"></a>/// `scanner_or_reader` must be either a `*std.json.Scanner` with complete input or a `*std.json.Reader`.
+<a id="L101"></a>/// Note that `error.BufferUnderrun` is not actually possible to return from this function.
+<a id="L102"></a>pub fn parseFromTokenSource(
+<a id="L103"></a>    comptime T: type,
+<a id="L104"></a>    allocator: Allocator,
+<a id="L105"></a>    scanner_or_reader: anytype,
+<a id="L106"></a>    options: ParseOptions,
+<a id="L107"></a>) ParseError(@TypeOf(scanner_or_reader.*))!Parsed(T) {
+<a id="L108"></a>    var parsed = Parsed(T){
+<a id="L109"></a>        .arena = try allocator.create(ArenaAllocator),
+<a id="L110"></a>        .value = undefined,
+<a id="L111"></a>    };
+<a id="L112"></a>    errdefer allocator.destroy(parsed.arena);
+<a id="L113"></a>    parsed.arena.* = ArenaAllocator.init(allocator);
+<a id="L114"></a>    errdefer parsed.arena.deinit();
+<a id="L115"></a>
+<a id="L116"></a>    parsed.value = try parseFromTokenSourceLeaky(T, parsed.arena.allocator(), scanner_or_reader, options);
+<a id="L117"></a>
+<a id="L118"></a>    return parsed;
+<a id="L119"></a>}
+<a id="L120"></a>
+<a id="L121"></a>/// `scanner_or_reader` must be either a `*std.json.Scanner` with complete input or a `*std.json.Reader`.
+<a id="L122"></a>/// Allocations made during this operation are not carefully tracked and may not be possible to individually clean up.
+<a id="L123"></a>/// It is recommended to use a `std.heap.ArenaAllocator` or similar.
+<a id="L124"></a>pub fn parseFromTokenSourceLeaky(
+<a id="L125"></a>    comptime T: type,
+<a id="L126"></a>    allocator: Allocator,
+<a id="L127"></a>    scanner_or_reader: anytype,
+<a id="L128"></a>    options: ParseOptions,
+<a id="L129"></a>) ParseError(@TypeOf(scanner_or_reader.*))!T {
+<a id="L130"></a>    if (@TypeOf(scanner_or_reader.*) == Scanner) {
+<a id="L131"></a>        assert(scanner_or_reader.is_end_of_input);
+<a id="L132"></a>    }
+<a id="L133"></a>    var resolved_options = options;
+<a id="L134"></a>    if (resolved_options.max_value_len == null) {
+<a id="L135"></a>        if (@TypeOf(scanner_or_reader.*) == Scanner) {
+<a id="L136"></a>            resolved_options.max_value_len = scanner_or_reader.input.len;
+<a id="L137"></a>        } else {
+<a id="L138"></a>            resolved_options.max_value_len = default_max_value_len;
+<a id="L139"></a>        }
+<a id="L140"></a>    }
+<a id="L141"></a>    if (resolved_options.allocate == null) {
+<a id="L142"></a>        if (@TypeOf(scanner_or_reader.*) == Scanner) {
+<a id="L143"></a>            resolved_options.allocate = .alloc_if_needed;
+<a id="L144"></a>        } else {
+<a id="L145"></a>            resolved_options.allocate = .alloc_always;
+<a id="L146"></a>        }
+<a id="L147"></a>    }
+<a id="L148"></a>
+<a id="L149"></a>    const value = try innerParse(T, allocator, scanner_or_reader, resolved_options);
+<a id="L150"></a>
+<a id="L151"></a>    assert(.end_of_document == try scanner_or_reader.next());
+<a id="L152"></a>
+<a id="L153"></a>    return value;
+<a id="L154"></a>}
+<a id="L155"></a>
+<a id="L156"></a>/// Like `parseFromSlice`, but the input is an already-parsed `std.json.Value` object.
+<a id="L157"></a>/// Only `options.ignore_unknown_fields` is used from `options`.
+<a id="L158"></a>pub fn parseFromValue(
+<a id="L159"></a>    comptime T: type,
+<a id="L160"></a>    allocator: Allocator,
+<a id="L161"></a>    source: Value,
+<a id="L162"></a>    options: ParseOptions,
+<a id="L163"></a>) ParseFromValueError!Parsed(T) {
+<a id="L164"></a>    var parsed = Parsed(T){
+<a id="L165"></a>        .arena = try allocator.create(ArenaAllocator),
+<a id="L166"></a>        .value = undefined,
+<a id="L167"></a>    };
+<a id="L168"></a>    errdefer allocator.destroy(parsed.arena);
+<a id="L169"></a>    parsed.arena.* = ArenaAllocator.init(allocator);
+<a id="L170"></a>    errdefer parsed.arena.deinit();
+<a id="L171"></a>
+<a id="L172"></a>    parsed.value = try parseFromValueLeaky(T, parsed.arena.allocator(), source, options);
+<a id="L173"></a>
+<a id="L174"></a>    return parsed;
+<a id="L175"></a>}
+<a id="L176"></a>
+<a id="L177"></a>pub fn parseFromValueLeaky(
+<a id="L178"></a>    comptime T: type,
+<a id="L179"></a>    allocator: Allocator,
+<a id="L180"></a>    source: Value,
+<a id="L181"></a>    options: ParseOptions,
+<a id="L182"></a>) ParseFromValueError!T {
+<a id="L183"></a>    // I guess this function doesn't need to exist,
+<a id="L184"></a>    // but the flow of the sourcecode is easy to follow and grouped nicely with
+<a id="L185"></a>    // this pub redirect function near the top and the implementation near the bottom.
+<a id="L186"></a>    return innerParseFromValue(T, allocator, source, options);
+<a id="L187"></a>}
+<a id="L188"></a>
+<a id="L189"></a>/// The error set that will be returned when parsing from `*Source`.
+<a id="L190"></a>/// Note that this may contain `error.BufferUnderrun`, but that error will never actually be returned.
+<a id="L191"></a>pub fn ParseError(comptime Source: type) type {
+<a id="L192"></a>    // A few of these will either always be present or present enough of the time that
+<a id="L193"></a>    // omitting them is more confusing than always including them.
+<a id="L194"></a>    return ParseFromValueError || Source.NextError || Source.PeekError || Source.AllocError;
+<a id="L195"></a>}
+<a id="L196"></a>
+<a id="L197"></a>pub const ParseFromValueError = std.fmt.ParseIntError || std.fmt.ParseFloatError || Allocator.Error || error{
+<a id="L198"></a>    UnexpectedToken,
+<a id="L199"></a>    InvalidNumber,
+<a id="L200"></a>    Overflow,
+<a id="L201"></a>    InvalidEnumTag,
+<a id="L202"></a>    DuplicateField,
+<a id="L203"></a>    UnknownField,
+<a id="L204"></a>    MissingField,
+<a id="L205"></a>    LengthMismatch,
+<a id="L206"></a>};
+<a id="L207"></a>
+<a id="L208"></a>/// This is an internal function called recursively
+<a id="L209"></a>/// during the implementation of `parseFromTokenSourceLeaky` and similar.
+<a id="L210"></a>/// It is exposed primarily to enable custom `jsonParse()` methods to call back into the `parseFrom*` system,
+<a id="L211"></a>/// such as if you're implementing a custom container of type `T`;
+<a id="L212"></a>/// you can call `innerParse(T, ...)` for each of the container's items.
+<a id="L213"></a>/// Note that `null` fields are not allowed on the `options` when calling this function.
+<a id="L214"></a>/// (The `options` you get in your `jsonParse` method has no `null` fields.)
+<a id="L215"></a>pub fn innerParse(
+<a id="L216"></a>    comptime T: type,
+<a id="L217"></a>    allocator: Allocator,
+<a id="L218"></a>    source: anytype,
+<a id="L219"></a>    options: ParseOptions,
+<a id="L220"></a>) ParseError(@TypeOf(source.*))!T {
+<a id="L221"></a>    switch (@typeInfo(T)) {
+<a id="L222"></a>        .bool =&gt; {
+<a id="L223"></a>            return switch (try source.next()) {
+<a id="L224"></a>                .true =&gt; true,
+<a id="L225"></a>                .false =&gt; false,
+<a id="L226"></a>                else =&gt; error.UnexpectedToken,
+<a id="L227"></a>            };
+<a id="L228"></a>        },
+<a id="L229"></a>        .float, .comptime_float =&gt; {
+<a id="L230"></a>            const token = try source.nextAllocMax(allocator, .alloc_if_needed, options.max_value_len.?);
+<a id="L231"></a>            defer freeAllocated(allocator, token);
+<a id="L232"></a>            const slice = switch (token) {
+<a id="L233"></a>                inline .number, .allocated_number, .string, .allocated_string =&gt; |slice| slice,
+<a id="L234"></a>                else =&gt; return error.UnexpectedToken,
+<a id="L235"></a>            };
+<a id="L236"></a>            return try std.fmt.parseFloat(T, slice);
+<a id="L237"></a>        },
+<a id="L238"></a>        .int, .comptime_int =&gt; {
+<a id="L239"></a>            const token = try source.nextAllocMax(allocator, .alloc_if_needed, options.max_value_len.?);
+<a id="L240"></a>            defer freeAllocated(allocator, token);
+<a id="L241"></a>            const slice = switch (token) {
+<a id="L242"></a>                inline .number, .allocated_number, .string, .allocated_string =&gt; |slice| slice,
+<a id="L243"></a>                else =&gt; return error.UnexpectedToken,
+<a id="L244"></a>            };
+<a id="L245"></a>            return sliceToInt(T, slice);
+<a id="L246"></a>        },
+<a id="L247"></a>        .optional =&gt; |optionalInfo| {
+<a id="L248"></a>            switch (try source.peekNextTokenType()) {
+<a id="L249"></a>                .null =&gt; {
+<a id="L250"></a>                    _ = try source.next();
+<a id="L251"></a>                    return null;
+<a id="L252"></a>                },
+<a id="L253"></a>                else =&gt; {
+<a id="L254"></a>                    return try innerParse(optionalInfo.child, allocator, source, options);
+<a id="L255"></a>                },
+<a id="L256"></a>            }
+<a id="L257"></a>        },
+<a id="L258"></a>        .@"enum" =&gt; {
+<a id="L259"></a>            if (std.meta.hasFn(T, "jsonParse")) {
+<a id="L260"></a>                return T.jsonParse(allocator, source, options);
+<a id="L261"></a>            }
+<a id="L262"></a>
+<a id="L263"></a>            const token = try source.nextAllocMax(allocator, .alloc_if_needed, options.max_value_len.?);
+<a id="L264"></a>            defer freeAllocated(allocator, token);
+<a id="L265"></a>            const slice = switch (token) {
+<a id="L266"></a>                inline .number, .allocated_number, .string, .allocated_string =&gt; |slice| slice,
+<a id="L267"></a>                else =&gt; return error.UnexpectedToken,
+<a id="L268"></a>            };
+<a id="L269"></a>            return sliceToEnum(T, slice);
+<a id="L270"></a>        },
+<a id="L271"></a>        .@"union" =&gt; |unionInfo| {
+<a id="L272"></a>            if (std.meta.hasFn(T, "jsonParse")) {
+<a id="L273"></a>                return T.jsonParse(allocator, source, options);
+<a id="L274"></a>            }
+<a id="L275"></a>
+<a id="L276"></a>            if (unionInfo.tag_type == null) @compileError("Unable to parse into untagged union '" ++ @typeName(T) ++ "'");
+<a id="L277"></a>
+<a id="L278"></a>            if (.object_begin != try source.next()) return error.UnexpectedToken;
+<a id="L279"></a>
+<a id="L280"></a>            var result: ?T = null;
+<a id="L281"></a>            var name_token: ?Token = try source.nextAllocMax(allocator, .alloc_if_needed, options.max_value_len.?);
+<a id="L282"></a>            const field_name = switch (name_token.?) {
+<a id="L283"></a>                inline .string, .allocated_string =&gt; |slice| slice,
+<a id="L284"></a>                else =&gt; {
+<a id="L285"></a>                    return error.UnexpectedToken;
+<a id="L286"></a>                },
+<a id="L287"></a>            };
+<a id="L288"></a>
+<a id="L289"></a>            inline for (unionInfo.fields) |u_field| {
+<a id="L290"></a>                if (std.mem.eql(u8, u_field.name, field_name)) {
+<a id="L291"></a>                    // Free the name token now in case we're using an allocator that optimizes freeing the last allocated object.
+<a id="L292"></a>                    // (Recursing into innerParse() might trigger more allocations.)
+<a id="L293"></a>                    freeAllocated(allocator, name_token.?);
+<a id="L294"></a>                    name_token = null;
+<a id="L295"></a>                    if (u_field.type == void) {
+<a id="L296"></a>                        // void isn't really a json type, but we can support void payload union tags with {} as a value.
+<a id="L297"></a>                        if (.object_begin != try source.next()) return error.UnexpectedToken;
+<a id="L298"></a>                        if (.object_end != try source.next()) return error.UnexpectedToken;
+<a id="L299"></a>                        result = @unionInit(T, u_field.name, {});
+<a id="L300"></a>                    } else {
+<a id="L301"></a>                        // Recurse.
+<a id="L302"></a>                        result = @unionInit(T, u_field.name, try innerParse(u_field.type, allocator, source, options));
+<a id="L303"></a>                    }
+<a id="L304"></a>                    break;
+<a id="L305"></a>                }
+<a id="L306"></a>            } else {
+<a id="L307"></a>                // Didn't match anything.
+<a id="L308"></a>                return error.UnknownField;
+<a id="L309"></a>            }
+<a id="L310"></a>
+<a id="L311"></a>            if (.object_end != try source.next()) return error.UnexpectedToken;
+<a id="L312"></a>
+<a id="L313"></a>            return result.?;
+<a id="L314"></a>        },
+<a id="L315"></a>
+<a id="L316"></a>        .@"struct" =&gt; |structInfo| {
+<a id="L317"></a>            if (structInfo.is_tuple) {
+<a id="L318"></a>                if (.array_begin != try source.next()) return error.UnexpectedToken;
+<a id="L319"></a>
+<a id="L320"></a>                var r: T = undefined;
+<a id="L321"></a>                inline for (0..structInfo.fields.len) |i| {
+<a id="L322"></a>                    r[i] = try innerParse(structInfo.fields[i].type, allocator, source, options);
+<a id="L323"></a>                }
+<a id="L324"></a>
+<a id="L325"></a>                if (.array_end != try source.next()) return error.UnexpectedToken;
+<a id="L326"></a>
+<a id="L327"></a>                return r;
+<a id="L328"></a>            }
+<a id="L329"></a>
+<a id="L330"></a>            if (std.meta.hasFn(T, "jsonParse")) {
+<a id="L331"></a>                return T.jsonParse(allocator, source, options);
+<a id="L332"></a>            }
+<a id="L333"></a>
+<a id="L334"></a>            if (.object_begin != try source.next()) return error.UnexpectedToken;
+<a id="L335"></a>
+<a id="L336"></a>            var r: T = undefined;
+<a id="L337"></a>            var fields_seen = [_]bool{false} ** structInfo.fields.len;
+<a id="L338"></a>
+<a id="L339"></a>            while (true) {
+<a id="L340"></a>                var name_token: ?Token = try source.nextAllocMax(allocator, .alloc_if_needed, options.max_value_len.?);
+<a id="L341"></a>                const field_name = switch (name_token.?) {
+<a id="L342"></a>                    inline .string, .allocated_string =&gt; |slice| slice,
+<a id="L343"></a>                    .object_end =&gt; { // No more fields.
+<a id="L344"></a>                        break;
+<a id="L345"></a>                    },
+<a id="L346"></a>                    else =&gt; {
+<a id="L347"></a>                        return error.UnexpectedToken;
+<a id="L348"></a>                    },
+<a id="L349"></a>                };
+<a id="L350"></a>
+<a id="L351"></a>                inline for (structInfo.fields, 0..) |field, i| {
+<a id="L352"></a>                    if (field.is_comptime) @compileError("comptime fields are not supported: " ++ @typeName(T) ++ "." ++ field.name);
+<a id="L353"></a>                    if (std.mem.eql(u8, field.name, field_name)) {
+<a id="L354"></a>                        // Free the name token now in case we're using an allocator that optimizes freeing the last allocated object.
+<a id="L355"></a>                        // (Recursing into innerParse() might trigger more allocations.)
+<a id="L356"></a>                        freeAllocated(allocator, name_token.?);
+<a id="L357"></a>                        name_token = null;
+<a id="L358"></a>                        if (fields_seen[i]) {
+<a id="L359"></a>                            switch (options.duplicate_field_behavior) {
+<a id="L360"></a>                                .use_first =&gt; {
+<a id="L361"></a>                                    // Parse and ignore the redundant value.
+<a id="L362"></a>                                    // We don't want to skip the value, because we want type checking.
+<a id="L363"></a>                                    _ = try innerParse(field.type, allocator, source, options);
+<a id="L364"></a>                                    break;
+<a id="L365"></a>                                },
+<a id="L366"></a>                                .@"error" =&gt; return error.DuplicateField,
+<a id="L367"></a>                                .use_last =&gt; {},
+<a id="L368"></a>                            }
+<a id="L369"></a>                        }
+<a id="L370"></a>                        @field(r, field.name) = try innerParse(field.type, allocator, source, options);
+<a id="L371"></a>                        fields_seen[i] = true;
+<a id="L372"></a>                        break;
+<a id="L373"></a>                    }
+<a id="L374"></a>                } else {
+<a id="L375"></a>                    // Didn't match anything.
+<a id="L376"></a>                    freeAllocated(allocator, name_token.?);
+<a id="L377"></a>                    if (options.ignore_unknown_fields) {
+<a id="L378"></a>                        try source.skipValue();
+<a id="L379"></a>                    } else {
+<a id="L380"></a>                        return error.UnknownField;
+<a id="L381"></a>                    }
+<a id="L382"></a>                }
+<a id="L383"></a>            }
+<a id="L384"></a>            try fillDefaultStructValues(T, &amp;r, &amp;fields_seen);
+<a id="L385"></a>            return r;
+<a id="L386"></a>        },
+<a id="L387"></a>
+<a id="L388"></a>        .array =&gt; |arrayInfo| {
+<a id="L389"></a>            switch (try source.peekNextTokenType()) {
+<a id="L390"></a>                .array_begin =&gt; {
+<a id="L391"></a>                    // Typical array.
+<a id="L392"></a>                    return internalParseArray(T, arrayInfo.child, allocator, source, options);
+<a id="L393"></a>                },
+<a id="L394"></a>                .string =&gt; {
+<a id="L395"></a>                    if (arrayInfo.child != u8) return error.UnexpectedToken;
+<a id="L396"></a>                    // Fixed-length string.
+<a id="L397"></a>
+<a id="L398"></a>                    var r: T = undefined;
+<a id="L399"></a>                    var i: usize = 0;
+<a id="L400"></a>                    while (true) {
+<a id="L401"></a>                        switch (try source.next()) {
+<a id="L402"></a>                            .string =&gt; |slice| {
+<a id="L403"></a>                                if (i + slice.len != r.len) return error.LengthMismatch;
+<a id="L404"></a>                                @memcpy(r[i..][0..slice.len], slice);
+<a id="L405"></a>                                break;
+<a id="L406"></a>                            },
+<a id="L407"></a>                            .partial_string =&gt; |slice| {
+<a id="L408"></a>                                if (i + slice.len &gt; r.len) return error.LengthMismatch;
+<a id="L409"></a>                                @memcpy(r[i..][0..slice.len], slice);
+<a id="L410"></a>                                i += slice.len;
+<a id="L411"></a>                            },
+<a id="L412"></a>                            .partial_string_escaped_1 =&gt; |arr| {
+<a id="L413"></a>                                if (i + arr.len &gt; r.len) return error.LengthMismatch;
+<a id="L414"></a>                                @memcpy(r[i..][0..arr.len], arr[0..]);
+<a id="L415"></a>                                i += arr.len;
+<a id="L416"></a>                            },
+<a id="L417"></a>                            .partial_string_escaped_2 =&gt; |arr| {
+<a id="L418"></a>                                if (i + arr.len &gt; r.len) return error.LengthMismatch;
+<a id="L419"></a>                                @memcpy(r[i..][0..arr.len], arr[0..]);
+<a id="L420"></a>                                i += arr.len;
+<a id="L421"></a>                            },
+<a id="L422"></a>                            .partial_string_escaped_3 =&gt; |arr| {
+<a id="L423"></a>                                if (i + arr.len &gt; r.len) return error.LengthMismatch;
+<a id="L424"></a>                                @memcpy(r[i..][0..arr.len], arr[0..]);
+<a id="L425"></a>                                i += arr.len;
+<a id="L426"></a>                            },
+<a id="L427"></a>                            .partial_string_escaped_4 =&gt; |arr| {
+<a id="L428"></a>                                if (i + arr.len &gt; r.len) return error.LengthMismatch;
+<a id="L429"></a>                                @memcpy(r[i..][0..arr.len], arr[0..]);
+<a id="L430"></a>                                i += arr.len;
+<a id="L431"></a>                            },
+<a id="L432"></a>                            else =&gt; unreachable,
+<a id="L433"></a>                        }
+<a id="L434"></a>                    }
+<a id="L435"></a>
+<a id="L436"></a>                    return r;
+<a id="L437"></a>                },
+<a id="L438"></a>
+<a id="L439"></a>                else =&gt; return error.UnexpectedToken,
+<a id="L440"></a>            }
+<a id="L441"></a>        },
+<a id="L442"></a>
+<a id="L443"></a>        .vector =&gt; |vector_info| {
+<a id="L444"></a>            switch (try source.peekNextTokenType()) {
+<a id="L445"></a>                .array_begin =&gt; {
+<a id="L446"></a>                    const A = [vector_info.len]vector_info.child;
+<a id="L447"></a>                    return try internalParseArray(A, vector_info.child, allocator, source, options);
+<a id="L448"></a>                },
+<a id="L449"></a>                else =&gt; return error.UnexpectedToken,
+<a id="L450"></a>            }
+<a id="L451"></a>        },
+<a id="L452"></a>
+<a id="L453"></a>        .pointer =&gt; |ptrInfo| {
+<a id="L454"></a>            switch (ptrInfo.size) {
+<a id="L455"></a>                .one =&gt; {
+<a id="L456"></a>                    const r: *ptrInfo.child = try allocator.create(ptrInfo.child);
+<a id="L457"></a>                    r.* = try innerParse(ptrInfo.child, allocator, source, options);
+<a id="L458"></a>                    return r;
+<a id="L459"></a>                },
+<a id="L460"></a>                .slice =&gt; {
+<a id="L461"></a>                    switch (try source.peekNextTokenType()) {
+<a id="L462"></a>                        .array_begin =&gt; {
+<a id="L463"></a>                            _ = try source.next();
+<a id="L464"></a>
+<a id="L465"></a>                            // Typical array.
+<a id="L466"></a>                            var arraylist = ArrayList(ptrInfo.child).init(allocator);
+<a id="L467"></a>                            while (true) {
+<a id="L468"></a>                                switch (try source.peekNextTokenType()) {
+<a id="L469"></a>                                    .array_end =&gt; {
+<a id="L470"></a>                                        _ = try source.next();
+<a id="L471"></a>                                        break;
+<a id="L472"></a>                                    },
+<a id="L473"></a>                                    else =&gt; {},
+<a id="L474"></a>                                }
+<a id="L475"></a>
+<a id="L476"></a>                                try arraylist.ensureUnusedCapacity(1);
+<a id="L477"></a>                                arraylist.appendAssumeCapacity(try innerParse(ptrInfo.child, allocator, source, options));
+<a id="L478"></a>                            }
+<a id="L479"></a>
+<a id="L480"></a>                            if (ptrInfo.sentinel()) |s| {
+<a id="L481"></a>                                return try arraylist.toOwnedSliceSentinel(s);
+<a id="L482"></a>                            }
+<a id="L483"></a>
+<a id="L484"></a>                            return try arraylist.toOwnedSlice();
+<a id="L485"></a>                        },
+<a id="L486"></a>                        .string =&gt; {
+<a id="L487"></a>                            if (ptrInfo.child != u8) return error.UnexpectedToken;
+<a id="L488"></a>
+<a id="L489"></a>                            // Dynamic length string.
+<a id="L490"></a>                            if (ptrInfo.sentinel()) |s| {
+<a id="L491"></a>                                // Use our own array list so we can append the sentinel.
+<a id="L492"></a>                                var value_list = ArrayList(u8).init(allocator);
+<a id="L493"></a>                                _ = try source.allocNextIntoArrayList(&amp;value_list, .alloc_always);
+<a id="L494"></a>                                return try value_list.toOwnedSliceSentinel(s);
+<a id="L495"></a>                            }
+<a id="L496"></a>                            if (ptrInfo.is_const) {
+<a id="L497"></a>                                switch (try source.nextAllocMax(allocator, options.allocate.?, options.max_value_len.?)) {
+<a id="L498"></a>                                    inline .string, .allocated_string =&gt; |slice| return slice,
+<a id="L499"></a>                                    else =&gt; unreachable,
+<a id="L500"></a>                                }
+<a id="L501"></a>                            } else {
+<a id="L502"></a>                                // Have to allocate to get a mutable copy.
+<a id="L503"></a>                                switch (try source.nextAllocMax(allocator, .alloc_always, options.max_value_len.?)) {
+<a id="L504"></a>                                    .allocated_string =&gt; |slice| return slice,
+<a id="L505"></a>                                    else =&gt; unreachable,
+<a id="L506"></a>                                }
+<a id="L507"></a>                            }
+<a id="L508"></a>                        },
+<a id="L509"></a>                        else =&gt; return error.UnexpectedToken,
+<a id="L510"></a>                    }
+<a id="L511"></a>                },
+<a id="L512"></a>                else =&gt; @compileError("Unable to parse into type '" ++ @typeName(T) ++ "'"),
+<a id="L513"></a>            }
+<a id="L514"></a>        },
+<a id="L515"></a>        else =&gt; @compileError("Unable to parse into type '" ++ @typeName(T) ++ "'"),
+<a id="L516"></a>    }
+<a id="L517"></a>    unreachable;
+<a id="L518"></a>}
+<a id="L519"></a>
+<a id="L520"></a>fn internalParseArray(
+<a id="L521"></a>    comptime T: type,
+<a id="L522"></a>    comptime Child: type,
+<a id="L523"></a>    allocator: Allocator,
+<a id="L524"></a>    source: anytype,
+<a id="L525"></a>    options: ParseOptions,
+<a id="L526"></a>) !T {
+<a id="L527"></a>    assert(.array_begin == try source.next());
+<a id="L528"></a>
+<a id="L529"></a>    var r: T = undefined;
+<a id="L530"></a>    for (&amp;r) |*elem| {
+<a id="L531"></a>        elem.* = try innerParse(Child, allocator, source, options);
+<a id="L532"></a>    }
+<a id="L533"></a>
+<a id="L534"></a>    if (.array_end != try source.next()) return error.UnexpectedToken;
+<a id="L535"></a>
+<a id="L536"></a>    return r;
+<a id="L537"></a>}
+<a id="L538"></a>
+<a id="L539"></a>/// This is an internal function called recursively
+<a id="L540"></a>/// during the implementation of `parseFromValueLeaky`.
+<a id="L541"></a>/// It is exposed primarily to enable custom `jsonParseFromValue()` methods to call back into the `parseFromValue*` system,
+<a id="L542"></a>/// such as if you're implementing a custom container of type `T`;
+<a id="L543"></a>/// you can call `innerParseFromValue(T, ...)` for each of the container's items.
+<a id="L544"></a>pub fn innerParseFromValue(
+<a id="L545"></a>    comptime T: type,
+<a id="L546"></a>    allocator: Allocator,
+<a id="L547"></a>    source: Value,
+<a id="L548"></a>    options: ParseOptions,
+<a id="L549"></a>) ParseFromValueError!T {
+<a id="L550"></a>    switch (@typeInfo(T)) {
+<a id="L551"></a>        .bool =&gt; {
+<a id="L552"></a>            switch (source) {
+<a id="L553"></a>                .bool =&gt; |b| return b,
+<a id="L554"></a>                else =&gt; return error.UnexpectedToken,
+<a id="L555"></a>            }
+<a id="L556"></a>        },
+<a id="L557"></a>        .float, .comptime_float =&gt; {
+<a id="L558"></a>            switch (source) {
+<a id="L559"></a>                .float =&gt; |f| return @as(T, @floatCast(f)),
+<a id="L560"></a>                .integer =&gt; |i| return @as(T, @floatFromInt(i)),
+<a id="L561"></a>                .number_string, .string =&gt; |s| return std.fmt.parseFloat(T, s),
+<a id="L562"></a>                else =&gt; return error.UnexpectedToken,
+<a id="L563"></a>            }
+<a id="L564"></a>        },
+<a id="L565"></a>        .int, .comptime_int =&gt; {
+<a id="L566"></a>            switch (source) {
+<a id="L567"></a>                .float =&gt; |f| {
+<a id="L568"></a>                    if (@round(f) != f) return error.InvalidNumber;
+<a id="L569"></a>                    if (f &gt; @as(@TypeOf(f), @floatFromInt(std.math.maxInt(T)))) return error.Overflow;
+<a id="L570"></a>                    if (f &lt; @as(@TypeOf(f), @floatFromInt(std.math.minInt(T)))) return error.Overflow;
+<a id="L571"></a>                    return @intFromFloat(f);
+<a id="L572"></a>                },
+<a id="L573"></a>                .integer =&gt; |i| {
+<a id="L574"></a>                    if (i &gt; std.math.maxInt(T)) return error.Overflow;
+<a id="L575"></a>                    if (i &lt; std.math.minInt(T)) return error.Overflow;
+<a id="L576"></a>                    return @intCast(i);
+<a id="L577"></a>                },
+<a id="L578"></a>                .number_string, .string =&gt; |s| {
+<a id="L579"></a>                    return sliceToInt(T, s);
+<a id="L580"></a>                },
+<a id="L581"></a>                else =&gt; return error.UnexpectedToken,
+<a id="L582"></a>            }
+<a id="L583"></a>        },
+<a id="L584"></a>        .optional =&gt; |optionalInfo| {
+<a id="L585"></a>            switch (source) {
+<a id="L586"></a>                .null =&gt; return null,
+<a id="L587"></a>                else =&gt; return try innerParseFromValue(optionalInfo.child, allocator, source, options),
+<a id="L588"></a>            }
+<a id="L589"></a>        },
+<a id="L590"></a>        .@"enum" =&gt; {
+<a id="L591"></a>            if (std.meta.hasFn(T, "jsonParseFromValue")) {
+<a id="L592"></a>                return T.jsonParseFromValue(allocator, source, options);
+<a id="L593"></a>            }
+<a id="L594"></a>
+<a id="L595"></a>            switch (source) {
+<a id="L596"></a>                .float =&gt; return error.InvalidEnumTag,
+<a id="L597"></a>                .integer =&gt; |i| return std.enums.fromInt(T, i) orelse return error.InvalidEnumTag,
+<a id="L598"></a>                .number_string, .string =&gt; |s| return sliceToEnum(T, s),
+<a id="L599"></a>                else =&gt; return error.UnexpectedToken,
+<a id="L600"></a>            }
+<a id="L601"></a>        },
+<a id="L602"></a>        .@"union" =&gt; |unionInfo| {
+<a id="L603"></a>            if (std.meta.hasFn(T, "jsonParseFromValue")) {
+<a id="L604"></a>                return T.jsonParseFromValue(allocator, source, options);
+<a id="L605"></a>            }
+<a id="L606"></a>
+<a id="L607"></a>            if (unionInfo.tag_type == null) @compileError("Unable to parse into untagged union '" ++ @typeName(T) ++ "'");
+<a id="L608"></a>
+<a id="L609"></a>            if (source != .object) return error.UnexpectedToken;
+<a id="L610"></a>            if (source.object.count() != 1) return error.UnexpectedToken;
+<a id="L611"></a>
+<a id="L612"></a>            var it = source.object.iterator();
+<a id="L613"></a>            const kv = it.next().?;
+<a id="L614"></a>            const field_name = kv.key_ptr.*;
+<a id="L615"></a>
+<a id="L616"></a>            inline for (unionInfo.fields) |u_field| {
+<a id="L617"></a>                if (std.mem.eql(u8, u_field.name, field_name)) {
+<a id="L618"></a>                    if (u_field.type == void) {
+<a id="L619"></a>                        // void isn't really a json type, but we can support void payload union tags with {} as a value.
+<a id="L620"></a>                        if (kv.value_ptr.* != .object) return error.UnexpectedToken;
+<a id="L621"></a>                        if (kv.value_ptr.*.object.count() != 0) return error.UnexpectedToken;
+<a id="L622"></a>                        return @unionInit(T, u_field.name, {});
+<a id="L623"></a>                    }
+<a id="L624"></a>                    // Recurse.
+<a id="L625"></a>                    return @unionInit(T, u_field.name, try innerParseFromValue(u_field.type, allocator, kv.value_ptr.*, options));
+<a id="L626"></a>                }
+<a id="L627"></a>            }
+<a id="L628"></a>            // Didn't match anything.
+<a id="L629"></a>            return error.UnknownField;
+<a id="L630"></a>        },
+<a id="L631"></a>
+<a id="L632"></a>        .@"struct" =&gt; |structInfo| {
+<a id="L633"></a>            if (structInfo.is_tuple) {
+<a id="L634"></a>                if (source != .array) return error.UnexpectedToken;
+<a id="L635"></a>                if (source.array.items.len != structInfo.fields.len) return error.UnexpectedToken;
+<a id="L636"></a>
+<a id="L637"></a>                var r: T = undefined;
+<a id="L638"></a>                inline for (0..structInfo.fields.len, source.array.items) |i, item| {
+<a id="L639"></a>                    r[i] = try innerParseFromValue(structInfo.fields[i].type, allocator, item, options);
+<a id="L640"></a>                }
+<a id="L641"></a>
+<a id="L642"></a>                return r;
+<a id="L643"></a>            }
+<a id="L644"></a>
+<a id="L645"></a>            if (std.meta.hasFn(T, "jsonParseFromValue")) {
+<a id="L646"></a>                return T.jsonParseFromValue(allocator, source, options);
+<a id="L647"></a>            }
+<a id="L648"></a>
+<a id="L649"></a>            if (source != .object) return error.UnexpectedToken;
+<a id="L650"></a>
+<a id="L651"></a>            var r: T = undefined;
+<a id="L652"></a>            var fields_seen = [_]bool{false} ** structInfo.fields.len;
+<a id="L653"></a>
+<a id="L654"></a>            var it = source.object.iterator();
+<a id="L655"></a>            while (it.next()) |kv| {
+<a id="L656"></a>                const field_name = kv.key_ptr.*;
+<a id="L657"></a>
+<a id="L658"></a>                inline for (structInfo.fields, 0..) |field, i| {
+<a id="L659"></a>                    if (field.is_comptime) @compileError("comptime fields are not supported: " ++ @typeName(T) ++ "." ++ field.name);
+<a id="L660"></a>                    if (std.mem.eql(u8, field.name, field_name)) {
+<a id="L661"></a>                        assert(!fields_seen[i]); // Can't have duplicate keys in a Value.object.
+<a id="L662"></a>                        @field(r, field.name) = try innerParseFromValue(field.type, allocator, kv.value_ptr.*, options);
+<a id="L663"></a>                        fields_seen[i] = true;
+<a id="L664"></a>                        break;
+<a id="L665"></a>                    }
+<a id="L666"></a>                } else {
+<a id="L667"></a>                    // Didn't match anything.
+<a id="L668"></a>                    if (!options.ignore_unknown_fields) return error.UnknownField;
+<a id="L669"></a>                }
+<a id="L670"></a>            }
+<a id="L671"></a>            try fillDefaultStructValues(T, &amp;r, &amp;fields_seen);
+<a id="L672"></a>            return r;
+<a id="L673"></a>        },
+<a id="L674"></a>
+<a id="L675"></a>        .array =&gt; |arrayInfo| {
+<a id="L676"></a>            switch (source) {
+<a id="L677"></a>                .array =&gt; |array| {
+<a id="L678"></a>                    // Typical array.
+<a id="L679"></a>                    return innerParseArrayFromArrayValue(T, arrayInfo.child, arrayInfo.len, allocator, array, options);
+<a id="L680"></a>                },
+<a id="L681"></a>                .string =&gt; |s| {
+<a id="L682"></a>                    if (arrayInfo.child != u8) return error.UnexpectedToken;
+<a id="L683"></a>                    // Fixed-length string.
+<a id="L684"></a>
+<a id="L685"></a>                    if (s.len != arrayInfo.len) return error.LengthMismatch;
+<a id="L686"></a>
+<a id="L687"></a>                    var r: T = undefined;
+<a id="L688"></a>                    @memcpy(r[0..], s);
+<a id="L689"></a>                    return r;
+<a id="L690"></a>                },
+<a id="L691"></a>
+<a id="L692"></a>                else =&gt; return error.UnexpectedToken,
+<a id="L693"></a>            }
+<a id="L694"></a>        },
+<a id="L695"></a>
+<a id="L696"></a>        .vector =&gt; |vecInfo| {
+<a id="L697"></a>            switch (source) {
+<a id="L698"></a>                .array =&gt; |array| {
+<a id="L699"></a>                    return innerParseArrayFromArrayValue(T, vecInfo.child, vecInfo.len, allocator, array, options);
+<a id="L700"></a>                },
+<a id="L701"></a>                else =&gt; return error.UnexpectedToken,
+<a id="L702"></a>            }
+<a id="L703"></a>        },
+<a id="L704"></a>
+<a id="L705"></a>        .pointer =&gt; |ptrInfo| {
+<a id="L706"></a>            switch (ptrInfo.size) {
+<a id="L707"></a>                .one =&gt; {
+<a id="L708"></a>                    const r: *ptrInfo.child = try allocator.create(ptrInfo.child);
+<a id="L709"></a>                    r.* = try innerParseFromValue(ptrInfo.child, allocator, source, options);
+<a id="L710"></a>                    return r;
+<a id="L711"></a>                },
+<a id="L712"></a>                .slice =&gt; {
+<a id="L713"></a>                    switch (source) {
+<a id="L714"></a>                        .array =&gt; |array| {
+<a id="L715"></a>                            const r = if (ptrInfo.sentinel()) |sentinel|
+<a id="L716"></a>                                try allocator.allocSentinel(ptrInfo.child, array.items.len, sentinel)
+<a id="L717"></a>                            else
+<a id="L718"></a>                                try allocator.alloc(ptrInfo.child, array.items.len);
+<a id="L719"></a>
+<a id="L720"></a>                            for (array.items, r) |item, *dest| {
+<a id="L721"></a>                                dest.* = try innerParseFromValue(ptrInfo.child, allocator, item, options);
+<a id="L722"></a>                            }
+<a id="L723"></a>
+<a id="L724"></a>                            return r;
+<a id="L725"></a>                        },
+<a id="L726"></a>                        .string =&gt; |s| {
+<a id="L727"></a>                            if (ptrInfo.child != u8) return error.UnexpectedToken;
+<a id="L728"></a>                            // Dynamic length string.
+<a id="L729"></a>
+<a id="L730"></a>                            const r = if (ptrInfo.sentinel()) |sentinel|
+<a id="L731"></a>                                try allocator.allocSentinel(ptrInfo.child, s.len, sentinel)
+<a id="L732"></a>                            else
+<a id="L733"></a>                                try allocator.alloc(ptrInfo.child, s.len);
+<a id="L734"></a>                            @memcpy(r[0..], s);
+<a id="L735"></a>
+<a id="L736"></a>                            return r;
+<a id="L737"></a>                        },
+<a id="L738"></a>                        else =&gt; return error.UnexpectedToken,
+<a id="L739"></a>                    }
+<a id="L740"></a>                },
+<a id="L741"></a>                else =&gt; @compileError("Unable to parse into type '" ++ @typeName(T) ++ "'"),
+<a id="L742"></a>            }
+<a id="L743"></a>        },
+<a id="L744"></a>        else =&gt; @compileError("Unable to parse into type '" ++ @typeName(T) ++ "'"),
+<a id="L745"></a>    }
+<a id="L746"></a>}
+<a id="L747"></a>
+<a id="L748"></a>fn innerParseArrayFromArrayValue(
+<a id="L749"></a>    comptime T: type,
+<a id="L750"></a>    comptime Child: type,
+<a id="L751"></a>    comptime len: comptime_int,
+<a id="L752"></a>    allocator: Allocator,
+<a id="L753"></a>    array: Array,
+<a id="L754"></a>    options: ParseOptions,
+<a id="L755"></a>) !T {
+<a id="L756"></a>    if (array.items.len != len) return error.LengthMismatch;
+<a id="L757"></a>
+<a id="L758"></a>    var r: T = undefined;
+<a id="L759"></a>    for (array.items, 0..) |item, i| {
+<a id="L760"></a>        r[i] = try innerParseFromValue(Child, allocator, item, options);
+<a id="L761"></a>    }
+<a id="L762"></a>
+<a id="L763"></a>    return r;
+<a id="L764"></a>}
+<a id="L765"></a>
+<a id="L766"></a>fn sliceToInt(comptime T: type, slice: []const u8) !T {
+<a id="L767"></a>    if (isNumberFormattedLikeAnInteger(slice))
+<a id="L768"></a>        return std.fmt.parseInt(T, slice, 10);
+<a id="L769"></a>    // Try to coerce a float to an integer.
+<a id="L770"></a>    const float = try std.fmt.parseFloat(f128, slice);
+<a id="L771"></a>    if (@round(float) != float) return error.InvalidNumber;
+<a id="L772"></a>    if (float &gt; @as(f128, @floatFromInt(std.math.maxInt(T))) or float &lt; @as(f128, @floatFromInt(std.math.minInt(T)))) return error.Overflow;
+<a id="L773"></a>    return @as(T, @intCast(@as(i128, @intFromFloat(float))));
+<a id="L774"></a>}
+<a id="L775"></a>
+<a id="L776"></a>fn sliceToEnum(comptime T: type, slice: []const u8) !T {
+<a id="L777"></a>    // Check for a named value.
+<a id="L778"></a>    if (std.meta.stringToEnum(T, slice)) |value| return value;
+<a id="L779"></a>    // Check for a numeric value.
+<a id="L780"></a>    if (!isNumberFormattedLikeAnInteger(slice)) return error.InvalidEnumTag;
+<a id="L781"></a>    const n = std.fmt.parseInt(@typeInfo(T).@"enum".tag_type, slice, 10) catch return error.InvalidEnumTag;
+<a id="L782"></a>    return std.enums.fromInt(T, n) orelse return error.InvalidEnumTag;
+<a id="L783"></a>}
+<a id="L784"></a>
+<a id="L785"></a>fn fillDefaultStructValues(comptime T: type, r: *T, fields_seen: *[@typeInfo(T).@"struct".fields.len]bool) !void {
+<a id="L786"></a>    inline for (@typeInfo(T).@"struct".fields, 0..) |field, i| {
+<a id="L787"></a>        if (!fields_seen[i]) {
+<a id="L788"></a>            if (field.defaultValue()) |default| {
+<a id="L789"></a>                @field(r, field.name) = default;
+<a id="L790"></a>            } else {
+<a id="L791"></a>                return error.MissingField;
+<a id="L792"></a>            }
+<a id="L793"></a>        }
+<a id="L794"></a>    }
+<a id="L795"></a>}
+<a id="L796"></a>
+<a id="L797"></a>fn freeAllocated(allocator: Allocator, token: Token) void {
+<a id="L798"></a>    switch (token) {
+<a id="L799"></a>        .allocated_number, .allocated_string =&gt; |slice| {
+<a id="L800"></a>            allocator.free(slice);
+<a id="L801"></a>        },
+<a id="L802"></a>        else =&gt; {},
+<a id="L803"></a>    }
+<a id="L804"></a>}
+<a id="L805"></a>
+<a id="L806"></a>test {
+<a id="L807"></a>    _ = @import("./static_test.zig");
+<a id="L808"></a>}
+</pre>
 </body>
 </html>

@@ -2,416 +2,419 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Source: zig-0.16.0-std/Build/Step/WriteFile.zig</title>
+    <title>Source: Build/Step/WriteFile.zig</title>
     <style>
         body { background: #1e1e1e; color: #d4d4d4; font-family: monospace; padding: 20px; }
         pre { white-space: pre-wrap; word-wrap: break-word; }
         .header { border-bottom: 1px solid #444; padding-bottom: 10px; margin-bottom: 20px; }
         a { color: #569cd6; }
+        a[id] { color: inherit; text-decoration: none; }
+        :target { background: #3a3a00; }
     </style>
 </head>
 <body>
     <div class="header">
-        <a href="/">Index</a> | <strong>File: zig-0.16.0-std/Build/Step/WriteFile.zig</strong>
+        <a href="/">Index</a> | <strong>File: Build/Step/WriteFile.zig</strong>
     </div>
-    <pre>//! WriteFile is used to create a directory in an appropriate location inside
-//! the local cache which has a set of files that have either been generated
-//! during the build, or are copied from the source package.
-const WriteFile = @This();
-
-const std = @import("std");
-const Io = std.Io;
-const Dir = std.Io.Dir;
-const Step = std.Build.Step;
-const ArrayList = std.ArrayList;
-const assert = std.debug.assert;
-
-step: Step,
-
-/// The elements here are pointers because we need stable pointers for the GeneratedFile field.
-files: std.ArrayList(File),
-directories: std.ArrayList(Directory),
-generated_directory: std.Build.GeneratedFile,
-mode: Mode = .whole_cached,
-
-pub const base_id: Step.Id = .write_file;
-
-pub const Mode = union(enum) {
-    /// Default mode. Integrates with the cache system. The directory should be
-    /// read-only during the make phase. Any different inputs result in
-    /// different "o" subdirectory.
-    whole_cached,
-    /// In this mode, the directory will be placed inside "tmp" rather than
-    /// "o", and caching will be skipped. During the `make` phase, the step
-    /// will always do all the file system operations, and on successful build
-    /// completion, the dir will be deleted along with all other tmp
-    /// directories. The directory is therefore eligible to be used for
-    /// mutations by other steps.
-    tmp,
-    /// The operations will not be performed against a freshly created
-    /// directory, but instead act against a temporary directory.
-    mutate: std.Build.LazyPath,
-};
-
-pub const File = struct {
-    sub_path: []const u8,
-    contents: Contents,
-};
-
-pub const Directory = struct {
-    source: std.Build.LazyPath,
-    sub_path: []const u8,
-    options: Options,
-
-    pub const Options = struct {
-        /// File paths that end in any of these suffixes will be excluded from copying.
-        exclude_extensions: []const []const u8 = &amp;.{},
-        /// Only file paths that end in any of these suffixes will be included in copying.
-        /// `null` means that all suffixes will be included.
-        /// `exclude_extensions` takes precedence over `include_extensions`.
-        include_extensions: ?[]const []const u8 = null,
-
-        pub fn dupe(opts: Options, b: *std.Build) Options {
-            return .{
-                .exclude_extensions = b.dupeStrings(opts.exclude_extensions),
-                .include_extensions = if (opts.include_extensions) |incs| b.dupeStrings(incs) else null,
-            };
-        }
-
-        pub fn pathIncluded(opts: Options, path: []const u8) bool {
-            for (opts.exclude_extensions) |ext| {
-                if (std.mem.endsWith(u8, path, ext))
-                    return false;
-            }
-            if (opts.include_extensions) |incs| {
-                for (incs) |inc| {
-                    if (std.mem.endsWith(u8, path, inc))
-                        return true;
-                } else {
-                    return false;
-                }
-            }
-            return true;
-        }
-    };
-};
-
-pub const Contents = union(enum) {
-    bytes: []const u8,
-    copy: std.Build.LazyPath,
-};
-
-pub fn create(owner: *std.Build) *WriteFile {
-    const write_file = owner.allocator.create(WriteFile) catch @panic("OOM");
-    write_file.* = .{
-        .step = Step.init(.{
-            .id = base_id,
-            .name = "WriteFile",
-            .owner = owner,
-            .makeFn = make,
-        }),
-        .files = .empty,
-        .directories = .empty,
-        .generated_directory = .{ .step = &amp;write_file.step },
-    };
-    return write_file;
-}
-
-pub fn add(write_file: *WriteFile, sub_path: []const u8, bytes: []const u8) std.Build.LazyPath {
-    const b = write_file.step.owner;
-    const gpa = b.allocator;
-    const file = File{
-        .sub_path = b.dupePath(sub_path),
-        .contents = .{ .bytes = b.dupe(bytes) },
-    };
-    write_file.files.append(gpa, file) catch @panic("OOM");
-    write_file.maybeUpdateName();
-    return .{
-        .generated = .{
-            .file = &amp;write_file.generated_directory,
-            .sub_path = file.sub_path,
-        },
-    };
-}
-
-/// Place the file into the generated directory within the local cache,
-/// along with all the rest of the files added to this step. The parameter
-/// here is the destination path relative to the local cache directory
-/// associated with this WriteFile. It may be a basename, or it may
-/// include sub-directories, in which case this step will ensure the
-/// required sub-path exists.
-/// This is the option expected to be used most commonly with `addCopyFile`.
-pub fn addCopyFile(write_file: *WriteFile, source: std.Build.LazyPath, sub_path: []const u8) std.Build.LazyPath {
-    const b = write_file.step.owner;
-    const gpa = b.allocator;
-    const file = File{
-        .sub_path = b.dupePath(sub_path),
-        .contents = .{ .copy = source },
-    };
-    write_file.files.append(gpa, file) catch @panic("OOM");
-
-    write_file.maybeUpdateName();
-    source.addStepDependencies(&amp;write_file.step);
-    return .{
-        .generated = .{
-            .file = &amp;write_file.generated_directory,
-            .sub_path = file.sub_path,
-        },
-    };
-}
-
-/// Copy files matching the specified exclude/include patterns to the specified subdirectory
-/// relative to this step's generated directory.
-/// The returned value is a lazy path to the generated subdirectory.
-pub fn addCopyDirectory(
-    write_file: *WriteFile,
-    source: std.Build.LazyPath,
-    sub_path: []const u8,
-    options: Directory.Options,
-) std.Build.LazyPath {
-    const b = write_file.step.owner;
-    const gpa = b.allocator;
-    const dir = Directory{
-        .source = source.dupe(b),
-        .sub_path = b.dupePath(sub_path),
-        .options = options.dupe(b),
-    };
-    write_file.directories.append(gpa, dir) catch @panic("OOM");
-
-    write_file.maybeUpdateName();
-    source.addStepDependencies(&amp;write_file.step);
-    return .{
-        .generated = .{
-            .file = &amp;write_file.generated_directory,
-            .sub_path = dir.sub_path,
-        },
-    };
-}
-
-/// Returns a `LazyPath` representing the base directory that contains all the
-/// files from this `WriteFile`.
-pub fn getDirectory(write_file: *WriteFile) std.Build.LazyPath {
-    return .{ .generated = .{ .file = &amp;write_file.generated_directory } };
-}
-
-fn maybeUpdateName(write_file: *WriteFile) void {
-    if (write_file.files.items.len == 1 and write_file.directories.items.len == 0) {
-        // First time adding a file; update name.
-        if (std.mem.eql(u8, write_file.step.name, "WriteFile")) {
-            write_file.step.name = write_file.step.owner.fmt("WriteFile {s}", .{write_file.files.items[0].sub_path});
-        }
-    } else if (write_file.directories.items.len == 1 and write_file.files.items.len == 0) {
-        // First time adding a directory; update name.
-        if (std.mem.eql(u8, write_file.step.name, "WriteFile")) {
-            write_file.step.name = write_file.step.owner.fmt("WriteFile {s}", .{write_file.directories.items[0].sub_path});
-        }
-    }
-}
-
-fn make(step: *Step, options: Step.MakeOptions) !void {
-    _ = options;
-    const b = step.owner;
-    const graph = b.graph;
-    const io = graph.io;
-    const arena = b.allocator;
-    const gpa = graph.cache.gpa;
-    const write_file: *WriteFile = @fieldParentPtr("step", step);
-
-    const open_dir_cache = try arena.alloc(Io.Dir, write_file.directories.items.len);
-    var open_dirs_count: usize = 0;
-    defer Io.Dir.closeMany(io, open_dir_cache[0..open_dirs_count]);
-
-    switch (write_file.mode) {
-        .whole_cached =&gt; {
-            step.clearWatchInputs();
-
-            // The cache is used here not really as a way to speed things up - because writing
-            // the data to a file would probably be very fast - but as a way to find a canonical
-            // location to put build artifacts.
-
-            // If, for example, a hard-coded path was used as the location to put WriteFile
-            // files, then two WriteFiles executing in parallel might clobber each other.
-
-            var man = b.graph.cache.obtain();
-            defer man.deinit();
-
-            for (write_file.files.items) |file| {
-                man.hash.addBytes(file.sub_path);
-
-                switch (file.contents) {
-                    .bytes =&gt; |bytes| {
-                        man.hash.addBytes(bytes);
-                    },
-                    .copy =&gt; |lazy_path| {
-                        const path = lazy_path.getPath3(b, step);
-                        _ = try man.addFilePath(path, null);
-                        try step.addWatchInput(lazy_path);
-                    },
-                }
-            }
-
-            for (write_file.directories.items, open_dir_cache) |dir, *open_dir_cache_elem| {
-                man.hash.addBytes(dir.sub_path);
-                for (dir.options.exclude_extensions) |ext| man.hash.addBytes(ext);
-                if (dir.options.include_extensions) |incs| for (incs) |inc| man.hash.addBytes(inc);
-
-                const need_derived_inputs = try step.addDirectoryWatchInput(dir.source);
-                const src_dir_path = dir.source.getPath3(b, step);
-
-                var src_dir = src_dir_path.root_dir.handle.openDir(io, src_dir_path.subPathOrDot(), .{ .iterate = true }) catch |err| {
-                    return step.fail("unable to open source directory '{f}': {s}", .{
-                        src_dir_path, @errorName(err),
-                    });
-                };
-                open_dir_cache_elem.* = src_dir;
-                open_dirs_count += 1;
-
-                var it = try src_dir.walk(gpa);
-                defer it.deinit();
-                while (try it.next(io)) |entry| {
-                    if (!dir.options.pathIncluded(entry.path)) continue;
-
-                    switch (entry.kind) {
-                        .directory =&gt; {
-                            if (need_derived_inputs) {
-                                const entry_path = try src_dir_path.join(arena, entry.path);
-                                try step.addDirectoryWatchInputFromPath(entry_path);
-                            }
-                        },
-                        .file =&gt; {
-                            const entry_path = try src_dir_path.join(arena, entry.path);
-                            _ = try man.addFilePath(entry_path, null);
-                        },
-                        else =&gt; continue,
-                    }
-                }
-            }
-
-            if (try step.cacheHit(&amp;man)) {
-                const digest = man.final();
-                write_file.generated_directory.path = try b.cache_root.join(arena, &amp;.{ "o", &amp;digest });
-                assert(step.result_cached);
-                return;
-            }
-
-            const digest = man.final();
-            const cache_path = "o" ++ Dir.path.sep_str ++ digest;
-
-            write_file.generated_directory.path = try b.cache_root.join(arena, &amp;.{cache_path});
-
-            try operate(write_file, open_dir_cache, .{
-                .root_dir = b.cache_root,
-                .sub_path = cache_path,
-            });
-
-            try step.writeManifest(&amp;man);
-        },
-        .tmp =&gt; {
-            step.result_cached = false;
-
-            var rand_int: u64 = undefined;
-            io.random(@ptrCast(&amp;rand_int));
-            const tmp_dir_sub_path = "tmp" ++ Dir.path.sep_str ++ std.fmt.hex(rand_int);
-
-            write_file.generated_directory.path = try b.cache_root.join(arena, &amp;.{tmp_dir_sub_path});
-
-            try operate(write_file, open_dir_cache, .{
-                .root_dir = b.cache_root,
-                .sub_path = tmp_dir_sub_path,
-            });
-        },
-        .mutate =&gt; |lp| {
-            step.result_cached = false;
-            const root_path = try lp.getPath4(b, step);
-            write_file.generated_directory.path = try root_path.toString(arena);
-            try operate(write_file, open_dir_cache, root_path);
-        },
-    }
-}
-
-fn operate(write_file: *WriteFile, open_dir_cache: []const Io.Dir, root_path: std.Build.Cache.Path) !void {
-    const step = &amp;write_file.step;
-    const b = step.owner;
-    const io = b.graph.io;
-    const gpa = b.graph.cache.gpa;
-    const arena = b.allocator;
-
-    var cache_dir = root_path.root_dir.handle.createDirPathOpen(io, root_path.sub_path, .{}) catch |err|
-        return step.fail("unable to make path {f}: {t}", .{ root_path, err });
-    defer cache_dir.close(io);
-
-    for (write_file.files.items) |file| {
-        if (Dir.path.dirname(file.sub_path)) |dirname| {
-            cache_dir.createDirPath(io, dirname) catch |err| {
-                return step.fail("unable to make path '{f}{c}{s}': {t}", .{
-                    root_path, Dir.path.sep, dirname, err,
-                });
-            };
-        }
-        switch (file.contents) {
-            .bytes =&gt; |bytes| {
-                cache_dir.writeFile(io, .{ .sub_path = file.sub_path, .data = bytes }) catch |err| {
-                    return step.fail("unable to write file '{f}{c}{s}': {t}", .{
-                        root_path, Dir.path.sep, file.sub_path, err,
-                    });
-                };
-            },
-            .copy =&gt; |file_source| {
-                const source_path = file_source.getPath2(b, step);
-                const prev_status = Io.Dir.updateFile(.cwd(), io, source_path, cache_dir, file.sub_path, .{}) catch |err| {
-                    return step.fail("unable to update file from '{s}' to '{f}{c}{s}': {t}", .{
-                        source_path, root_path, Dir.path.sep, file.sub_path, err,
-                    });
-                };
-                // At this point we already will mark the step as a cache miss.
-                // But this is kind of a partial cache hit since individual
-                // file copies may be avoided. Oh well, this information is
-                // discarded.
-                _ = prev_status;
-            },
-        }
-    }
-
-    for (write_file.directories.items, open_dir_cache) |dir, already_open_dir| {
-        const src_dir_path = dir.source.getPath3(b, step);
-        const dest_dirname = dir.sub_path;
-
-        if (dest_dirname.len != 0) {
-            cache_dir.createDirPath(io, dest_dirname) catch |err| {
-                return step.fail("unable to make path '{f}{c}{s}': {t}", .{
-                    root_path, Dir.path.sep, dest_dirname, err,
-                });
-            };
-        }
-
-        var it = try already_open_dir.walk(gpa);
-        defer it.deinit();
-        while (try it.next(io)) |entry| {
-            if (!dir.options.pathIncluded(entry.path)) continue;
-
-            const src_entry_path = try src_dir_path.join(arena, entry.path);
-            const dest_path = b.pathJoin(&amp;.{ dest_dirname, entry.path });
-            switch (entry.kind) {
-                .directory =&gt; try cache_dir.createDirPath(io, dest_path),
-                .file =&gt; {
-                    const prev_status = Io.Dir.updateFile(
-                        src_entry_path.root_dir.handle,
-                        io,
-                        src_entry_path.sub_path,
-                        cache_dir,
-                        dest_path,
-                        .{},
-                    ) catch |err| {
-                        return step.fail("unable to update file from '{f}' to '{f}{c}{s}': {t}", .{
-                            src_entry_path, root_path, Dir.path.sep, dest_path, err,
-                        });
-                    };
-                    _ = prev_status;
-                },
-                else =&gt; continue,
-            }
-        }
-    }
-}</pre>
+    <pre><a id="L1"></a>//! WriteFile is used to create a directory in an appropriate location inside
+<a id="L2"></a>//! the local cache which has a set of files that have either been generated
+<a id="L3"></a>//! during the build, or are copied from the source package.
+<a id="L4"></a>const WriteFile = @This();
+<a id="L5"></a>
+<a id="L6"></a>const std = @import("std");
+<a id="L7"></a>const Io = std.Io;
+<a id="L8"></a>const Dir = std.Io.Dir;
+<a id="L9"></a>const Step = std.Build.Step;
+<a id="L10"></a>const ArrayList = std.ArrayList;
+<a id="L11"></a>const assert = std.debug.assert;
+<a id="L12"></a>
+<a id="L13"></a>step: Step,
+<a id="L14"></a>
+<a id="L15"></a>/// The elements here are pointers because we need stable pointers for the GeneratedFile field.
+<a id="L16"></a>files: std.ArrayList(File),
+<a id="L17"></a>directories: std.ArrayList(Directory),
+<a id="L18"></a>generated_directory: std.Build.GeneratedFile,
+<a id="L19"></a>mode: Mode = .whole_cached,
+<a id="L20"></a>
+<a id="L21"></a>pub const base_id: Step.Id = .write_file;
+<a id="L22"></a>
+<a id="L23"></a>pub const Mode = union(enum) {
+<a id="L24"></a>    /// Default mode. Integrates with the cache system. The directory should be
+<a id="L25"></a>    /// read-only during the make phase. Any different inputs result in
+<a id="L26"></a>    /// different "o" subdirectory.
+<a id="L27"></a>    whole_cached,
+<a id="L28"></a>    /// In this mode, the directory will be placed inside "tmp" rather than
+<a id="L29"></a>    /// "o", and caching will be skipped. During the `make` phase, the step
+<a id="L30"></a>    /// will always do all the file system operations, and on successful build
+<a id="L31"></a>    /// completion, the dir will be deleted along with all other tmp
+<a id="L32"></a>    /// directories. The directory is therefore eligible to be used for
+<a id="L33"></a>    /// mutations by other steps.
+<a id="L34"></a>    tmp,
+<a id="L35"></a>    /// The operations will not be performed against a freshly created
+<a id="L36"></a>    /// directory, but instead act against a temporary directory.
+<a id="L37"></a>    mutate: std.Build.LazyPath,
+<a id="L38"></a>};
+<a id="L39"></a>
+<a id="L40"></a>pub const File = struct {
+<a id="L41"></a>    sub_path: []const u8,
+<a id="L42"></a>    contents: Contents,
+<a id="L43"></a>};
+<a id="L44"></a>
+<a id="L45"></a>pub const Directory = struct {
+<a id="L46"></a>    source: std.Build.LazyPath,
+<a id="L47"></a>    sub_path: []const u8,
+<a id="L48"></a>    options: Options,
+<a id="L49"></a>
+<a id="L50"></a>    pub const Options = struct {
+<a id="L51"></a>        /// File paths that end in any of these suffixes will be excluded from copying.
+<a id="L52"></a>        exclude_extensions: []const []const u8 = &amp;.{},
+<a id="L53"></a>        /// Only file paths that end in any of these suffixes will be included in copying.
+<a id="L54"></a>        /// `null` means that all suffixes will be included.
+<a id="L55"></a>        /// `exclude_extensions` takes precedence over `include_extensions`.
+<a id="L56"></a>        include_extensions: ?[]const []const u8 = null,
+<a id="L57"></a>
+<a id="L58"></a>        pub fn dupe(opts: Options, b: *std.Build) Options {
+<a id="L59"></a>            return .{
+<a id="L60"></a>                .exclude_extensions = b.dupeStrings(opts.exclude_extensions),
+<a id="L61"></a>                .include_extensions = if (opts.include_extensions) |incs| b.dupeStrings(incs) else null,
+<a id="L62"></a>            };
+<a id="L63"></a>        }
+<a id="L64"></a>
+<a id="L65"></a>        pub fn pathIncluded(opts: Options, path: []const u8) bool {
+<a id="L66"></a>            for (opts.exclude_extensions) |ext| {
+<a id="L67"></a>                if (std.mem.endsWith(u8, path, ext))
+<a id="L68"></a>                    return false;
+<a id="L69"></a>            }
+<a id="L70"></a>            if (opts.include_extensions) |incs| {
+<a id="L71"></a>                for (incs) |inc| {
+<a id="L72"></a>                    if (std.mem.endsWith(u8, path, inc))
+<a id="L73"></a>                        return true;
+<a id="L74"></a>                } else {
+<a id="L75"></a>                    return false;
+<a id="L76"></a>                }
+<a id="L77"></a>            }
+<a id="L78"></a>            return true;
+<a id="L79"></a>        }
+<a id="L80"></a>    };
+<a id="L81"></a>};
+<a id="L82"></a>
+<a id="L83"></a>pub const Contents = union(enum) {
+<a id="L84"></a>    bytes: []const u8,
+<a id="L85"></a>    copy: std.Build.LazyPath,
+<a id="L86"></a>};
+<a id="L87"></a>
+<a id="L88"></a>pub fn create(owner: *std.Build) *WriteFile {
+<a id="L89"></a>    const write_file = owner.allocator.create(WriteFile) catch @panic("OOM");
+<a id="L90"></a>    write_file.* = .{
+<a id="L91"></a>        .step = Step.init(.{
+<a id="L92"></a>            .id = base_id,
+<a id="L93"></a>            .name = "WriteFile",
+<a id="L94"></a>            .owner = owner,
+<a id="L95"></a>            .makeFn = make,
+<a id="L96"></a>        }),
+<a id="L97"></a>        .files = .empty,
+<a id="L98"></a>        .directories = .empty,
+<a id="L99"></a>        .generated_directory = .{ .step = &amp;write_file.step },
+<a id="L100"></a>    };
+<a id="L101"></a>    return write_file;
+<a id="L102"></a>}
+<a id="L103"></a>
+<a id="L104"></a>pub fn add(write_file: *WriteFile, sub_path: []const u8, bytes: []const u8) std.Build.LazyPath {
+<a id="L105"></a>    const b = write_file.step.owner;
+<a id="L106"></a>    const gpa = b.allocator;
+<a id="L107"></a>    const file = File{
+<a id="L108"></a>        .sub_path = b.dupePath(sub_path),
+<a id="L109"></a>        .contents = .{ .bytes = b.dupe(bytes) },
+<a id="L110"></a>    };
+<a id="L111"></a>    write_file.files.append(gpa, file) catch @panic("OOM");
+<a id="L112"></a>    write_file.maybeUpdateName();
+<a id="L113"></a>    return .{
+<a id="L114"></a>        .generated = .{
+<a id="L115"></a>            .file = &amp;write_file.generated_directory,
+<a id="L116"></a>            .sub_path = file.sub_path,
+<a id="L117"></a>        },
+<a id="L118"></a>    };
+<a id="L119"></a>}
+<a id="L120"></a>
+<a id="L121"></a>/// Place the file into the generated directory within the local cache,
+<a id="L122"></a>/// along with all the rest of the files added to this step. The parameter
+<a id="L123"></a>/// here is the destination path relative to the local cache directory
+<a id="L124"></a>/// associated with this WriteFile. It may be a basename, or it may
+<a id="L125"></a>/// include sub-directories, in which case this step will ensure the
+<a id="L126"></a>/// required sub-path exists.
+<a id="L127"></a>/// This is the option expected to be used most commonly with `addCopyFile`.
+<a id="L128"></a>pub fn addCopyFile(write_file: *WriteFile, source: std.Build.LazyPath, sub_path: []const u8) std.Build.LazyPath {
+<a id="L129"></a>    const b = write_file.step.owner;
+<a id="L130"></a>    const gpa = b.allocator;
+<a id="L131"></a>    const file = File{
+<a id="L132"></a>        .sub_path = b.dupePath(sub_path),
+<a id="L133"></a>        .contents = .{ .copy = source },
+<a id="L134"></a>    };
+<a id="L135"></a>    write_file.files.append(gpa, file) catch @panic("OOM");
+<a id="L136"></a>
+<a id="L137"></a>    write_file.maybeUpdateName();
+<a id="L138"></a>    source.addStepDependencies(&amp;write_file.step);
+<a id="L139"></a>    return .{
+<a id="L140"></a>        .generated = .{
+<a id="L141"></a>            .file = &amp;write_file.generated_directory,
+<a id="L142"></a>            .sub_path = file.sub_path,
+<a id="L143"></a>        },
+<a id="L144"></a>    };
+<a id="L145"></a>}
+<a id="L146"></a>
+<a id="L147"></a>/// Copy files matching the specified exclude/include patterns to the specified subdirectory
+<a id="L148"></a>/// relative to this step's generated directory.
+<a id="L149"></a>/// The returned value is a lazy path to the generated subdirectory.
+<a id="L150"></a>pub fn addCopyDirectory(
+<a id="L151"></a>    write_file: *WriteFile,
+<a id="L152"></a>    source: std.Build.LazyPath,
+<a id="L153"></a>    sub_path: []const u8,
+<a id="L154"></a>    options: Directory.Options,
+<a id="L155"></a>) std.Build.LazyPath {
+<a id="L156"></a>    const b = write_file.step.owner;
+<a id="L157"></a>    const gpa = b.allocator;
+<a id="L158"></a>    const dir = Directory{
+<a id="L159"></a>        .source = source.dupe(b),
+<a id="L160"></a>        .sub_path = b.dupePath(sub_path),
+<a id="L161"></a>        .options = options.dupe(b),
+<a id="L162"></a>    };
+<a id="L163"></a>    write_file.directories.append(gpa, dir) catch @panic("OOM");
+<a id="L164"></a>
+<a id="L165"></a>    write_file.maybeUpdateName();
+<a id="L166"></a>    source.addStepDependencies(&amp;write_file.step);
+<a id="L167"></a>    return .{
+<a id="L168"></a>        .generated = .{
+<a id="L169"></a>            .file = &amp;write_file.generated_directory,
+<a id="L170"></a>            .sub_path = dir.sub_path,
+<a id="L171"></a>        },
+<a id="L172"></a>    };
+<a id="L173"></a>}
+<a id="L174"></a>
+<a id="L175"></a>/// Returns a `LazyPath` representing the base directory that contains all the
+<a id="L176"></a>/// files from this `WriteFile`.
+<a id="L177"></a>pub fn getDirectory(write_file: *WriteFile) std.Build.LazyPath {
+<a id="L178"></a>    return .{ .generated = .{ .file = &amp;write_file.generated_directory } };
+<a id="L179"></a>}
+<a id="L180"></a>
+<a id="L181"></a>fn maybeUpdateName(write_file: *WriteFile) void {
+<a id="L182"></a>    if (write_file.files.items.len == 1 and write_file.directories.items.len == 0) {
+<a id="L183"></a>        // First time adding a file; update name.
+<a id="L184"></a>        if (std.mem.eql(u8, write_file.step.name, "WriteFile")) {
+<a id="L185"></a>            write_file.step.name = write_file.step.owner.fmt("WriteFile {s}", .{write_file.files.items[0].sub_path});
+<a id="L186"></a>        }
+<a id="L187"></a>    } else if (write_file.directories.items.len == 1 and write_file.files.items.len == 0) {
+<a id="L188"></a>        // First time adding a directory; update name.
+<a id="L189"></a>        if (std.mem.eql(u8, write_file.step.name, "WriteFile")) {
+<a id="L190"></a>            write_file.step.name = write_file.step.owner.fmt("WriteFile {s}", .{write_file.directories.items[0].sub_path});
+<a id="L191"></a>        }
+<a id="L192"></a>    }
+<a id="L193"></a>}
+<a id="L194"></a>
+<a id="L195"></a>fn make(step: *Step, options: Step.MakeOptions) !void {
+<a id="L196"></a>    _ = options;
+<a id="L197"></a>    const b = step.owner;
+<a id="L198"></a>    const graph = b.graph;
+<a id="L199"></a>    const io = graph.io;
+<a id="L200"></a>    const arena = b.allocator;
+<a id="L201"></a>    const gpa = graph.cache.gpa;
+<a id="L202"></a>    const write_file: *WriteFile = @fieldParentPtr("step", step);
+<a id="L203"></a>
+<a id="L204"></a>    const open_dir_cache = try arena.alloc(Io.Dir, write_file.directories.items.len);
+<a id="L205"></a>    var open_dirs_count: usize = 0;
+<a id="L206"></a>    defer Io.Dir.closeMany(io, open_dir_cache[0..open_dirs_count]);
+<a id="L207"></a>
+<a id="L208"></a>    switch (write_file.mode) {
+<a id="L209"></a>        .whole_cached =&gt; {
+<a id="L210"></a>            step.clearWatchInputs();
+<a id="L211"></a>
+<a id="L212"></a>            // The cache is used here not really as a way to speed things up - because writing
+<a id="L213"></a>            // the data to a file would probably be very fast - but as a way to find a canonical
+<a id="L214"></a>            // location to put build artifacts.
+<a id="L215"></a>
+<a id="L216"></a>            // If, for example, a hard-coded path was used as the location to put WriteFile
+<a id="L217"></a>            // files, then two WriteFiles executing in parallel might clobber each other.
+<a id="L218"></a>
+<a id="L219"></a>            var man = b.graph.cache.obtain();
+<a id="L220"></a>            defer man.deinit();
+<a id="L221"></a>
+<a id="L222"></a>            for (write_file.files.items) |file| {
+<a id="L223"></a>                man.hash.addBytes(file.sub_path);
+<a id="L224"></a>
+<a id="L225"></a>                switch (file.contents) {
+<a id="L226"></a>                    .bytes =&gt; |bytes| {
+<a id="L227"></a>                        man.hash.addBytes(bytes);
+<a id="L228"></a>                    },
+<a id="L229"></a>                    .copy =&gt; |lazy_path| {
+<a id="L230"></a>                        const path = lazy_path.getPath3(b, step);
+<a id="L231"></a>                        _ = try man.addFilePath(path, null);
+<a id="L232"></a>                        try step.addWatchInput(lazy_path);
+<a id="L233"></a>                    },
+<a id="L234"></a>                }
+<a id="L235"></a>            }
+<a id="L236"></a>
+<a id="L237"></a>            for (write_file.directories.items, open_dir_cache) |dir, *open_dir_cache_elem| {
+<a id="L238"></a>                man.hash.addBytes(dir.sub_path);
+<a id="L239"></a>                for (dir.options.exclude_extensions) |ext| man.hash.addBytes(ext);
+<a id="L240"></a>                if (dir.options.include_extensions) |incs| for (incs) |inc| man.hash.addBytes(inc);
+<a id="L241"></a>
+<a id="L242"></a>                const need_derived_inputs = try step.addDirectoryWatchInput(dir.source);
+<a id="L243"></a>                const src_dir_path = dir.source.getPath3(b, step);
+<a id="L244"></a>
+<a id="L245"></a>                var src_dir = src_dir_path.root_dir.handle.openDir(io, src_dir_path.subPathOrDot(), .{ .iterate = true }) catch |err| {
+<a id="L246"></a>                    return step.fail("unable to open source directory '{f}': {s}", .{
+<a id="L247"></a>                        src_dir_path, @errorName(err),
+<a id="L248"></a>                    });
+<a id="L249"></a>                };
+<a id="L250"></a>                open_dir_cache_elem.* = src_dir;
+<a id="L251"></a>                open_dirs_count += 1;
+<a id="L252"></a>
+<a id="L253"></a>                var it = try src_dir.walk(gpa);
+<a id="L254"></a>                defer it.deinit();
+<a id="L255"></a>                while (try it.next(io)) |entry| {
+<a id="L256"></a>                    if (!dir.options.pathIncluded(entry.path)) continue;
+<a id="L257"></a>
+<a id="L258"></a>                    switch (entry.kind) {
+<a id="L259"></a>                        .directory =&gt; {
+<a id="L260"></a>                            if (need_derived_inputs) {
+<a id="L261"></a>                                const entry_path = try src_dir_path.join(arena, entry.path);
+<a id="L262"></a>                                try step.addDirectoryWatchInputFromPath(entry_path);
+<a id="L263"></a>                            }
+<a id="L264"></a>                        },
+<a id="L265"></a>                        .file =&gt; {
+<a id="L266"></a>                            const entry_path = try src_dir_path.join(arena, entry.path);
+<a id="L267"></a>                            _ = try man.addFilePath(entry_path, null);
+<a id="L268"></a>                        },
+<a id="L269"></a>                        else =&gt; continue,
+<a id="L270"></a>                    }
+<a id="L271"></a>                }
+<a id="L272"></a>            }
+<a id="L273"></a>
+<a id="L274"></a>            if (try step.cacheHit(&amp;man)) {
+<a id="L275"></a>                const digest = man.final();
+<a id="L276"></a>                write_file.generated_directory.path = try b.cache_root.join(arena, &amp;.{ "o", &amp;digest });
+<a id="L277"></a>                assert(step.result_cached);
+<a id="L278"></a>                return;
+<a id="L279"></a>            }
+<a id="L280"></a>
+<a id="L281"></a>            const digest = man.final();
+<a id="L282"></a>            const cache_path = "o" ++ Dir.path.sep_str ++ digest;
+<a id="L283"></a>
+<a id="L284"></a>            write_file.generated_directory.path = try b.cache_root.join(arena, &amp;.{cache_path});
+<a id="L285"></a>
+<a id="L286"></a>            try operate(write_file, open_dir_cache, .{
+<a id="L287"></a>                .root_dir = b.cache_root,
+<a id="L288"></a>                .sub_path = cache_path,
+<a id="L289"></a>            });
+<a id="L290"></a>
+<a id="L291"></a>            try step.writeManifest(&amp;man);
+<a id="L292"></a>        },
+<a id="L293"></a>        .tmp =&gt; {
+<a id="L294"></a>            step.result_cached = false;
+<a id="L295"></a>
+<a id="L296"></a>            var rand_int: u64 = undefined;
+<a id="L297"></a>            io.random(@ptrCast(&amp;rand_int));
+<a id="L298"></a>            const tmp_dir_sub_path = "tmp" ++ Dir.path.sep_str ++ std.fmt.hex(rand_int);
+<a id="L299"></a>
+<a id="L300"></a>            write_file.generated_directory.path = try b.cache_root.join(arena, &amp;.{tmp_dir_sub_path});
+<a id="L301"></a>
+<a id="L302"></a>            try operate(write_file, open_dir_cache, .{
+<a id="L303"></a>                .root_dir = b.cache_root,
+<a id="L304"></a>                .sub_path = tmp_dir_sub_path,
+<a id="L305"></a>            });
+<a id="L306"></a>        },
+<a id="L307"></a>        .mutate =&gt; |lp| {
+<a id="L308"></a>            step.result_cached = false;
+<a id="L309"></a>            const root_path = try lp.getPath4(b, step);
+<a id="L310"></a>            write_file.generated_directory.path = try root_path.toString(arena);
+<a id="L311"></a>            try operate(write_file, open_dir_cache, root_path);
+<a id="L312"></a>        },
+<a id="L313"></a>    }
+<a id="L314"></a>}
+<a id="L315"></a>
+<a id="L316"></a>fn operate(write_file: *WriteFile, open_dir_cache: []const Io.Dir, root_path: std.Build.Cache.Path) !void {
+<a id="L317"></a>    const step = &amp;write_file.step;
+<a id="L318"></a>    const b = step.owner;
+<a id="L319"></a>    const io = b.graph.io;
+<a id="L320"></a>    const gpa = b.graph.cache.gpa;
+<a id="L321"></a>    const arena = b.allocator;
+<a id="L322"></a>
+<a id="L323"></a>    var cache_dir = root_path.root_dir.handle.createDirPathOpen(io, root_path.sub_path, .{}) catch |err|
+<a id="L324"></a>        return step.fail("unable to make path {f}: {t}", .{ root_path, err });
+<a id="L325"></a>    defer cache_dir.close(io);
+<a id="L326"></a>
+<a id="L327"></a>    for (write_file.files.items) |file| {
+<a id="L328"></a>        if (Dir.path.dirname(file.sub_path)) |dirname| {
+<a id="L329"></a>            cache_dir.createDirPath(io, dirname) catch |err| {
+<a id="L330"></a>                return step.fail("unable to make path '{f}{c}{s}': {t}", .{
+<a id="L331"></a>                    root_path, Dir.path.sep, dirname, err,
+<a id="L332"></a>                });
+<a id="L333"></a>            };
+<a id="L334"></a>        }
+<a id="L335"></a>        switch (file.contents) {
+<a id="L336"></a>            .bytes =&gt; |bytes| {
+<a id="L337"></a>                cache_dir.writeFile(io, .{ .sub_path = file.sub_path, .data = bytes }) catch |err| {
+<a id="L338"></a>                    return step.fail("unable to write file '{f}{c}{s}': {t}", .{
+<a id="L339"></a>                        root_path, Dir.path.sep, file.sub_path, err,
+<a id="L340"></a>                    });
+<a id="L341"></a>                };
+<a id="L342"></a>            },
+<a id="L343"></a>            .copy =&gt; |file_source| {
+<a id="L344"></a>                const source_path = file_source.getPath2(b, step);
+<a id="L345"></a>                const prev_status = Io.Dir.updateFile(.cwd(), io, source_path, cache_dir, file.sub_path, .{}) catch |err| {
+<a id="L346"></a>                    return step.fail("unable to update file from '{s}' to '{f}{c}{s}': {t}", .{
+<a id="L347"></a>                        source_path, root_path, Dir.path.sep, file.sub_path, err,
+<a id="L348"></a>                    });
+<a id="L349"></a>                };
+<a id="L350"></a>                // At this point we already will mark the step as a cache miss.
+<a id="L351"></a>                // But this is kind of a partial cache hit since individual
+<a id="L352"></a>                // file copies may be avoided. Oh well, this information is
+<a id="L353"></a>                // discarded.
+<a id="L354"></a>                _ = prev_status;
+<a id="L355"></a>            },
+<a id="L356"></a>        }
+<a id="L357"></a>    }
+<a id="L358"></a>
+<a id="L359"></a>    for (write_file.directories.items, open_dir_cache) |dir, already_open_dir| {
+<a id="L360"></a>        const src_dir_path = dir.source.getPath3(b, step);
+<a id="L361"></a>        const dest_dirname = dir.sub_path;
+<a id="L362"></a>
+<a id="L363"></a>        if (dest_dirname.len != 0) {
+<a id="L364"></a>            cache_dir.createDirPath(io, dest_dirname) catch |err| {
+<a id="L365"></a>                return step.fail("unable to make path '{f}{c}{s}': {t}", .{
+<a id="L366"></a>                    root_path, Dir.path.sep, dest_dirname, err,
+<a id="L367"></a>                });
+<a id="L368"></a>            };
+<a id="L369"></a>        }
+<a id="L370"></a>
+<a id="L371"></a>        var it = try already_open_dir.walk(gpa);
+<a id="L372"></a>        defer it.deinit();
+<a id="L373"></a>        while (try it.next(io)) |entry| {
+<a id="L374"></a>            if (!dir.options.pathIncluded(entry.path)) continue;
+<a id="L375"></a>
+<a id="L376"></a>            const src_entry_path = try src_dir_path.join(arena, entry.path);
+<a id="L377"></a>            const dest_path = b.pathJoin(&amp;.{ dest_dirname, entry.path });
+<a id="L378"></a>            switch (entry.kind) {
+<a id="L379"></a>                .directory =&gt; try cache_dir.createDirPath(io, dest_path),
+<a id="L380"></a>                .file =&gt; {
+<a id="L381"></a>                    const prev_status = Io.Dir.updateFile(
+<a id="L382"></a>                        src_entry_path.root_dir.handle,
+<a id="L383"></a>                        io,
+<a id="L384"></a>                        src_entry_path.sub_path,
+<a id="L385"></a>                        cache_dir,
+<a id="L386"></a>                        dest_path,
+<a id="L387"></a>                        .{},
+<a id="L388"></a>                    ) catch |err| {
+<a id="L389"></a>                        return step.fail("unable to update file from '{f}' to '{f}{c}{s}': {t}", .{
+<a id="L390"></a>                            src_entry_path, root_path, Dir.path.sep, dest_path, err,
+<a id="L391"></a>                        });
+<a id="L392"></a>                    };
+<a id="L393"></a>                    _ = prev_status;
+<a id="L394"></a>                },
+<a id="L395"></a>                else =&gt; continue,
+<a id="L396"></a>            }
+<a id="L397"></a>        }
+<a id="L398"></a>    }
+<a id="L399"></a>}
+</pre>
 </body>
 </html>

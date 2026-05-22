@@ -2,734 +2,737 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Source: zig-0.16.0-std/deque.zig</title>
+    <title>Source: deque.zig</title>
     <style>
         body { background: #1e1e1e; color: #d4d4d4; font-family: monospace; padding: 20px; }
         pre { white-space: pre-wrap; word-wrap: break-word; }
         .header { border-bottom: 1px solid #444; padding-bottom: 10px; margin-bottom: 20px; }
         a { color: #569cd6; }
+        a[id] { color: inherit; text-decoration: none; }
+        :target { background: #3a3a00; }
     </style>
 </head>
 <body>
     <div class="header">
-        <a href="/">Index</a> | <strong>File: zig-0.16.0-std/deque.zig</strong>
+        <a href="/">Index</a> | <strong>File: deque.zig</strong>
     </div>
-    <pre>const std = @import("std");
-const assert = std.debug.assert;
-const Allocator = std.mem.Allocator;
-
-/// A contiguous, growable, double-ended queue.
-///
-/// Pushing/popping items from either end of the queue is O(1).
-pub fn Deque(comptime T: type) type {
-    return struct {
-        const Self = @This();
-
-        /// A ring buffer.
-        buffer: []T,
-        /// The index in buffer where the first item in the logical deque is stored.
-        head: usize,
-        /// The number of items stored in the logical deque.
-        len: usize,
-
-        /// A Deque containing no elements.
-        pub const empty: Self = .{
-            .buffer = &amp;.{},
-            .head = 0,
-            .len = 0,
-        };
-
-        /// Initialize with capacity to hold `capacity` elements.
-        /// The resulting capacity will equal `capacity` exactly.
-        /// Deinitialize with `deinit`.
-        pub fn initCapacity(gpa: Allocator, capacity: usize) Allocator.Error!Self {
-            var deque: Self = .empty;
-            try deque.ensureTotalCapacityPrecise(gpa, capacity);
-            return deque;
-        }
-
-        /// Initialize with externally-managed memory. The buffer determines the
-        /// capacity and the deque is initially empty.
-        ///
-        /// When initialized this way, all functions that accept an Allocator
-        /// argument cause illegal behavior.
-        pub fn initBuffer(buffer: []T) Self {
-            return .{
-                .buffer = buffer,
-                .head = 0,
-                .len = 0,
-            };
-        }
-
-        /// Release all allocated memory.
-        pub fn deinit(deque: *Self, gpa: Allocator) void {
-            gpa.free(deque.buffer);
-            deque.* = undefined;
-        }
-
-        /// Modify the deque so that it can hold at least `new_capacity` items.
-        /// Implements super-linear growth to achieve amortized O(1) push/pop operations.
-        /// Invalidates element pointers if additional memory is needed.
-        pub fn ensureTotalCapacity(deque: *Self, gpa: Allocator, new_capacity: usize) Allocator.Error!void {
-            if (deque.buffer.len &gt;= new_capacity) return;
-            return deque.ensureTotalCapacityPrecise(gpa, std.ArrayList(T).growCapacity(new_capacity));
-        }
-
-        /// If the current capacity is less than `new_capacity`, this function will
-        /// modify the deque so that it can hold exactly `new_capacity` items.
-        /// Invalidates element pointers if additional memory is needed.
-        pub fn ensureTotalCapacityPrecise(deque: *Self, gpa: Allocator, new_capacity: usize) Allocator.Error!void {
-            if (deque.buffer.len &gt;= new_capacity) return;
-            const old_buffer = deque.buffer;
-            if (gpa.remap(old_buffer, new_capacity)) |new_buffer| {
-                // If the items wrap around the end of the buffer we need to do
-                // a memcpy to prevent a gap after resizing the buffer.
-                if (deque.head &gt; old_buffer.len - deque.len) {
-                    // The gap splits the items in the deque into head and tail parts.
-                    // Choose the shorter part to copy.
-                    const head = new_buffer[deque.head..old_buffer.len];
-                    const tail = new_buffer[0 .. deque.len - head.len];
-                    if (head.len &gt; tail.len and new_buffer.len - old_buffer.len &gt; tail.len) {
-                        @memcpy(new_buffer[old_buffer.len..][0..tail.len], tail);
-                    } else {
-                        // In this case overlap is possible if e.g. the capacity increase is 1
-                        // and head.len is greater than 1.
-                        deque.head = new_buffer.len - head.len;
-                        @memmove(new_buffer[deque.head..][0..head.len], head);
-                    }
-                }
-                deque.buffer = new_buffer;
-            } else {
-                const new_buffer = try gpa.alloc(T, new_capacity);
-                if (deque.head &lt; old_buffer.len - deque.len) {
-                    @memcpy(new_buffer[0..deque.len], old_buffer[deque.head..][0..deque.len]);
-                } else {
-                    const head = old_buffer[deque.head..];
-                    const tail = old_buffer[0 .. deque.len - head.len];
-                    @memcpy(new_buffer[0..head.len], head);
-                    @memcpy(new_buffer[head.len..][0..tail.len], tail);
-                }
-                deque.head = 0;
-                deque.buffer = new_buffer;
-                gpa.free(old_buffer);
-            }
-        }
-
-        /// Modify the deque so that it can hold at least `additional_count` **more** items.
-        /// Invalidates element pointers if additional memory is needed.
-        pub fn ensureUnusedCapacity(
-            deque: *Self,
-            gpa: Allocator,
-            additional_count: usize,
-        ) Allocator.Error!void {
-            return deque.ensureTotalCapacity(gpa, try addOrOom(deque.len, additional_count));
-        }
-
-        /// Add one item to the front of the deque.
-        ///
-        /// Invalidates element pointers if additional memory is needed.
-        pub fn pushFront(deque: *Self, gpa: Allocator, item: T) error{OutOfMemory}!void {
-            try deque.ensureUnusedCapacity(gpa, 1);
-            deque.pushFrontAssumeCapacity(item);
-        }
-
-        /// Add one item to the front of the deque.
-        ///
-        /// Never invalidates element pointers.
-        ///
-        /// If the deque lacks unused capacity for the additional item, returns
-        /// `error.OutOfMemory`.
-        pub fn pushFrontBounded(deque: *Self, item: T) error{OutOfMemory}!void {
-            if (deque.buffer.len - deque.len == 0) return error.OutOfMemory;
-            return deque.pushFrontAssumeCapacity(item);
-        }
-
-        /// Add one item to the front of the deque.
-        ///
-        /// Never invalidates element pointers.
-        ///
-        /// Asserts that the deque can hold one additional item.
-        pub fn pushFrontAssumeCapacity(deque: *Self, item: T) void {
-            assert(deque.len &lt; deque.buffer.len);
-            if (deque.head == 0) {
-                deque.head = deque.buffer.len;
-            }
-            deque.head -= 1;
-            deque.buffer[deque.head] = item;
-            deque.len += 1;
-        }
-
-        /// Add one item to the back of the deque.
-        ///
-        /// Invalidates element pointers if additional memory is needed.
-        pub fn pushBack(deque: *Self, gpa: Allocator, item: T) error{OutOfMemory}!void {
-            try deque.ensureUnusedCapacity(gpa, 1);
-            deque.pushBackAssumeCapacity(item);
-        }
-
-        /// Add one item to the back of the deque.
-        ///
-        /// Never invalidates element pointers.
-        ///
-        /// If the deque lacks unused capacity for the additional item, returns
-        /// `error.OutOfMemory`.
-        pub fn pushBackBounded(deque: *Self, item: T) error{OutOfMemory}!void {
-            if (deque.buffer.len - deque.len == 0) return error.OutOfMemory;
-            deque.pushBackAssumeCapacity(item);
-        }
-
-        /// Add one item to the back of the deque.
-        ///
-        /// Never invalidates element pointers.
-        ///
-        /// Asserts that the deque can hold one additional item.
-        pub fn pushBackAssumeCapacity(deque: *Self, item: T) void {
-            assert(deque.len &lt; deque.buffer.len);
-            const buffer_index = deque.bufferIndex(deque.len);
-            deque.buffer[buffer_index] = item;
-            deque.len += 1;
-        }
-
-        /// Add `items` to the front of the deque.
-        /// This is equivalent to iterating `items` in reverse and calling
-        /// `pushFront` on every single entry.
-        ///
-        /// Invalidates element pointers if additional memory is needed.
-        pub fn pushFrontSlice(deque: *Self, gpa: Allocator, items: []const T) error{OutOfMemory}!void {
-            try deque.ensureUnusedCapacity(gpa, items.len);
-            return deque.pushFrontSliceAssumeCapacity(items);
-        }
-
-        /// Add `items` to the front of the deque.
-        /// This is equivalent to iterating `items` in reverse and calling
-        /// `pushFront` on every single entry.
-        ///
-        /// Never invalidates element pointers.
-        ///
-        /// If the deque lacks unused capacity for the additional items, returns
-        /// `error.OutOfMemory`.
-        pub fn pushFrontSliceBounded(deque: *Self, items: []const T) error{OutOfMemory}!void {
-            if (deque.buffer.len - deque.len &lt; items.len) return error.OutOfMemory;
-            return deque.pushFrontSliceAssumeCapacity(items);
-        }
-
-        /// Add `items` to the front of the deque.
-        /// This is equivalent to iterating `items` in reverse and calling
-        /// `pushFront` on every single entry.
-        ///
-        /// Never invalidates element pointers.
-        ///
-        /// Asserts that the deque can hold the additional items.
-        pub fn pushFrontSliceAssumeCapacity(deque: *Self, items: []const T) void {
-            assert(deque.buffer.len - deque.len &gt;= items.len);
-            if (deque.head &lt; items.len) {
-                @memcpy(deque.buffer[0..deque.head], items[items.len - deque.head ..]);
-                deque.head = deque.buffer.len - items.len + deque.head;
-                @memcpy(deque.buffer[deque.head..], items.ptr);
-            } else {
-                deque.head -= items.len;
-                @memcpy(deque.buffer[deque.head..][0..items.len], items);
-            }
-            deque.len += items.len;
-        }
-
-        /// Add `items` to the back of the deque.
-        /// This is equivalent to iterating `items` in order and calling
-        /// `pushBack` on every single entry.
-        ///
-        /// Invalidates element pointers if additional memory is needed.
-        pub fn pushBackSlice(deque: *Self, gpa: Allocator, items: []const T) error{OutOfMemory}!void {
-            try deque.ensureUnusedCapacity(gpa, items.len);
-            return deque.pushBackSliceAssumeCapacity(items);
-        }
-
-        /// Add `items` to the back of the deque.
-        /// This is equivalent to iterating `items` in order and calling
-        /// `pushBack` on every single entry.
-        ///
-        /// Never invalidates element pointers.
-        ///
-        /// If the deque lacks unused capacity for the additional items, returns
-        /// `error.OutOfMemory`.
-        pub fn pushBackSliceBounded(deque: *Self, items: []const T) error{OutOfMemory}!void {
-            if (deque.buffer.len - deque.len &lt; items.len) return error.OutOfMemory;
-            return deque.pushBackSliceAssumeCapacity(items);
-        }
-
-        /// Add `items` to the back of the deque.
-        /// This is equivalent to iterating `items` in order and calling
-        /// `pushBack` on every single entry.
-        ///
-        /// Never invalidates element pointers.
-        ///
-        /// Asserts that the deque can hold the additional items.
-        pub fn pushBackSliceAssumeCapacity(deque: *Self, items: []const T) void {
-            assert(deque.buffer.len - deque.len &gt;= items.len);
-            const trailing_buffer = deque.buffer[deque.bufferIndex(deque.len)..];
-            if (trailing_buffer.len &lt; items.len) {
-                @memcpy(trailing_buffer, items[0..trailing_buffer.len]);
-                @memcpy(deque.buffer.ptr, items[trailing_buffer.len..]);
-            } else {
-                @memcpy(trailing_buffer[0..items.len], items);
-            }
-            deque.len += items.len;
-        }
-
-        /// Return the first item in the deque or null if empty.
-        pub fn front(deque: *const Self) ?T {
-            if (deque.len == 0) return null;
-            return deque.buffer[deque.head];
-        }
-
-        /// Return pointer to the first item in the deque or null if empty.
-        pub fn frontPtr(deque: *const Self) ?*T {
-            if (deque.len == 0) return null;
-            return &amp;deque.buffer[deque.head];
-        }
-
-        /// Return the last item in the deque or null if empty.
-        pub fn back(deque: *const Self) ?T {
-            if (deque.len == 0) return null;
-            return deque.buffer[deque.bufferIndex(deque.len - 1)];
-        }
-
-        /// Return the last item in the deque or null if empty.
-        pub fn backPtr(deque: *const Self) ?*T {
-            if (deque.len == 0) return null;
-            return &amp;deque.buffer[deque.bufferIndex(deque.len - 1)];
-        }
-
-        /// Return the item at the given index in the deque.
-        ///
-        /// The first item in the queue is at index 0.
-        ///
-        /// Asserts that the index is in-bounds.
-        pub fn at(deque: *const Self, index: usize) T {
-            assert(index &lt; deque.len);
-            return deque.buffer[deque.bufferIndex(index)];
-        }
-
-        /// Return pointer to the item at the given index in the deque.
-        ///
-        /// The first item in the queue is at index 0.
-        ///
-        /// Asserts that the index is in-bounds.
-        pub fn atPtr(deque: *const Self, index: usize) *T {
-            assert(index &lt; deque.len);
-            return &amp;deque.buffer[deque.bufferIndex(index)];
-        }
-
-        /// Remove and return the first item in the deque or null if empty.
-        pub fn popFront(deque: *Self) ?T {
-            if (deque.len == 0) return null;
-            const pop_index = deque.head;
-            deque.head = deque.bufferIndex(1);
-            deque.len -= 1;
-            return deque.buffer[pop_index];
-        }
-
-        /// Remove and return the last item in the deque or null if empty.
-        pub fn popBack(deque: *Self) ?T {
-            if (deque.len == 0) return null;
-            deque.len -= 1;
-            return deque.buffer[deque.bufferIndex(deque.len)];
-        }
-
-        pub const Iterator = struct {
-            deque: *const Self,
-            index: usize,
-
-            pub fn peek(it: Iterator) ?T {
-                if (it.index &gt;= it.deque.len) return null;
-                return it.deque.at(it.index);
-            }
-            pub fn next(it: *Iterator) ?T {
-                const item = it.peek() orelse return null;
-                it.index += 1;
-                return item;
-            }
-
-            pub fn peekPtr(it: Iterator) ?*T {
-                if (it.index &gt;= it.deque.len) return null;
-                return it.deque.atPtr(it.index);
-            }
-            pub fn nextPtr(it: *Iterator) ?*T {
-                const item_ptr = it.peekPtr() orelse return null;
-                it.index += 1;
-                return item_ptr;
-            }
-        };
-
-        /// Iterates over all items in the deque in order from front to back.
-        pub fn iterator(deque: *const Self) Iterator {
-            return .{ .deque = deque, .index = 0 };
-        }
-
-        /// Returns the index in `buffer` where the element at the given
-        /// index in the logical deque is stored.
-        fn bufferIndex(deque: *const Self, index: usize) usize {
-            // This function is written in this way to avoid overflow and
-            // expensive division.
-            const head_len = deque.buffer.len - deque.head;
-            if (index &lt; head_len) {
-                return deque.head + index;
-            } else {
-                return index - head_len;
-            }
-        }
-    };
-}
-
-/// Integer addition returning `error.OutOfMemory` on overflow.
-fn addOrOom(a: usize, b: usize) error{OutOfMemory}!usize {
-    const result, const overflow = @addWithOverflow(a, b);
-    if (overflow != 0) return error.OutOfMemory;
-    return result;
-}
-
-test "basic" {
-    const testing = std.testing;
-    const gpa = testing.allocator;
-
-    var q: Deque(u32) = .empty;
-    defer q.deinit(gpa);
-
-    try testing.expectEqual(null, q.popFront());
-    try testing.expectEqual(null, q.popBack());
-
-    try q.pushBack(gpa, 1);
-    try q.pushBack(gpa, 2);
-    try q.pushBack(gpa, 3);
-    try q.pushFront(gpa, 0);
-
-    try testing.expectEqual(0, q.popFront());
-    try testing.expectEqual(1, q.popFront());
-    try testing.expectEqual(3, q.popBack());
-    try testing.expectEqual(2, q.popFront());
-    try testing.expectEqual(null, q.popFront());
-    try testing.expectEqual(null, q.popBack());
-}
-
-test "buffer" {
-    const testing = std.testing;
-
-    var buffer: [4]u32 = undefined;
-    var q: Deque(u32) = .initBuffer(&amp;buffer);
-
-    try testing.expectEqual(null, q.popFront());
-    try testing.expectEqual(null, q.popBack());
-
-    try q.pushBackBounded(1);
-    try q.pushBackBounded(2);
-    try q.pushBackBounded(3);
-    try q.pushFrontBounded(0);
-    try testing.expectError(error.OutOfMemory, q.pushBackBounded(4));
-
-    try testing.expectEqual(0, q.popFront());
-    try testing.expectEqual(1, q.popFront());
-    try testing.expectEqual(3, q.popBack());
-    try testing.expectEqual(2, q.popFront());
-    try testing.expectEqual(null, q.popFront());
-    try testing.expectEqual(null, q.popBack());
-}
-
-test "slow growth" {
-    const testing = std.testing;
-    const gpa = testing.allocator;
-
-    var q: Deque(i32) = .empty;
-    defer q.deinit(gpa);
-
-    try q.ensureTotalCapacityPrecise(gpa, 1);
-    q.pushBackAssumeCapacity(1);
-    try q.ensureTotalCapacityPrecise(gpa, 2);
-    q.pushFrontAssumeCapacity(0);
-    try q.ensureTotalCapacityPrecise(gpa, 3);
-    q.pushBackAssumeCapacity(2);
-    try q.ensureTotalCapacityPrecise(gpa, 5);
-    q.pushBackAssumeCapacity(3);
-    q.pushFrontAssumeCapacity(-1);
-    try q.ensureTotalCapacityPrecise(gpa, 6);
-    q.pushFrontAssumeCapacity(-2);
-
-    try testing.expectEqual(-2, q.popFront());
-    try testing.expectEqual(-1, q.popFront());
-    try testing.expectEqual(3, q.popBack());
-    try testing.expectEqual(0, q.popFront());
-    try testing.expectEqual(2, q.popBack());
-    try testing.expectEqual(1, q.popBack());
-    try testing.expectEqual(null, q.popFront());
-    try testing.expectEqual(null, q.popBack());
-}
-
-test "slice" {
-    const testing = std.testing;
-    const gpa = testing.allocator;
-
-    var q: Deque(i32) = .empty;
-    defer q.deinit(gpa);
-
-    try q.pushBackSlice(gpa, &amp;.{ 3, 4, 5 });
-    try q.pushBackSlice(gpa, &amp;.{ 6, 7 });
-    try q.pushFrontSlice(gpa, &amp;.{2});
-    try q.pushBackSlice(gpa, &amp;.{});
-    try q.pushFrontSlice(gpa, &amp;.{ 0, 1 });
-    try q.pushFrontSlice(gpa, &amp;.{});
-
-    try testing.expectEqual(0, q.popFront());
-    try testing.expectEqual(1, q.popFront());
-    try testing.expectEqual(7, q.popBack());
-    try testing.expectEqual(6, q.popBack());
-
-    try q.pushFrontSlice(gpa, &amp;.{ 0, 1 });
-    try q.pushBackSlice(gpa, &amp;.{ 6, 7 });
-
-    try testing.expectEqual(0, q.popFront());
-    try testing.expectEqual(1, q.popFront());
-    try testing.expectEqual(2, q.popFront());
-    try testing.expectEqual(7, q.popBack());
-    try testing.expectEqual(6, q.popBack());
-    try testing.expectEqual(3, q.popFront());
-    try testing.expectEqual(4, q.popFront());
-    try testing.expectEqual(5, q.popBack());
-    try testing.expectEqual(null, q.popFront());
-    try testing.expectEqual(null, q.popBack());
-}
-
-test "iterator" {
-    const testing = std.testing;
-    const gpa = testing.allocator;
-
-    var q: Deque(i32) = .empty;
-    defer q.deinit(gpa);
-
-    const items: []const i32 = &amp;.{ 0, 1, 2, 3, 4, 5 };
-    try q.pushFrontSlice(gpa, items);
-
-    {
-        var it = q.iterator();
-        for (items) |item| {
-            try testing.expectEqual(item, it.peek());
-            try testing.expectEqual(item, it.next());
-        }
-        try testing.expectEqual(null, it.peek());
-        try testing.expectEqual(null, it.next());
-    }
-    {
-        var it = q.iterator();
-        for (items) |item| {
-            if (it.peekPtr()) |ptr| {
-                try testing.expectEqual(item, ptr.*);
-            } else return error.TestExpectedNonNull;
-            if (it.nextPtr()) |ptr| {
-                try testing.expectEqual(item, ptr.*);
-            } else return error.TestExpectedNonNull;
-        }
-        try testing.expectEqual(null, it.peekPtr());
-        try testing.expectEqual(null, it.nextPtr());
-    }
-}
-
-test "fuzz against ArrayList oracle" {
-    try std.testing.fuzz({}, fuzzAgainstArrayList, .{});
-}
-
-const FuzzAllocator = struct {
-    smith: *std.testing.Smith,
-    bufs: [2][256 * 4]u8 align(4),
-    used_bitmap: u2,
-    used_len: [2]usize,
-
-    pub fn init(smith: *std.testing.Smith) FuzzAllocator {
-        return .{
-            .smith = smith,
-            .bufs = undefined,
-            .used_len = undefined,
-            .used_bitmap = 0,
-        };
-    }
-
-    pub fn allocator(f: *FuzzAllocator) std.mem.Allocator {
-        return .{
-            .ptr = f,
-            .vtable = &amp;.{
-                .alloc = alloc,
-                .resize = resize,
-                .remap = remap,
-                .free = free,
-            },
-        };
-    }
-
-    pub fn allocCount(f: *FuzzAllocator) u2 {
-        return @popCount(f.used_bitmap);
-    }
-
-    fn alloc(ctx: *anyopaque, len: usize, a: std.mem.Alignment, _: usize) ?[*]u8 {
-        const f: *FuzzAllocator = @ptrCast(@alignCast(ctx));
-        assert(a == .@"4");
-        assert(len % 4 == 0);
-
-        const slot: u1 = @intCast(@ctz(~f.used_bitmap));
-        const buf: []u8 = &amp;f.bufs[slot];
-        if (len &gt; buf.len) return null;
-        f.used_bitmap |= @as(u2, 1) &lt;&lt; slot;
-        f.used_len[slot] = len;
-        return buf.ptr;
-    }
-
-    fn memSlot(f: *FuzzAllocator, mem: []u8) u1 {
-        const slot: u1 = if (&amp;mem[0] == &amp;f.bufs[0][0])
-            0
-        else if (&amp;mem[0] == &amp;f.bufs[1][0])
-            1
-        else
-            unreachable;
-        assert((f.used_bitmap &gt;&gt; slot) &amp; 1 == 1);
-        assert(mem.len == f.used_len[slot]);
-        return slot;
-    }
-
-    fn resize(ctx: *anyopaque, mem: []u8, a: std.mem.Alignment, new_len: usize, _: usize) bool {
-        const f: *FuzzAllocator = @ptrCast(@alignCast(ctx));
-        assert(a == .@"4");
-        assert(f.allocCount() == 1);
-
-        const slot = f.memSlot(mem);
-        if (new_len &gt; f.bufs[slot].len or f.smith.value(bool)) return false;
-        f.used_len[slot] = new_len;
-        return true;
-    }
-
-    fn remap(ctx: *anyopaque, mem: []u8, a: std.mem.Alignment, new_len: usize, _: usize) ?[*]u8 {
-        const f: *FuzzAllocator = @ptrCast(@alignCast(ctx));
-        assert(a == .@"4");
-        assert(f.allocCount() == 1);
-
-        const slot = f.memSlot(mem);
-        if (new_len &gt; f.bufs[slot].len or f.smith.value(bool)) return null;
-
-        if (f.smith.value(bool)) {
-            f.used_len[slot] = new_len;
-            // remap in place
-            return mem.ptr;
-        } else {
-            // moving remap
-            const new_slot = ~slot;
-            f.used_bitmap = ~f.used_bitmap;
-            f.used_len[new_slot] = new_len;
-
-            const new_buf = &amp;f.bufs[new_slot];
-            @memcpy(new_buf[0..mem.len], mem);
-            return new_buf.ptr;
-        }
-    }
-
-    fn free(ctx: *anyopaque, mem: []u8, a: std.mem.Alignment, _: usize) void {
-        const f: *FuzzAllocator = @ptrCast(@alignCast(ctx));
-        assert(a == .@"4");
-        f.used_bitmap ^= @as(u2, 1) &lt;&lt; f.memSlot(mem);
-    }
-};
-
-fn fuzzAgainstArrayList(_: void, smith: *std.testing.Smith) anyerror!void {
-    const testing = std.testing;
-
-    var q_gpa_inst: FuzzAllocator = .init(smith);
-    var l_gpa_buf: [q_gpa_inst.bufs[0].len]u8 align(4) = undefined;
-    var l_gpa_inst: std.heap.FixedBufferAllocator = .init(&amp;l_gpa_buf);
-    const q_gpa = q_gpa_inst.allocator();
-    const l_gpa = l_gpa_inst.allocator();
-
-    var q: Deque(u32) = .empty;
-    var l: std.ArrayList(u32) = .empty;
-
-    const Action = enum(u8) {
-        grow,
-        push_back,
-        push_front,
-        push_back_slice,
-        push_front_slice,
-        pop_back,
-        pop_front,
-    };
-
-    while (!smith.eosWeightedSimple(15, 1)) {
-        const baseline = testing.Smith.baselineWeights(Action);
-        const grow_weight: testing.Smith.Weight = .value(Action, .grow, 3);
-        switch (smith.valueWeighted(Action, baseline ++ .{grow_weight})) {
-            .push_back =&gt; {
-                const item = smith.value(u32);
-                try testing.expectEqual(
-                    l.appendBounded(item),
-                    q.pushBackBounded(item),
-                );
-            },
-            .push_front =&gt; {
-                const item = smith.value(u32);
-                try testing.expectEqual(
-                    l.insertBounded(0, item),
-                    q.pushFrontBounded(item),
-                );
-            },
-            .push_back_slice =&gt; {
-                var buffer: [std.math.maxInt(u3)]u32 = undefined;
-                const items = buffer[0..smith.value(u3)];
-                for (items) |*item| {
-                    item.* = smith.value(u32);
-                }
-                try testing.expectEqual(
-                    l.appendSliceBounded(items),
-                    q.pushBackSliceBounded(items),
-                );
-            },
-            .push_front_slice =&gt; {
-                var buffer: [std.math.maxInt(u3)]u32 = undefined;
-                const items = buffer[0..smith.value(u3)];
-                for (items) |*item| {
-                    item.* = smith.value(u32);
-                }
-                try testing.expectEqual(
-                    l.insertSliceBounded(0, items),
-                    q.pushFrontSliceBounded(items),
-                );
-            },
-            .pop_back =&gt; {
-                try testing.expectEqual(l.pop(), q.popBack());
-            },
-            .pop_front =&gt; {
-                try testing.expectEqual(
-                    if (l.items.len &gt; 0) l.orderedRemove(0) else null,
-                    q.popFront(),
-                );
-            },
-            // Growing by small, random, linear amounts seems to better test
-            // ensureTotalCapacityPrecise(), which is the most complex part
-            // of the Deque implementation.
-            .grow =&gt; {
-                const growth = smith.value(u3);
-                try l.ensureTotalCapacityPrecise(l_gpa, l.items.len + growth);
-                try q.ensureTotalCapacityPrecise(q_gpa, q.len + growth);
-            },
-        }
-        try testing.expectEqual(l.getLastOrNull(), q.back());
-        try testing.expectEqual(
-            if (l.items.len &gt; 0) l.items[0] else null,
-            q.front(),
-        );
-        try testing.expectEqual(l.items.len, q.len);
-        try testing.expectEqual(l.capacity, q.buffer.len);
-        {
-            var it = q.iterator();
-            for (l.items) |item| {
-                try testing.expectEqual(item, it.next());
-            }
-            try testing.expectEqual(null, it.next());
-        }
-        try testing.expectEqual(@intFromBool(q.buffer.len != 0), q_gpa_inst.allocCount());
-    }
-    q.deinit(q_gpa);
-    try testing.expectEqual(0, q_gpa_inst.allocCount());
-}</pre>
+    <pre><a id="L1"></a>const std = @import("std");
+<a id="L2"></a>const assert = std.debug.assert;
+<a id="L3"></a>const Allocator = std.mem.Allocator;
+<a id="L4"></a>
+<a id="L5"></a>/// A contiguous, growable, double-ended queue.
+<a id="L6"></a>///
+<a id="L7"></a>/// Pushing/popping items from either end of the queue is O(1).
+<a id="L8"></a>pub fn Deque(comptime T: type) type {
+<a id="L9"></a>    return struct {
+<a id="L10"></a>        const Self = @This();
+<a id="L11"></a>
+<a id="L12"></a>        /// A ring buffer.
+<a id="L13"></a>        buffer: []T,
+<a id="L14"></a>        /// The index in buffer where the first item in the logical deque is stored.
+<a id="L15"></a>        head: usize,
+<a id="L16"></a>        /// The number of items stored in the logical deque.
+<a id="L17"></a>        len: usize,
+<a id="L18"></a>
+<a id="L19"></a>        /// A Deque containing no elements.
+<a id="L20"></a>        pub const empty: Self = .{
+<a id="L21"></a>            .buffer = &amp;.{},
+<a id="L22"></a>            .head = 0,
+<a id="L23"></a>            .len = 0,
+<a id="L24"></a>        };
+<a id="L25"></a>
+<a id="L26"></a>        /// Initialize with capacity to hold `capacity` elements.
+<a id="L27"></a>        /// The resulting capacity will equal `capacity` exactly.
+<a id="L28"></a>        /// Deinitialize with `deinit`.
+<a id="L29"></a>        pub fn initCapacity(gpa: Allocator, capacity: usize) Allocator.Error!Self {
+<a id="L30"></a>            var deque: Self = .empty;
+<a id="L31"></a>            try deque.ensureTotalCapacityPrecise(gpa, capacity);
+<a id="L32"></a>            return deque;
+<a id="L33"></a>        }
+<a id="L34"></a>
+<a id="L35"></a>        /// Initialize with externally-managed memory. The buffer determines the
+<a id="L36"></a>        /// capacity and the deque is initially empty.
+<a id="L37"></a>        ///
+<a id="L38"></a>        /// When initialized this way, all functions that accept an Allocator
+<a id="L39"></a>        /// argument cause illegal behavior.
+<a id="L40"></a>        pub fn initBuffer(buffer: []T) Self {
+<a id="L41"></a>            return .{
+<a id="L42"></a>                .buffer = buffer,
+<a id="L43"></a>                .head = 0,
+<a id="L44"></a>                .len = 0,
+<a id="L45"></a>            };
+<a id="L46"></a>        }
+<a id="L47"></a>
+<a id="L48"></a>        /// Release all allocated memory.
+<a id="L49"></a>        pub fn deinit(deque: *Self, gpa: Allocator) void {
+<a id="L50"></a>            gpa.free(deque.buffer);
+<a id="L51"></a>            deque.* = undefined;
+<a id="L52"></a>        }
+<a id="L53"></a>
+<a id="L54"></a>        /// Modify the deque so that it can hold at least `new_capacity` items.
+<a id="L55"></a>        /// Implements super-linear growth to achieve amortized O(1) push/pop operations.
+<a id="L56"></a>        /// Invalidates element pointers if additional memory is needed.
+<a id="L57"></a>        pub fn ensureTotalCapacity(deque: *Self, gpa: Allocator, new_capacity: usize) Allocator.Error!void {
+<a id="L58"></a>            if (deque.buffer.len &gt;= new_capacity) return;
+<a id="L59"></a>            return deque.ensureTotalCapacityPrecise(gpa, std.ArrayList(T).growCapacity(new_capacity));
+<a id="L60"></a>        }
+<a id="L61"></a>
+<a id="L62"></a>        /// If the current capacity is less than `new_capacity`, this function will
+<a id="L63"></a>        /// modify the deque so that it can hold exactly `new_capacity` items.
+<a id="L64"></a>        /// Invalidates element pointers if additional memory is needed.
+<a id="L65"></a>        pub fn ensureTotalCapacityPrecise(deque: *Self, gpa: Allocator, new_capacity: usize) Allocator.Error!void {
+<a id="L66"></a>            if (deque.buffer.len &gt;= new_capacity) return;
+<a id="L67"></a>            const old_buffer = deque.buffer;
+<a id="L68"></a>            if (gpa.remap(old_buffer, new_capacity)) |new_buffer| {
+<a id="L69"></a>                // If the items wrap around the end of the buffer we need to do
+<a id="L70"></a>                // a memcpy to prevent a gap after resizing the buffer.
+<a id="L71"></a>                if (deque.head &gt; old_buffer.len - deque.len) {
+<a id="L72"></a>                    // The gap splits the items in the deque into head and tail parts.
+<a id="L73"></a>                    // Choose the shorter part to copy.
+<a id="L74"></a>                    const head = new_buffer[deque.head..old_buffer.len];
+<a id="L75"></a>                    const tail = new_buffer[0 .. deque.len - head.len];
+<a id="L76"></a>                    if (head.len &gt; tail.len and new_buffer.len - old_buffer.len &gt; tail.len) {
+<a id="L77"></a>                        @memcpy(new_buffer[old_buffer.len..][0..tail.len], tail);
+<a id="L78"></a>                    } else {
+<a id="L79"></a>                        // In this case overlap is possible if e.g. the capacity increase is 1
+<a id="L80"></a>                        // and head.len is greater than 1.
+<a id="L81"></a>                        deque.head = new_buffer.len - head.len;
+<a id="L82"></a>                        @memmove(new_buffer[deque.head..][0..head.len], head);
+<a id="L83"></a>                    }
+<a id="L84"></a>                }
+<a id="L85"></a>                deque.buffer = new_buffer;
+<a id="L86"></a>            } else {
+<a id="L87"></a>                const new_buffer = try gpa.alloc(T, new_capacity);
+<a id="L88"></a>                if (deque.head &lt; old_buffer.len - deque.len) {
+<a id="L89"></a>                    @memcpy(new_buffer[0..deque.len], old_buffer[deque.head..][0..deque.len]);
+<a id="L90"></a>                } else {
+<a id="L91"></a>                    const head = old_buffer[deque.head..];
+<a id="L92"></a>                    const tail = old_buffer[0 .. deque.len - head.len];
+<a id="L93"></a>                    @memcpy(new_buffer[0..head.len], head);
+<a id="L94"></a>                    @memcpy(new_buffer[head.len..][0..tail.len], tail);
+<a id="L95"></a>                }
+<a id="L96"></a>                deque.head = 0;
+<a id="L97"></a>                deque.buffer = new_buffer;
+<a id="L98"></a>                gpa.free(old_buffer);
+<a id="L99"></a>            }
+<a id="L100"></a>        }
+<a id="L101"></a>
+<a id="L102"></a>        /// Modify the deque so that it can hold at least `additional_count` **more** items.
+<a id="L103"></a>        /// Invalidates element pointers if additional memory is needed.
+<a id="L104"></a>        pub fn ensureUnusedCapacity(
+<a id="L105"></a>            deque: *Self,
+<a id="L106"></a>            gpa: Allocator,
+<a id="L107"></a>            additional_count: usize,
+<a id="L108"></a>        ) Allocator.Error!void {
+<a id="L109"></a>            return deque.ensureTotalCapacity(gpa, try addOrOom(deque.len, additional_count));
+<a id="L110"></a>        }
+<a id="L111"></a>
+<a id="L112"></a>        /// Add one item to the front of the deque.
+<a id="L113"></a>        ///
+<a id="L114"></a>        /// Invalidates element pointers if additional memory is needed.
+<a id="L115"></a>        pub fn pushFront(deque: *Self, gpa: Allocator, item: T) error{OutOfMemory}!void {
+<a id="L116"></a>            try deque.ensureUnusedCapacity(gpa, 1);
+<a id="L117"></a>            deque.pushFrontAssumeCapacity(item);
+<a id="L118"></a>        }
+<a id="L119"></a>
+<a id="L120"></a>        /// Add one item to the front of the deque.
+<a id="L121"></a>        ///
+<a id="L122"></a>        /// Never invalidates element pointers.
+<a id="L123"></a>        ///
+<a id="L124"></a>        /// If the deque lacks unused capacity for the additional item, returns
+<a id="L125"></a>        /// `error.OutOfMemory`.
+<a id="L126"></a>        pub fn pushFrontBounded(deque: *Self, item: T) error{OutOfMemory}!void {
+<a id="L127"></a>            if (deque.buffer.len - deque.len == 0) return error.OutOfMemory;
+<a id="L128"></a>            return deque.pushFrontAssumeCapacity(item);
+<a id="L129"></a>        }
+<a id="L130"></a>
+<a id="L131"></a>        /// Add one item to the front of the deque.
+<a id="L132"></a>        ///
+<a id="L133"></a>        /// Never invalidates element pointers.
+<a id="L134"></a>        ///
+<a id="L135"></a>        /// Asserts that the deque can hold one additional item.
+<a id="L136"></a>        pub fn pushFrontAssumeCapacity(deque: *Self, item: T) void {
+<a id="L137"></a>            assert(deque.len &lt; deque.buffer.len);
+<a id="L138"></a>            if (deque.head == 0) {
+<a id="L139"></a>                deque.head = deque.buffer.len;
+<a id="L140"></a>            }
+<a id="L141"></a>            deque.head -= 1;
+<a id="L142"></a>            deque.buffer[deque.head] = item;
+<a id="L143"></a>            deque.len += 1;
+<a id="L144"></a>        }
+<a id="L145"></a>
+<a id="L146"></a>        /// Add one item to the back of the deque.
+<a id="L147"></a>        ///
+<a id="L148"></a>        /// Invalidates element pointers if additional memory is needed.
+<a id="L149"></a>        pub fn pushBack(deque: *Self, gpa: Allocator, item: T) error{OutOfMemory}!void {
+<a id="L150"></a>            try deque.ensureUnusedCapacity(gpa, 1);
+<a id="L151"></a>            deque.pushBackAssumeCapacity(item);
+<a id="L152"></a>        }
+<a id="L153"></a>
+<a id="L154"></a>        /// Add one item to the back of the deque.
+<a id="L155"></a>        ///
+<a id="L156"></a>        /// Never invalidates element pointers.
+<a id="L157"></a>        ///
+<a id="L158"></a>        /// If the deque lacks unused capacity for the additional item, returns
+<a id="L159"></a>        /// `error.OutOfMemory`.
+<a id="L160"></a>        pub fn pushBackBounded(deque: *Self, item: T) error{OutOfMemory}!void {
+<a id="L161"></a>            if (deque.buffer.len - deque.len == 0) return error.OutOfMemory;
+<a id="L162"></a>            deque.pushBackAssumeCapacity(item);
+<a id="L163"></a>        }
+<a id="L164"></a>
+<a id="L165"></a>        /// Add one item to the back of the deque.
+<a id="L166"></a>        ///
+<a id="L167"></a>        /// Never invalidates element pointers.
+<a id="L168"></a>        ///
+<a id="L169"></a>        /// Asserts that the deque can hold one additional item.
+<a id="L170"></a>        pub fn pushBackAssumeCapacity(deque: *Self, item: T) void {
+<a id="L171"></a>            assert(deque.len &lt; deque.buffer.len);
+<a id="L172"></a>            const buffer_index = deque.bufferIndex(deque.len);
+<a id="L173"></a>            deque.buffer[buffer_index] = item;
+<a id="L174"></a>            deque.len += 1;
+<a id="L175"></a>        }
+<a id="L176"></a>
+<a id="L177"></a>        /// Add `items` to the front of the deque.
+<a id="L178"></a>        /// This is equivalent to iterating `items` in reverse and calling
+<a id="L179"></a>        /// `pushFront` on every single entry.
+<a id="L180"></a>        ///
+<a id="L181"></a>        /// Invalidates element pointers if additional memory is needed.
+<a id="L182"></a>        pub fn pushFrontSlice(deque: *Self, gpa: Allocator, items: []const T) error{OutOfMemory}!void {
+<a id="L183"></a>            try deque.ensureUnusedCapacity(gpa, items.len);
+<a id="L184"></a>            return deque.pushFrontSliceAssumeCapacity(items);
+<a id="L185"></a>        }
+<a id="L186"></a>
+<a id="L187"></a>        /// Add `items` to the front of the deque.
+<a id="L188"></a>        /// This is equivalent to iterating `items` in reverse and calling
+<a id="L189"></a>        /// `pushFront` on every single entry.
+<a id="L190"></a>        ///
+<a id="L191"></a>        /// Never invalidates element pointers.
+<a id="L192"></a>        ///
+<a id="L193"></a>        /// If the deque lacks unused capacity for the additional items, returns
+<a id="L194"></a>        /// `error.OutOfMemory`.
+<a id="L195"></a>        pub fn pushFrontSliceBounded(deque: *Self, items: []const T) error{OutOfMemory}!void {
+<a id="L196"></a>            if (deque.buffer.len - deque.len &lt; items.len) return error.OutOfMemory;
+<a id="L197"></a>            return deque.pushFrontSliceAssumeCapacity(items);
+<a id="L198"></a>        }
+<a id="L199"></a>
+<a id="L200"></a>        /// Add `items` to the front of the deque.
+<a id="L201"></a>        /// This is equivalent to iterating `items` in reverse and calling
+<a id="L202"></a>        /// `pushFront` on every single entry.
+<a id="L203"></a>        ///
+<a id="L204"></a>        /// Never invalidates element pointers.
+<a id="L205"></a>        ///
+<a id="L206"></a>        /// Asserts that the deque can hold the additional items.
+<a id="L207"></a>        pub fn pushFrontSliceAssumeCapacity(deque: *Self, items: []const T) void {
+<a id="L208"></a>            assert(deque.buffer.len - deque.len &gt;= items.len);
+<a id="L209"></a>            if (deque.head &lt; items.len) {
+<a id="L210"></a>                @memcpy(deque.buffer[0..deque.head], items[items.len - deque.head ..]);
+<a id="L211"></a>                deque.head = deque.buffer.len - items.len + deque.head;
+<a id="L212"></a>                @memcpy(deque.buffer[deque.head..], items.ptr);
+<a id="L213"></a>            } else {
+<a id="L214"></a>                deque.head -= items.len;
+<a id="L215"></a>                @memcpy(deque.buffer[deque.head..][0..items.len], items);
+<a id="L216"></a>            }
+<a id="L217"></a>            deque.len += items.len;
+<a id="L218"></a>        }
+<a id="L219"></a>
+<a id="L220"></a>        /// Add `items` to the back of the deque.
+<a id="L221"></a>        /// This is equivalent to iterating `items` in order and calling
+<a id="L222"></a>        /// `pushBack` on every single entry.
+<a id="L223"></a>        ///
+<a id="L224"></a>        /// Invalidates element pointers if additional memory is needed.
+<a id="L225"></a>        pub fn pushBackSlice(deque: *Self, gpa: Allocator, items: []const T) error{OutOfMemory}!void {
+<a id="L226"></a>            try deque.ensureUnusedCapacity(gpa, items.len);
+<a id="L227"></a>            return deque.pushBackSliceAssumeCapacity(items);
+<a id="L228"></a>        }
+<a id="L229"></a>
+<a id="L230"></a>        /// Add `items` to the back of the deque.
+<a id="L231"></a>        /// This is equivalent to iterating `items` in order and calling
+<a id="L232"></a>        /// `pushBack` on every single entry.
+<a id="L233"></a>        ///
+<a id="L234"></a>        /// Never invalidates element pointers.
+<a id="L235"></a>        ///
+<a id="L236"></a>        /// If the deque lacks unused capacity for the additional items, returns
+<a id="L237"></a>        /// `error.OutOfMemory`.
+<a id="L238"></a>        pub fn pushBackSliceBounded(deque: *Self, items: []const T) error{OutOfMemory}!void {
+<a id="L239"></a>            if (deque.buffer.len - deque.len &lt; items.len) return error.OutOfMemory;
+<a id="L240"></a>            return deque.pushBackSliceAssumeCapacity(items);
+<a id="L241"></a>        }
+<a id="L242"></a>
+<a id="L243"></a>        /// Add `items` to the back of the deque.
+<a id="L244"></a>        /// This is equivalent to iterating `items` in order and calling
+<a id="L245"></a>        /// `pushBack` on every single entry.
+<a id="L246"></a>        ///
+<a id="L247"></a>        /// Never invalidates element pointers.
+<a id="L248"></a>        ///
+<a id="L249"></a>        /// Asserts that the deque can hold the additional items.
+<a id="L250"></a>        pub fn pushBackSliceAssumeCapacity(deque: *Self, items: []const T) void {
+<a id="L251"></a>            assert(deque.buffer.len - deque.len &gt;= items.len);
+<a id="L252"></a>            const trailing_buffer = deque.buffer[deque.bufferIndex(deque.len)..];
+<a id="L253"></a>            if (trailing_buffer.len &lt; items.len) {
+<a id="L254"></a>                @memcpy(trailing_buffer, items[0..trailing_buffer.len]);
+<a id="L255"></a>                @memcpy(deque.buffer.ptr, items[trailing_buffer.len..]);
+<a id="L256"></a>            } else {
+<a id="L257"></a>                @memcpy(trailing_buffer[0..items.len], items);
+<a id="L258"></a>            }
+<a id="L259"></a>            deque.len += items.len;
+<a id="L260"></a>        }
+<a id="L261"></a>
+<a id="L262"></a>        /// Return the first item in the deque or null if empty.
+<a id="L263"></a>        pub fn front(deque: *const Self) ?T {
+<a id="L264"></a>            if (deque.len == 0) return null;
+<a id="L265"></a>            return deque.buffer[deque.head];
+<a id="L266"></a>        }
+<a id="L267"></a>
+<a id="L268"></a>        /// Return pointer to the first item in the deque or null if empty.
+<a id="L269"></a>        pub fn frontPtr(deque: *const Self) ?*T {
+<a id="L270"></a>            if (deque.len == 0) return null;
+<a id="L271"></a>            return &amp;deque.buffer[deque.head];
+<a id="L272"></a>        }
+<a id="L273"></a>
+<a id="L274"></a>        /// Return the last item in the deque or null if empty.
+<a id="L275"></a>        pub fn back(deque: *const Self) ?T {
+<a id="L276"></a>            if (deque.len == 0) return null;
+<a id="L277"></a>            return deque.buffer[deque.bufferIndex(deque.len - 1)];
+<a id="L278"></a>        }
+<a id="L279"></a>
+<a id="L280"></a>        /// Return the last item in the deque or null if empty.
+<a id="L281"></a>        pub fn backPtr(deque: *const Self) ?*T {
+<a id="L282"></a>            if (deque.len == 0) return null;
+<a id="L283"></a>            return &amp;deque.buffer[deque.bufferIndex(deque.len - 1)];
+<a id="L284"></a>        }
+<a id="L285"></a>
+<a id="L286"></a>        /// Return the item at the given index in the deque.
+<a id="L287"></a>        ///
+<a id="L288"></a>        /// The first item in the queue is at index 0.
+<a id="L289"></a>        ///
+<a id="L290"></a>        /// Asserts that the index is in-bounds.
+<a id="L291"></a>        pub fn at(deque: *const Self, index: usize) T {
+<a id="L292"></a>            assert(index &lt; deque.len);
+<a id="L293"></a>            return deque.buffer[deque.bufferIndex(index)];
+<a id="L294"></a>        }
+<a id="L295"></a>
+<a id="L296"></a>        /// Return pointer to the item at the given index in the deque.
+<a id="L297"></a>        ///
+<a id="L298"></a>        /// The first item in the queue is at index 0.
+<a id="L299"></a>        ///
+<a id="L300"></a>        /// Asserts that the index is in-bounds.
+<a id="L301"></a>        pub fn atPtr(deque: *const Self, index: usize) *T {
+<a id="L302"></a>            assert(index &lt; deque.len);
+<a id="L303"></a>            return &amp;deque.buffer[deque.bufferIndex(index)];
+<a id="L304"></a>        }
+<a id="L305"></a>
+<a id="L306"></a>        /// Remove and return the first item in the deque or null if empty.
+<a id="L307"></a>        pub fn popFront(deque: *Self) ?T {
+<a id="L308"></a>            if (deque.len == 0) return null;
+<a id="L309"></a>            const pop_index = deque.head;
+<a id="L310"></a>            deque.head = deque.bufferIndex(1);
+<a id="L311"></a>            deque.len -= 1;
+<a id="L312"></a>            return deque.buffer[pop_index];
+<a id="L313"></a>        }
+<a id="L314"></a>
+<a id="L315"></a>        /// Remove and return the last item in the deque or null if empty.
+<a id="L316"></a>        pub fn popBack(deque: *Self) ?T {
+<a id="L317"></a>            if (deque.len == 0) return null;
+<a id="L318"></a>            deque.len -= 1;
+<a id="L319"></a>            return deque.buffer[deque.bufferIndex(deque.len)];
+<a id="L320"></a>        }
+<a id="L321"></a>
+<a id="L322"></a>        pub const Iterator = struct {
+<a id="L323"></a>            deque: *const Self,
+<a id="L324"></a>            index: usize,
+<a id="L325"></a>
+<a id="L326"></a>            pub fn peek(it: Iterator) ?T {
+<a id="L327"></a>                if (it.index &gt;= it.deque.len) return null;
+<a id="L328"></a>                return it.deque.at(it.index);
+<a id="L329"></a>            }
+<a id="L330"></a>            pub fn next(it: *Iterator) ?T {
+<a id="L331"></a>                const item = it.peek() orelse return null;
+<a id="L332"></a>                it.index += 1;
+<a id="L333"></a>                return item;
+<a id="L334"></a>            }
+<a id="L335"></a>
+<a id="L336"></a>            pub fn peekPtr(it: Iterator) ?*T {
+<a id="L337"></a>                if (it.index &gt;= it.deque.len) return null;
+<a id="L338"></a>                return it.deque.atPtr(it.index);
+<a id="L339"></a>            }
+<a id="L340"></a>            pub fn nextPtr(it: *Iterator) ?*T {
+<a id="L341"></a>                const item_ptr = it.peekPtr() orelse return null;
+<a id="L342"></a>                it.index += 1;
+<a id="L343"></a>                return item_ptr;
+<a id="L344"></a>            }
+<a id="L345"></a>        };
+<a id="L346"></a>
+<a id="L347"></a>        /// Iterates over all items in the deque in order from front to back.
+<a id="L348"></a>        pub fn iterator(deque: *const Self) Iterator {
+<a id="L349"></a>            return .{ .deque = deque, .index = 0 };
+<a id="L350"></a>        }
+<a id="L351"></a>
+<a id="L352"></a>        /// Returns the index in `buffer` where the element at the given
+<a id="L353"></a>        /// index in the logical deque is stored.
+<a id="L354"></a>        fn bufferIndex(deque: *const Self, index: usize) usize {
+<a id="L355"></a>            // This function is written in this way to avoid overflow and
+<a id="L356"></a>            // expensive division.
+<a id="L357"></a>            const head_len = deque.buffer.len - deque.head;
+<a id="L358"></a>            if (index &lt; head_len) {
+<a id="L359"></a>                return deque.head + index;
+<a id="L360"></a>            } else {
+<a id="L361"></a>                return index - head_len;
+<a id="L362"></a>            }
+<a id="L363"></a>        }
+<a id="L364"></a>    };
+<a id="L365"></a>}
+<a id="L366"></a>
+<a id="L367"></a>/// Integer addition returning `error.OutOfMemory` on overflow.
+<a id="L368"></a>fn addOrOom(a: usize, b: usize) error{OutOfMemory}!usize {
+<a id="L369"></a>    const result, const overflow = @addWithOverflow(a, b);
+<a id="L370"></a>    if (overflow != 0) return error.OutOfMemory;
+<a id="L371"></a>    return result;
+<a id="L372"></a>}
+<a id="L373"></a>
+<a id="L374"></a>test "basic" {
+<a id="L375"></a>    const testing = std.testing;
+<a id="L376"></a>    const gpa = testing.allocator;
+<a id="L377"></a>
+<a id="L378"></a>    var q: Deque(u32) = .empty;
+<a id="L379"></a>    defer q.deinit(gpa);
+<a id="L380"></a>
+<a id="L381"></a>    try testing.expectEqual(null, q.popFront());
+<a id="L382"></a>    try testing.expectEqual(null, q.popBack());
+<a id="L383"></a>
+<a id="L384"></a>    try q.pushBack(gpa, 1);
+<a id="L385"></a>    try q.pushBack(gpa, 2);
+<a id="L386"></a>    try q.pushBack(gpa, 3);
+<a id="L387"></a>    try q.pushFront(gpa, 0);
+<a id="L388"></a>
+<a id="L389"></a>    try testing.expectEqual(0, q.popFront());
+<a id="L390"></a>    try testing.expectEqual(1, q.popFront());
+<a id="L391"></a>    try testing.expectEqual(3, q.popBack());
+<a id="L392"></a>    try testing.expectEqual(2, q.popFront());
+<a id="L393"></a>    try testing.expectEqual(null, q.popFront());
+<a id="L394"></a>    try testing.expectEqual(null, q.popBack());
+<a id="L395"></a>}
+<a id="L396"></a>
+<a id="L397"></a>test "buffer" {
+<a id="L398"></a>    const testing = std.testing;
+<a id="L399"></a>
+<a id="L400"></a>    var buffer: [4]u32 = undefined;
+<a id="L401"></a>    var q: Deque(u32) = .initBuffer(&amp;buffer);
+<a id="L402"></a>
+<a id="L403"></a>    try testing.expectEqual(null, q.popFront());
+<a id="L404"></a>    try testing.expectEqual(null, q.popBack());
+<a id="L405"></a>
+<a id="L406"></a>    try q.pushBackBounded(1);
+<a id="L407"></a>    try q.pushBackBounded(2);
+<a id="L408"></a>    try q.pushBackBounded(3);
+<a id="L409"></a>    try q.pushFrontBounded(0);
+<a id="L410"></a>    try testing.expectError(error.OutOfMemory, q.pushBackBounded(4));
+<a id="L411"></a>
+<a id="L412"></a>    try testing.expectEqual(0, q.popFront());
+<a id="L413"></a>    try testing.expectEqual(1, q.popFront());
+<a id="L414"></a>    try testing.expectEqual(3, q.popBack());
+<a id="L415"></a>    try testing.expectEqual(2, q.popFront());
+<a id="L416"></a>    try testing.expectEqual(null, q.popFront());
+<a id="L417"></a>    try testing.expectEqual(null, q.popBack());
+<a id="L418"></a>}
+<a id="L419"></a>
+<a id="L420"></a>test "slow growth" {
+<a id="L421"></a>    const testing = std.testing;
+<a id="L422"></a>    const gpa = testing.allocator;
+<a id="L423"></a>
+<a id="L424"></a>    var q: Deque(i32) = .empty;
+<a id="L425"></a>    defer q.deinit(gpa);
+<a id="L426"></a>
+<a id="L427"></a>    try q.ensureTotalCapacityPrecise(gpa, 1);
+<a id="L428"></a>    q.pushBackAssumeCapacity(1);
+<a id="L429"></a>    try q.ensureTotalCapacityPrecise(gpa, 2);
+<a id="L430"></a>    q.pushFrontAssumeCapacity(0);
+<a id="L431"></a>    try q.ensureTotalCapacityPrecise(gpa, 3);
+<a id="L432"></a>    q.pushBackAssumeCapacity(2);
+<a id="L433"></a>    try q.ensureTotalCapacityPrecise(gpa, 5);
+<a id="L434"></a>    q.pushBackAssumeCapacity(3);
+<a id="L435"></a>    q.pushFrontAssumeCapacity(-1);
+<a id="L436"></a>    try q.ensureTotalCapacityPrecise(gpa, 6);
+<a id="L437"></a>    q.pushFrontAssumeCapacity(-2);
+<a id="L438"></a>
+<a id="L439"></a>    try testing.expectEqual(-2, q.popFront());
+<a id="L440"></a>    try testing.expectEqual(-1, q.popFront());
+<a id="L441"></a>    try testing.expectEqual(3, q.popBack());
+<a id="L442"></a>    try testing.expectEqual(0, q.popFront());
+<a id="L443"></a>    try testing.expectEqual(2, q.popBack());
+<a id="L444"></a>    try testing.expectEqual(1, q.popBack());
+<a id="L445"></a>    try testing.expectEqual(null, q.popFront());
+<a id="L446"></a>    try testing.expectEqual(null, q.popBack());
+<a id="L447"></a>}
+<a id="L448"></a>
+<a id="L449"></a>test "slice" {
+<a id="L450"></a>    const testing = std.testing;
+<a id="L451"></a>    const gpa = testing.allocator;
+<a id="L452"></a>
+<a id="L453"></a>    var q: Deque(i32) = .empty;
+<a id="L454"></a>    defer q.deinit(gpa);
+<a id="L455"></a>
+<a id="L456"></a>    try q.pushBackSlice(gpa, &amp;.{ 3, 4, 5 });
+<a id="L457"></a>    try q.pushBackSlice(gpa, &amp;.{ 6, 7 });
+<a id="L458"></a>    try q.pushFrontSlice(gpa, &amp;.{2});
+<a id="L459"></a>    try q.pushBackSlice(gpa, &amp;.{});
+<a id="L460"></a>    try q.pushFrontSlice(gpa, &amp;.{ 0, 1 });
+<a id="L461"></a>    try q.pushFrontSlice(gpa, &amp;.{});
+<a id="L462"></a>
+<a id="L463"></a>    try testing.expectEqual(0, q.popFront());
+<a id="L464"></a>    try testing.expectEqual(1, q.popFront());
+<a id="L465"></a>    try testing.expectEqual(7, q.popBack());
+<a id="L466"></a>    try testing.expectEqual(6, q.popBack());
+<a id="L467"></a>
+<a id="L468"></a>    try q.pushFrontSlice(gpa, &amp;.{ 0, 1 });
+<a id="L469"></a>    try q.pushBackSlice(gpa, &amp;.{ 6, 7 });
+<a id="L470"></a>
+<a id="L471"></a>    try testing.expectEqual(0, q.popFront());
+<a id="L472"></a>    try testing.expectEqual(1, q.popFront());
+<a id="L473"></a>    try testing.expectEqual(2, q.popFront());
+<a id="L474"></a>    try testing.expectEqual(7, q.popBack());
+<a id="L475"></a>    try testing.expectEqual(6, q.popBack());
+<a id="L476"></a>    try testing.expectEqual(3, q.popFront());
+<a id="L477"></a>    try testing.expectEqual(4, q.popFront());
+<a id="L478"></a>    try testing.expectEqual(5, q.popBack());
+<a id="L479"></a>    try testing.expectEqual(null, q.popFront());
+<a id="L480"></a>    try testing.expectEqual(null, q.popBack());
+<a id="L481"></a>}
+<a id="L482"></a>
+<a id="L483"></a>test "iterator" {
+<a id="L484"></a>    const testing = std.testing;
+<a id="L485"></a>    const gpa = testing.allocator;
+<a id="L486"></a>
+<a id="L487"></a>    var q: Deque(i32) = .empty;
+<a id="L488"></a>    defer q.deinit(gpa);
+<a id="L489"></a>
+<a id="L490"></a>    const items: []const i32 = &amp;.{ 0, 1, 2, 3, 4, 5 };
+<a id="L491"></a>    try q.pushFrontSlice(gpa, items);
+<a id="L492"></a>
+<a id="L493"></a>    {
+<a id="L494"></a>        var it = q.iterator();
+<a id="L495"></a>        for (items) |item| {
+<a id="L496"></a>            try testing.expectEqual(item, it.peek());
+<a id="L497"></a>            try testing.expectEqual(item, it.next());
+<a id="L498"></a>        }
+<a id="L499"></a>        try testing.expectEqual(null, it.peek());
+<a id="L500"></a>        try testing.expectEqual(null, it.next());
+<a id="L501"></a>    }
+<a id="L502"></a>    {
+<a id="L503"></a>        var it = q.iterator();
+<a id="L504"></a>        for (items) |item| {
+<a id="L505"></a>            if (it.peekPtr()) |ptr| {
+<a id="L506"></a>                try testing.expectEqual(item, ptr.*);
+<a id="L507"></a>            } else return error.TestExpectedNonNull;
+<a id="L508"></a>            if (it.nextPtr()) |ptr| {
+<a id="L509"></a>                try testing.expectEqual(item, ptr.*);
+<a id="L510"></a>            } else return error.TestExpectedNonNull;
+<a id="L511"></a>        }
+<a id="L512"></a>        try testing.expectEqual(null, it.peekPtr());
+<a id="L513"></a>        try testing.expectEqual(null, it.nextPtr());
+<a id="L514"></a>    }
+<a id="L515"></a>}
+<a id="L516"></a>
+<a id="L517"></a>test "fuzz against ArrayList oracle" {
+<a id="L518"></a>    try std.testing.fuzz({}, fuzzAgainstArrayList, .{});
+<a id="L519"></a>}
+<a id="L520"></a>
+<a id="L521"></a>const FuzzAllocator = struct {
+<a id="L522"></a>    smith: *std.testing.Smith,
+<a id="L523"></a>    bufs: [2][256 * 4]u8 align(4),
+<a id="L524"></a>    used_bitmap: u2,
+<a id="L525"></a>    used_len: [2]usize,
+<a id="L526"></a>
+<a id="L527"></a>    pub fn init(smith: *std.testing.Smith) FuzzAllocator {
+<a id="L528"></a>        return .{
+<a id="L529"></a>            .smith = smith,
+<a id="L530"></a>            .bufs = undefined,
+<a id="L531"></a>            .used_len = undefined,
+<a id="L532"></a>            .used_bitmap = 0,
+<a id="L533"></a>        };
+<a id="L534"></a>    }
+<a id="L535"></a>
+<a id="L536"></a>    pub fn allocator(f: *FuzzAllocator) std.mem.Allocator {
+<a id="L537"></a>        return .{
+<a id="L538"></a>            .ptr = f,
+<a id="L539"></a>            .vtable = &amp;.{
+<a id="L540"></a>                .alloc = alloc,
+<a id="L541"></a>                .resize = resize,
+<a id="L542"></a>                .remap = remap,
+<a id="L543"></a>                .free = free,
+<a id="L544"></a>            },
+<a id="L545"></a>        };
+<a id="L546"></a>    }
+<a id="L547"></a>
+<a id="L548"></a>    pub fn allocCount(f: *FuzzAllocator) u2 {
+<a id="L549"></a>        return @popCount(f.used_bitmap);
+<a id="L550"></a>    }
+<a id="L551"></a>
+<a id="L552"></a>    fn alloc(ctx: *anyopaque, len: usize, a: std.mem.Alignment, _: usize) ?[*]u8 {
+<a id="L553"></a>        const f: *FuzzAllocator = @ptrCast(@alignCast(ctx));
+<a id="L554"></a>        assert(a == .@"4");
+<a id="L555"></a>        assert(len % 4 == 0);
+<a id="L556"></a>
+<a id="L557"></a>        const slot: u1 = @intCast(@ctz(~f.used_bitmap));
+<a id="L558"></a>        const buf: []u8 = &amp;f.bufs[slot];
+<a id="L559"></a>        if (len &gt; buf.len) return null;
+<a id="L560"></a>        f.used_bitmap |= @as(u2, 1) &lt;&lt; slot;
+<a id="L561"></a>        f.used_len[slot] = len;
+<a id="L562"></a>        return buf.ptr;
+<a id="L563"></a>    }
+<a id="L564"></a>
+<a id="L565"></a>    fn memSlot(f: *FuzzAllocator, mem: []u8) u1 {
+<a id="L566"></a>        const slot: u1 = if (&amp;mem[0] == &amp;f.bufs[0][0])
+<a id="L567"></a>            0
+<a id="L568"></a>        else if (&amp;mem[0] == &amp;f.bufs[1][0])
+<a id="L569"></a>            1
+<a id="L570"></a>        else
+<a id="L571"></a>            unreachable;
+<a id="L572"></a>        assert((f.used_bitmap &gt;&gt; slot) &amp; 1 == 1);
+<a id="L573"></a>        assert(mem.len == f.used_len[slot]);
+<a id="L574"></a>        return slot;
+<a id="L575"></a>    }
+<a id="L576"></a>
+<a id="L577"></a>    fn resize(ctx: *anyopaque, mem: []u8, a: std.mem.Alignment, new_len: usize, _: usize) bool {
+<a id="L578"></a>        const f: *FuzzAllocator = @ptrCast(@alignCast(ctx));
+<a id="L579"></a>        assert(a == .@"4");
+<a id="L580"></a>        assert(f.allocCount() == 1);
+<a id="L581"></a>
+<a id="L582"></a>        const slot = f.memSlot(mem);
+<a id="L583"></a>        if (new_len &gt; f.bufs[slot].len or f.smith.value(bool)) return false;
+<a id="L584"></a>        f.used_len[slot] = new_len;
+<a id="L585"></a>        return true;
+<a id="L586"></a>    }
+<a id="L587"></a>
+<a id="L588"></a>    fn remap(ctx: *anyopaque, mem: []u8, a: std.mem.Alignment, new_len: usize, _: usize) ?[*]u8 {
+<a id="L589"></a>        const f: *FuzzAllocator = @ptrCast(@alignCast(ctx));
+<a id="L590"></a>        assert(a == .@"4");
+<a id="L591"></a>        assert(f.allocCount() == 1);
+<a id="L592"></a>
+<a id="L593"></a>        const slot = f.memSlot(mem);
+<a id="L594"></a>        if (new_len &gt; f.bufs[slot].len or f.smith.value(bool)) return null;
+<a id="L595"></a>
+<a id="L596"></a>        if (f.smith.value(bool)) {
+<a id="L597"></a>            f.used_len[slot] = new_len;
+<a id="L598"></a>            // remap in place
+<a id="L599"></a>            return mem.ptr;
+<a id="L600"></a>        } else {
+<a id="L601"></a>            // moving remap
+<a id="L602"></a>            const new_slot = ~slot;
+<a id="L603"></a>            f.used_bitmap = ~f.used_bitmap;
+<a id="L604"></a>            f.used_len[new_slot] = new_len;
+<a id="L605"></a>
+<a id="L606"></a>            const new_buf = &amp;f.bufs[new_slot];
+<a id="L607"></a>            @memcpy(new_buf[0..mem.len], mem);
+<a id="L608"></a>            return new_buf.ptr;
+<a id="L609"></a>        }
+<a id="L610"></a>    }
+<a id="L611"></a>
+<a id="L612"></a>    fn free(ctx: *anyopaque, mem: []u8, a: std.mem.Alignment, _: usize) void {
+<a id="L613"></a>        const f: *FuzzAllocator = @ptrCast(@alignCast(ctx));
+<a id="L614"></a>        assert(a == .@"4");
+<a id="L615"></a>        f.used_bitmap ^= @as(u2, 1) &lt;&lt; f.memSlot(mem);
+<a id="L616"></a>    }
+<a id="L617"></a>};
+<a id="L618"></a>
+<a id="L619"></a>fn fuzzAgainstArrayList(_: void, smith: *std.testing.Smith) anyerror!void {
+<a id="L620"></a>    const testing = std.testing;
+<a id="L621"></a>
+<a id="L622"></a>    var q_gpa_inst: FuzzAllocator = .init(smith);
+<a id="L623"></a>    var l_gpa_buf: [q_gpa_inst.bufs[0].len]u8 align(4) = undefined;
+<a id="L624"></a>    var l_gpa_inst: std.heap.FixedBufferAllocator = .init(&amp;l_gpa_buf);
+<a id="L625"></a>    const q_gpa = q_gpa_inst.allocator();
+<a id="L626"></a>    const l_gpa = l_gpa_inst.allocator();
+<a id="L627"></a>
+<a id="L628"></a>    var q: Deque(u32) = .empty;
+<a id="L629"></a>    var l: std.ArrayList(u32) = .empty;
+<a id="L630"></a>
+<a id="L631"></a>    const Action = enum(u8) {
+<a id="L632"></a>        grow,
+<a id="L633"></a>        push_back,
+<a id="L634"></a>        push_front,
+<a id="L635"></a>        push_back_slice,
+<a id="L636"></a>        push_front_slice,
+<a id="L637"></a>        pop_back,
+<a id="L638"></a>        pop_front,
+<a id="L639"></a>    };
+<a id="L640"></a>
+<a id="L641"></a>    while (!smith.eosWeightedSimple(15, 1)) {
+<a id="L642"></a>        const baseline = testing.Smith.baselineWeights(Action);
+<a id="L643"></a>        const grow_weight: testing.Smith.Weight = .value(Action, .grow, 3);
+<a id="L644"></a>        switch (smith.valueWeighted(Action, baseline ++ .{grow_weight})) {
+<a id="L645"></a>            .push_back =&gt; {
+<a id="L646"></a>                const item = smith.value(u32);
+<a id="L647"></a>                try testing.expectEqual(
+<a id="L648"></a>                    l.appendBounded(item),
+<a id="L649"></a>                    q.pushBackBounded(item),
+<a id="L650"></a>                );
+<a id="L651"></a>            },
+<a id="L652"></a>            .push_front =&gt; {
+<a id="L653"></a>                const item = smith.value(u32);
+<a id="L654"></a>                try testing.expectEqual(
+<a id="L655"></a>                    l.insertBounded(0, item),
+<a id="L656"></a>                    q.pushFrontBounded(item),
+<a id="L657"></a>                );
+<a id="L658"></a>            },
+<a id="L659"></a>            .push_back_slice =&gt; {
+<a id="L660"></a>                var buffer: [std.math.maxInt(u3)]u32 = undefined;
+<a id="L661"></a>                const items = buffer[0..smith.value(u3)];
+<a id="L662"></a>                for (items) |*item| {
+<a id="L663"></a>                    item.* = smith.value(u32);
+<a id="L664"></a>                }
+<a id="L665"></a>                try testing.expectEqual(
+<a id="L666"></a>                    l.appendSliceBounded(items),
+<a id="L667"></a>                    q.pushBackSliceBounded(items),
+<a id="L668"></a>                );
+<a id="L669"></a>            },
+<a id="L670"></a>            .push_front_slice =&gt; {
+<a id="L671"></a>                var buffer: [std.math.maxInt(u3)]u32 = undefined;
+<a id="L672"></a>                const items = buffer[0..smith.value(u3)];
+<a id="L673"></a>                for (items) |*item| {
+<a id="L674"></a>                    item.* = smith.value(u32);
+<a id="L675"></a>                }
+<a id="L676"></a>                try testing.expectEqual(
+<a id="L677"></a>                    l.insertSliceBounded(0, items),
+<a id="L678"></a>                    q.pushFrontSliceBounded(items),
+<a id="L679"></a>                );
+<a id="L680"></a>            },
+<a id="L681"></a>            .pop_back =&gt; {
+<a id="L682"></a>                try testing.expectEqual(l.pop(), q.popBack());
+<a id="L683"></a>            },
+<a id="L684"></a>            .pop_front =&gt; {
+<a id="L685"></a>                try testing.expectEqual(
+<a id="L686"></a>                    if (l.items.len &gt; 0) l.orderedRemove(0) else null,
+<a id="L687"></a>                    q.popFront(),
+<a id="L688"></a>                );
+<a id="L689"></a>            },
+<a id="L690"></a>            // Growing by small, random, linear amounts seems to better test
+<a id="L691"></a>            // ensureTotalCapacityPrecise(), which is the most complex part
+<a id="L692"></a>            // of the Deque implementation.
+<a id="L693"></a>            .grow =&gt; {
+<a id="L694"></a>                const growth = smith.value(u3);
+<a id="L695"></a>                try l.ensureTotalCapacityPrecise(l_gpa, l.items.len + growth);
+<a id="L696"></a>                try q.ensureTotalCapacityPrecise(q_gpa, q.len + growth);
+<a id="L697"></a>            },
+<a id="L698"></a>        }
+<a id="L699"></a>        try testing.expectEqual(l.getLastOrNull(), q.back());
+<a id="L700"></a>        try testing.expectEqual(
+<a id="L701"></a>            if (l.items.len &gt; 0) l.items[0] else null,
+<a id="L702"></a>            q.front(),
+<a id="L703"></a>        );
+<a id="L704"></a>        try testing.expectEqual(l.items.len, q.len);
+<a id="L705"></a>        try testing.expectEqual(l.capacity, q.buffer.len);
+<a id="L706"></a>        {
+<a id="L707"></a>            var it = q.iterator();
+<a id="L708"></a>            for (l.items) |item| {
+<a id="L709"></a>                try testing.expectEqual(item, it.next());
+<a id="L710"></a>            }
+<a id="L711"></a>            try testing.expectEqual(null, it.next());
+<a id="L712"></a>        }
+<a id="L713"></a>        try testing.expectEqual(@intFromBool(q.buffer.len != 0), q_gpa_inst.allocCount());
+<a id="L714"></a>    }
+<a id="L715"></a>    q.deinit(q_gpa);
+<a id="L716"></a>    try testing.expectEqual(0, q_gpa_inst.allocCount());
+<a id="L717"></a>}
+</pre>
 </body>
 </html>

@@ -2,781 +2,784 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Source: zig-0.16.0-std/Target/Query.zig</title>
+    <title>Source: Target/Query.zig</title>
     <style>
         body { background: #1e1e1e; color: #d4d4d4; font-family: monospace; padding: 20px; }
         pre { white-space: pre-wrap; word-wrap: break-word; }
         .header { border-bottom: 1px solid #444; padding-bottom: 10px; margin-bottom: 20px; }
         a { color: #569cd6; }
+        a[id] { color: inherit; text-decoration: none; }
+        :target { background: #3a3a00; }
     </style>
 </head>
 <body>
     <div class="header">
-        <a href="/">Index</a> | <strong>File: zig-0.16.0-std/Target/Query.zig</strong>
+        <a href="/">Index</a> | <strong>File: Target/Query.zig</strong>
     </div>
-    <pre>//! Contains all the same data as `Target`, additionally introducing the
-//! concept of "the native target". The purpose of this abstraction is to
-//! provide meaningful and unsurprising defaults. This struct does reference
-//! any resources and it is copyable.
-
-const Query = @This();
-const std = @import("../std.zig");
-const builtin = @import("builtin");
-const assert = std.debug.assert;
-const Target = std.Target;
-const mem = std.mem;
-const Allocator = std.mem.Allocator;
-const ArrayList = std.ArrayList;
-
-/// `null` means native.
-cpu_arch: ?Target.Cpu.Arch = null,
-
-cpu_model: CpuModel = .determined_by_arch_os,
-
-/// Sparse set of CPU features to add to the set from `cpu_model`.
-cpu_features_add: Target.Cpu.Feature.Set = .empty,
-
-/// Sparse set of CPU features to remove from the set from `cpu_model`.
-cpu_features_sub: Target.Cpu.Feature.Set = .empty,
-
-/// `null` means native.
-os_tag: ?Target.Os.Tag = null,
-
-/// `null` means the default version range for `os_tag`. If `os_tag` is `null` (native)
-/// then `null` for this field means native.
-os_version_min: ?OsVersion = null,
-
-/// When cross compiling, `null` means default (latest known OS version).
-/// When `os_tag` is native, `null` means equal to the native OS version.
-os_version_max: ?OsVersion = null,
-
-/// `null` means default when cross compiling, or native when `os_tag` is native.
-/// If `isGnu()` is `false`, this must be `null` and is ignored.
-glibc_version: ?SemanticVersion = null,
-
-/// `null` means default when cross compiling, or native when `os_tag` is native.
-/// If `isAndroid()` is `false`, this must be `null` and is ignored.
-android_api_level: ?u32 = null,
-
-/// `null` means the native C ABI, if `os_tag` is native, otherwise it means the default C ABI.
-abi: ?Target.Abi = null,
-
-/// When `os_tag` is `null`, then `null` means native. Otherwise it means the standard path
-/// based on the `os_tag`.  When `dynamic_linker` is a non-`null` empty string, no dynamic
-/// linker is used regardless of `os_tag`.
-dynamic_linker: ?Target.DynamicLinker = null,
-
-/// `null` means default for the cpu/arch/os combo.
-ofmt: ?Target.ObjectFormat = null,
-
-pub const CpuModel = union(enum) {
-    /// Always native
-    native,
-
-    /// Always baseline
-    baseline,
-
-    /// If CPU Architecture is native, then the CPU model will be native. Otherwise,
-    /// it will be baseline.
-    determined_by_arch_os,
-
-    explicit: *const Target.Cpu.Model,
-
-    pub fn eql(a: CpuModel, b: CpuModel) bool {
-        const Tag = @typeInfo(CpuModel).@"union".tag_type.?;
-        const a_tag: Tag = a;
-        const b_tag: Tag = b;
-        if (a_tag != b_tag) return false;
-        return switch (a) {
-            .native, .baseline, .determined_by_arch_os =&gt; true,
-            .explicit =&gt; |a_model| a_model == b.explicit,
-        };
-    }
-};
-
-pub const OsVersion = union(enum) {
-    none: void,
-    semver: SemanticVersion,
-    windows: Target.Os.WindowsVersion,
-
-    pub fn eql(a: OsVersion, b: OsVersion) bool {
-        const Tag = @typeInfo(OsVersion).@"union".tag_type.?;
-        const a_tag: Tag = a;
-        const b_tag: Tag = b;
-        if (a_tag != b_tag) return false;
-        return switch (a) {
-            .none =&gt; true,
-            .semver =&gt; |a_semver| a_semver.order(b.semver) == .eq,
-            .windows =&gt; |a_windows| a_windows == b.windows,
-        };
-    }
-
-    pub fn eqlOpt(a: ?OsVersion, b: ?OsVersion) bool {
-        if (a == null and b == null) return true;
-        if (a == null or b == null) return false;
-        return OsVersion.eql(a.?, b.?);
-    }
-};
-
-pub const SemanticVersion = std.SemanticVersion;
-
-pub fn fromTarget(target: *const Target) Query {
-    var result: Query = .{
-        .cpu_arch = target.cpu.arch,
-        .cpu_model = .{ .explicit = target.cpu.model },
-        .os_tag = target.os.tag,
-        .os_version_min = undefined,
-        .os_version_max = undefined,
-        .abi = target.abi,
-        .glibc_version = if (target.abi.isGnu()) target.os.versionRange().gnuLibCVersion() else null,
-        .android_api_level = if (target.abi.isAndroid()) target.os.version_range.linux.android else null,
-    };
-    result.updateOsVersionRange(target.os);
-
-    const all_features = target.cpu.arch.allFeaturesList();
-    var cpu_model_set = target.cpu.model.features;
-    cpu_model_set.populateDependencies(all_features);
-    {
-        // The "add" set is the full set with the CPU Model set removed.
-        const add_set = &amp;result.cpu_features_add;
-        add_set.* = target.cpu.features;
-        add_set.removeFeatureSet(cpu_model_set);
-    }
-    {
-        // The "sub" set is the features that are on in CPU Model set and off in the full set.
-        const sub_set = &amp;result.cpu_features_sub;
-        sub_set.* = cpu_model_set;
-        sub_set.removeFeatureSet(target.cpu.features);
-    }
-    return result;
-}
-
-fn updateOsVersionRange(self: *Query, os: Target.Os) void {
-    self.os_version_min, self.os_version_max = switch (os.tag.versionRangeTag()) {
-        .none =&gt; .{ .{ .none = {} }, .{ .none = {} } },
-        .semver =&gt; .{
-            .{ .semver = os.version_range.semver.min },
-            .{ .semver = os.version_range.semver.max },
-        },
-        inline .hurd, .linux =&gt; |t| .{
-            .{ .semver = @field(os.version_range, @tagName(t)).range.min },
-            .{ .semver = @field(os.version_range, @tagName(t)).range.max },
-        },
-        .windows =&gt; .{
-            .{ .windows = os.version_range.windows.min },
-            .{ .windows = os.version_range.windows.max },
-        },
-    };
-}
-
-pub const ParseOptions = struct {
-    /// This is sometimes called a "triple". It looks roughly like this:
-    ///     riscv64-linux-musl
-    /// The fields are, respectively:
-    /// * CPU Architecture
-    /// * Operating System (and optional version range)
-    /// * C ABI (optional, with optional glibc version or Android API level)
-    /// The string "native" can be used for CPU architecture as well as Operating System.
-    /// If the CPU Architecture is specified as "native", then the Operating System and C ABI may be omitted.
-    arch_os_abi: []const u8 = "native",
-
-    /// Looks like "name+a+b-c-d+e", where "name" is a CPU Model name, "a", "b", and "e"
-    /// are examples of CPU features to add to the set, and "c" and "d" are examples of CPU features
-    /// to remove from the set.
-    /// The following special strings are recognized for CPU Model name:
-    /// * "baseline" - The "default" set of CPU features for cross-compiling. A conservative set
-    ///                of features that is expected to be supported on most available hardware.
-    /// * "native"   - The native CPU model is to be detected when compiling.
-    /// If this field is not provided (`null`), then the value will depend on the
-    /// parsed CPU Architecture. If native, then this will be "native". Otherwise, it will be "baseline".
-    cpu_features: ?[]const u8 = null,
-
-    /// Absolute path to dynamic linker, to override the default, which is either a natively
-    /// detected path, or a standard path.
-    dynamic_linker: ?[]const u8 = null,
-
-    object_format: ?[]const u8 = null,
-
-    /// If this is provided, the function will populate some information about parsing failures,
-    /// so that user-friendly error messages can be delivered.
-    diagnostics: ?*Diagnostics = null,
-
-    pub const Diagnostics = struct {
-        /// If the architecture was determined, this will be populated.
-        arch: ?Target.Cpu.Arch = null,
-
-        /// If the OS name was determined, this will be populated.
-        os_name: ?[]const u8 = null,
-
-        /// If the OS tag was determined, this will be populated.
-        os_tag: ?Target.Os.Tag = null,
-
-        /// If the ABI was determined, this will be populated.
-        abi: ?Target.Abi = null,
-
-        /// If the CPU name was determined, this will be populated.
-        cpu_name: ?[]const u8 = null,
-
-        /// If error.UnknownCpuFeature is returned, this will be populated.
-        unknown_feature_name: ?[]const u8 = null,
-
-        /// If error.UnknownArchitecture is returned, this will be populated.
-        unknown_architecture_name: ?[]const u8 = null,
-    };
-};
-
-pub fn parse(args: ParseOptions) !Query {
-    var dummy_diags: ParseOptions.Diagnostics = undefined;
-    const diags = args.diagnostics orelse &amp;dummy_diags;
-
-    var result: Query = .{
-        .dynamic_linker = if (args.dynamic_linker) |dynamic_linker| .init(dynamic_linker) else null,
-    };
-
-    var it = mem.splitScalar(u8, args.arch_os_abi, '-');
-    const arch_name = it.first();
-    const arch_is_native = mem.eql(u8, arch_name, "native");
-    if (!arch_is_native) {
-        result.cpu_arch = std.meta.stringToEnum(Target.Cpu.Arch, arch_name) orelse {
-            diags.unknown_architecture_name = arch_name;
-            return error.UnknownArchitecture;
-        };
-    }
-    const arch = result.cpu_arch orelse builtin.cpu.arch;
-    diags.arch = arch;
-
-    if (it.next()) |os_text| {
-        try parseOs(&amp;result, diags, os_text);
-    } else if (!arch_is_native) {
-        return error.MissingOperatingSystem;
-    }
-
-    const opt_abi_text = it.next();
-    if (opt_abi_text) |abi_text| {
-        var abi_it = mem.splitScalar(u8, abi_text, '.');
-        const abi = std.meta.stringToEnum(Target.Abi, abi_it.first()) orelse
-            return error.UnknownApplicationBinaryInterface;
-        result.abi = abi;
-        diags.abi = abi;
-
-        const abi_ver_text = abi_it.rest();
-        if (abi_it.next() != null) {
-            if (abi.isGnu()) {
-                result.glibc_version = parseVersion(abi_ver_text) catch |err| switch (err) {
-                    error.Overflow =&gt; return error.InvalidAbiVersion,
-                    error.InvalidVersion =&gt; return error.InvalidAbiVersion,
-                };
-            } else if (abi.isAndroid()) {
-                result.android_api_level = std.fmt.parseUnsigned(u32, abi_ver_text, 10) catch |err| switch (err) {
-                    error.InvalidCharacter =&gt; return error.InvalidVersion,
-                    error.Overflow =&gt; return error.Overflow,
-                };
-            } else {
-                return error.InvalidAbiVersion;
-            }
-        }
-    }
-
-    if (it.next() != null) return error.UnexpectedExtraField;
-
-    if (args.cpu_features) |cpu_features| {
-        const all_features = arch.allFeaturesList();
-        var index: usize = 0;
-        while (index &lt; cpu_features.len and
-            cpu_features[index] != '+' and
-            cpu_features[index] != '-')
-        {
-            index += 1;
-        }
-        const cpu_name = cpu_features[0..index];
-        diags.cpu_name = cpu_name;
-
-        const add_set = &amp;result.cpu_features_add;
-        const sub_set = &amp;result.cpu_features_sub;
-        if (mem.eql(u8, cpu_name, "native")) {
-            result.cpu_model = .native;
-        } else if (mem.eql(u8, cpu_name, "baseline")) {
-            result.cpu_model = .baseline;
-        } else {
-            result.cpu_model = .{ .explicit = try arch.parseCpuModel(cpu_name) };
-        }
-
-        while (index &lt; cpu_features.len) {
-            const op = cpu_features[index];
-            const set = switch (op) {
-                '+' =&gt; add_set,
-                '-' =&gt; sub_set,
-                else =&gt; unreachable,
-            };
-            index += 1;
-            const start = index;
-            while (index &lt; cpu_features.len and
-                cpu_features[index] != '+' and
-                cpu_features[index] != '-')
-            {
-                index += 1;
-            }
-            const feature_name = cpu_features[start..index];
-            for (all_features, 0..) |feature, feat_index_usize| {
-                const feat_index = @as(Target.Cpu.Feature.Set.Index, @intCast(feat_index_usize));
-                if (mem.eql(u8, feature_name, feature.name)) {
-                    set.addFeature(feat_index);
-                    break;
-                }
-            } else {
-                diags.unknown_feature_name = feature_name;
-                return error.UnknownCpuFeature;
-            }
-        }
-    }
-
-    if (args.object_format) |ofmt_name| {
-        result.ofmt = std.meta.stringToEnum(Target.ObjectFormat, ofmt_name) orelse
-            return error.UnknownObjectFormat;
-    }
-
-    return result;
-}
-
-/// Similar to `parse` except instead of fully parsing, it only determines the CPU
-/// architecture and returns it if it can be determined, and returns `null` otherwise.
-/// This is intended to be used if the API user of Query needs to learn the
-/// target CPU architecture in order to fully populate `ParseOptions`.
-pub fn parseCpuArch(args: ParseOptions) ?Target.Cpu.Arch {
-    var it = mem.splitScalar(u8, args.arch_os_abi, '-');
-    const arch_name = it.first();
-    const arch_is_native = mem.eql(u8, arch_name, "native");
-    if (arch_is_native) {
-        return builtin.cpu.arch;
-    } else {
-        return std.meta.stringToEnum(Target.Cpu.Arch, arch_name);
-    }
-}
-
-/// Similar to `SemanticVersion.parse`, but with following changes:
-/// * Leading zeroes are allowed.
-/// * Supports only 2 or 3 version components (major, minor, [patch]). If 3-rd component is omitted, it will be 0.
-/// * Prerelease and build components are disallowed.
-pub fn parseVersion(ver: []const u8) error{ InvalidVersion, Overflow }!SemanticVersion {
-    const parseVersionComponentFn = (struct {
-        fn parseVersionComponentInner(component: []const u8) error{ InvalidVersion, Overflow }!usize {
-            return std.fmt.parseUnsigned(usize, component, 10) catch |err| switch (err) {
-                error.InvalidCharacter =&gt; return error.InvalidVersion,
-                error.Overflow =&gt; return error.Overflow,
-            };
-        }
-    }).parseVersionComponentInner;
-
-    var version_components = mem.splitScalar(u8, ver, '.');
-
-    const major = version_components.first();
-    const minor = version_components.next() orelse return error.InvalidVersion;
-    const patch = version_components.next() orelse "0";
-    if (version_components.next() != null) return error.InvalidVersion;
-
-    return .{
-        .major = try parseVersionComponentFn(major),
-        .minor = try parseVersionComponentFn(minor),
-        .patch = try parseVersionComponentFn(patch),
-    };
-}
-
-test parseVersion {
-    try std.testing.expectEqual(SemanticVersion{ .major = 1, .minor = 2, .patch = 0 }, try parseVersion("1.2"));
-    try std.testing.expectEqual(SemanticVersion{ .major = 1, .minor = 2, .patch = 3 }, try parseVersion("1.2.3"));
-
-    try std.testing.expectError(error.InvalidVersion, parseVersion("1"));
-    try std.testing.expectError(error.InvalidVersion, parseVersion("1.2.3.4"));
-    try std.testing.expectError(error.InvalidVersion, parseVersion("1.2.3-dev"));
-}
-
-pub fn isNativeCpu(self: Query) bool {
-    return self.cpu_arch == null and
-        (self.cpu_model == .native or self.cpu_model == .determined_by_arch_os) and
-        self.cpu_features_sub.isEmpty() and self.cpu_features_add.isEmpty();
-}
-
-pub fn isNativeOs(self: Query) bool {
-    return self.os_tag == null and self.os_version_min == null and self.os_version_max == null and
-        self.dynamic_linker == null and self.glibc_version == null and self.android_api_level == null;
-}
-
-pub fn isNativeAbi(self: Query) bool {
-    return self.os_tag == null and self.abi == null;
-}
-
-pub fn isNativeTriple(self: Query) bool {
-    return self.isNativeCpu() and self.isNativeOs() and self.isNativeAbi();
-}
-
-pub fn isNative(self: Query) bool {
-    return self.isNativeTriple() and self.ofmt == null;
-}
-
-pub fn canDetectLibC(self: Query) bool {
-    if (self.isNativeOs()) return true;
-    if (self.os_tag) |os| {
-        if (builtin.os.tag == .macos and os.isDarwin()) return true;
-        if (os == .linux) {
-            if (self.abi) |abi| if (abi.isAndroid()) return true;
-        }
-    }
-    return false;
-}
-
-/// Formats a version with the patch component omitted if it is zero,
-/// unlike SemanticVersion.format which formats all its version components regardless.
-fn formatVersion(version: SemanticVersion, gpa: Allocator, list: *ArrayList(u8)) !void {
-    if (version.patch == 0) {
-        try list.print(gpa, "{d}.{d}", .{ version.major, version.minor });
-    } else {
-        try list.print(gpa, "{d}.{d}.{d}", .{ version.major, version.minor, version.patch });
-    }
-}
-
-pub fn zigTriple(self: Query, gpa: Allocator) Allocator.Error![]u8 {
-    if (self.isNativeTriple()) return gpa.dupe(u8, "native");
-
-    const arch_name = if (self.cpu_arch) |arch| @tagName(arch) else "native";
-    const os_name = if (self.os_tag) |os_tag| @tagName(os_tag) else "native";
-
-    var result: ArrayList(u8) = .empty;
-    defer result.deinit(gpa);
-
-    try result.print(gpa, "{s}-{s}", .{ arch_name, os_name });
-
-    // The zig target syntax does not allow specifying a max os version with no min, so
-    // if either are present, we need the min.
-    if (self.os_version_min) |min| {
-        switch (min) {
-            .none =&gt; {},
-            .semver =&gt; |v| {
-                try result.appendSlice(gpa, ".");
-                try formatVersion(v, gpa, &amp;result);
-            },
-            .windows =&gt; |v| {
-                try result.print(gpa, "{f}", .{v});
-            },
-        }
-    }
-    if (self.os_version_max) |max| {
-        switch (max) {
-            .none =&gt; {},
-            .semver =&gt; |v| {
-                try result.appendSlice(gpa, "...");
-                try formatVersion(v, gpa, &amp;result);
-            },
-            .windows =&gt; |v| {
-                // This is counting on a custom format() function defined on `WindowsVersion`
-                // to add a prefix '.' and make there be a total of three dots.
-                try result.print(gpa, "..{f}", .{v});
-            },
-        }
-    }
-
-    if (self.glibc_version) |v| {
-        const name = if (self.abi) |abi| @tagName(abi) else "gnu";
-        try result.ensureUnusedCapacity(gpa, name.len + 2);
-        result.appendAssumeCapacity('-');
-        result.appendSliceAssumeCapacity(name);
-        result.appendAssumeCapacity('.');
-        try formatVersion(v, gpa, &amp;result);
-    } else if (self.android_api_level) |lvl| {
-        const name = if (self.abi) |abi| @tagName(abi) else "android";
-        try result.ensureUnusedCapacity(gpa, name.len + 2);
-        result.appendAssumeCapacity('-');
-        result.appendSliceAssumeCapacity(name);
-        result.appendAssumeCapacity('.');
-        try result.print(gpa, "{d}", .{lvl});
-    } else if (self.abi) |abi| {
-        const name = @tagName(abi);
-        try result.ensureUnusedCapacity(gpa, name.len + 1);
-        result.appendAssumeCapacity('-');
-        result.appendSliceAssumeCapacity(name);
-    }
-
-    return result.toOwnedSlice(gpa);
-}
-
-/// Renders the query into a textual representation that can be parsed via the
-/// `-mcpu` flag passed to the Zig compiler.
-/// Appends the result to `buffer`.
-pub fn serializeCpu(q: Query, buffer: *std.array_list.Managed(u8)) Allocator.Error!void {
-    try buffer.ensureUnusedCapacity(8);
-    switch (q.cpu_model) {
-        .native =&gt; {
-            buffer.appendSliceAssumeCapacity("native");
-        },
-        .baseline =&gt; {
-            buffer.appendSliceAssumeCapacity("baseline");
-        },
-        .determined_by_arch_os =&gt; {
-            if (q.cpu_arch == null) {
-                buffer.appendSliceAssumeCapacity("native");
-            } else {
-                buffer.appendSliceAssumeCapacity("baseline");
-            }
-        },
-        .explicit =&gt; |model| {
-            try buffer.appendSlice(model.name);
-        },
-    }
-
-    if (q.cpu_features_add.isEmpty() and q.cpu_features_sub.isEmpty()) {
-        // The CPU name alone is sufficient.
-        return;
-    }
-
-    const cpu_arch = q.cpu_arch orelse builtin.cpu.arch;
-    const all_features = cpu_arch.allFeaturesList();
-
-    for (all_features, 0..) |feature, i_usize| {
-        const i: Target.Cpu.Feature.Set.Index = @intCast(i_usize);
-        try buffer.ensureUnusedCapacity(feature.name.len + 1);
-        if (q.cpu_features_sub.isEnabled(i)) {
-            buffer.appendAssumeCapacity('-');
-            buffer.appendSliceAssumeCapacity(feature.name);
-        } else if (q.cpu_features_add.isEnabled(i)) {
-            buffer.appendAssumeCapacity('+');
-            buffer.appendSliceAssumeCapacity(feature.name);
-        }
-    }
-}
-
-pub fn serializeCpuAlloc(q: Query, ally: Allocator) Allocator.Error![]u8 {
-    var buffer = std.array_list.Managed(u8).init(ally);
-    try serializeCpu(q, &amp;buffer);
-    return buffer.toOwnedSlice();
-}
-
-pub fn allocDescription(self: Query, allocator: Allocator) ![]u8 {
-    // TODO is there anything else worthy of the description that is not
-    // already captured in the triple?
-    return self.zigTriple(allocator);
-}
-
-pub fn setGnuLibCVersion(self: *Query, major: u32, minor: u32, patch: u32) void {
-    self.glibc_version = SemanticVersion{ .major = major, .minor = minor, .patch = patch };
-}
-
-fn parseOs(result: *Query, diags: *ParseOptions.Diagnostics, text: []const u8) !void {
-    var it = mem.splitScalar(u8, text, '.');
-    const os_name = it.first();
-    diags.os_name = os_name;
-    const os_is_native = mem.eql(u8, os_name, "native");
-    if (!os_is_native) {
-        result.os_tag = std.meta.stringToEnum(Target.Os.Tag, os_name) orelse
-            return error.UnknownOperatingSystem;
-    }
-    const tag = result.os_tag orelse builtin.os.tag;
-    diags.os_tag = tag;
-
-    const version_text = it.rest();
-    if (version_text.len &gt; 0) switch (tag.versionRangeTag()) {
-        .none =&gt; return error.InvalidOperatingSystemVersion,
-        .semver, .hurd, .linux =&gt; {
-            var range_it = mem.splitSequence(u8, version_text, "...");
-            result.os_version_min = .{
-                .semver = parseVersion(range_it.first()) catch |err| switch (err) {
-                    error.Overflow =&gt; return error.InvalidOperatingSystemVersion,
-                    error.InvalidVersion =&gt; return error.InvalidOperatingSystemVersion,
-                },
-            };
-            if (range_it.next()) |v| {
-                result.os_version_max = .{
-                    .semver = parseVersion(v) catch |err| switch (err) {
-                        error.Overflow =&gt; return error.InvalidOperatingSystemVersion,
-                        error.InvalidVersion =&gt; return error.InvalidOperatingSystemVersion,
-                    },
-                };
-            }
-        },
-        .windows =&gt; {
-            var range_it = mem.splitSequence(u8, version_text, "...");
-            result.os_version_min = .{
-                .windows = try Target.Os.WindowsVersion.parse(range_it.first()),
-            };
-            if (range_it.next()) |v| {
-                result.os_version_max = .{
-                    .windows = try Target.Os.WindowsVersion.parse(v),
-                };
-            }
-        },
-    };
-}
-
-pub fn eql(a: Query, b: Query) bool {
-    if (a.cpu_arch != b.cpu_arch) return false;
-    if (!a.cpu_model.eql(b.cpu_model)) return false;
-    if (!a.cpu_features_add.eql(b.cpu_features_add)) return false;
-    if (!a.cpu_features_sub.eql(b.cpu_features_sub)) return false;
-    if (a.os_tag != b.os_tag) return false;
-    if (!OsVersion.eqlOpt(a.os_version_min, b.os_version_min)) return false;
-    if (!OsVersion.eqlOpt(a.os_version_max, b.os_version_max)) return false;
-    if (!versionEqualOpt(a.glibc_version, b.glibc_version)) return false;
-    if (a.android_api_level != b.android_api_level) return false;
-    if (a.abi != b.abi) return false;
-    if (!dynamicLinkerEqualOpt(a.dynamic_linker, b.dynamic_linker)) return false;
-    if (a.ofmt != b.ofmt) return false;
-
-    return true;
-}
-
-fn versionEqualOpt(a: ?SemanticVersion, b: ?SemanticVersion) bool {
-    if (a == null and b == null) return true;
-    if (a == null or b == null) return false;
-    return SemanticVersion.order(a.?, b.?) == .eq;
-}
-
-fn dynamicLinkerEqualOpt(a: ?Target.DynamicLinker, b: ?Target.DynamicLinker) bool {
-    if (a == null and b == null) return true;
-    if (a == null or b == null) return false;
-    return a.?.eql(b.?);
-}
-
-test parse {
-    const io = std.testing.io;
-
-    if (builtin.target.isGnuLibC()) {
-        var query = try Query.parse(.{});
-        query.setGnuLibCVersion(2, 1, 1);
-
-        const text = try query.zigTriple(std.testing.allocator);
-        defer std.testing.allocator.free(text);
-
-        try std.testing.expectEqualSlices(u8, "native-native-gnu.2.1.1", text);
-    }
-    if (builtin.target.abi.isAndroid()) {
-        var query = try Query.parse(.{});
-        query.android_api_level = 30;
-
-        const text = try query.zigTriple(std.testing.allocator);
-        defer std.testing.allocator.free(text);
-
-        try std.testing.expectEqualSlices(u8, "native-native-android.30", text);
-    }
-    {
-        const query = try Query.parse(.{
-            .arch_os_abi = "aarch64-linux",
-            .cpu_features = "native",
-        });
-
-        try std.testing.expect(query.cpu_arch.? == .aarch64);
-        try std.testing.expect(query.cpu_model == .native);
-    }
-    {
-        const query = try Query.parse(.{ .arch_os_abi = "native" });
-
-        try std.testing.expect(query.cpu_arch == null);
-        try std.testing.expect(query.isNative());
-
-        const text = try query.zigTriple(std.testing.allocator);
-        defer std.testing.allocator.free(text);
-        try std.testing.expectEqualSlices(u8, "native", text);
-    }
-    {
-        const query = try Query.parse(.{
-            .arch_os_abi = "x86_64-linux-gnu",
-            .cpu_features = "x86_64-sse-sse2-avx-cx8",
-        });
-        const target = try std.zig.system.resolveTargetQuery(io, query);
-
-        try std.testing.expect(target.os.tag == .linux);
-        try std.testing.expect(target.abi == .gnu);
-        try std.testing.expect(target.cpu.arch == .x86_64);
-        try std.testing.expect(!target.cpu.has(.x86, .sse));
-        try std.testing.expect(!target.cpu.has(.x86, .avx));
-        try std.testing.expect(!target.cpu.has(.x86, .cx8));
-        try std.testing.expect(target.cpu.has(.x86, .cmov));
-        try std.testing.expect(target.cpu.has(.x86, .fxsr));
-
-        try std.testing.expect(target.cpu.hasAny(.x86, &amp;.{ .sse, .avx, .cmov }));
-        try std.testing.expect(!target.cpu.hasAny(.x86, &amp;.{ .sse, .avx }));
-        try std.testing.expect(target.cpu.hasAll(.x86, &amp;.{ .mmx, .x87 }));
-        try std.testing.expect(!target.cpu.hasAll(.x86, &amp;.{ .mmx, .x87, .sse }));
-
-        const text = try query.zigTriple(std.testing.allocator);
-        defer std.testing.allocator.free(text);
-        try std.testing.expectEqualSlices(u8, "x86_64-linux-gnu", text);
-    }
-    {
-        const query = try Query.parse(.{
-            .arch_os_abi = "arm-linux-musleabihf",
-            .cpu_features = "generic+v8a",
-        });
-        const target = try std.zig.system.resolveTargetQuery(io, query);
-
-        try std.testing.expect(target.os.tag == .linux);
-        try std.testing.expect(target.abi == .musleabihf);
-        try std.testing.expect(target.cpu.arch == .arm);
-        try std.testing.expect(target.cpu.model == &amp;Target.arm.cpu.generic);
-        try std.testing.expect(target.cpu.has(.arm, .v8a));
-
-        const text = try query.zigTriple(std.testing.allocator);
-        defer std.testing.allocator.free(text);
-        try std.testing.expectEqualSlices(u8, "arm-linux-musleabihf", text);
-    }
-    {
-        const query = try Query.parse(.{
-            .arch_os_abi = "aarch64-linux.3.10...4.4.1-gnu.2.27",
-            .cpu_features = "generic+v8a",
-        });
-        const target = try std.zig.system.resolveTargetQuery(io, query);
-
-        try std.testing.expect(target.cpu.arch == .aarch64);
-        try std.testing.expect(target.os.tag == .linux);
-        try std.testing.expect(target.os.version_range.linux.range.min.major == 3);
-        try std.testing.expect(target.os.version_range.linux.range.min.minor == 10);
-        try std.testing.expect(target.os.version_range.linux.range.min.patch == 0);
-        try std.testing.expect(target.os.version_range.linux.range.max.major == 4);
-        try std.testing.expect(target.os.version_range.linux.range.max.minor == 4);
-        try std.testing.expect(target.os.version_range.linux.range.max.patch == 1);
-        try std.testing.expect(target.os.version_range.linux.glibc.major == 2);
-        try std.testing.expect(target.os.version_range.linux.glibc.minor == 27);
-        try std.testing.expect(target.os.version_range.linux.glibc.patch == 0);
-        try std.testing.expect(target.abi == .gnu);
-
-        const text = try query.zigTriple(std.testing.allocator);
-        defer std.testing.allocator.free(text);
-        try std.testing.expectEqualSlices(u8, "aarch64-linux.3.10...4.4.1-gnu.2.27", text);
-    }
-    {
-        const query = try Query.parse(.{
-            .arch_os_abi = "aarch64-linux.3.10...4.4.1-android.30",
-        });
-        const target = try std.zig.system.resolveTargetQuery(io, query);
-
-        try std.testing.expect(target.cpu.arch == .aarch64);
-        try std.testing.expect(target.os.tag == .linux);
-        try std.testing.expect(target.os.version_range.linux.range.min.major == 3);
-        try std.testing.expect(target.os.version_range.linux.range.min.minor == 10);
-        try std.testing.expect(target.os.version_range.linux.range.min.patch == 0);
-        try std.testing.expect(target.os.version_range.linux.range.max.major == 4);
-        try std.testing.expect(target.os.version_range.linux.range.max.minor == 4);
-        try std.testing.expect(target.os.version_range.linux.range.max.patch == 1);
-        try std.testing.expect(target.os.version_range.linux.android == 30);
-        try std.testing.expect(target.abi == .android);
-
-        const text = try query.zigTriple(std.testing.allocator);
-        defer std.testing.allocator.free(text);
-        try std.testing.expectEqualSlices(u8, "aarch64-linux.3.10...4.4.1-android.30", text);
-    }
-    {
-        const query = try Query.parse(.{
-            .arch_os_abi = "x86-windows.xp...win8-msvc",
-        });
-        const target = try std.zig.system.resolveTargetQuery(io, query);
-
-        try std.testing.expect(target.cpu.arch == .x86);
-        try std.testing.expect(target.os.tag == .windows);
-        try std.testing.expect(target.os.version_range.windows.min == .xp);
-        try std.testing.expect(target.os.version_range.windows.max == .win8);
-        try std.testing.expect(target.abi == .msvc);
-
-        const text = try query.zigTriple(std.testing.allocator);
-        defer std.testing.allocator.free(text);
-        try std.testing.expectEqualSlices(u8, "x86-windows.xp...win8-msvc", text);
-    }
-}</pre>
+    <pre><a id="L1"></a>//! Contains all the same data as `Target`, additionally introducing the
+<a id="L2"></a>//! concept of "the native target". The purpose of this abstraction is to
+<a id="L3"></a>//! provide meaningful and unsurprising defaults. This struct does reference
+<a id="L4"></a>//! any resources and it is copyable.
+<a id="L5"></a>
+<a id="L6"></a>const Query = @This();
+<a id="L7"></a>const std = @import("../std.zig");
+<a id="L8"></a>const builtin = @import("builtin");
+<a id="L9"></a>const assert = std.debug.assert;
+<a id="L10"></a>const Target = std.Target;
+<a id="L11"></a>const mem = std.mem;
+<a id="L12"></a>const Allocator = std.mem.Allocator;
+<a id="L13"></a>const ArrayList = std.ArrayList;
+<a id="L14"></a>
+<a id="L15"></a>/// `null` means native.
+<a id="L16"></a>cpu_arch: ?Target.Cpu.Arch = null,
+<a id="L17"></a>
+<a id="L18"></a>cpu_model: CpuModel = .determined_by_arch_os,
+<a id="L19"></a>
+<a id="L20"></a>/// Sparse set of CPU features to add to the set from `cpu_model`.
+<a id="L21"></a>cpu_features_add: Target.Cpu.Feature.Set = .empty,
+<a id="L22"></a>
+<a id="L23"></a>/// Sparse set of CPU features to remove from the set from `cpu_model`.
+<a id="L24"></a>cpu_features_sub: Target.Cpu.Feature.Set = .empty,
+<a id="L25"></a>
+<a id="L26"></a>/// `null` means native.
+<a id="L27"></a>os_tag: ?Target.Os.Tag = null,
+<a id="L28"></a>
+<a id="L29"></a>/// `null` means the default version range for `os_tag`. If `os_tag` is `null` (native)
+<a id="L30"></a>/// then `null` for this field means native.
+<a id="L31"></a>os_version_min: ?OsVersion = null,
+<a id="L32"></a>
+<a id="L33"></a>/// When cross compiling, `null` means default (latest known OS version).
+<a id="L34"></a>/// When `os_tag` is native, `null` means equal to the native OS version.
+<a id="L35"></a>os_version_max: ?OsVersion = null,
+<a id="L36"></a>
+<a id="L37"></a>/// `null` means default when cross compiling, or native when `os_tag` is native.
+<a id="L38"></a>/// If `isGnu()` is `false`, this must be `null` and is ignored.
+<a id="L39"></a>glibc_version: ?SemanticVersion = null,
+<a id="L40"></a>
+<a id="L41"></a>/// `null` means default when cross compiling, or native when `os_tag` is native.
+<a id="L42"></a>/// If `isAndroid()` is `false`, this must be `null` and is ignored.
+<a id="L43"></a>android_api_level: ?u32 = null,
+<a id="L44"></a>
+<a id="L45"></a>/// `null` means the native C ABI, if `os_tag` is native, otherwise it means the default C ABI.
+<a id="L46"></a>abi: ?Target.Abi = null,
+<a id="L47"></a>
+<a id="L48"></a>/// When `os_tag` is `null`, then `null` means native. Otherwise it means the standard path
+<a id="L49"></a>/// based on the `os_tag`.  When `dynamic_linker` is a non-`null` empty string, no dynamic
+<a id="L50"></a>/// linker is used regardless of `os_tag`.
+<a id="L51"></a>dynamic_linker: ?Target.DynamicLinker = null,
+<a id="L52"></a>
+<a id="L53"></a>/// `null` means default for the cpu/arch/os combo.
+<a id="L54"></a>ofmt: ?Target.ObjectFormat = null,
+<a id="L55"></a>
+<a id="L56"></a>pub const CpuModel = union(enum) {
+<a id="L57"></a>    /// Always native
+<a id="L58"></a>    native,
+<a id="L59"></a>
+<a id="L60"></a>    /// Always baseline
+<a id="L61"></a>    baseline,
+<a id="L62"></a>
+<a id="L63"></a>    /// If CPU Architecture is native, then the CPU model will be native. Otherwise,
+<a id="L64"></a>    /// it will be baseline.
+<a id="L65"></a>    determined_by_arch_os,
+<a id="L66"></a>
+<a id="L67"></a>    explicit: *const Target.Cpu.Model,
+<a id="L68"></a>
+<a id="L69"></a>    pub fn eql(a: CpuModel, b: CpuModel) bool {
+<a id="L70"></a>        const Tag = @typeInfo(CpuModel).@"union".tag_type.?;
+<a id="L71"></a>        const a_tag: Tag = a;
+<a id="L72"></a>        const b_tag: Tag = b;
+<a id="L73"></a>        if (a_tag != b_tag) return false;
+<a id="L74"></a>        return switch (a) {
+<a id="L75"></a>            .native, .baseline, .determined_by_arch_os =&gt; true,
+<a id="L76"></a>            .explicit =&gt; |a_model| a_model == b.explicit,
+<a id="L77"></a>        };
+<a id="L78"></a>    }
+<a id="L79"></a>};
+<a id="L80"></a>
+<a id="L81"></a>pub const OsVersion = union(enum) {
+<a id="L82"></a>    none: void,
+<a id="L83"></a>    semver: SemanticVersion,
+<a id="L84"></a>    windows: Target.Os.WindowsVersion,
+<a id="L85"></a>
+<a id="L86"></a>    pub fn eql(a: OsVersion, b: OsVersion) bool {
+<a id="L87"></a>        const Tag = @typeInfo(OsVersion).@"union".tag_type.?;
+<a id="L88"></a>        const a_tag: Tag = a;
+<a id="L89"></a>        const b_tag: Tag = b;
+<a id="L90"></a>        if (a_tag != b_tag) return false;
+<a id="L91"></a>        return switch (a) {
+<a id="L92"></a>            .none =&gt; true,
+<a id="L93"></a>            .semver =&gt; |a_semver| a_semver.order(b.semver) == .eq,
+<a id="L94"></a>            .windows =&gt; |a_windows| a_windows == b.windows,
+<a id="L95"></a>        };
+<a id="L96"></a>    }
+<a id="L97"></a>
+<a id="L98"></a>    pub fn eqlOpt(a: ?OsVersion, b: ?OsVersion) bool {
+<a id="L99"></a>        if (a == null and b == null) return true;
+<a id="L100"></a>        if (a == null or b == null) return false;
+<a id="L101"></a>        return OsVersion.eql(a.?, b.?);
+<a id="L102"></a>    }
+<a id="L103"></a>};
+<a id="L104"></a>
+<a id="L105"></a>pub const SemanticVersion = std.SemanticVersion;
+<a id="L106"></a>
+<a id="L107"></a>pub fn fromTarget(target: *const Target) Query {
+<a id="L108"></a>    var result: Query = .{
+<a id="L109"></a>        .cpu_arch = target.cpu.arch,
+<a id="L110"></a>        .cpu_model = .{ .explicit = target.cpu.model },
+<a id="L111"></a>        .os_tag = target.os.tag,
+<a id="L112"></a>        .os_version_min = undefined,
+<a id="L113"></a>        .os_version_max = undefined,
+<a id="L114"></a>        .abi = target.abi,
+<a id="L115"></a>        .glibc_version = if (target.abi.isGnu()) target.os.versionRange().gnuLibCVersion() else null,
+<a id="L116"></a>        .android_api_level = if (target.abi.isAndroid()) target.os.version_range.linux.android else null,
+<a id="L117"></a>    };
+<a id="L118"></a>    result.updateOsVersionRange(target.os);
+<a id="L119"></a>
+<a id="L120"></a>    const all_features = target.cpu.arch.allFeaturesList();
+<a id="L121"></a>    var cpu_model_set = target.cpu.model.features;
+<a id="L122"></a>    cpu_model_set.populateDependencies(all_features);
+<a id="L123"></a>    {
+<a id="L124"></a>        // The "add" set is the full set with the CPU Model set removed.
+<a id="L125"></a>        const add_set = &amp;result.cpu_features_add;
+<a id="L126"></a>        add_set.* = target.cpu.features;
+<a id="L127"></a>        add_set.removeFeatureSet(cpu_model_set);
+<a id="L128"></a>    }
+<a id="L129"></a>    {
+<a id="L130"></a>        // The "sub" set is the features that are on in CPU Model set and off in the full set.
+<a id="L131"></a>        const sub_set = &amp;result.cpu_features_sub;
+<a id="L132"></a>        sub_set.* = cpu_model_set;
+<a id="L133"></a>        sub_set.removeFeatureSet(target.cpu.features);
+<a id="L134"></a>    }
+<a id="L135"></a>    return result;
+<a id="L136"></a>}
+<a id="L137"></a>
+<a id="L138"></a>fn updateOsVersionRange(self: *Query, os: Target.Os) void {
+<a id="L139"></a>    self.os_version_min, self.os_version_max = switch (os.tag.versionRangeTag()) {
+<a id="L140"></a>        .none =&gt; .{ .{ .none = {} }, .{ .none = {} } },
+<a id="L141"></a>        .semver =&gt; .{
+<a id="L142"></a>            .{ .semver = os.version_range.semver.min },
+<a id="L143"></a>            .{ .semver = os.version_range.semver.max },
+<a id="L144"></a>        },
+<a id="L145"></a>        inline .hurd, .linux =&gt; |t| .{
+<a id="L146"></a>            .{ .semver = @field(os.version_range, @tagName(t)).range.min },
+<a id="L147"></a>            .{ .semver = @field(os.version_range, @tagName(t)).range.max },
+<a id="L148"></a>        },
+<a id="L149"></a>        .windows =&gt; .{
+<a id="L150"></a>            .{ .windows = os.version_range.windows.min },
+<a id="L151"></a>            .{ .windows = os.version_range.windows.max },
+<a id="L152"></a>        },
+<a id="L153"></a>    };
+<a id="L154"></a>}
+<a id="L155"></a>
+<a id="L156"></a>pub const ParseOptions = struct {
+<a id="L157"></a>    /// This is sometimes called a "triple". It looks roughly like this:
+<a id="L158"></a>    ///     riscv64-linux-musl
+<a id="L159"></a>    /// The fields are, respectively:
+<a id="L160"></a>    /// * CPU Architecture
+<a id="L161"></a>    /// * Operating System (and optional version range)
+<a id="L162"></a>    /// * C ABI (optional, with optional glibc version or Android API level)
+<a id="L163"></a>    /// The string "native" can be used for CPU architecture as well as Operating System.
+<a id="L164"></a>    /// If the CPU Architecture is specified as "native", then the Operating System and C ABI may be omitted.
+<a id="L165"></a>    arch_os_abi: []const u8 = "native",
+<a id="L166"></a>
+<a id="L167"></a>    /// Looks like "name+a+b-c-d+e", where "name" is a CPU Model name, "a", "b", and "e"
+<a id="L168"></a>    /// are examples of CPU features to add to the set, and "c" and "d" are examples of CPU features
+<a id="L169"></a>    /// to remove from the set.
+<a id="L170"></a>    /// The following special strings are recognized for CPU Model name:
+<a id="L171"></a>    /// * "baseline" - The "default" set of CPU features for cross-compiling. A conservative set
+<a id="L172"></a>    ///                of features that is expected to be supported on most available hardware.
+<a id="L173"></a>    /// * "native"   - The native CPU model is to be detected when compiling.
+<a id="L174"></a>    /// If this field is not provided (`null`), then the value will depend on the
+<a id="L175"></a>    /// parsed CPU Architecture. If native, then this will be "native". Otherwise, it will be "baseline".
+<a id="L176"></a>    cpu_features: ?[]const u8 = null,
+<a id="L177"></a>
+<a id="L178"></a>    /// Absolute path to dynamic linker, to override the default, which is either a natively
+<a id="L179"></a>    /// detected path, or a standard path.
+<a id="L180"></a>    dynamic_linker: ?[]const u8 = null,
+<a id="L181"></a>
+<a id="L182"></a>    object_format: ?[]const u8 = null,
+<a id="L183"></a>
+<a id="L184"></a>    /// If this is provided, the function will populate some information about parsing failures,
+<a id="L185"></a>    /// so that user-friendly error messages can be delivered.
+<a id="L186"></a>    diagnostics: ?*Diagnostics = null,
+<a id="L187"></a>
+<a id="L188"></a>    pub const Diagnostics = struct {
+<a id="L189"></a>        /// If the architecture was determined, this will be populated.
+<a id="L190"></a>        arch: ?Target.Cpu.Arch = null,
+<a id="L191"></a>
+<a id="L192"></a>        /// If the OS name was determined, this will be populated.
+<a id="L193"></a>        os_name: ?[]const u8 = null,
+<a id="L194"></a>
+<a id="L195"></a>        /// If the OS tag was determined, this will be populated.
+<a id="L196"></a>        os_tag: ?Target.Os.Tag = null,
+<a id="L197"></a>
+<a id="L198"></a>        /// If the ABI was determined, this will be populated.
+<a id="L199"></a>        abi: ?Target.Abi = null,
+<a id="L200"></a>
+<a id="L201"></a>        /// If the CPU name was determined, this will be populated.
+<a id="L202"></a>        cpu_name: ?[]const u8 = null,
+<a id="L203"></a>
+<a id="L204"></a>        /// If error.UnknownCpuFeature is returned, this will be populated.
+<a id="L205"></a>        unknown_feature_name: ?[]const u8 = null,
+<a id="L206"></a>
+<a id="L207"></a>        /// If error.UnknownArchitecture is returned, this will be populated.
+<a id="L208"></a>        unknown_architecture_name: ?[]const u8 = null,
+<a id="L209"></a>    };
+<a id="L210"></a>};
+<a id="L211"></a>
+<a id="L212"></a>pub fn parse(args: ParseOptions) !Query {
+<a id="L213"></a>    var dummy_diags: ParseOptions.Diagnostics = undefined;
+<a id="L214"></a>    const diags = args.diagnostics orelse &amp;dummy_diags;
+<a id="L215"></a>
+<a id="L216"></a>    var result: Query = .{
+<a id="L217"></a>        .dynamic_linker = if (args.dynamic_linker) |dynamic_linker| .init(dynamic_linker) else null,
+<a id="L218"></a>    };
+<a id="L219"></a>
+<a id="L220"></a>    var it = mem.splitScalar(u8, args.arch_os_abi, '-');
+<a id="L221"></a>    const arch_name = it.first();
+<a id="L222"></a>    const arch_is_native = mem.eql(u8, arch_name, "native");
+<a id="L223"></a>    if (!arch_is_native) {
+<a id="L224"></a>        result.cpu_arch = std.meta.stringToEnum(Target.Cpu.Arch, arch_name) orelse {
+<a id="L225"></a>            diags.unknown_architecture_name = arch_name;
+<a id="L226"></a>            return error.UnknownArchitecture;
+<a id="L227"></a>        };
+<a id="L228"></a>    }
+<a id="L229"></a>    const arch = result.cpu_arch orelse builtin.cpu.arch;
+<a id="L230"></a>    diags.arch = arch;
+<a id="L231"></a>
+<a id="L232"></a>    if (it.next()) |os_text| {
+<a id="L233"></a>        try parseOs(&amp;result, diags, os_text);
+<a id="L234"></a>    } else if (!arch_is_native) {
+<a id="L235"></a>        return error.MissingOperatingSystem;
+<a id="L236"></a>    }
+<a id="L237"></a>
+<a id="L238"></a>    const opt_abi_text = it.next();
+<a id="L239"></a>    if (opt_abi_text) |abi_text| {
+<a id="L240"></a>        var abi_it = mem.splitScalar(u8, abi_text, '.');
+<a id="L241"></a>        const abi = std.meta.stringToEnum(Target.Abi, abi_it.first()) orelse
+<a id="L242"></a>            return error.UnknownApplicationBinaryInterface;
+<a id="L243"></a>        result.abi = abi;
+<a id="L244"></a>        diags.abi = abi;
+<a id="L245"></a>
+<a id="L246"></a>        const abi_ver_text = abi_it.rest();
+<a id="L247"></a>        if (abi_it.next() != null) {
+<a id="L248"></a>            if (abi.isGnu()) {
+<a id="L249"></a>                result.glibc_version = parseVersion(abi_ver_text) catch |err| switch (err) {
+<a id="L250"></a>                    error.Overflow =&gt; return error.InvalidAbiVersion,
+<a id="L251"></a>                    error.InvalidVersion =&gt; return error.InvalidAbiVersion,
+<a id="L252"></a>                };
+<a id="L253"></a>            } else if (abi.isAndroid()) {
+<a id="L254"></a>                result.android_api_level = std.fmt.parseUnsigned(u32, abi_ver_text, 10) catch |err| switch (err) {
+<a id="L255"></a>                    error.InvalidCharacter =&gt; return error.InvalidVersion,
+<a id="L256"></a>                    error.Overflow =&gt; return error.Overflow,
+<a id="L257"></a>                };
+<a id="L258"></a>            } else {
+<a id="L259"></a>                return error.InvalidAbiVersion;
+<a id="L260"></a>            }
+<a id="L261"></a>        }
+<a id="L262"></a>    }
+<a id="L263"></a>
+<a id="L264"></a>    if (it.next() != null) return error.UnexpectedExtraField;
+<a id="L265"></a>
+<a id="L266"></a>    if (args.cpu_features) |cpu_features| {
+<a id="L267"></a>        const all_features = arch.allFeaturesList();
+<a id="L268"></a>        var index: usize = 0;
+<a id="L269"></a>        while (index &lt; cpu_features.len and
+<a id="L270"></a>            cpu_features[index] != '+' and
+<a id="L271"></a>            cpu_features[index] != '-')
+<a id="L272"></a>        {
+<a id="L273"></a>            index += 1;
+<a id="L274"></a>        }
+<a id="L275"></a>        const cpu_name = cpu_features[0..index];
+<a id="L276"></a>        diags.cpu_name = cpu_name;
+<a id="L277"></a>
+<a id="L278"></a>        const add_set = &amp;result.cpu_features_add;
+<a id="L279"></a>        const sub_set = &amp;result.cpu_features_sub;
+<a id="L280"></a>        if (mem.eql(u8, cpu_name, "native")) {
+<a id="L281"></a>            result.cpu_model = .native;
+<a id="L282"></a>        } else if (mem.eql(u8, cpu_name, "baseline")) {
+<a id="L283"></a>            result.cpu_model = .baseline;
+<a id="L284"></a>        } else {
+<a id="L285"></a>            result.cpu_model = .{ .explicit = try arch.parseCpuModel(cpu_name) };
+<a id="L286"></a>        }
+<a id="L287"></a>
+<a id="L288"></a>        while (index &lt; cpu_features.len) {
+<a id="L289"></a>            const op = cpu_features[index];
+<a id="L290"></a>            const set = switch (op) {
+<a id="L291"></a>                '+' =&gt; add_set,
+<a id="L292"></a>                '-' =&gt; sub_set,
+<a id="L293"></a>                else =&gt; unreachable,
+<a id="L294"></a>            };
+<a id="L295"></a>            index += 1;
+<a id="L296"></a>            const start = index;
+<a id="L297"></a>            while (index &lt; cpu_features.len and
+<a id="L298"></a>                cpu_features[index] != '+' and
+<a id="L299"></a>                cpu_features[index] != '-')
+<a id="L300"></a>            {
+<a id="L301"></a>                index += 1;
+<a id="L302"></a>            }
+<a id="L303"></a>            const feature_name = cpu_features[start..index];
+<a id="L304"></a>            for (all_features, 0..) |feature, feat_index_usize| {
+<a id="L305"></a>                const feat_index = @as(Target.Cpu.Feature.Set.Index, @intCast(feat_index_usize));
+<a id="L306"></a>                if (mem.eql(u8, feature_name, feature.name)) {
+<a id="L307"></a>                    set.addFeature(feat_index);
+<a id="L308"></a>                    break;
+<a id="L309"></a>                }
+<a id="L310"></a>            } else {
+<a id="L311"></a>                diags.unknown_feature_name = feature_name;
+<a id="L312"></a>                return error.UnknownCpuFeature;
+<a id="L313"></a>            }
+<a id="L314"></a>        }
+<a id="L315"></a>    }
+<a id="L316"></a>
+<a id="L317"></a>    if (args.object_format) |ofmt_name| {
+<a id="L318"></a>        result.ofmt = std.meta.stringToEnum(Target.ObjectFormat, ofmt_name) orelse
+<a id="L319"></a>            return error.UnknownObjectFormat;
+<a id="L320"></a>    }
+<a id="L321"></a>
+<a id="L322"></a>    return result;
+<a id="L323"></a>}
+<a id="L324"></a>
+<a id="L325"></a>/// Similar to `parse` except instead of fully parsing, it only determines the CPU
+<a id="L326"></a>/// architecture and returns it if it can be determined, and returns `null` otherwise.
+<a id="L327"></a>/// This is intended to be used if the API user of Query needs to learn the
+<a id="L328"></a>/// target CPU architecture in order to fully populate `ParseOptions`.
+<a id="L329"></a>pub fn parseCpuArch(args: ParseOptions) ?Target.Cpu.Arch {
+<a id="L330"></a>    var it = mem.splitScalar(u8, args.arch_os_abi, '-');
+<a id="L331"></a>    const arch_name = it.first();
+<a id="L332"></a>    const arch_is_native = mem.eql(u8, arch_name, "native");
+<a id="L333"></a>    if (arch_is_native) {
+<a id="L334"></a>        return builtin.cpu.arch;
+<a id="L335"></a>    } else {
+<a id="L336"></a>        return std.meta.stringToEnum(Target.Cpu.Arch, arch_name);
+<a id="L337"></a>    }
+<a id="L338"></a>}
+<a id="L339"></a>
+<a id="L340"></a>/// Similar to `SemanticVersion.parse`, but with following changes:
+<a id="L341"></a>/// * Leading zeroes are allowed.
+<a id="L342"></a>/// * Supports only 2 or 3 version components (major, minor, [patch]). If 3-rd component is omitted, it will be 0.
+<a id="L343"></a>/// * Prerelease and build components are disallowed.
+<a id="L344"></a>pub fn parseVersion(ver: []const u8) error{ InvalidVersion, Overflow }!SemanticVersion {
+<a id="L345"></a>    const parseVersionComponentFn = (struct {
+<a id="L346"></a>        fn parseVersionComponentInner(component: []const u8) error{ InvalidVersion, Overflow }!usize {
+<a id="L347"></a>            return std.fmt.parseUnsigned(usize, component, 10) catch |err| switch (err) {
+<a id="L348"></a>                error.InvalidCharacter =&gt; return error.InvalidVersion,
+<a id="L349"></a>                error.Overflow =&gt; return error.Overflow,
+<a id="L350"></a>            };
+<a id="L351"></a>        }
+<a id="L352"></a>    }).parseVersionComponentInner;
+<a id="L353"></a>
+<a id="L354"></a>    var version_components = mem.splitScalar(u8, ver, '.');
+<a id="L355"></a>
+<a id="L356"></a>    const major = version_components.first();
+<a id="L357"></a>    const minor = version_components.next() orelse return error.InvalidVersion;
+<a id="L358"></a>    const patch = version_components.next() orelse "0";
+<a id="L359"></a>    if (version_components.next() != null) return error.InvalidVersion;
+<a id="L360"></a>
+<a id="L361"></a>    return .{
+<a id="L362"></a>        .major = try parseVersionComponentFn(major),
+<a id="L363"></a>        .minor = try parseVersionComponentFn(minor),
+<a id="L364"></a>        .patch = try parseVersionComponentFn(patch),
+<a id="L365"></a>    };
+<a id="L366"></a>}
+<a id="L367"></a>
+<a id="L368"></a>test parseVersion {
+<a id="L369"></a>    try std.testing.expectEqual(SemanticVersion{ .major = 1, .minor = 2, .patch = 0 }, try parseVersion("1.2"));
+<a id="L370"></a>    try std.testing.expectEqual(SemanticVersion{ .major = 1, .minor = 2, .patch = 3 }, try parseVersion("1.2.3"));
+<a id="L371"></a>
+<a id="L372"></a>    try std.testing.expectError(error.InvalidVersion, parseVersion("1"));
+<a id="L373"></a>    try std.testing.expectError(error.InvalidVersion, parseVersion("1.2.3.4"));
+<a id="L374"></a>    try std.testing.expectError(error.InvalidVersion, parseVersion("1.2.3-dev"));
+<a id="L375"></a>}
+<a id="L376"></a>
+<a id="L377"></a>pub fn isNativeCpu(self: Query) bool {
+<a id="L378"></a>    return self.cpu_arch == null and
+<a id="L379"></a>        (self.cpu_model == .native or self.cpu_model == .determined_by_arch_os) and
+<a id="L380"></a>        self.cpu_features_sub.isEmpty() and self.cpu_features_add.isEmpty();
+<a id="L381"></a>}
+<a id="L382"></a>
+<a id="L383"></a>pub fn isNativeOs(self: Query) bool {
+<a id="L384"></a>    return self.os_tag == null and self.os_version_min == null and self.os_version_max == null and
+<a id="L385"></a>        self.dynamic_linker == null and self.glibc_version == null and self.android_api_level == null;
+<a id="L386"></a>}
+<a id="L387"></a>
+<a id="L388"></a>pub fn isNativeAbi(self: Query) bool {
+<a id="L389"></a>    return self.os_tag == null and self.abi == null;
+<a id="L390"></a>}
+<a id="L391"></a>
+<a id="L392"></a>pub fn isNativeTriple(self: Query) bool {
+<a id="L393"></a>    return self.isNativeCpu() and self.isNativeOs() and self.isNativeAbi();
+<a id="L394"></a>}
+<a id="L395"></a>
+<a id="L396"></a>pub fn isNative(self: Query) bool {
+<a id="L397"></a>    return self.isNativeTriple() and self.ofmt == null;
+<a id="L398"></a>}
+<a id="L399"></a>
+<a id="L400"></a>pub fn canDetectLibC(self: Query) bool {
+<a id="L401"></a>    if (self.isNativeOs()) return true;
+<a id="L402"></a>    if (self.os_tag) |os| {
+<a id="L403"></a>        if (builtin.os.tag == .macos and os.isDarwin()) return true;
+<a id="L404"></a>        if (os == .linux) {
+<a id="L405"></a>            if (self.abi) |abi| if (abi.isAndroid()) return true;
+<a id="L406"></a>        }
+<a id="L407"></a>    }
+<a id="L408"></a>    return false;
+<a id="L409"></a>}
+<a id="L410"></a>
+<a id="L411"></a>/// Formats a version with the patch component omitted if it is zero,
+<a id="L412"></a>/// unlike SemanticVersion.format which formats all its version components regardless.
+<a id="L413"></a>fn formatVersion(version: SemanticVersion, gpa: Allocator, list: *ArrayList(u8)) !void {
+<a id="L414"></a>    if (version.patch == 0) {
+<a id="L415"></a>        try list.print(gpa, "{d}.{d}", .{ version.major, version.minor });
+<a id="L416"></a>    } else {
+<a id="L417"></a>        try list.print(gpa, "{d}.{d}.{d}", .{ version.major, version.minor, version.patch });
+<a id="L418"></a>    }
+<a id="L419"></a>}
+<a id="L420"></a>
+<a id="L421"></a>pub fn zigTriple(self: Query, gpa: Allocator) Allocator.Error![]u8 {
+<a id="L422"></a>    if (self.isNativeTriple()) return gpa.dupe(u8, "native");
+<a id="L423"></a>
+<a id="L424"></a>    const arch_name = if (self.cpu_arch) |arch| @tagName(arch) else "native";
+<a id="L425"></a>    const os_name = if (self.os_tag) |os_tag| @tagName(os_tag) else "native";
+<a id="L426"></a>
+<a id="L427"></a>    var result: ArrayList(u8) = .empty;
+<a id="L428"></a>    defer result.deinit(gpa);
+<a id="L429"></a>
+<a id="L430"></a>    try result.print(gpa, "{s}-{s}", .{ arch_name, os_name });
+<a id="L431"></a>
+<a id="L432"></a>    // The zig target syntax does not allow specifying a max os version with no min, so
+<a id="L433"></a>    // if either are present, we need the min.
+<a id="L434"></a>    if (self.os_version_min) |min| {
+<a id="L435"></a>        switch (min) {
+<a id="L436"></a>            .none =&gt; {},
+<a id="L437"></a>            .semver =&gt; |v| {
+<a id="L438"></a>                try result.appendSlice(gpa, ".");
+<a id="L439"></a>                try formatVersion(v, gpa, &amp;result);
+<a id="L440"></a>            },
+<a id="L441"></a>            .windows =&gt; |v| {
+<a id="L442"></a>                try result.print(gpa, "{f}", .{v});
+<a id="L443"></a>            },
+<a id="L444"></a>        }
+<a id="L445"></a>    }
+<a id="L446"></a>    if (self.os_version_max) |max| {
+<a id="L447"></a>        switch (max) {
+<a id="L448"></a>            .none =&gt; {},
+<a id="L449"></a>            .semver =&gt; |v| {
+<a id="L450"></a>                try result.appendSlice(gpa, "...");
+<a id="L451"></a>                try formatVersion(v, gpa, &amp;result);
+<a id="L452"></a>            },
+<a id="L453"></a>            .windows =&gt; |v| {
+<a id="L454"></a>                // This is counting on a custom format() function defined on `WindowsVersion`
+<a id="L455"></a>                // to add a prefix '.' and make there be a total of three dots.
+<a id="L456"></a>                try result.print(gpa, "..{f}", .{v});
+<a id="L457"></a>            },
+<a id="L458"></a>        }
+<a id="L459"></a>    }
+<a id="L460"></a>
+<a id="L461"></a>    if (self.glibc_version) |v| {
+<a id="L462"></a>        const name = if (self.abi) |abi| @tagName(abi) else "gnu";
+<a id="L463"></a>        try result.ensureUnusedCapacity(gpa, name.len + 2);
+<a id="L464"></a>        result.appendAssumeCapacity('-');
+<a id="L465"></a>        result.appendSliceAssumeCapacity(name);
+<a id="L466"></a>        result.appendAssumeCapacity('.');
+<a id="L467"></a>        try formatVersion(v, gpa, &amp;result);
+<a id="L468"></a>    } else if (self.android_api_level) |lvl| {
+<a id="L469"></a>        const name = if (self.abi) |abi| @tagName(abi) else "android";
+<a id="L470"></a>        try result.ensureUnusedCapacity(gpa, name.len + 2);
+<a id="L471"></a>        result.appendAssumeCapacity('-');
+<a id="L472"></a>        result.appendSliceAssumeCapacity(name);
+<a id="L473"></a>        result.appendAssumeCapacity('.');
+<a id="L474"></a>        try result.print(gpa, "{d}", .{lvl});
+<a id="L475"></a>    } else if (self.abi) |abi| {
+<a id="L476"></a>        const name = @tagName(abi);
+<a id="L477"></a>        try result.ensureUnusedCapacity(gpa, name.len + 1);
+<a id="L478"></a>        result.appendAssumeCapacity('-');
+<a id="L479"></a>        result.appendSliceAssumeCapacity(name);
+<a id="L480"></a>    }
+<a id="L481"></a>
+<a id="L482"></a>    return result.toOwnedSlice(gpa);
+<a id="L483"></a>}
+<a id="L484"></a>
+<a id="L485"></a>/// Renders the query into a textual representation that can be parsed via the
+<a id="L486"></a>/// `-mcpu` flag passed to the Zig compiler.
+<a id="L487"></a>/// Appends the result to `buffer`.
+<a id="L488"></a>pub fn serializeCpu(q: Query, buffer: *std.array_list.Managed(u8)) Allocator.Error!void {
+<a id="L489"></a>    try buffer.ensureUnusedCapacity(8);
+<a id="L490"></a>    switch (q.cpu_model) {
+<a id="L491"></a>        .native =&gt; {
+<a id="L492"></a>            buffer.appendSliceAssumeCapacity("native");
+<a id="L493"></a>        },
+<a id="L494"></a>        .baseline =&gt; {
+<a id="L495"></a>            buffer.appendSliceAssumeCapacity("baseline");
+<a id="L496"></a>        },
+<a id="L497"></a>        .determined_by_arch_os =&gt; {
+<a id="L498"></a>            if (q.cpu_arch == null) {
+<a id="L499"></a>                buffer.appendSliceAssumeCapacity("native");
+<a id="L500"></a>            } else {
+<a id="L501"></a>                buffer.appendSliceAssumeCapacity("baseline");
+<a id="L502"></a>            }
+<a id="L503"></a>        },
+<a id="L504"></a>        .explicit =&gt; |model| {
+<a id="L505"></a>            try buffer.appendSlice(model.name);
+<a id="L506"></a>        },
+<a id="L507"></a>    }
+<a id="L508"></a>
+<a id="L509"></a>    if (q.cpu_features_add.isEmpty() and q.cpu_features_sub.isEmpty()) {
+<a id="L510"></a>        // The CPU name alone is sufficient.
+<a id="L511"></a>        return;
+<a id="L512"></a>    }
+<a id="L513"></a>
+<a id="L514"></a>    const cpu_arch = q.cpu_arch orelse builtin.cpu.arch;
+<a id="L515"></a>    const all_features = cpu_arch.allFeaturesList();
+<a id="L516"></a>
+<a id="L517"></a>    for (all_features, 0..) |feature, i_usize| {
+<a id="L518"></a>        const i: Target.Cpu.Feature.Set.Index = @intCast(i_usize);
+<a id="L519"></a>        try buffer.ensureUnusedCapacity(feature.name.len + 1);
+<a id="L520"></a>        if (q.cpu_features_sub.isEnabled(i)) {
+<a id="L521"></a>            buffer.appendAssumeCapacity('-');
+<a id="L522"></a>            buffer.appendSliceAssumeCapacity(feature.name);
+<a id="L523"></a>        } else if (q.cpu_features_add.isEnabled(i)) {
+<a id="L524"></a>            buffer.appendAssumeCapacity('+');
+<a id="L525"></a>            buffer.appendSliceAssumeCapacity(feature.name);
+<a id="L526"></a>        }
+<a id="L527"></a>    }
+<a id="L528"></a>}
+<a id="L529"></a>
+<a id="L530"></a>pub fn serializeCpuAlloc(q: Query, ally: Allocator) Allocator.Error![]u8 {
+<a id="L531"></a>    var buffer = std.array_list.Managed(u8).init(ally);
+<a id="L532"></a>    try serializeCpu(q, &amp;buffer);
+<a id="L533"></a>    return buffer.toOwnedSlice();
+<a id="L534"></a>}
+<a id="L535"></a>
+<a id="L536"></a>pub fn allocDescription(self: Query, allocator: Allocator) ![]u8 {
+<a id="L537"></a>    // TODO is there anything else worthy of the description that is not
+<a id="L538"></a>    // already captured in the triple?
+<a id="L539"></a>    return self.zigTriple(allocator);
+<a id="L540"></a>}
+<a id="L541"></a>
+<a id="L542"></a>pub fn setGnuLibCVersion(self: *Query, major: u32, minor: u32, patch: u32) void {
+<a id="L543"></a>    self.glibc_version = SemanticVersion{ .major = major, .minor = minor, .patch = patch };
+<a id="L544"></a>}
+<a id="L545"></a>
+<a id="L546"></a>fn parseOs(result: *Query, diags: *ParseOptions.Diagnostics, text: []const u8) !void {
+<a id="L547"></a>    var it = mem.splitScalar(u8, text, '.');
+<a id="L548"></a>    const os_name = it.first();
+<a id="L549"></a>    diags.os_name = os_name;
+<a id="L550"></a>    const os_is_native = mem.eql(u8, os_name, "native");
+<a id="L551"></a>    if (!os_is_native) {
+<a id="L552"></a>        result.os_tag = std.meta.stringToEnum(Target.Os.Tag, os_name) orelse
+<a id="L553"></a>            return error.UnknownOperatingSystem;
+<a id="L554"></a>    }
+<a id="L555"></a>    const tag = result.os_tag orelse builtin.os.tag;
+<a id="L556"></a>    diags.os_tag = tag;
+<a id="L557"></a>
+<a id="L558"></a>    const version_text = it.rest();
+<a id="L559"></a>    if (version_text.len &gt; 0) switch (tag.versionRangeTag()) {
+<a id="L560"></a>        .none =&gt; return error.InvalidOperatingSystemVersion,
+<a id="L561"></a>        .semver, .hurd, .linux =&gt; {
+<a id="L562"></a>            var range_it = mem.splitSequence(u8, version_text, "...");
+<a id="L563"></a>            result.os_version_min = .{
+<a id="L564"></a>                .semver = parseVersion(range_it.first()) catch |err| switch (err) {
+<a id="L565"></a>                    error.Overflow =&gt; return error.InvalidOperatingSystemVersion,
+<a id="L566"></a>                    error.InvalidVersion =&gt; return error.InvalidOperatingSystemVersion,
+<a id="L567"></a>                },
+<a id="L568"></a>            };
+<a id="L569"></a>            if (range_it.next()) |v| {
+<a id="L570"></a>                result.os_version_max = .{
+<a id="L571"></a>                    .semver = parseVersion(v) catch |err| switch (err) {
+<a id="L572"></a>                        error.Overflow =&gt; return error.InvalidOperatingSystemVersion,
+<a id="L573"></a>                        error.InvalidVersion =&gt; return error.InvalidOperatingSystemVersion,
+<a id="L574"></a>                    },
+<a id="L575"></a>                };
+<a id="L576"></a>            }
+<a id="L577"></a>        },
+<a id="L578"></a>        .windows =&gt; {
+<a id="L579"></a>            var range_it = mem.splitSequence(u8, version_text, "...");
+<a id="L580"></a>            result.os_version_min = .{
+<a id="L581"></a>                .windows = try Target.Os.WindowsVersion.parse(range_it.first()),
+<a id="L582"></a>            };
+<a id="L583"></a>            if (range_it.next()) |v| {
+<a id="L584"></a>                result.os_version_max = .{
+<a id="L585"></a>                    .windows = try Target.Os.WindowsVersion.parse(v),
+<a id="L586"></a>                };
+<a id="L587"></a>            }
+<a id="L588"></a>        },
+<a id="L589"></a>    };
+<a id="L590"></a>}
+<a id="L591"></a>
+<a id="L592"></a>pub fn eql(a: Query, b: Query) bool {
+<a id="L593"></a>    if (a.cpu_arch != b.cpu_arch) return false;
+<a id="L594"></a>    if (!a.cpu_model.eql(b.cpu_model)) return false;
+<a id="L595"></a>    if (!a.cpu_features_add.eql(b.cpu_features_add)) return false;
+<a id="L596"></a>    if (!a.cpu_features_sub.eql(b.cpu_features_sub)) return false;
+<a id="L597"></a>    if (a.os_tag != b.os_tag) return false;
+<a id="L598"></a>    if (!OsVersion.eqlOpt(a.os_version_min, b.os_version_min)) return false;
+<a id="L599"></a>    if (!OsVersion.eqlOpt(a.os_version_max, b.os_version_max)) return false;
+<a id="L600"></a>    if (!versionEqualOpt(a.glibc_version, b.glibc_version)) return false;
+<a id="L601"></a>    if (a.android_api_level != b.android_api_level) return false;
+<a id="L602"></a>    if (a.abi != b.abi) return false;
+<a id="L603"></a>    if (!dynamicLinkerEqualOpt(a.dynamic_linker, b.dynamic_linker)) return false;
+<a id="L604"></a>    if (a.ofmt != b.ofmt) return false;
+<a id="L605"></a>
+<a id="L606"></a>    return true;
+<a id="L607"></a>}
+<a id="L608"></a>
+<a id="L609"></a>fn versionEqualOpt(a: ?SemanticVersion, b: ?SemanticVersion) bool {
+<a id="L610"></a>    if (a == null and b == null) return true;
+<a id="L611"></a>    if (a == null or b == null) return false;
+<a id="L612"></a>    return SemanticVersion.order(a.?, b.?) == .eq;
+<a id="L613"></a>}
+<a id="L614"></a>
+<a id="L615"></a>fn dynamicLinkerEqualOpt(a: ?Target.DynamicLinker, b: ?Target.DynamicLinker) bool {
+<a id="L616"></a>    if (a == null and b == null) return true;
+<a id="L617"></a>    if (a == null or b == null) return false;
+<a id="L618"></a>    return a.?.eql(b.?);
+<a id="L619"></a>}
+<a id="L620"></a>
+<a id="L621"></a>test parse {
+<a id="L622"></a>    const io = std.testing.io;
+<a id="L623"></a>
+<a id="L624"></a>    if (builtin.target.isGnuLibC()) {
+<a id="L625"></a>        var query = try Query.parse(.{});
+<a id="L626"></a>        query.setGnuLibCVersion(2, 1, 1);
+<a id="L627"></a>
+<a id="L628"></a>        const text = try query.zigTriple(std.testing.allocator);
+<a id="L629"></a>        defer std.testing.allocator.free(text);
+<a id="L630"></a>
+<a id="L631"></a>        try std.testing.expectEqualSlices(u8, "native-native-gnu.2.1.1", text);
+<a id="L632"></a>    }
+<a id="L633"></a>    if (builtin.target.abi.isAndroid()) {
+<a id="L634"></a>        var query = try Query.parse(.{});
+<a id="L635"></a>        query.android_api_level = 30;
+<a id="L636"></a>
+<a id="L637"></a>        const text = try query.zigTriple(std.testing.allocator);
+<a id="L638"></a>        defer std.testing.allocator.free(text);
+<a id="L639"></a>
+<a id="L640"></a>        try std.testing.expectEqualSlices(u8, "native-native-android.30", text);
+<a id="L641"></a>    }
+<a id="L642"></a>    {
+<a id="L643"></a>        const query = try Query.parse(.{
+<a id="L644"></a>            .arch_os_abi = "aarch64-linux",
+<a id="L645"></a>            .cpu_features = "native",
+<a id="L646"></a>        });
+<a id="L647"></a>
+<a id="L648"></a>        try std.testing.expect(query.cpu_arch.? == .aarch64);
+<a id="L649"></a>        try std.testing.expect(query.cpu_model == .native);
+<a id="L650"></a>    }
+<a id="L651"></a>    {
+<a id="L652"></a>        const query = try Query.parse(.{ .arch_os_abi = "native" });
+<a id="L653"></a>
+<a id="L654"></a>        try std.testing.expect(query.cpu_arch == null);
+<a id="L655"></a>        try std.testing.expect(query.isNative());
+<a id="L656"></a>
+<a id="L657"></a>        const text = try query.zigTriple(std.testing.allocator);
+<a id="L658"></a>        defer std.testing.allocator.free(text);
+<a id="L659"></a>        try std.testing.expectEqualSlices(u8, "native", text);
+<a id="L660"></a>    }
+<a id="L661"></a>    {
+<a id="L662"></a>        const query = try Query.parse(.{
+<a id="L663"></a>            .arch_os_abi = "x86_64-linux-gnu",
+<a id="L664"></a>            .cpu_features = "x86_64-sse-sse2-avx-cx8",
+<a id="L665"></a>        });
+<a id="L666"></a>        const target = try std.zig.system.resolveTargetQuery(io, query);
+<a id="L667"></a>
+<a id="L668"></a>        try std.testing.expect(target.os.tag == .linux);
+<a id="L669"></a>        try std.testing.expect(target.abi == .gnu);
+<a id="L670"></a>        try std.testing.expect(target.cpu.arch == .x86_64);
+<a id="L671"></a>        try std.testing.expect(!target.cpu.has(.x86, .sse));
+<a id="L672"></a>        try std.testing.expect(!target.cpu.has(.x86, .avx));
+<a id="L673"></a>        try std.testing.expect(!target.cpu.has(.x86, .cx8));
+<a id="L674"></a>        try std.testing.expect(target.cpu.has(.x86, .cmov));
+<a id="L675"></a>        try std.testing.expect(target.cpu.has(.x86, .fxsr));
+<a id="L676"></a>
+<a id="L677"></a>        try std.testing.expect(target.cpu.hasAny(.x86, &amp;.{ .sse, .avx, .cmov }));
+<a id="L678"></a>        try std.testing.expect(!target.cpu.hasAny(.x86, &amp;.{ .sse, .avx }));
+<a id="L679"></a>        try std.testing.expect(target.cpu.hasAll(.x86, &amp;.{ .mmx, .x87 }));
+<a id="L680"></a>        try std.testing.expect(!target.cpu.hasAll(.x86, &amp;.{ .mmx, .x87, .sse }));
+<a id="L681"></a>
+<a id="L682"></a>        const text = try query.zigTriple(std.testing.allocator);
+<a id="L683"></a>        defer std.testing.allocator.free(text);
+<a id="L684"></a>        try std.testing.expectEqualSlices(u8, "x86_64-linux-gnu", text);
+<a id="L685"></a>    }
+<a id="L686"></a>    {
+<a id="L687"></a>        const query = try Query.parse(.{
+<a id="L688"></a>            .arch_os_abi = "arm-linux-musleabihf",
+<a id="L689"></a>            .cpu_features = "generic+v8a",
+<a id="L690"></a>        });
+<a id="L691"></a>        const target = try std.zig.system.resolveTargetQuery(io, query);
+<a id="L692"></a>
+<a id="L693"></a>        try std.testing.expect(target.os.tag == .linux);
+<a id="L694"></a>        try std.testing.expect(target.abi == .musleabihf);
+<a id="L695"></a>        try std.testing.expect(target.cpu.arch == .arm);
+<a id="L696"></a>        try std.testing.expect(target.cpu.model == &amp;Target.arm.cpu.generic);
+<a id="L697"></a>        try std.testing.expect(target.cpu.has(.arm, .v8a));
+<a id="L698"></a>
+<a id="L699"></a>        const text = try query.zigTriple(std.testing.allocator);
+<a id="L700"></a>        defer std.testing.allocator.free(text);
+<a id="L701"></a>        try std.testing.expectEqualSlices(u8, "arm-linux-musleabihf", text);
+<a id="L702"></a>    }
+<a id="L703"></a>    {
+<a id="L704"></a>        const query = try Query.parse(.{
+<a id="L705"></a>            .arch_os_abi = "aarch64-linux.3.10...4.4.1-gnu.2.27",
+<a id="L706"></a>            .cpu_features = "generic+v8a",
+<a id="L707"></a>        });
+<a id="L708"></a>        const target = try std.zig.system.resolveTargetQuery(io, query);
+<a id="L709"></a>
+<a id="L710"></a>        try std.testing.expect(target.cpu.arch == .aarch64);
+<a id="L711"></a>        try std.testing.expect(target.os.tag == .linux);
+<a id="L712"></a>        try std.testing.expect(target.os.version_range.linux.range.min.major == 3);
+<a id="L713"></a>        try std.testing.expect(target.os.version_range.linux.range.min.minor == 10);
+<a id="L714"></a>        try std.testing.expect(target.os.version_range.linux.range.min.patch == 0);
+<a id="L715"></a>        try std.testing.expect(target.os.version_range.linux.range.max.major == 4);
+<a id="L716"></a>        try std.testing.expect(target.os.version_range.linux.range.max.minor == 4);
+<a id="L717"></a>        try std.testing.expect(target.os.version_range.linux.range.max.patch == 1);
+<a id="L718"></a>        try std.testing.expect(target.os.version_range.linux.glibc.major == 2);
+<a id="L719"></a>        try std.testing.expect(target.os.version_range.linux.glibc.minor == 27);
+<a id="L720"></a>        try std.testing.expect(target.os.version_range.linux.glibc.patch == 0);
+<a id="L721"></a>        try std.testing.expect(target.abi == .gnu);
+<a id="L722"></a>
+<a id="L723"></a>        const text = try query.zigTriple(std.testing.allocator);
+<a id="L724"></a>        defer std.testing.allocator.free(text);
+<a id="L725"></a>        try std.testing.expectEqualSlices(u8, "aarch64-linux.3.10...4.4.1-gnu.2.27", text);
+<a id="L726"></a>    }
+<a id="L727"></a>    {
+<a id="L728"></a>        const query = try Query.parse(.{
+<a id="L729"></a>            .arch_os_abi = "aarch64-linux.3.10...4.4.1-android.30",
+<a id="L730"></a>        });
+<a id="L731"></a>        const target = try std.zig.system.resolveTargetQuery(io, query);
+<a id="L732"></a>
+<a id="L733"></a>        try std.testing.expect(target.cpu.arch == .aarch64);
+<a id="L734"></a>        try std.testing.expect(target.os.tag == .linux);
+<a id="L735"></a>        try std.testing.expect(target.os.version_range.linux.range.min.major == 3);
+<a id="L736"></a>        try std.testing.expect(target.os.version_range.linux.range.min.minor == 10);
+<a id="L737"></a>        try std.testing.expect(target.os.version_range.linux.range.min.patch == 0);
+<a id="L738"></a>        try std.testing.expect(target.os.version_range.linux.range.max.major == 4);
+<a id="L739"></a>        try std.testing.expect(target.os.version_range.linux.range.max.minor == 4);
+<a id="L740"></a>        try std.testing.expect(target.os.version_range.linux.range.max.patch == 1);
+<a id="L741"></a>        try std.testing.expect(target.os.version_range.linux.android == 30);
+<a id="L742"></a>        try std.testing.expect(target.abi == .android);
+<a id="L743"></a>
+<a id="L744"></a>        const text = try query.zigTriple(std.testing.allocator);
+<a id="L745"></a>        defer std.testing.allocator.free(text);
+<a id="L746"></a>        try std.testing.expectEqualSlices(u8, "aarch64-linux.3.10...4.4.1-android.30", text);
+<a id="L747"></a>    }
+<a id="L748"></a>    {
+<a id="L749"></a>        const query = try Query.parse(.{
+<a id="L750"></a>            .arch_os_abi = "x86-windows.xp...win8-msvc",
+<a id="L751"></a>        });
+<a id="L752"></a>        const target = try std.zig.system.resolveTargetQuery(io, query);
+<a id="L753"></a>
+<a id="L754"></a>        try std.testing.expect(target.cpu.arch == .x86);
+<a id="L755"></a>        try std.testing.expect(target.os.tag == .windows);
+<a id="L756"></a>        try std.testing.expect(target.os.version_range.windows.min == .xp);
+<a id="L757"></a>        try std.testing.expect(target.os.version_range.windows.max == .win8);
+<a id="L758"></a>        try std.testing.expect(target.abi == .msvc);
+<a id="L759"></a>
+<a id="L760"></a>        const text = try query.zigTriple(std.testing.allocator);
+<a id="L761"></a>        defer std.testing.allocator.free(text);
+<a id="L762"></a>        try std.testing.expectEqualSlices(u8, "x86-windows.xp...win8-msvc", text);
+<a id="L763"></a>    }
+<a id="L764"></a>}
+</pre>
 </body>
 </html>
